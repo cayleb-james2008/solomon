@@ -320,8 +320,12 @@ def run_pi(task: str, timeout: int = 1800, system_md: Path | None = None) -> sub
     # pi's node grandchild holding the stdout pipe makes the read block forever — that froze a
     # run for 5h. We force-kill the whole tree on timeout, then re-raise so the caller reverts.
     flags = _NO_WINDOW | (subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0)
+    # encoding="utf-8": pi emits UTF-8 (em-dashes, smart quotes). Without this, text=True
+    # decodes with the platform default (cp1252 on Windows) and mangles non-ASCII into mojibake
+    # — which then gets written verbatim into the provisioned AGENT.md/backlog.md.
     proc = subprocess.Popen(args, cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, env=env, creationflags=flags)
+                            text=True, encoding="utf-8", errors="replace", env=env,
+                            creationflags=flags)
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:

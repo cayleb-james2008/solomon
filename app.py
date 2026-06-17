@@ -9,8 +9,9 @@ import os
 import sys
 import webbrowser
 
-import webview
-
+# NOTE: pywebview is imported lazily inside main() — the module-level import would crash the
+# headless control surface (--state/--start/--stop/--supervise, used by tests and the scheduled
+# supervisor sweep) on any host without pywebview/WebView2 installed.
 import control
 
 sys.path.insert(0, os.path.join(control.HERE, "improver"))  # solomon.py lives beside the runner
@@ -268,6 +269,7 @@ def main():
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Solomon.Dashboard")
         except Exception:  # noqa: BLE001 — best-effort cosmetic
             pass
+    import webview  # lazy: GUI-only dependency, not needed by the headless control surface
     api = Api()
     webview.create_window(
         "Solomon",

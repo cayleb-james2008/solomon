@@ -1,6 +1,7 @@
 """Tests for the deterministic provisioner, the start() provisioning interlock, and the
 runner --provision parser. No network / gh / real pi."""
 import importlib.util
+import json
 import os
 import sys
 
@@ -37,6 +38,34 @@ def test_detect_stack_node(tmp_path):
     open(os.path.join(tmp_path, "package.json"), "w").close()
     st = control._detect_stack({"name": "x", "path": str(tmp_path)})
     assert st["lang"] == "node" and st["test_cmd"] == "npm test"
+
+
+def _make_venv_and_tests(tmp_path):
+    """Create an OS-appropriate .venv python stub + a tests/ dir, with NO manifest."""
+    if os.name == "nt":
+        vd = tmp_path / ".venv" / "Scripts"
+        vd.mkdir(parents=True)
+        (vd / "python.exe").write_text("", encoding="utf-8")
+    else:
+        vd = tmp_path / ".venv" / "bin"
+        vd.mkdir(parents=True)
+        (vd / "python").write_text("", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+
+
+def test_detect_stack_unittest_fallback(tmp_path):
+    # venv + tests/ but no manifest (e.g. sover) -> python with unittest discovery
+    _make_venv_and_tests(tmp_path)
+    st = control._detect_stack({"name": "x", "path": str(tmp_path)})
+    assert st["lang"] == "python"
+    assert "unittest discover -s tests -t tests" in st["test_cmd"]
+
+
+def test_detect_stack_pytest_when_conftest(tmp_path):
+    open(os.path.join(tmp_path, "pyproject.toml"), "w").close()
+    open(os.path.join(tmp_path, "conftest.py"), "w").close()
+    st = control._detect_stack({"name": "x", "path": str(tmp_path)})
+    assert st["lang"] == "python" and st["test_cmd"].endswith("-m pytest")
 
 
 # ---- rendering -------------------------------------------------------------
@@ -79,6 +108,28 @@ def test_ensure_contracts_does_not_overwrite(tmp_path, monkeypatch):
     res = control.ensure_contracts(r)
     assert res["created"] == ["backlog.md"]                              # only the missing one
     assert control.read_contract(r, "agent")["text"] == "# custom contract\n"   # preserved
+
+
+def test_ensure_contracts_sets_gate_from_detection(tmp_path, monkeypatch):
+    # provisioning must leave the loop with a runnable gate, not the failing pytest fallback
+    monkeypatch.setattr(control, "HERE", str(tmp_path))
+    repos = tmp_path / "repos.json"
+    repos.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(control, "REPOS_JSON", str(repos))
+    monkeypatch.setattr(control, "PROJECTS_DIR", str(tmp_path / "projects"))
+    _make_venv_and_tests(tmp_path)
+    res = control.ensure_contracts({"name": "demo", "path": str(tmp_path)})
+    assert res["ok"] and "unittest discover" in res.get("gate_set", "")
+    saved = next(x for x in json.loads(repos.read_text(encoding="utf-8")) if x["name"] == "demo")
+    assert "unittest discover" in (saved.get("gate") or "")
+
+
+def test_ensure_contracts_keeps_operator_gate(tmp_path, monkeypatch):
+    monkeypatch.setattr(control, "HERE", str(tmp_path))
+    monkeypatch.setattr(control, "REPOS_JSON", str(tmp_path / "repos.json"))
+    _make_venv_and_tests(tmp_path)
+    res = control.ensure_contracts({"name": "demo", "path": str(tmp_path), "gate": "make test"})
+    assert "gate_set" not in res                                         # operator gate untouched
 
 
 # ---- start() provisions before spawning the loop ---------------------------
