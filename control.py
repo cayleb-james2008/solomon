@@ -841,15 +841,34 @@ def _detect_stack(repo):
     if not path or not os.path.isdir(path):
         return out
     here = lambda f: os.path.exists(os.path.join(path, f))
-    if any(here(f) for f in ("pyproject.toml", "requirements.txt", "requirements-dev.txt",
-                             "setup.py", "setup.cfg")):
-        out["lang"], out["test_cmd"] = "python", ".venv/Scripts/python -m pytest"
+    isdir = lambda f: os.path.isdir(os.path.join(path, f))
+    win = os.name == "nt"
+    venv_rel = ".venv/Scripts/python.exe" if win else ".venv/bin/python"
+    # The emitted command runs through cmd.exe (shell=True): a forward-slash exe path at the
+    # start of the line ("'.venv' is not recognized") fails there, so use backslashes on Windows.
+    py = (r".venv\Scripts\python" if win else ".venv/bin/python") if here(venv_rel) else "python"
+    pytest_cfg = here("pytest.ini") or here("conftest.py") or here("tests/conftest.py")
+
+    def _py_test_cmd():
+        # pytest if the project configures it; else unittest discovery when a tests/ dir exists
+        # (many app repos — e.g. sover — ship a tests/ dir + venv but no pytest config or manifest).
+        if pytest_cfg or not isdir("tests"):
+            return f"{py} -m pytest"
+        return f"{py} -m unittest discover -s tests -t tests"
+
+    has_manifest = any(here(f) for f in ("pyproject.toml", "requirements.txt", "requirements-dev.txt",
+                                         "setup.py", "setup.cfg"))
+    if has_manifest:
+        out["lang"], out["test_cmd"] = "python", _py_test_cmd()
     elif here("package.json"):
         out["lang"], out["test_cmd"] = "node", "npm test"
     elif here("Cargo.toml"):
         out["lang"], out["test_cmd"] = "rust", "cargo test"
     elif here("go.mod"):
         out["lang"], out["test_cmd"] = "go", "go test ./..."
+    elif here(venv_rel) and isdir("tests"):
+        # Python project with a venv + tests but no manifest (e.g. sover): detect it anyway.
+        out["lang"], out["test_cmd"] = "python", _py_test_cmd()
     for ep in ("app.py", "main.py", "__main__.py", "index.js", "src/main.py",
                "src/main.js", "src/main.ts"):
         if here(ep):
@@ -954,21 +973,29 @@ def contracts_present(repo):
 def ensure_contracts(repo):
     """Idempotent: guarantee improver/<name>/AGENT.md + backlog.md exist (deterministic template)
     BEFORE the first RSI loop, so the runner never hits a missing-contract crash. Never overwrites
-    a present file. Returns {ok, created:[...]} or {ok:false, error}."""
+    a present file. Also auto-sets the runner's gate from stack detection when the operator hasn't
+    set one — otherwise the loop falls back to the built-in pytest gate, which fails (and reverts
+    every iteration) on a non-pytest project like a unittest-only repo. Returns {ok, created:[...],
+    gate_set?} or {ok:false, error}."""
     if not _repo_name(repo):
         return {"ok": False, "error": "repo has no name"}
     pres = contracts_present(repo)
-    if pres.get("agent") and pres.get("backlog"):
-        return {"ok": True, "created": []}
-    agent_md, backlog_md = render_default_contract(repo)
     created = []
-    for which, text, label in (("agent", agent_md, "AGENT.md"), ("backlog", backlog_md, "backlog.md")):
-        if not pres.get(which):
-            r = write_contract(repo, which, text)
-            if not r.get("ok"):
-                return {"ok": False, "error": r.get("error")}
-            created.append(label)
-    return {"ok": True, "created": created}
+    if not (pres.get("agent") and pres.get("backlog")):
+        agent_md, backlog_md = render_default_contract(repo)
+        for which, text, label in (("agent", agent_md, "AGENT.md"),
+                                   ("backlog", backlog_md, "backlog.md")):
+            if not pres.get(which):
+                r = write_contract(repo, which, text)
+                if not r.get("ok"):
+                    return {"ok": False, "error": r.get("error")}
+                created.append(label)
+    out = {"ok": True, "created": created}
+    if not project_gate(repo):
+        det = _detect_stack(repo).get("test_cmd")
+        if det and set_repo_config(_repo_name(repo), gate=det).get("ok"):
+            out["gate_set"] = det
+    return out
 
 
 def enrich_contract(repo, background=False):

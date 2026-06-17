@@ -6,5 +6,11 @@
     "model": "glm-5.2",
     "ship": "auto-merge",
     "gate": ""
+  },
+  {
+    "name": "sover",
+    "branch_prefix": "rsi/",
+    "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\sover",
+    "gate": ".venv\\Scripts\\python -m unittest discover -s tests -t tests"
   }
 ]
