@@ -242,6 +242,49 @@ def test_run_gate_parses_unittest_failures(monkeypatch):
     assert not green and tests["passed"] == 7 and tests["failed"] == 2 and tests["errors"] == 1
 
 
+def test_ship_succeeded_distinguishes_real_ship_from_failure():
+    m = _load_runner()
+    assert m._ship_succeeded({"number": 5})                                    # PR opened
+    assert m._ship_succeeded({"number": None, "state": "local branch (unshipped)"})
+    assert m._ship_succeeded({"number": None, "state": "local (no remote)"})
+    assert not m._ship_succeeded({"number": None, "state": "push-failed"})
+    assert not m._ship_succeeded({"number": None, "state": "local (ship pending gh auth)"})
+
+
+def _fake_run(cmds):
+    def run(args, **k):
+        cmds.append(args)
+        return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    return run
+
+
+def test_auto_merge_blocks_on_ci_red(monkeypatch):
+    m = _load_runner()
+    cmds = []
+    monkeypatch.setattr(m.subprocess, "run", _fake_run(cmds))
+    monkeypatch.setattr(m, "gh_exe", lambda: "gh")
+    pr = m._auto_merge({"number": 7, "checks": "failure"})
+    assert "CI red" in pr["state"] and cmds == []          # never invoked gh merge
+
+
+def test_auto_merge_queues_on_pending(monkeypatch):
+    m = _load_runner()
+    cmds = []
+    monkeypatch.setattr(m.subprocess, "run", _fake_run(cmds))
+    monkeypatch.setattr(m, "gh_exe", lambda: "gh")
+    pr = m._auto_merge({"number": 7, "checks": "pending"})
+    assert "queued" in pr["state"] and any("--auto" in c for c in cmds)
+
+
+def test_auto_merge_merges_on_success(monkeypatch):
+    m = _load_runner()
+    cmds = []
+    monkeypatch.setattr(m.subprocess, "run", _fake_run(cmds))
+    monkeypatch.setattr(m, "gh_exe", lambda: "gh")
+    pr = m._auto_merge({"number": 7, "checks": "success"})
+    assert pr["state"] == "merged" and any("--squash" in c and "--auto" not in c for c in cmds)
+
+
 def test_runner_clean_env_strips_github_tokens(monkeypatch):
     m = _load_runner()
     monkeypatch.setenv("GITHUB_TOKEN", "bad")

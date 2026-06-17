@@ -191,6 +191,28 @@ def test_recover_gate_red_streak_optin(tmp_path, monkeypatch):
     assert "solomon_fix_session" in res2["actions_taken"] and len(calls) == 1
 
 
+def test_recover_dirty_tree_refuses_under_live_loop(tmp_path, monkeypatch):
+    rt = _rt(tmp_path, monkeypatch)
+    _hb(rt, status="error", phase="preflight", last_summary="Working tree is dirty — commit or stash")
+    monkeypatch.setattr(control, "is_running", lambda repo: True)
+    resets = []
+    monkeypatch.setattr(control, "reset_to_base", lambda repo: resets.append(repo) or {"ok": True})
+    res = solomon.recover(_repo(tmp_path), allow_pi=False)
+    assert res["escalate"] and resets == []            # never hard-reset git under a live iteration
+
+
+def test_recover_gate_red_streak_refuses_under_live_loop(tmp_path, monkeypatch):
+    rt = _rt(tmp_path, monkeypatch)
+    _hb(rt, status="sleeping")
+    _hist(rt, [{"status": "reverted"}] * 3)
+    monkeypatch.setattr(control, "is_running", lambda repo: True)
+    monkeypatch.setattr(control, "keys_status", lambda: {"ollama-cloud": True})
+    spawned = []
+    monkeypatch.setattr(solomon, "solomon_fix_session", lambda repo: spawned.append(repo) or {"ok": True})
+    res = solomon.recover(_repo(tmp_path, provider="ollama-cloud"), allow_pi=True)
+    assert res["escalate"] and spawned == []           # never fix-session against a live lock
+
+
 # ---- app bridges (safe: no live mutation) ----------------------------------
 def test_app_bridges_unknown_repo_safe():
     import app

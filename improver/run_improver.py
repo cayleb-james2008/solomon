@@ -504,11 +504,24 @@ def _open_pr(branch: str, title: str, summary: str, tests: dict | None) -> dict:
 
 
 def _auto_merge(pr: dict) -> dict:
-    """Squash-merge an open PR and delete its branch. On success state='merged'
-    (url/number kept); on failure leave the PR open + log, return it unchanged."""
+    """Squash-merge an open PR — but NEVER on CI-red (pr-only-shipping-with-auto-revert applies to CI
+    too). checks: 'failure' -> leave open, do not merge; 'pending' -> queue GitHub native auto-merge
+    (merges only after required checks pass); 'success'/None(no CI) -> the gate(s) we have are green,
+    merge now. On success state='merged'; otherwise the PR is left open + logged."""
     num = pr.get("number")
     if not num:
         return pr
+    checks = pr.get("checks")
+    if checks == "failure":
+        log(f"auto-merge: CI FAILING on PR {num} — leaving open, NOT merging")
+        return {**pr, "state": "open (CI red — not merged)"}
+    if checks == "pending":
+        am = subprocess.run([gh_exe(), "pr", "merge", str(num), "--auto", "--squash", "--delete-branch"],
+                            cwd=REPO, capture_output=True, text=True, env=_clean_env(), creationflags=_NO_WINDOW)
+        if am.returncode == 0:
+            return {**pr, "state": "auto-merge queued (awaiting CI)"}
+        log(f"auto-merge: CI pending and native --auto unavailable on PR {num} — leaving open until CI resolves")
+        return {**pr, "state": "open (awaiting CI)"}
     m = subprocess.run([gh_exe(), "pr", "merge", str(num), "--squash", "--delete-branch"],
                        cwd=REPO, capture_output=True, text=True, env=_clean_env(), creationflags=_NO_WINDOW)
     if m.returncode == 0:
@@ -545,6 +558,21 @@ def one_iteration() -> None:
     git("reset", "--hard")  # drop any leftover working-tree changes from a dead run
     if has_remote():
         git("fetch", "origin", "--quiet")
+        # never-hand-patched keystone (enforced, not prose): REFUSE to adopt a base that moved
+        # without a gated iteration. Committed-but-un-pushed commits on BASE_BRANCH — an operator
+        # hand-patch, or a dead run's local commit — must NOT be silently hard-reset away. Surface
+        # them and skip; the loop changes a repo only through gated PRs.
+        ahead = git("rev-list", "--count", f"origin/{BASE_BRANCH}..{BASE_BRANCH}")
+        n_ahead = int((ahead.stdout or "0").strip() or "0") if ahead.returncode == 0 else 0
+        if n_ahead > 0:
+            shas = git("log", f"origin/{BASE_BRANCH}..{BASE_BRANCH}", "--oneline").stdout.strip()
+            heartbeat(status="error", phase="preflight",
+                      last_summary=f"{BASE_BRANCH} has {n_ahead} commit(s) not on origin "
+                                   f"(out-of-band / un-pushed base change). Refusing to hard-reset — "
+                                   f"push or revert them; managed repos change only via gated PRs. "
+                                   f"Commits: {shas[:300]}")
+            log(f"REFUSE preflight reset: {n_ahead} un-pushed base commit(s) on {BASE_BRANCH}")
+            return
         rs = git("reset", "--hard", f"origin/{BASE_BRANCH}")
         if rs.returncode != 0:
             log(f"reset to origin/{BASE_BRANCH} failed: {(rs.stderr or '').strip()[:160]} — using local {BASE_BRANCH}")
@@ -552,6 +580,21 @@ def one_iteration() -> None:
         heartbeat(status="error", phase="preflight", last_summary=f"Could not create branch {branch}")
         return
     base = head_sha()
+
+    # Anti-gaming baseline (gate-enforced-by-runner): measure the gate on the CLEAN base before Pi
+    # touches anything, so a post-change "green" that actually dropped the pass count — deleted,
+    # weakened, or skipped tests — is caught and reverted. Skipped for the docs-only/supervisor modes.
+    base_tests = None
+    if not BEAUTIFY and not SOLOMON:
+        bgreen, base_tests, _ = run_gate()
+        if not bgreen:
+            heartbeat(status="error", phase="preflight",
+                      last_summary=f"Base gate is RED before any change ({base_tests}). Fix the gate "
+                                   f"command or the base; the loop can't measure a gain from a red base.")
+            log(f"base gate RED — skipping iteration {n}")
+            git("checkout", "--force", BASE_BRANCH)
+            git("branch", "-D", branch)
+            return
 
     if SOLOMON:
         goal = "supervise: diagnose and fix the persistent gate failure"
@@ -601,6 +644,24 @@ def one_iteration() -> None:
             _drop_branch(branch, "reverted",
                          f"Reverted — tests failed ({tests['failed']} failed). {summary}")
             return
+        # Anti-gaming: a GREEN gate that DROPPED the pass count means tests were removed/weakened/
+        # skipped — the gate was gamed. Revert even though it is "green".
+        if base_tests and tests["passed"] < base_tests["passed"]:
+            log(f"anti-gaming: pass count fell {base_tests['passed']} -> {tests['passed']} — reverting")
+            _drop_branch(branch, "reverted",
+                         f"Reverted — anti-gaming: pass count fell {base_tests['passed']}→"
+                         f"{tests['passed']} (tests removed/weakened/skipped). {summary}")
+            return
+        # ...and catch newly-introduced skip/xfail markers (weakening that needn't drop the count).
+        diff = git("diff", BASE_BRANCH).stdout or ""
+        new_skips = [ln for ln in diff.splitlines() if ln.startswith("+")
+                     and re.search(r"@\s*(pytest\.mark\.(skip|xfail)|unittest\.skip)", ln)]
+        if new_skips:
+            log(f"anti-gaming: {len(new_skips)} new skip/xfail marker(s) — reverting")
+            _drop_branch(branch, "reverted",
+                         f"Reverted — anti-gaming: introduced {len(new_skips)} skip/xfail "
+                         f"marker(s). {summary}")
+            return
 
     # commit anything Pi left uncommitted (it shouldn't commit, but be robust)
     heartbeat(phase="commit")
@@ -636,10 +697,21 @@ def one_iteration() -> None:
     title = "beautify repo" if BEAUTIFY else _pr_title(goal, summary)
     pr = _ship(branch, title, summary, tests)
     git("checkout", BASE_BRANCH)
-    if not BEAUTIFY and not SOLOMON:
-        _mark_backlog_done(goal)   # tick the shipped item so a continuous loop advances to the next
+    # Advance the backlog ONLY on a real ship — a PR was opened/merged, or the work was deliberately
+    # kept local (ship=local) — never on a push/auth FAILURE (else the item is lost without landing).
+    if not BEAUTIFY and not SOLOMON and _ship_succeeded(pr):
+        _mark_backlog_done(goal)
     heartbeat(status="sleeping", phase="sleep", last_pr=pr, last_summary=summary)
     _record_history("shipped", branch, summary)
+
+
+def _ship_succeeded(pr: dict) -> bool:
+    """A terminal, non-failed ship: a PR was opened (has a number) OR the branch was deliberately
+    kept local (ship=local). NOT a push/auth failure (those didn't land and must be retried)."""
+    if pr.get("number"):
+        return True
+    state = (pr.get("state") or "").lower()
+    return "local" in state and "fail" not in state and "pending" not in state
 
 
 def _ship(branch: str, title: str, summary: str, tests: dict) -> dict:
