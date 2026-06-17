@@ -1,7 +1,7 @@
 # Sover backlog
 
 - [x] Add a roundtrip test for `strategy.save_strategy()` that verifies atomic write, reload preserves values, and omitted `auto_post` stays `False`. (shipped: PR #1, merged into main)
-- [ ] Add tests for `config.asset()` override resolution (per-profile asset wins over shared asset; missing shared path is returned gracefully).
+- [x] Add tests for `config.asset()` override resolution (per-profile asset wins over shared asset; missing shared path is returned gracefully). (shipped: PR #2)
 - [ ] Add tests for `jsonstore.locked()` concurrent acquisition and stale-lock steal behavior using temporary paths.
 - [ ] Add a characterization test for `frozen_guard.baseline()`/`verify()` that records and detects a single-bit change in a frozen file.
 - [ ] Add a smoke test for the FastAPI app factory (`api.app:create_app()`) that confirms expected routers are wired and the root redirect resolves.

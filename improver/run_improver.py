@@ -411,6 +411,27 @@ def _top_backlog_item() -> str:
     return "model-chosen improvement"
 
 
+def _mark_backlog_done(goal: str) -> None:
+    """After a successful ship, tick the backlog item we just implemented (`- [ ]` -> `- [x]`) so a
+    continuous loop advances to the NEXT item instead of re-shipping the same one each iteration
+    (every iteration bases off the integration branch, which doesn't yet have the in-flight PRs)."""
+    if not goal:
+        return
+    try:
+        lines = BACKLOG.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith("- [ ]") and s[5:].strip() == goal.strip():
+            lines[i] = ln.replace("- [ ]", "- [x]", 1)
+            try:
+                BACKLOG.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            except OSError:
+                pass
+            return
+
+
 def _pr_title(goal: str, summary: str = "") -> str:
     """Concise PR/commit title from the backlog goal; fall back to the summary's first line
     when the goal is the generic placeholder (so the title isn't a truncated paragraph)."""
@@ -615,6 +636,8 @@ def one_iteration() -> None:
     title = "beautify repo" if BEAUTIFY else _pr_title(goal, summary)
     pr = _ship(branch, title, summary, tests)
     git("checkout", BASE_BRANCH)
+    if not BEAUTIFY and not SOLOMON:
+        _mark_backlog_done(goal)   # tick the shipped item so a continuous loop advances to the next
     heartbeat(status="sleeping", phase="sleep", last_pr=pr, last_summary=summary)
     _record_history("shipped", branch, summary)
 

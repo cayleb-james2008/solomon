@@ -199,6 +199,19 @@ def test_enrich_contract_background_spawn(tmp_path, monkeypatch):
     assert r["ok"] and r.get("started") and calls and "--provision" in calls[0]
 
 
+def test_mark_backlog_done_ticks_item_and_advances(tmp_path, monkeypatch):
+    m = _load_runner()
+    bl = tmp_path / "backlog.md"
+    bl.write_text("# x backlog\n\n- [ ] first item\n- [ ] second item\n", encoding="utf-8")
+    monkeypatch.setattr(m, "BACKLOG", bl)
+    m._mark_backlog_done("first item")
+    txt = bl.read_text(encoding="utf-8")
+    assert "- [x] first item" in txt and "- [ ] second item" in txt
+    assert m._top_backlog_item() == "second item"   # loop now advances
+    m._mark_backlog_done("nonexistent")              # no-op, no crash
+    assert bl.read_text(encoding="utf-8") == txt
+
+
 def test_pr_title_prefers_goal_over_summary():
     m = _load_runner()
     # concise backlog goal wins, not the verbose summary
