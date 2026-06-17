@@ -411,8 +411,13 @@ def _top_backlog_item() -> str:
     return "model-chosen improvement"
 
 
-def _pr_title(summary: str) -> str:
-    first = next((ln.strip() for ln in summary.splitlines() if ln.strip()), "improvement")
+def _pr_title(goal: str, summary: str = "") -> str:
+    """Concise PR/commit title from the backlog goal; fall back to the summary's first line
+    when the goal is the generic placeholder (so the title isn't a truncated paragraph)."""
+    g = (goal or "").strip()
+    if g and g.lower() != "model-chosen improvement":
+        return g[:72]
+    first = next((ln.strip() for ln in (summary or "").splitlines() if ln.strip()), "improvement")
     return first[:72]
 
 
@@ -580,7 +585,7 @@ def one_iteration() -> None:
     heartbeat(phase="commit")
     git("add", "-A")
     if git("diff", "--cached", "--quiet").returncode != 0:
-        title = "beautify repo" if BEAUTIFY else _pr_title(summary)
+        title = "beautify repo" if BEAUTIFY else _pr_title(goal, summary)
         prefix = "docs" if BEAUTIFY else "rsi"
         git("commit", "-m", f"{prefix}: {title}\n\n{summary}")
     rl = git("rev-list", "--count", f"{BASE_BRANCH}..HEAD")
@@ -607,7 +612,7 @@ def one_iteration() -> None:
         _record_history("stopped", branch, summary)
         return
 
-    title = "beautify repo" if BEAUTIFY else _pr_title(summary)
+    title = "beautify repo" if BEAUTIFY else _pr_title(goal, summary)
     pr = _ship(branch, title, summary, tests)
     git("checkout", BASE_BRANCH)
     heartbeat(status="sleeping", phase="sleep", last_pr=pr, last_summary=summary)
@@ -895,7 +900,7 @@ def main(argv=None) -> int:
 
     _hb["started_at"] = _now()
     heartbeat(status="idle", phase=None)
-    log("Maki RSI improver started")
+    log(f"Solomon RSI improver started for {NAME}")
     try:
         while True:
             if STOP.exists():

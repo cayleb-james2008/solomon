@@ -199,6 +199,16 @@ def test_enrich_contract_background_spawn(tmp_path, monkeypatch):
     assert r["ok"] and r.get("started") and calls and "--provision" in calls[0]
 
 
+def test_pr_title_prefers_goal_over_summary():
+    m = _load_runner()
+    # concise backlog goal wins, not the verbose summary
+    assert m._pr_title("Add a roundtrip test for save_strategy()", "Added a TestSaveStrategy class with two tests that ...") \
+        == "Add a roundtrip test for save_strategy()"
+    # generic placeholder goal -> fall back to the summary's first line
+    assert m._pr_title("model-chosen improvement", "Tightened error handling\nmore detail") == "Tightened error handling"
+    assert len(m._pr_title("x" * 200)) == 72
+
+
 def test_run_gate_parses_unittest_pass(monkeypatch):
     m = _load_runner()
     m.GATE_CMD = "dummy"  # take the custom-gate branch
