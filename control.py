@@ -253,12 +253,18 @@ def _venv_python(repo):
 
 
 def _clean_subenv():
-    """os.environ minus GITHUB_TOKEN/GH_TOKEN. Solomon authenticates gh via `gh auth login` (keyring);
-    a stale token env var would shadow it and make gh exit non-zero — which would block the
-    GitHub-ready gate, blank the PR list, and break pushes. Stripping it forces the keyring path."""
+    """os.environ minus GITHUB_TOKEN/GH_TOKEN and PYTHONPATH/PYTHONHOME.
+
+    - GITHUB_TOKEN/GH_TOKEN: Solomon authenticates gh via `gh auth login` (keyring); a stale token
+      env var would shadow it and make gh exit non-zero — blocking the GitHub-ready gate, blanking
+      the PR list, and breaking pushes. Stripping it forces the keyring path.
+    - PYTHONPATH/PYTHONHOME: when Solomon runs from one Python (e.g. 3.11) and spawns a repo's
+      `.venv` python of a different minor (e.g. 3.12), a leaked PYTHONPATH/PYTHONHOME makes the
+      child load the wrong stdlib and crash with `SRE module mismatch` on `import re`. Strip them
+      so each venv python uses only its own stdlib."""
     env = dict(os.environ)
-    env.pop("GITHUB_TOKEN", None)
-    env.pop("GH_TOKEN", None)
+    for k in ("GITHUB_TOKEN", "GH_TOKEN", "PYTHONPATH", "PYTHONHOME"):
+        env.pop(k, None)
     return env
 
 
@@ -587,6 +593,7 @@ def start(repo, auto_push=True, once=False):
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
             close_fds=True,
+            env=_clean_subenv(),   # strip stale gh token + PYTHONPATH so the repo venv python is clean
         )
         return {"ok": True, "pid": proc.pid}
     except OSError as e:
@@ -636,6 +643,7 @@ def beautify(repo, auto_push=True):
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
             close_fds=True,
+            env=_clean_subenv(),
         )
         return {"ok": True, "pid": proc.pid}
     except OSError as e:
@@ -1023,7 +1031,8 @@ def enrich_contract(repo, background=False):
             flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
         try:
             subprocess.Popen(args, cwd=path, creationflags=flags, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, close_fds=True)
+                             stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, close_fds=True,
+                             env=_clean_subenv())
             return {"ok": True, "started": True}
         except OSError as e:
             return {"ok": False, "error": str(e)}
