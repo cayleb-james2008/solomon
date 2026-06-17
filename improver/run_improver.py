@@ -118,8 +118,26 @@ def build_task(goal: str) -> str:
         "(`.venv/Scripts/python -m pytest`) yourself to confirm it is green. Do NOT run git or "
         "gh — the runner commits and opens the pull request. If that item is already done or "
         "unclear, instead fix one clear small bug or cleanup you find. End with a 2-4 sentence "
-        "summary of what you changed."
+        "summary of what you changed, then a FINAL line that is exactly `ITEM-STATUS: done` if you "
+        "implemented (or it was already fully done) the named item above, or `ITEM-STATUS: deviated` "
+        "if you instead changed something else."
     )
+
+
+def _split_item_status(summary: str):
+    """Pull the trailing `ITEM-STATUS: done|deviated` marker off the agent summary. Returns
+    (clean_summary, deviated: bool). Used to tick the backlog item ONLY when the agent actually
+    implemented it — not when it deviated to some other change (which would silently skip the item)."""
+    deviated = False
+    lines = (summary or "").splitlines()
+    kept = []
+    for ln in lines:
+        m = re.match(r"\s*ITEM-STATUS:\s*(done|deviated|skipped)\b", ln, re.I)
+        if m:
+            deviated = m.group(1).lower() != "done"
+            continue   # strip the marker line from the PR/commit body
+        kept.append(ln)
+    return ("\n".join(kept).strip() or summary), deviated
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 BASE_BRANCH = "main"  # the repo's integration branch; re-resolved from the launch branch in main()
 
@@ -672,6 +690,7 @@ def one_iteration() -> None:
         _drop_branch(branch, "noop", "Pi session timed out.")
         return
     summary = final_text(p.stdout) or "(no summary returned)"
+    summary, item_deviated = _split_item_status(summary)   # don't tick the item if the agent deviated
     log(f"Pi rc={p.returncode}: {summary[:200]}")
 
     if not tree_dirty() and head_sha() == base:
@@ -717,7 +736,7 @@ def one_iteration() -> None:
     heartbeat(phase="commit")
     git("add", "-A")
     if git("diff", "--cached", "--quiet").returncode != 0:
-        title = "beautify repo" if BEAUTIFY else _pr_title(goal, summary)
+        title = "beautify repo" if BEAUTIFY else _pr_title("" if item_deviated else goal, summary)
         prefix = "docs" if BEAUTIFY else "rsi"
         git("commit", "-m", f"{prefix}: {title}\n\n{summary}")
     rl = git("rev-list", "--count", f"{BASE_BRANCH}..HEAD")
@@ -744,12 +763,14 @@ def one_iteration() -> None:
         _record_history("stopped", branch, summary)
         return
 
-    title = "beautify repo" if BEAUTIFY else _pr_title(goal, summary)
+    title = "beautify repo" if BEAUTIFY else _pr_title("" if item_deviated else goal, summary)
     pr = _ship(branch, title, summary, tests)
     git("checkout", BASE_BRANCH)
-    # Advance the backlog ONLY on a real ship — a PR was opened/merged, or the work was deliberately
-    # kept local (ship=local) — never on a push/auth FAILURE (else the item is lost without landing).
-    if not BEAUTIFY and not SOLOMON and _ship_succeeded(pr):
+    # Advance the backlog ONLY on a real ship of the NAMED item — a PR was opened/merged, or the
+    # work was deliberately kept local (ship=local). Never on a push/auth FAILURE (item lost without
+    # landing), and never when the agent DEVIATED to a different change (else the item is silently
+    # skipped while something unrelated ships under its name).
+    if not BEAUTIFY and not SOLOMON and _ship_succeeded(pr) and not item_deviated:
         _mark_backlog_done(goal)
     heartbeat(status="sleeping", phase="sleep", last_pr=pr, last_summary=summary)
     _record_history("shipped", branch, summary)
