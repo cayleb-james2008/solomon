@@ -1,0 +1,17 @@
+# PyInstaller build output
+dist/
+build/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# operator runtime + secrets (per-machine, not source)
+runtime/
+.env
+.solomon.json
+.rsi-control.json
+
+# generated icon verification scratch (icon.ico / icon.png are kept)
+web/assets/_exe_icon_verify.png
