@@ -461,3 +461,12 @@ def test_clean_subenv_strips_github_tokens(monkeypatch):
     monkeypatch.setenv("GH_TOKEN", "bad2")
     env = control._clean_subenv()
     assert "GITHUB_TOKEN" not in env and "GH_TOKEN" not in env
+
+
+def test_clean_subenv_strips_pythonpath(monkeypatch):
+    # leaked PYTHONPATH/PYTHONHOME crash a spawned repo .venv python of a different minor
+    # version with "SRE module mismatch" — they must not reach the child.
+    monkeypatch.setenv("PYTHONPATH", "C:/some/3.11/libs")
+    monkeypatch.setenv("PYTHONHOME", "C:/some/3.11")
+    env = control._clean_subenv()
+    assert "PYTHONPATH" not in env and "PYTHONHOME" not in env
