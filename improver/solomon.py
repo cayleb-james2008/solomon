@@ -216,6 +216,11 @@ def recover(repo, allow_pi=False, allow_restart=True):
             pass
         actions.append("clear_stop")
     elif cat == "dirty_tree":
+        # supervisor-authorized-recovery: never hard-reset git UNDER a live iteration (that dirty
+        # tree may be the running loop's in-progress work). Refuse + escalate while it's alive.
+        if control.is_running(repo):
+            return _finish(repo, d, actions, escalate=True,
+                           msg="loop is live — stop it before Solomon resets the working tree")
         r = control.reset_to_base(repo)
         actions.append("reset_to_base")
         if not r.get("ok"):
@@ -237,6 +242,11 @@ def recover(repo, allow_pi=False, allow_restart=True):
         if not (allow_pi and control.keys_status().get(control.project_provider(repo))):
             return _finish(repo, d, actions, escalate=True,
                            msg="persistent gate failure — tick 'Allow AI fix' to run a Solomon fix-session")
+        # A fix-session takes the runner's single-flight lock; if the loop is still live the child
+        # would race the lock and silently exit. Require a quiesced loop first.
+        if control.is_running(repo):
+            return _finish(repo, d, actions, escalate=True,
+                           msg="loop is live — stop it before running a Solomon fix-session")
         r = solomon_fix_session(repo)
         actions.append("solomon_fix_session")
         return _finish(repo, d, actions, escalate=not r.get("ok"),
