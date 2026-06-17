@@ -234,7 +234,8 @@ function renderOnboarding(v) {
         <div class="step-num">3</div>
         <div class="step-main"><h4>Add a repository</h4><p>Any GitHub repo (<code>owner/repo</code>) or local project.</p>
           <div class="step-row"><input class="input" id="obRepo" type="text" placeholder="owner/repo or GitHub URL" style="max-width:300px" />
-            <button class="btn sm accent" id="obAdd">Add project</button></div></div>
+            <button class="btn sm accent" id="obAdd">Add project</button></div>
+          <textarea class="input" id="obGoal" rows="2" style="margin-top:8px" placeholder="North-star goal (optional, weighted heavily) — e.g. grow followers, engagement & revenue autonomously; start as a simple chat-only social-media executive and build capabilities over time."></textarea></div>
       </div>
     </div>`;
   const ks = $("#obKeySave", v); if (ks) ks.onclick = async () => {
@@ -244,7 +245,7 @@ function renderOnboarding(v) {
   };
   const add = $("#obAdd", v); if (add) add.onclick = async () => {
     const spec = $("#obRepo", v).value.trim(); if (!spec) return;
-    const x = await call("add_project", spec);
+    const x = await call("add_project", spec, ($("#obGoal", v).value || "").trim());
     toast(x.ok ? `Added ${x.name}${x.enriching ? " — enriching contract…" : ""}` : `Failed: ${x.error}`, x.ok ? "ok" : "err"); refresh();
   };
 }
@@ -505,6 +506,7 @@ async function renderWsTab(r) {
   }
   if (state.wsTab === "config") {
     body.innerHTML = `<div class="cfg-grid">
+      <div class="cfg-field full"><label>North-star goal — weighted heavily into every iteration</label><textarea class="input" id="cGoal" rows="3" placeholder="e.g. Grow followers, engagement, and revenue fully autonomously. Start as a simple chat-only social-media executive that learns the brand, then build new capabilities into the profile over time. Open-source, money always human-gated.">${esc(r.goal || "")}</textarea></div>
       <div class="cfg-field"><label>Provider</label><select class="select" id="cP">${state.providers.map(p => `<option value="${p}"${p === (r.provider || "ollama-cloud") ? " selected" : ""}>${esc(PROVIDER_LABEL[p] || p)}</option>`).join("")}</select></div>
       <div class="cfg-field"><label>Model</label><input class="input" id="cM" value="${esc(r.model || "")}" placeholder="model id" /></div>
       <div class="cfg-field"><label>Ship mode</label><select class="select" id="cS">${SHIP_MODES.map(([vv, l]) => `<option value="${vv}"${vv === (r.ship || "pr") ? " selected" : ""}>${l}</option>`).join("")}</select></div>
@@ -518,7 +520,8 @@ async function renderWsTab(r) {
     $("#cSave", body).onclick = async () => {
       const x = await call("set_repo_config", r.name, $("#cP", body).value, $("#cM", body).value.trim(),
         $("#cS", body).value, $("#cG", body).value.trim(), $("#cB", body).value.trim() || "main",
-        parseInt($("#cI", body).value) || 120, parseInt($("#cX", body).value) || 0, $("#cR", body).value);
+        parseInt($("#cI", body).value) || 120, parseInt($("#cX", body).value) || 0, $("#cR", body).value,
+        $("#cGoal", body).value.trim());
       toast(x.ok ? `${r.name}: configuration saved` : `Failed: ${x.error}`, x.ok ? "ok" : "err"); refresh();
     };
     return;

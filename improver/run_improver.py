@@ -67,6 +67,7 @@ PI_MODEL = "kimi-k2.7-code"
 SHIP = "pr"           # local|push|pr|auto-merge — set from --ship
 GATE_CMD = ""         # optional custom shell test-command — set from --gate (empty = built-in pytest)
 REASONING = ""        # pi --thinking level (off|minimal|low|medium|high|xhigh) — set from --reasoning
+GOAL = ""             # operator north-star goal, weighted heavily into every task — set from --goal
 BEAUTIFY = False      # one docs-only beautify pass — set from --beautify (skips the gate)
 BEAUTIFY_MD = HERE / "beautify.md"   # the beautify system-prompt contract (provider-agnostic)
 GITHUB_TOOLS = False                 # expose read-only github_* tools to the agent (remote repos only)
@@ -103,9 +104,16 @@ def configure(repo: str, name: str, provider: str = "ollama-cloud",
 
 def build_task(goal: str) -> str:
     """Per-iteration instruction for the Pi coder. The full operating contract is injected
-    separately via --append-system-prompt (AGENT_MD); here we just name the chosen item."""
+    separately via --append-system-prompt (AGENT_MD); here we name the chosen item and, when set,
+    the operator's north-star GOAL so the change is steered toward it (and a missing capability may
+    be BUILT to serve it)."""
+    north_star = (
+        f'NORTH-STAR GOAL (weigh above all): {GOAL}\nChoose the change with the most leverage toward '
+        f'that goal; if it needs a capability the project lacks, BUILD that capability as this one '
+        f'increment.\n\n' if GOAL else ""
+    )
     return (
-        f'Implement exactly ONE improvement in this repository: "{goal}". Make the smallest '
+        f'{north_star}Implement exactly ONE improvement in this repository: "{goal}". Make the smallest '
         "coherent change and add or update a pytest test for it, then run the test suite "
         "(`.venv/Scripts/python -m pytest`) yourself to confirm it is green. Do NOT run git or "
         "gh — the runner commits and opens the pull request. If that item is already done or "
@@ -857,8 +865,12 @@ def provision() -> int:
     """One-shot: pi reads the repo and emits the two contract blocks; the runner writes them
     (Python owns the filesystem — pi never writes contract files). Prints one JSON line. No gate,
     no git, no loop."""
+    goal_line = (f"\n\nThe operator's NORTH-STAR GOAL for this project (weigh it heavily — the "
+                 f"contract must lead with it and the backlog must be ordered to advance it, "
+                 f"including building any capability the goal needs that the project lacks):\n"
+                 f"{GOAL}\n") if GOAL else ""
     task = ("Read this repository and generate its Solomon improver contract and backlog per "
-            "provision.md. Output ONLY the two fenced blocks.")
+            "provision.md. Output ONLY the two fenced blocks." + goal_line)
     try:
         p = run_pi(task, system_md=PROVISION_MD, timeout=600)
     except subprocess.TimeoutExpired:
@@ -923,6 +935,8 @@ def main(argv=None) -> int:
     ap.add_argument("--reasoning", default="",
                     choices=["", "off", "minimal", "low", "medium", "high", "xhigh"],
                     help="agent thinking level passed to pi --thinking (default: model default)")
+    ap.add_argument("--goal", default="",
+                    help="operator north-star goal, weighted heavily into every task + the provisioner")
     ap.add_argument("--once", action="store_true", help="run one iteration then exit")
     ap.add_argument("--interval", type=int, default=120, help="seconds between iterations")
     ap.add_argument("--smoke", action="store_true", help="connectivity probe; no repo changes")
@@ -934,10 +948,11 @@ def main(argv=None) -> int:
                     help="supervisor fix-session: diagnose + fix a persistent gate failure (one iteration)")
     a = ap.parse_args(argv)
     configure(a.repo, a.name or Path(a.repo).name, a.provider, a.model)
-    global SHIP, GATE_CMD, REASONING, BEAUTIFY, SOLOMON
+    global SHIP, GATE_CMD, REASONING, GOAL, BEAUTIFY, SOLOMON
     SHIP = a.ship
     GATE_CMD = a.gate or ""
     REASONING = a.reasoning or ""
+    GOAL = (a.goal or "").strip()
     BEAUTIFY = a.beautify
     SOLOMON = a.solomon
     if BEAUTIFY or SOLOMON:

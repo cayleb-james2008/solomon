@@ -185,9 +185,16 @@ def project_reasoning(repo):
     return (repo or {}).get("reasoning") or ""
 
 
+def project_goal(repo):
+    """The operator's heavily-weighted north-star GOAL for this repo's RSI loop, or '' (unset).
+    Baked into the contract (the per-iteration system prompt) + the provisioner so every iteration
+    is steered by it."""
+    return ((repo or {}).get("goal") or "").strip()
+
+
 def set_repo_config(name, provider=None, model=None, ship=None, gate=None,
                     pr_target_branch=None, interval=None, max_iterations=None,
-                    reasoning=None):
+                    reasoning=None, goal=None):
     """Upsert the repos.json entry for `name`, setting any passed (non-None) keys.
     Creates the entry (carrying its discovered path) if it doesn't exist."""
     if not name:
@@ -220,6 +227,8 @@ def set_repo_config(name, provider=None, model=None, ship=None, gate=None,
         entry["max_iterations"] = max_iterations
     if reasoning is not None:
         entry["reasoning"] = reasoning
+    if goal is not None:
+        entry["goal"] = goal
     try:
         with open(REPOS_JSON, "w", encoding="utf-8") as f:
             json.dump(entries, f, indent=2)
@@ -581,7 +590,8 @@ def start(repo, auto_push=True, once=False):
             "--pr-target-branch", project_pr_target_branch(repo),
             "--reasoning", project_reasoning(repo),
             "--interval", str(project_interval(repo)),
-            "--max-iterations", str(project_max_iterations(repo))]
+            "--max-iterations", str(project_max_iterations(repo)),
+            "--goal", project_goal(repo)]
     if once:
         args.append("--once")
     try:
@@ -897,6 +907,20 @@ def render_default_contract(repo):
     stack = _detect_stack(repo)
     gate = project_gate(repo) or stack["test_cmd"] or "(set a gate command in Config)"
     has_remote = bool((repo or {}).get("has_remote"))
+    goal = project_goal(repo)
+    # The operator's north-star GOAL is weighted heavily: it leads the contract (the per-iteration
+    # system prompt) so EVERY improvement is chosen to advance it, and the agent may BUILD a missing
+    # capability when the goal needs one (still one gated increment at a time).
+    goal_block = (f"""## North-star goal (weigh this above all else)
+
+> {goal}
+
+Every iteration must move this goal forward — choose the single improvement with the most leverage
+toward it. If achieving it needs a capability the project does not have yet, **build that capability**
+(still as one small, tested, shippable increment). The backlog serves the goal; when the backlog and
+the goal disagree, the goal wins.
+
+""" if goal else "")
     if stack["entrypoints"]:
         code_map = ("- Entry points: " + ", ".join("`%s`" % e for e in stack["entrypoints"])
                     + ("\n- Detected stack: %s." % stack["lang"])
@@ -917,7 +941,7 @@ You are the **{name} improver** — an autonomous coding agent running one itera
 continuous self-improvement loop on the {name} codebase. Each run, ship **one** small, real,
 verified improvement.
 
-## Your job this run (exactly one improvement)
+{goal_block}## Your job this run (exactly one improvement)
 
 1. **The improvement is named in your task message.** Implement that one item. If it is already
    done or unclear, instead fix one clear bug, missing test, rough edge, or simplification you
@@ -1024,7 +1048,7 @@ def enrich_contract(repo, background=False):
     if not os.path.exists(runner):
         return {"ok": False, "error": "runner not found"}
     args = [py, runner, "--repo", path, "--name", name, "--provider", prov,
-            "--model", project_model(repo), "--provision"]
+            "--model", project_model(repo), "--goal", project_goal(repo), "--provision"]
     if background:
         flags = 0
         if sys.platform == "win32":
