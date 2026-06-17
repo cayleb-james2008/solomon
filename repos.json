@@ -1,0 +1,10 @@
+[
+  {
+    "name": "maki",
+    "branch_prefix": "rsi/",
+    "provider": "ollama-cloud",
+    "model": "glm-5.2",
+    "ship": "auto-merge",
+    "gate": ""
+  }
+]
