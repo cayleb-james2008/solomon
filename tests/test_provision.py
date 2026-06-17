@@ -234,6 +234,24 @@ def test_mark_backlog_done_ticks_item_and_advances(tmp_path, monkeypatch):
     assert bl.read_text(encoding="utf-8") == txt
 
 
+def test_note_noop_defers_stuck_item_after_three_tries(tmp_path, monkeypatch):
+    m = _load_runner()
+    bl = tmp_path / "backlog.md"
+    bl.write_text("# b\n\n- [ ] hard item\n- [ ] easy item\n", encoding="utf-8")
+    monkeypatch.setattr(m, "BACKLOG", bl)
+    monkeypatch.setattr(m, "log", lambda *a, **k: None)
+    m.BEAUTIFY = False
+    m.SOLOMON = False
+    m._noop_counts.clear()
+    assert m._top_backlog_item() == "hard item"
+    m._note_noop("hard item")
+    m._note_noop("hard item")
+    assert m._top_backlog_item() == "hard item"          # 2 noops — not deferred yet
+    m._note_noop("hard item")                            # 3rd noop — deferred to the bottom
+    assert m._top_backlog_item() == "easy item"
+    assert "deferred" in bl.read_text(encoding="utf-8")
+
+
 def test_pr_title_prefers_goal_over_summary():
     m = _load_runner()
     # concise backlog goal wins, not the verbose summary
