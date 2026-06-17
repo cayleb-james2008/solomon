@@ -326,18 +326,20 @@ def test_set_repo_config_persists_new_fields(tmp_path, monkeypatch):
     _projects(tmp_path, monkeypatch, "alpha")
     _repos_json(tmp_path, monkeypatch, [])
     r = control.set_repo_config("alpha", pr_target_branch="develop", reasoning="high",
-                                interval=300, max_iterations=10)
+                                interval=300, max_iterations=10, goal="Grow the account autonomously")
     assert r["ok"] is True
     alpha = next(x for x in control.load_repos() if x["name"] == "alpha")
     assert control.project_pr_target_branch(alpha) == "develop"
     assert control.project_reasoning(alpha) == "high"
     assert control.project_interval(alpha) == 300
     assert control.project_max_iterations(alpha) == 10
-    # updating only reasoning preserves the rest
+    assert control.project_goal(alpha) == "Grow the account autonomously"
+    # updating only reasoning preserves the rest (incl. the goal)
     control.set_repo_config("alpha", reasoning="low")
     alpha = next(x for x in control.load_repos() if x["name"] == "alpha")
     assert control.project_reasoning(alpha) == "low"
     assert control.project_pr_target_branch(alpha) == "develop"
+    assert control.project_goal(alpha) == "Grow the account autonomously"
     assert control.project_max_iterations(alpha) == 10
 
 

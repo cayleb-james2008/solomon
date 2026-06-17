@@ -80,6 +80,28 @@ def test_render_default_contract_sections_no_placeholders(tmp_path, monkeypatch)
     assert backlog.strip().startswith("# alpha backlog")
 
 
+def test_render_contract_weights_goal_when_set(tmp_path, monkeypatch):
+    r = _repo(tmp_path, monkeypatch, name="g", has_remote=True,
+              goal="Grow followers, engagement, and revenue fully autonomously")
+    agent, _ = control.render_default_contract(r)
+    assert "## North-star goal" in agent and "Grow followers, engagement, and revenue" in agent
+    assert agent.index("North-star goal") < agent.index("Your job this run")   # leads the contract
+    assert control.project_goal(r) == "Grow followers, engagement, and revenue fully autonomously"
+    # no goal -> no goal section
+    agent2, _ = control.render_default_contract(_repo(tmp_path, monkeypatch, name="g2"))
+    assert "North-star goal" not in agent2 and control.project_goal({"name": "x"}) == ""
+
+
+def test_build_task_weaves_north_star_goal():
+    m = _load_runner()
+    m.GOAL = "More followers and creative monetization"
+    t = m.build_task("Add a test for the strategy module")
+    assert "NORTH-STAR GOAL" in t and "More followers and creative monetization" in t
+    assert "Add a test for the strategy module" in t
+    m.GOAL = ""
+    assert "NORTH-STAR" not in m.build_task("Add a test")
+
+
 def test_render_no_github_para_when_local(tmp_path, monkeypatch):
     r = _repo(tmp_path, monkeypatch, name="loc", has_remote=False)
     agent, _ = control.render_default_contract(r)

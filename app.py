@@ -72,6 +72,7 @@ class Api:
                     "gate": control.project_gate(r),
                     "pr_target_branch": control.project_pr_target_branch(r),
                     "reasoning": control.project_reasoning(r),
+                    "goal": control.project_goal(r),
                     "interval": control.project_interval(r),
                     "max_iterations": control.project_max_iterations(r),
                     "is_git": bool(r.get("is_git")),
@@ -131,17 +132,19 @@ class Api:
     # ---- config ---------------------------------------------------------
     def set_repo_config(self, name, provider=None, model=None, ship=None, gate=None,
                         pr_target_branch=None, interval=None, max_iterations=None,
-                        reasoning=None):
+                        reasoning=None, goal=None):
         return control.set_repo_config(name, provider=provider, model=model, ship=ship, gate=gate,
                                        pr_target_branch=pr_target_branch, interval=interval,
-                                       max_iterations=max_iterations, reasoning=reasoning)
+                                       max_iterations=max_iterations, reasoning=reasoning, goal=goal)
 
     def set_key(self, provider, value):
         return control.set_key(provider, value)
 
-    def add_project(self, spec):
+    def add_project(self, spec, goal=None):
         r = control.add_project(spec)
         if r.get("ok"):                       # auto-enrich the new repo's contract once, in the background
+            if goal:                          # set the north-star goal FIRST so the enrichment is steered by it
+                control.set_repo_config(r.get("name"), goal=goal.strip())
             repo = self._repo(r.get("name"))
             if repo and control.enrich_contract(repo, background=True).get("ok"):
                 r = {**r, "enriching": True}
