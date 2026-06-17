@@ -199,6 +199,26 @@ def test_enrich_contract_background_spawn(tmp_path, monkeypatch):
     assert r["ok"] and r.get("started") and calls and "--provision" in calls[0]
 
 
+def test_run_gate_parses_unittest_pass(monkeypatch):
+    m = _load_runner()
+    m.GATE_CMD = "dummy"  # take the custom-gate branch
+    out = ".......\n----------\nRan 71 tests in 0.71s\n\nOK\n"
+    monkeypatch.setattr(m.subprocess, "run",
+                        lambda *a, **k: type("P", (), {"returncode": 0, "stdout": out, "stderr": ""})())
+    green, tests, _ = m.run_gate()
+    assert green and tests["passed"] == 71 and tests["failed"] == 0 and tests["errors"] == 0
+
+
+def test_run_gate_parses_unittest_failures(monkeypatch):
+    m = _load_runner()
+    m.GATE_CMD = "dummy"
+    out = "Ran 10 tests in 0.10s\n\nFAILED (failures=2, errors=1)\n"
+    monkeypatch.setattr(m.subprocess, "run",
+                        lambda *a, **k: type("P", (), {"returncode": 1, "stdout": out, "stderr": ""})())
+    green, tests, _ = m.run_gate()
+    assert not green and tests["passed"] == 7 and tests["failed"] == 2 and tests["errors"] == 1
+
+
 def test_runner_clean_env_strips_github_tokens(monkeypatch):
     m = _load_runner()
     monkeypatch.setenv("GITHUB_TOKEN", "bad")

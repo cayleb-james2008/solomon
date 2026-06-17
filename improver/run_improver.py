@@ -386,8 +386,16 @@ def run_gate() -> tuple:
         m = re.search(pat, out)
         return int(m.group(1)) if m else 0
 
-    tests = {"passed": _n(r"(\d+) passed"), "failed": _n(r"(\d+) failed"),
-             "errors": _n(r"(\d+) error"), "green": p.returncode == 0}
+    passed, failed, errors = _n(r"(\d+) passed"), _n(r"(\d+) failed"), _n(r"(\d+) error")
+    if not passed and not failed and not errors:
+        # unittest doesn't print pytest-style "N passed"; parse its own summary so unittest gates
+        # (e.g. `python -m unittest discover`) report real counts in the heartbeat + PR body.
+        ran = re.search(r"Ran (\d+) tests?", out)
+        if ran:
+            failed, errors = _n(r"failures=(\d+)"), _n(r"errors=(\d+)")
+            passed = max(int(ran.group(1)) - failed - errors, 0)
+
+    tests = {"passed": passed, "failed": failed, "errors": errors, "green": p.returncode == 0}
     return p.returncode == 0, tests, out[-1500:]
 
 
@@ -847,6 +855,21 @@ def main(argv=None) -> int:
     global BASE_BRANCH
     BASE_BRANCH = (a.pr_target_branch or "").strip() or \
         (git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "main")
+    # Ensure the base branch actually exists before the loop. Otherwise every iteration's preflight
+    # `git checkout BASE_BRANCH` fails and the loop spins forever with zero progress. If it's missing
+    # locally but present on a (freshly-wired) origin, create it tracking origin/<base>.
+    if git("rev-parse", "--verify", "--quiet", BASE_BRANCH).returncode != 0:
+        created = False
+        if has_remote():
+            git("fetch", "origin", "--quiet")
+            if git("rev-parse", "--verify", "--quiet", f"origin/{BASE_BRANCH}").returncode == 0:
+                created = git("checkout", "-B", BASE_BRANCH, f"origin/{BASE_BRANCH}").returncode == 0
+        if not created:
+            heartbeat(status="error",
+                      last_summary=f"Base branch '{BASE_BRANCH}' does not exist locally or on origin — "
+                                   f"set this repo's PR-target branch to a real branch in Config.")
+            print(f"ERROR: base branch '{BASE_BRANCH}' not found (local or origin).")
+            return 2
     key = _required_key()
     if not os.environ.get(key):
         heartbeat(status="error", last_summary=f"{key} not set — add it to Solomon/.env")
