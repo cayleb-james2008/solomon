@@ -234,6 +234,16 @@ def test_mark_backlog_done_ticks_item_and_advances(tmp_path, monkeypatch):
     assert bl.read_text(encoding="utf-8") == txt
 
 
+def test_split_item_status_marks_deviation_and_strips_marker():
+    m = _load_runner()
+    s, dev = m._split_item_status("Implemented the named item.\nITEM-STATUS: done")
+    assert not dev and "ITEM-STATUS" not in s and s == "Implemented the named item."
+    s2, dev2 = m._split_item_status("Fixed an unrelated route bug instead.\nITEM-STATUS: deviated")
+    assert dev2 and "ITEM-STATUS" not in s2
+    s3, dev3 = m._split_item_status("No marker here.")
+    assert not dev3 and s3 == "No marker here."          # missing marker -> assume done (progress-biased)
+
+
 def test_note_noop_defers_stuck_item_after_three_tries(tmp_path, monkeypatch):
     m = _load_runner()
     bl = tmp_path / "backlog.md"
