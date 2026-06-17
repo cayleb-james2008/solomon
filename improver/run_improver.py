@@ -440,6 +440,47 @@ def _mark_backlog_done(goal: str) -> None:
             return
 
 
+_noop_counts: dict = {}   # per-goal consecutive-noop tally, for this loop process's lifetime
+
+
+def _note_noop(goal: str, limit: int = 3) -> None:
+    """Track consecutive no-change iterations on a backlog goal. After `limit` of them — the agent
+    can't implement this item right now — defer it to the bottom of the backlog so the loop ADVANCES
+    instead of spinning forever on a too-hard item (the supervisor's gate_red_streak only catches
+    reverts/errors, not noops)."""
+    if not goal or BEAUTIFY or SOLOMON or goal.lower() == "model-chosen improvement":
+        return
+    _noop_counts[goal] = _noop_counts.get(goal, 0) + 1
+    if _noop_counts[goal] >= limit:
+        if _defer_backlog_item(goal):
+            log(f"item noop'd {limit}x — deferred to bottom of backlog: {goal[:60]}")
+        _noop_counts[goal] = 0
+
+
+def _defer_backlog_item(goal: str) -> bool:
+    """Move a stuck `- [ ]` item to the BOTTOM of the backlog (with a note) so `_top_backlog_item`
+    returns the next item. Returns True if it moved one."""
+    if not goal:
+        return False
+    try:
+        lines = BACKLOG.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith("- [ ]") and s[5:].strip() == goal.strip():
+            item = lines.pop(i).rstrip()
+            if "(deferred" not in item:
+                item += "  (deferred: agent could not implement after repeated tries)"
+            lines.append(item)
+            try:
+                BACKLOG.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                return True
+            except OSError:
+                return False
+    return False
+
+
 def _pr_title(goal: str, summary: str = "") -> str:
     """Concise PR/commit title from the backlog goal; fall back to the summary's first line
     when the goal is the generic placeholder (so the title isn't a truncated paragraph)."""
@@ -635,6 +676,7 @@ def one_iteration() -> None:
 
     if not tree_dirty() and head_sha() == base:
         log("Pi made no changes — dropping branch")
+        _note_noop(goal)          # defer this item if the agent keeps failing to implement it
         _drop_branch(branch, "noop", summary)
         return
 
