@@ -324,3 +324,49 @@ def test_secret_value_never_in_state_or_health(tmp_path, monkeypatch):
     assert SENTINEL not in state_blob
     health_blob = json.dumps(control.health())
     assert SENTINEL not in health_blob
+
+
+# --------------------------------------------------------------------------- #
+# LOCK-1 — acquire_lock single-flight: an EMPTY existing lock is HELD (not stolen).
+# Regression for the live double-runner: two improvers ran on sover because the old
+# create-then-write left a window where a racer read the empty lock as a stale pid 0
+# and stole it. acquire_lock must refuse an empty lock, a live-pid lock, and ours; and
+# take over ONLY a confirmed-dead-pid lock.
+# --------------------------------------------------------------------------- #
+def _runner_with_lock(tmp_path):
+    m = _load_runner()
+    m.RUNTIME = tmp_path
+    m.LOCK = tmp_path / "lock"
+    return m
+
+
+def test_acquire_lock_refuses_empty_lock(tmp_path, monkeypatch):
+    m = _runner_with_lock(tmp_path)
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: False)   # even with "dead" pids, empty != stale
+    m.LOCK.write_text("", encoding="utf-8")                   # a racer's just-created, not-yet-written lock
+    assert m.acquire_lock() is False                          # MUST back off, not steal
+    assert m.LOCK.read_text(encoding="utf-8") == ""           # and must not overwrite it
+
+
+def test_acquire_lock_refuses_live_holder(tmp_path, monkeypatch):
+    m = _runner_with_lock(tmp_path)
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: True)
+    m.LOCK.write_text("99999", encoding="utf-8")
+    assert m.acquire_lock() is False
+    assert m.LOCK.read_text(encoding="utf-8") == "99999"      # untouched
+
+
+def test_acquire_lock_takes_over_dead_holder(tmp_path, monkeypatch):
+    m = _runner_with_lock(tmp_path)
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: False)   # recorded pid is dead
+    m.LOCK.write_text("99999", encoding="utf-8")
+    assert m.acquire_lock() is True
+    assert m.LOCK.read_text(encoding="utf-8").strip() == str(os.getpid())
+
+
+def test_acquire_lock_creates_with_pid(tmp_path):
+    m = _runner_with_lock(tmp_path)
+    assert not m.LOCK.exists()
+    assert m.acquire_lock() is True
+    assert m.LOCK.read_text(encoding="utf-8").strip() == str(os.getpid())  # never created empty
+    assert m.acquire_lock() is True                                        # idempotent for our own pid
