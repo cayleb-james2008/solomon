@@ -889,23 +889,41 @@ def one_iteration() -> None:
     title = "beautify repo" if BEAUTIFY else _pr_title("" if item_deviated else goal, summary)
     pr = _ship(branch, title, summary, tests)
     git("checkout", BASE_BRANCH)
-    # Advance the backlog ONLY on a real ship of the NAMED item — a PR was opened/merged, or the
-    # work was deliberately kept local (ship=local). Never on a push/auth FAILURE (item lost without
-    # landing), and never when the agent DEVIATED to a different change (else the item is silently
-    # skipped while something unrelated ships under its name).
-    if not BEAUTIFY and not SOLOMON and _ship_succeeded(pr) and not item_deviated:
+    # Advance the backlog ONLY on a real LANDED ship of the NAMED item — a PR opened (pr-mode) /
+    # merged or queued (auto-merge) / a verified push / a kept-local branch. Never on a push/auth
+    # FAILURE or an auto-merge PR left un-merged on red CI (item lost without landing), and never
+    # when the agent DEVIATED to a different change (the item didn't ship under its own name).
+    landed = _ship_succeeded(pr)
+    if not BEAUTIFY and not SOLOMON and landed and not item_deviated:
         _mark_backlog_done(goal)
     heartbeat(status="sleeping", phase="sleep", last_pr=pr, last_summary=summary)
-    _record_history("shipped", branch, summary)
+    # 'shipped' only when the change actually landed (or is in-flight to merge); an auto-merge PR
+    # left un-merged on red/awaiting CI, or a failed push, records 'blocked' so it is not counted as
+    # a success and a streak of them is diagnosable (ci_red_streak) instead of silently 'shipped'.
+    _record_history("shipped" if landed else "blocked", branch, summary)
 
 
 def _ship_succeeded(pr: dict) -> bool:
-    """A terminal, non-failed ship: a PR was opened (has a number) OR the branch was deliberately
-    kept local (ship=local). NOT a push/auth failure (those didn't land and must be retried)."""
-    if pr.get("number"):
-        return True
+    """A terminal ship that LANDED (and so should advance the backlog item):
+      - an opened PR (pr/auto-merge) — EXCEPT an auto-merge PR left un-merged on red/awaiting CI
+        ('open (CI red ...)' / 'open (awaiting CI)' / 'open (stopped...)'); those did NOT land, so
+        the item stays open and the supervisor's ci_red_streak surfaces them instead of the item
+        being silently consumed while the red PR rots;
+      - a VERIFIED push (ship=push) — without this the loop re-pushes the same branch every iteration;
+      - a deliberately kept-local branch (ship=local).
+    NOT a push/auth failure (those didn't land and must be retried)."""
     state = (pr.get("state") or "").lower()
-    return "local" in state and "fail" not in state and "pending" not in state
+    if "fail" in state:
+        return False
+    if pr.get("number"):
+        # un-landed auto-merge states all read 'open (CI red ...)' / 'open (awaiting CI)' /
+        # 'open (stopped ...)'; the landed/in-flight ones ('merged', 'auto-merge queued (...)') and a
+        # plain pr-mode 'open' do not contain the '(' marker. (Substring-safe: 'not merged' contains
+        # 'merged', so we must NOT test for 'merged' directly.)
+        return "open (" not in state
+    if "local" in state and "pending" not in state:
+        return True
+    return state.startswith("pushed") and bool(pr.get("verified"))
 
 
 def _ship(branch: str, title: str, summary: str, tests: dict) -> dict:
@@ -958,8 +976,15 @@ def _ship(branch: str, title: str, summary: str, tests: dict) -> dict:
                     else _pr_checks(pr.get("number")))
     log(f"opened PR: {pr.get('url')} (push {'verified' if verified else 'UNVERIFIED'}, CI {pr.get('checks') or 'none'})")
     if SHIP == "auto-merge":
-        heartbeat(phase="merge")
-        pr = _auto_merge(pr)
+        if STOP.exists():
+            # a Stop arrived during the iteration (e.g. while _await_pr_checks was polling, which
+            # returns None on a STOP-break): do NOT auto-merge — merging on a None rollup would land
+            # an un-CI'd PR. Leave it open for review (honors the halt switch).
+            log("stop requested — not auto-merging; PR left open for review")
+            pr = {**pr, "state": "open (stopped before merge)"}
+        else:
+            heartbeat(phase="merge")
+            pr = _auto_merge(pr)
         log(f"ship=auto-merge — {pr.get('state')}: {pr.get('url')}")
     return pr
 

@@ -341,11 +341,20 @@ def test_run_gate_parses_unittest_failures(monkeypatch):
 
 def test_ship_succeeded_distinguishes_real_ship_from_failure():
     m = _load_runner()
-    assert m._ship_succeeded({"number": 5})                                    # PR opened
+    assert m._ship_succeeded({"number": 5})                                    # plain opened PR (pr-mode)
     assert m._ship_succeeded({"number": None, "state": "local branch (unshipped)"})
     assert m._ship_succeeded({"number": None, "state": "local (no remote)"})
     assert not m._ship_succeeded({"number": None, "state": "push-failed"})
     assert not m._ship_succeeded({"number": None, "state": "local (ship pending gh auth)"})
+    # auto-merge: a LANDED/in-flight PR ticks; an un-merged red/awaiting/stopped PR does NOT
+    assert m._ship_succeeded({"number": 7, "state": "merged"})
+    assert m._ship_succeeded({"number": 7, "state": "auto-merge queued (awaiting CI)"})
+    assert not m._ship_succeeded({"number": 7, "state": "open (CI red — not merged)"})
+    assert not m._ship_succeeded({"number": 7, "state": "open (awaiting CI)"})
+    assert not m._ship_succeeded({"number": 7, "state": "open (stopped before merge)"})
+    # ship=push: only a VERIFIED push counts (else the loop re-pushes the same branch forever)
+    assert m._ship_succeeded({"number": None, "state": "pushed (no PR)", "verified": True})
+    assert not m._ship_succeeded({"number": None, "state": "pushed (unverified)", "verified": False})
 
 
 def _fake_run(cmds):
