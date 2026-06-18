@@ -1238,6 +1238,17 @@ def reset_to_base(repo):
         return _run([git, "-C", path, *a])
 
     try:
+        # never destroy uncommitted operator work: a reset_to_base (checkout --force + reset --hard)
+        # silently discards uncommitted TRACKED changes. The only guard used to be for un-pushed
+        # COMMITS, leaving uncommitted WIP unprotected — so dirty_tree auto-recovery (and the
+        # unattended watchdog that drives it every couple of minutes) could eat an operator's edits.
+        # A dead run's own leftovers live on an rsi/* branch and are cleaned by the runner's preflight,
+        # so by the time a dirty BASE tree reaches here it is operator work: refuse + escalate.
+        dirty = g("status", "--porcelain", "--untracked-files=no")
+        if (dirty.stdout or "").strip():
+            return {"ok": False,
+                    "error": "uncommitted tracked changes on the base tree — escalate "
+                             "(won't auto-discard operator work; commit or stash first)"}
         has_origin = g("remote", "get-url", "origin").returncode == 0
         if has_origin:
             ahead = g("log", "--oneline", f"origin/{base}..{base}")

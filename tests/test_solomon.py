@@ -150,7 +150,9 @@ def test_reset_to_base_guard_refuses_unpushed(tmp_path):
 
 
 @pytest.mark.skipif(not shutil.which("git"), reason="git not available")
-def test_reset_to_base_clean(tmp_path):
+def test_reset_to_base_refuses_uncommitted_tracked(tmp_path):
+    # reset_to_base must NOT discard uncommitted operator WIP — it refuses + escalates so the
+    # operator commits/stashes first (the watchdog drives this unattended; eating WIP is unsafe).
     origin = tmp_path / "origin.git"
     work = tmp_path / "work"
     subprocess.run(["git", "init", "--bare", str(origin)], capture_output=True)
@@ -159,10 +161,27 @@ def test_reset_to_base_clean(tmp_path):
     _git(work, "checkout", "-b", "main")
     (work / "f.txt").write_text("1"); _git(work, "add", "-A"); _git(work, "commit", "-m", "init")
     _git(work, "push", "-u", "origin", "main")
-    (work / "f.txt").write_text("dirty")                                            # uncommitted mess
+    (work / "f.txt").write_text("operator WIP")                                      # uncommitted tracked edit
+    r = control.reset_to_base({"name": "w", "path": str(work), "pr_target_branch": "main"})
+    assert not r["ok"] and "uncommitted" in r["error"]
+    assert (work / "f.txt").read_text() == "operator WIP"                            # WIP preserved
+
+
+@pytest.mark.skipif(not shutil.which("git"), reason="git not available")
+def test_reset_to_base_syncs_clean_tree(tmp_path):
+    # a CLEAN tree behind origin is still resynced to origin truth (the legitimate use case).
+    origin = tmp_path / "origin.git"
+    work = tmp_path / "work"
+    subprocess.run(["git", "init", "--bare", str(origin)], capture_output=True)
+    subprocess.run(["git", "clone", str(origin), str(work)], capture_output=True)
+    _git(work, "config", "user.email", "t@t"); _git(work, "config", "user.name", "t")
+    _git(work, "checkout", "-b", "main")
+    (work / "f.txt").write_text("1"); _git(work, "add", "-A"); _git(work, "commit", "-m", "init")
+    _git(work, "push", "-u", "origin", "main")
+    _git(work, "checkout", "-b", "rsi/stray")                                        # left on a stray branch, clean
     r = control.reset_to_base({"name": "w", "path": str(work), "pr_target_branch": "main"})
     assert r["ok"] and r["base"] == "main"
-    assert _git(work, "status", "--porcelain").stdout.strip() == ""                 # tree clean again
+    assert _git(work, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "main"
 
 
 def test_read_supervisor_log_tail(tmp_path, monkeypatch):
