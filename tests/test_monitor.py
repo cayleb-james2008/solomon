@@ -24,10 +24,17 @@ def test_leave_clean_stop_alone():
     assert monitor.should_restart(running=False, hb={"status": "stopped"}, paused=False, stop_pending=False) is False
 
 
-def test_leave_error_state_for_supervisor():
-    # an error state (halt-on-revert-failure, missing key, dirty base) needs operator/supervisor
-    # attention — a blind restart just re-hits it, so the watchdog leaves it alone.
-    assert monitor.should_restart(running=False, hb={"status": "error"}, paused=False, stop_pending=False) is False
+def test_leave_revert_halt_for_operator():
+    # the revert-failure HALT (status=error, phase=reverted) needs operator cleanup -> don't restart
+    assert monitor.should_restart(running=False, hb={"status": "error", "phase": "reverted"},
+                                  paused=False, stop_pending=False) is False
+
+
+def test_restart_transient_error():
+    # a transient/retryable error (e.g. a flaky red base gate, status=error/phase=preflight) that is
+    # NOT the halt IS retried — otherwise a one-off blip would strand the loop down all night.
+    assert monitor.should_restart(running=False, hb={"status": "error", "phase": "preflight"},
+                                  paused=False, stop_pending=False) is True
 
 
 def test_never_restart_running():
