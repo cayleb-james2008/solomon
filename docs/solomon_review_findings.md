@@ -407,3 +407,40 @@ blast-radius, needs careful live testing): strip `git`+`gh` from the AGENT subpr
 `run_pi()`** (prepend a dir of refusing shims) while keeping the explicit `.venv\Scripts\python` gate
 runnable; the runner's own git/gh use the real PATH and are unaffected. Wave-1 Item 1 only covers a
 PR opened on the runner's *current* branch; the agent's-own-branch case still needs this.
+
+---
+
+## Overnight continuation session (2026-06-18 — operator run + hardening, cont'd)
+
+Continued the overnight campaign. All three loops verified live and producing real, test-green work
+on glm-5.2. **Shipped to `main` this session (full suite 165 passed, up from 160):**
+- `459a32d` preflight: guard `git clean -fd` from deleting operator UNTRACKED files — the blanket
+  clean on the base branch silently destroyed operator scratch files every iteration (a data-loss
+  path the never-discard-operator-work keystone covered for TRACKED files but not untracked). The
+  guard checks `git status --porcelain --untracked-files=normal` for `??` entries and skip+escalates
+  if any are present; only cleans when there is nothing to destroy.
+- `f82a23e` control: (1) `reset_to_base` now fetches origin BEFORE the un-pushed-commit check so
+  `origin/{base}` is current truth (matching the runner's preflight ordering — a stale local origin
+  ref could spuriously refuse or miss un-pushed commits); (2) `start()` re-reads the live repo dict
+  from `load_repos()` after `ensure_contracts` auto-sets a detected gate, so the first launch uses
+  the right gate instead of the stale `''` (which spawned the runner with the built-in pytest gate
+  and reded out every iteration on a unittest-only project until a manual restart).
+
+### Loop progress this session
+- **maki**: PR #43 merged (353 tests, atomic search-history write). Runner crashed after iter 2
+  (no clean-exit log line; both PIDs gone). Restarted on the new code.
+- **sover**: PR #29 merged (215 tests, LLM-driven render/measure/monetize lanes) + PR #30 merged
+  (224 tests, **beyond-tree self-expansion** — a north-star milestone: the profile no longer stops
+  growing when the fixed 8-node tree is complete; it authors NEW capabilities from vetted templates).
+  Now iter 6 on a counterfactual code-mod simulator.
+- **asmodeus**: 2 local ships (360 tests each — auto-breaker wired into paper mode + venue
+  bracket-fill PnL). Now iter 3 on an `asmodeus status` CLI subcommand.
+
+### Remaining open items (lower priority)
+- **gate_red_streak anti-thrash ceiling** (MEDIUM): a fix-session can respawn each sweep under
+  auto_ai_fix. The watchdog uses allow_pi=False, so this only bites under manual auto_ai_fix.
+- **_parse_provision backtick stripping** (LOW): can corrupt contract bodies with inline-code spans.
+- **Preflight increments iteration counter before early-return** (LOW): burns --max-iterations on
+  no-op wedges.
+- **SOLOMON fix-session anti-gaming baseline** (LOW): red baseline comparison can block a legitimate
+  recovery that quarantines a broken test.
