@@ -104,6 +104,34 @@ def configure(repo: str, name: str, provider: str = "ollama-cloud",
     _hb["model"] = PI_MODEL
 
 
+def _refresh_config_from_registry() -> None:
+    """Re-read THIS repo's row from repos.json at the top of each iteration so an operator edit to
+    model/gate/reasoning/goal (via the dashboard) takes effect WITHOUT a stop+restart. Config was
+    captured once into globals at launch and never re-read, so a live loop silently steered by stale
+    values — e.g. asmodeus kept running kimi after the operator switched it to glm-5.2 in the registry.
+    SHIP is deliberately NOT refreshed here: the launcher passes control.effective_ship(), which already
+    applied the global auto_push gate, so re-reading the raw 'ship' field would bypass it. BASE_BRANCH /
+    interval / max_iterations are launch-owned too. Best-effort: any read/parse error keeps the current
+    config (writes to repos.json are atomic, so a torn read is transient)."""
+    global PI_PROVIDER, PI_MODEL, PI_EXT, GATE_CMD, REASONING, GOAL
+    try:
+        rows = json.loads((CONTROL / "repos.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):       # ValueError covers json.JSONDecodeError
+        return
+    row = (next((r for r in rows if isinstance(r, dict) and r.get("name") == NAME), None)
+           if isinstance(rows, list) else None)
+    if not isinstance(row, dict):
+        return
+    prov = PROVIDERS.get(row.get("provider") or "ollama-cloud") or PROVIDERS["ollama-cloud"]
+    PI_PROVIDER = prov["pi_provider"]
+    PI_EXT = HERE / prov["ext"]
+    PI_MODEL = row.get("model") or prov["default_model"]
+    GATE_CMD = (row.get("gate") or "").strip()
+    REASONING = row.get("reasoning") or ""
+    GOAL = (row.get("goal") or "").strip()
+    _hb["model"] = PI_MODEL
+
+
 def build_task(goal: str, tier: str = "chore") -> str:
     """Per-iteration instruction for the Pi coder. The full operating contract is injected
     separately via --append-system-prompt (AGENT_MD); here we name the chosen item, its ambition
@@ -458,6 +486,19 @@ def final_text(stdout: str) -> str:
     return final.strip()
 
 
+def _narrated_without_writing(summary: str) -> bool:
+    """Heuristic: did the agent CLAIM it wrote/added code while the tree is actually clean? A weak model
+    sometimes hallucinates its tool calls — it narrates 'Added tests/test_x.py …' but made no file edits,
+    so the iteration is a no-op. Surfacing this distinguishes 'did nothing' from 'claimed work it didn't
+    do' (a model-quality signal) without changing control flow. Pure over the summary text."""
+    if not summary:
+        return False
+    s = summary.lower()
+    claims_work = any(w in s for w in ("added ", "created ", "i add", "implement", "wrote ", "new file"))
+    mentions_file = bool(re.search(r"`[^`]+\.[A-Za-z]{1,4}`", summary)) or ".py" in s
+    return claims_work and mentions_file
+
+
 # ---- gate -----------------------------------------------------------------
 def run_gate() -> tuple:
     """Authoritative test gate. Returns (green, {passed,failed,errors,green}, tail).
@@ -724,6 +765,25 @@ def _await_pr_checks(number, attempts: int = 6, delay: float = 8.0) -> str | Non
     return last
 
 
+def _existing_open_pr(branch: str) -> tuple:
+    """(number, url) of the OPEN PR whose head is ``branch``, or (None, None). Used to ADOPT a PR the
+    agent opened itself (it is told NOT to run gh, but an over-eager model sometimes does) so the runner
+    doesn't fall to 'push-only' on a 'gh pr create … already exists' error — which never ticks the item,
+    so the loop re-ships the same backlog item forever (the live sover dup-PR spin)."""
+    p = subprocess.run([gh_exe(), "pr", "list", "--head", branch, "--state", "open",
+                        "--json", "number,url"],
+                       cwd=REPO, capture_output=True, text=True, env=_clean_env(), creationflags=_NO_WINDOW)
+    if p.returncode != 0:
+        return None, None
+    try:
+        arr = json.loads(p.stdout or "[]")
+    except (ValueError, TypeError):
+        return None, None
+    if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+        return arr[0].get("number"), arr[0].get("url")
+    return None, None
+
+
 def _open_pr(branch: str, title: str, summary: str, tests: dict | None) -> dict:
     if BEAUTIFY:
         body = (f"Repo beautification (docs/presentation only — no code changes).\n\n{summary}\n\n"
@@ -740,7 +800,16 @@ def _open_pr(branch: str, title: str, summary: str, tests: dict | None) -> dict:
                         "--title", pr_title, "--body", body],
                        cwd=REPO, capture_output=True, text=True, env=_clean_env(), creationflags=_NO_WINDOW)
     if p.returncode != 0:
-        log(f"gh pr create failed: {(p.stderr or '').strip()[:200]}")
+        stderr = (p.stderr or "").strip()
+        # The agent may have already opened a PR for this branch (it's told NOT to run gh, but a
+        # too-eager model sometimes does) — 'gh pr create' then fails "already exists". Adopt that PR
+        # instead of returning push-only (which never ticks the item, so the loop re-ships it forever).
+        if "already exists" in stderr.lower():
+            num, url = _existing_open_pr(branch)
+            if num:
+                log(f"adopted existing PR #{num} for {branch} (gh pr create: already exists)")
+                return {"number": num, "url": url, "branch": branch, "state": "open"}
+        log(f"gh pr create failed: {stderr[:200]}")
         return {"number": None, "url": None, "branch": branch, "state": "push-only"}
     url = (p.stdout or "").strip().splitlines()[-1] if p.stdout.strip() else None
     num = None
@@ -894,7 +963,12 @@ def one_iteration() -> None:
     log(f"Pi rc={p.returncode}: {summary[:200]}")
 
     if not tree_dirty() and head_sha() == base:
-        log("Pi made no changes — dropping branch")
+        if _narrated_without_writing(summary):
+            log("WARNING: Pi narrated a change but wrote nothing to a clean tree — the model likely "
+                "hallucinated its file edits; counting as a no-op")
+            summary = "[narrated-but-unwritten] " + summary
+        else:
+            log("Pi made no changes — dropping branch")
         _note_noop(goal)          # defer this item if the agent keeps failing to implement it
         _drop_branch(branch, "noop", summary)
         return
@@ -1402,6 +1476,7 @@ def main(argv=None) -> int:
             if STOP.exists():
                 log("stop flag set — exiting")
                 break
+            _refresh_config_from_registry()   # pick up dashboard edits to model/gate/reasoning/goal mid-loop
             one_iteration()
             if _HALTED:
                 log("halted after an unrecoverable revert failure — operator action required "

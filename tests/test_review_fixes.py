@@ -436,3 +436,100 @@ def test_start_does_not_revoke_pending_stop_on_live_loop(tmp_path, monkeypatch):
     r = control.start({"name": "x", "path": str(tmp_path)})
     assert r.get("already") and r.get("pid") == 4242
     assert (rt / "stop").exists()                            # the live Stop was NOT silently revoked
+
+
+# --------------------------------------------------------------------------- #
+# DUP-PR — _open_pr ADOPTS an existing PR on 'already exists' instead of falling to push-only.
+# Regression for the live sover dup-PR spin: the agent opened the PR itself, the runner's
+# 'gh pr create' then failed "already exists", the item never ticked, and the same backlog
+# item re-shipped every iteration (PRs #18/#19 accumulated).
+# --------------------------------------------------------------------------- #
+def test_open_pr_adopts_existing_pr_on_already_exists(monkeypatch):
+    m = _load_runner()
+    monkeypatch.setattr(m, "gh_exe", lambda: "gh")
+    monkeypatch.setattr(m, "BASE_BRANCH", "main")
+    monkeypatch.setattr(m, "BEAUTIFY", False)
+
+    def fake_run(args, **k):
+        if "create" in args:
+            return type("P", (), {"returncode": 1, "stdout": "",
+                                  "stderr": 'a pull request for branch "rsi/iter-x" into "main" '
+                                            'already exists:\nhttps://github.com/o/r/pull/18'})()
+        if "list" in args:
+            return type("P", (), {"returncode": 0, "stderr": "",
+                                  "stdout": json.dumps([{"number": 18, "url": "https://github.com/o/r/pull/18"}])})()
+        return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+
+    pr = m._open_pr("rsi/iter-x", "title", "summary", {"passed": 5, "failed": 0})
+    assert pr["number"] == 18 and pr["state"] == "open"
+    assert m._ship_succeeded(pr) is True              # an adopted PR ticks the backlog item (loop advances)
+
+
+def test_open_pr_push_only_when_create_fails_without_existing_pr(monkeypatch):
+    m = _load_runner()
+    monkeypatch.setattr(m, "gh_exe", lambda: "gh")
+    monkeypatch.setattr(m, "BASE_BRANCH", "main")
+    monkeypatch.setattr(m, "BEAUTIFY", False)
+
+    def fake_run(args, **k):
+        if "create" in args:
+            return type("P", (), {"returncode": 1, "stdout": "", "stderr": "some transient gh error"})()
+        if "list" in args:
+            return type("P", (), {"returncode": 0, "stdout": "[]", "stderr": ""})()
+        return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+
+    pr = m._open_pr("rsi/iter-y", "title", "summary", None)
+    assert pr["number"] is None and pr["state"] == "push-only"
+    assert m._ship_succeeded(pr) is False             # a genuine create failure must NOT tick the item
+
+
+# --------------------------------------------------------------------------- #
+# NARRATE-1 — _narrated_without_writing flags a clean-tree no-op whose summary CLAIMS file
+# writes (a weak model hallucinating its tool calls — the asmodeus/kimi no-op storm).
+# --------------------------------------------------------------------------- #
+def test_narrated_without_writing_flags_claimed_files():
+    m = _load_runner()
+    assert m._narrated_without_writing("Added `tests/test_subprocess_util.py` with 17 tests.") is True
+    assert m._narrated_without_writing("Created backend/tvmaze.py and wired it in.") is True
+    assert m._narrated_without_writing("I added tests in test_helpers.py for the loader.") is True
+    # honest no-op (no claim of writing a file) -> not flagged
+    assert m._narrated_without_writing("The item is already fully implemented; no change needed.") is False
+    assert m._narrated_without_writing("(no summary returned)") is False
+    assert m._narrated_without_writing("") is False
+    assert m._narrated_without_writing(None) is False
+
+
+# --------------------------------------------------------------------------- #
+# CFG-1 — the loop re-reads repos.json each iteration so a dashboard model/goal/gate edit
+# takes effect without a stop+restart (asmodeus stayed on kimi after a glm-5.2 switch).
+# --------------------------------------------------------------------------- #
+def test_refresh_config_picks_up_new_model_and_goal(tmp_path, monkeypatch):
+    m = _load_runner()
+    monkeypatch.setattr(m, "CONTROL", tmp_path)
+    monkeypatch.setattr(m, "NAME", "asmodeus")
+    m.PI_MODEL = "kimi-k2.7-code"; m.GOAL = ""; m.GATE_CMD = ""; m.REASONING = ""
+    (tmp_path / "repos.json").write_text(json.dumps([
+        {"name": "asmodeus", "provider": "ollama-cloud", "model": "glm-5.2",
+         "gate": ".venv\\Scripts\\python -m pytest", "reasoning": "xhigh", "goal": "be excellent"},
+        {"name": "other", "model": "should-not-pick"},
+    ]), encoding="utf-8")
+    m._refresh_config_from_registry()
+    assert m.PI_MODEL == "glm-5.2"
+    assert m._hb["model"] == "glm-5.2"
+    assert m.GOAL == "be excellent"
+    assert m.REASONING == "xhigh"
+    assert m.GATE_CMD.endswith("pytest")
+
+
+def test_refresh_config_tolerates_missing_or_torn_file(tmp_path, monkeypatch):
+    m = _load_runner()
+    monkeypatch.setattr(m, "CONTROL", tmp_path)        # no repos.json present
+    monkeypatch.setattr(m, "NAME", "asmodeus")
+    m.PI_MODEL = "keep-me"
+    m._refresh_config_from_registry()                  # missing file -> no change, no raise
+    assert m.PI_MODEL == "keep-me"
+    (tmp_path / "repos.json").write_text("{ this is not json", encoding="utf-8")
+    m._refresh_config_from_registry()                  # torn/invalid -> no change, no raise
+    assert m.PI_MODEL == "keep-me"
