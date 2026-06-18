@@ -440,6 +440,51 @@ def _kill_tree(pid: int) -> None:
             pass
 
 
+def _write_shim(path: Path, content: str) -> None:
+    try:
+        path.write_text(content, encoding="utf-8")
+        os.chmod(path, 0o755)
+    except OSError:
+        pass
+
+
+def _agent_shim_dir() -> "Path | None":
+    """Create (idempotently) a dir of PATH shims that block the AGENT from the version-control
+    operations that escape the runner's branch-per-iteration sandbox — DESPITE the AGENT.md 'do NOT run
+    git or gh' rule that a capable model (glm-5.2) ignores: ANY `gh` (it must use the read-only
+    github_* tools, never the gh CLI), and `git push|pull|merge|rebase` (which push a branch to origin
+    or conflict the base — the cause of the sover dup-PRs and maki's conflicted main). Prepended to the
+    agent's PATH so its `git`/`gh` resolve here first; read-only git and pi's OWN internal git use PASS
+    THROUGH to the real binary, so this can only ever REFUSE the four named git verbs + gh. The runner's
+    own git/gh use the real PATH (_clean_env), unaffected. Returns the dir, or None if it can't be made."""
+    try:
+        d = RUNTIME / "agent_shims"
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    _write_shim(d / "gh", '#!/bin/sh\necho "blocked by Solomon: use the read-only github_* tools, '
+                          'not the gh CLI (the runner owns GitHub)" >&2\nexit 1\n')
+    _write_shim(d / "gh.cmd", '@echo off\r\necho blocked by Solomon: use the github_* tools, not gh 1>&2'
+                              '\r\nexit /b 1\r\n')
+    real_git = shutil.which("git")
+    if real_git and os.path.isabs(real_git):
+        _write_shim(d / "git",
+                    '#!/bin/sh\ncase "$1" in\n'
+                    '  push|pull|merge|rebase) echo "blocked by Solomon: the runner owns version control '
+                    '(no git $1 in the agent)" >&2; exit 1;;\n'
+                    '  *) exec "' + real_git + '" "$@";;\nesac\n')
+        _write_shim(d / "git.cmd",
+                    '@echo off\r\n'
+                    'if /I "%~1"=="push" goto blk\r\n'
+                    'if /I "%~1"=="pull" goto blk\r\n'
+                    'if /I "%~1"=="merge" goto blk\r\n'
+                    'if /I "%~1"=="rebase" goto blk\r\n'
+                    '"' + real_git + '" %*\r\n'
+                    'goto :eof\r\n'
+                    ':blk\r\necho blocked by Solomon: the runner owns version control 1>&2\r\nexit /b 1\r\n')
+    return d
+
+
 def run_pi(task: str, timeout: int = 1800, system_md: Path | None = None) -> subprocess.CompletedProcess:
     args = [pi_exe(), "--print", "--mode", "json",
             "--provider", PI_PROVIDER, "--model", PI_MODEL]
@@ -452,6 +497,9 @@ def run_pi(task: str, timeout: int = 1800, system_md: Path | None = None) -> sub
     env = _clean_env()
     env["RSI_MODEL"] = PI_MODEL  # the extension registers exactly this model id
     env["RSI_REASONING"] = REASONING  # extension flips model.reasoning on when a level is set
+    shim = _agent_shim_dir()    # block the agent from gh + git push/merge/etc. (it ignores the contract)
+    if shim:
+        env["PATH"] = str(shim) + os.pathsep + env.get("PATH", "")
     # Popen (not subprocess.run): subprocess.run's timeout only kills the direct child, and
     # pi's node grandchild holding the stdout pipe makes the read block forever — that froze a
     # run for 5h. We force-kill the whole tree on timeout, then re-raise so the caller reverts.
