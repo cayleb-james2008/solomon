@@ -234,6 +234,30 @@ def test_parse_provision_blocks():
     assert m._parse_provision("no blocks here") == (None, None)
 
 
+def test_parse_provision_strips_complete_fence_not_inline_code():
+    """A complete ``` fence around a block is stripped, but an inline-code span (e.g. `pytest -q`
+    as the first content line) is NOT mangled — the old str.strip('`') removed ALL backtick chars."""
+    m = _load_runner()
+    text = ("===AGENT.md===\n```\n# Agent\n\nRun `pytest -q` for the gate.\n```\n"
+            "===backlog.md===\n```\n- [ ] first\n- [ ] second\n```\n")
+    a, b = m._parse_provision(text)
+    assert a.startswith("# Agent")
+    assert "`pytest -q`" in a                          # inline-code span preserved, not stripped to pytest -q
+    assert "- [ ] first" in b
+    assert a.count("`") == 2                            # only the inline-code backticks remain
+    assert b.count("`") == 0                            # the fence is stripped, no inline code in backlog
+
+
+def test_parse_provision_backlog_not_truncated_by_horizontal_rule():
+    """A '===' inside the backlog content (e.g. a markdown horizontal rule or table) must NOT
+    truncate the block — the old .split('===')[0] dropped everything after the first '==='."""
+    m = _load_runner()
+    text = ("===AGENT.md===\n# Agent\n===backlog.md===\n- [ ] first\n\n---\n\n===\n\n- [ ] second\n")
+    a, b = m._parse_provision(text)
+    assert a == "# Agent"
+    assert "- [ ] first" in b and "- [ ] second" in b   # both items survive the horizontal rule
+
+
 def test_provision_writes_files(tmp_path, monkeypatch):
     m = _load_runner()
     monkeypatch.setattr(m, "AGENT_MD", tmp_path / "AGENT.md")

@@ -1448,14 +1448,33 @@ def smoke() -> int:
 
 
 # ---- provision (one-shot contract generation) -----------------------------
+def _strip_code_fence(text: str) -> str:
+    """Strip a SINGLE leading/trailing ``` code fence if present — NOT all backtick characters.
+    str.strip('`') removes every leading/trailing backtick, mangling content whose first/last line
+    is an inline-code span (e.g. an AGENT.md gate line starting with `pytest -q`). Only a complete
+    fence (a line that is just ``` optionally followed by a language tag) should be removed."""
+    lines = text.splitlines()
+    # strip a leading fence line
+    if lines and re.match(r"^```\w*\s*$", lines[0].strip()):
+        lines = lines[1:]
+    # strip a trailing fence line
+    if lines and re.match(r"^```\s*$", lines[-1].strip()):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
 def _parse_provision(text: str):
     """Pull the two ===AGENT.md=== / ===backlog.md=== blocks out of the provisioner's output."""
     if "===AGENT.md===" not in text or "===backlog.md===" not in text:
         return None, None
     after = text.split("===AGENT.md===", 1)[1]
     agent_part, backlog_part = after.split("===backlog.md===", 1)
-    agent_md = agent_part.strip().strip("`").strip()
-    backlog_md = backlog_part.split("===")[0].strip().strip("`").strip()
+    # The old code did backlog_part.split("===")[0] which truncated at the FIRST '===' substring —
+    # a markdown horizontal rule or table inside the backlog would silently drop the rest. The
+    # backlog block runs to end-of-text (the provisioner emits nothing after it); _strip_code_fence
+    # removes a trailing ``` fence if the model wrapped the block.
+    agent_md = _strip_code_fence(agent_part.strip())
+    backlog_md = _strip_code_fence(backlog_part.strip())
     return (agent_md or None), (backlog_md or None)
 
 
