@@ -766,3 +766,24 @@ def test_deviated_only_on_edit_mandate_with_suffix_match():
     # vague item (no edit mandate) -> never flagged
     assert m._deviated_from_named_files("Improve the scheduling heuristic", "scripts/scheduler.py\n") is False
     assert m._deviated_from_named_files("", "x.py\n") is False
+
+
+# --------------------------------------------------------------------------- #
+# IDEATE-1 — the ideate parser must tolerate how a model actually formats idea lines (bullets,
+# markdown, optional brackets, |/:/-/— separators, multi/absent leverage), not just the exact spec.
+# --------------------------------------------------------------------------- #
+def test_parse_ideas_tolerant_of_formatting():
+    m = _load_runner()
+    txt = ("Here are the ideas:\n"
+           "- **[feature]** | 4 | Build a counterfactual code-mod simulator for safer mutations\n"
+           "[architecture] : 5 : Federate cross-profile learning into a shared patterns store\n"
+           "3. [refactor] - Consolidate the duplicated PR-rollup reducers into one\n"   # no leverage -> default 3
+           "this feature is nice but is plainly not an idea line\n"                     # prose -> ignored
+           "[chore] | 2 | Tidy the import ordering across the package\n")                # chore tier -> dropped
+    ideas = m._parse_ideas(txt)
+    tiers = {t for _l, t, _i in ideas}
+    assert tiers == {"feature", "architecture", "refactor"}              # ambitious tiers only; chore dropped
+    assert all(1 <= lev <= 5 for lev, _t, _i in ideas)
+    assert ideas[0][0] == 5                                   # sorted by leverage desc (architecture first)
+    assert not any("not an idea" in i.lower() or "tidy the import" in i.lower()
+                   for _l, _t, i in ideas)                    # prose AND chore lines excluded
