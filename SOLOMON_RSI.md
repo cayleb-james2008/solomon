@@ -178,3 +178,188 @@ isn't merged as "no CI"), backlog-advance on a **verified ship** (PR opened / me
 on a push/auth failure or agent deviation; step 8), preflight **refuse-on-out-of-band-base-move**
 (never-hand-patched keystone, step 1), and the **supervisor holding the single-flight lock** during
 recovery (step 9). These are tracked and landed as gated changes to Solomon's own harness code.
+
+The Video-1-grounded enhancement pass (cross-repo gate, `EVAL_CMD` eval needles, visual hard-gate,
+agent-artifact recovery, dirty-repo self-recovery, ideate external research) is documented in the
+sections above. All 7 invariants + the safety rails are untouched — the new gates ADD to the gate
+(`gate-enforced-by-runner`), they don't replace it; recovery stays reversible-first; the agent still
+authors under contract; the supervisor still holds the lock; the base still compounds only via merged
+PRs. Test suite: 256 passed, 1 skipped (`tests/test_e2e_loop.py` covers the full `one_iteration()`
+orchestration against a mock pi).
+
+---
+
+## Correlated test discovery & enhanced anti-gaming
+
+### Problem: Missed correlated tests
+
+When the agent changes files in module X, the gate would only run tests that directly test X, missing
+tests in other files that import or depend on X. This could lead to regressions in dependent code
+going undetected.
+
+### Solution: Correlated test discovery
+
+The runner now automatically discovers and runs tests that are **correlated** with the changes:
+
+1. **Extract module names** from changed files (e.g., `scripts/config.py` → `config`)
+2. **Search test files** for imports/references to those modules using regex
+3. **Expand the gate** to include correlated test files alongside the default gate
+
+**Example:**
+```
+Changed file: asmodeus/execution/broker.py
+Test file: tests/test_broker.py contains "from asmodeus.execution.broker import paper"
+Result: tests/test_broker.py is included in the gate automatically
+```
+
+### Enhanced anti-gaming measures
+
+The anti-gaming checks have been enhanced with additional safeguards:
+
+1. **Error count increase**: Detects when error count increased (new test failures introduced)
+2. **Significant skip count increase**: Detects when skip count increased significantly (tests being skipped instead of fixed)
+3. **Collected count gaming detection**: Logs warnings when collected count increases but pass count stays the same (possible gaming by adding trivial tests)
+
+### Implementation
+
+Key functions added to `run_improver.py`:
+
+- `_find_correlated_tests(changed_files)`: Finds test files that import changed modules
+- `_expand_gate_with_correlated(gate_cmd, changed_files)`: Expands gate command to include correlated tests
+- `_get_changed_files_for_correlation(base_sha)`: Gets list of changed `.py` files
+
+### Integration
+
+The `run_gate()` function now accepts an optional `changed_files` parameter:
+
+```python
+def run_gate(changed_files: list[str] | None = None) -> tuple:
+    """Authoritative test gate. Returns (green, {passed,failed,errors,green}, tail)."""
+    # Expand gate command to include correlated tests if changed_files provided
+    effective_gate_cmd = GATE_CMD
+    if changed_files:
+        effective_gate_cmd = _expand_gate_with_correlated(GATE_CMD, changed_files)
+    # ... rest of function
+```
+
+### Testing
+
+Comprehensive test suite in `tests/test_correlated_tests.py` with 33 tests covering:
+- Correlated test discovery
+- Gate expansion
+- Anti-gaming measures
+- Skip marker detection
+
+All 201 tests pass (including 28 existing tests, confirming no regressions).
+
+---
+
+## Cross-repo correlated test gate
+
+When a managed repo shares a module with another repo, a change in one can break the other — and a
+single-repo gate would miss it. A repo may declare `cross_repo_deps` in `repos.json`: a list of repo
+names whose gate should run when THIS repo changes a shared module.
+
+```json
+{"name": "sover", "cross_repo_deps": ["maki"]}
+```
+
+After the primary gate passes (green + anti-gaming clean), the runner runs each declared dep repo's
+OWN gate (from the dep's `repos.json` row) in the dep repo's cwd. Any red dep reverts the branch
+(same as a primary gate red). The per-dep results are recorded in `history.jsonl` under
+`cross_repo_gates`. Self-references are excluded (the primary gate already covers this repo). If
+`cross_repo_deps` is absent/empty, behavior is unchanged (backward compatible).
+
+---
+
+## Per-repo eval needles (`EVAL_CMD`)
+
+Video 1: "metrics can be misleading… amount of code merged = bloat/slop." A green test gate alone
+optimizes for "tests pass", not for the real product metric. A repo may declare `EVAL_CMD` in
+`repos.json`: a benchmark/visual/product-metric command run AFTER the test gate passes, parsed by
+the RUNNER (never the model).
+
+```json
+{"name": "maki", "EVAL_CMD": ".venv\\Scripts\\python bench.py"}
+```
+
+The runner parses a single float from the command's stdout (the first float wins; e.g.
+`score: 0.85 | p99: 210ms` yields `0.85`) and measures it on the clean base BEFORE any change, then
+again after the gate passes. Anti-gaming: if the score DROPPED vs the baseline, the branch is
+reverted — a green test gate that made the product WORSE on the richer needle still reverts. If the
+command prints no float, or times out, the gate is INACTIVE (don't block on a missing needle; the
+runner logs it). If `EVAL_CMD` is absent, behavior is unchanged. This is the spec's "evals are
+everything" multiplier — richer per-repo needles beyond unit tests.
+
+---
+
+## Visual review hard gate
+
+Video 1: "agents can cheat… rewrite the evaluation function." The visual E2E review (boots the app
+in a sandbox, captures screenshots, runs a vision agent) was advisory-only — a gap. A repo may
+declare `visual_gate: true` in `repos.json` to upgrade a SUCCESSFUL review WITH ≥1 critical finding
+to a BLOCKING gate: the branch is reverted (same as a test-gate red). Off by default for non-UI repos
+(backward compatible). The existing advisory-only path (feedback for the next iteration) is unchanged
+for warnings/info and for repos without the flag. A review that itself FAILED to run still does NOT
+block (best-effort — the RSI loop must not break if the visual infra is down).
+
+```json
+{"name": "sover", "visual_gate": true, "sandbox": {"enabled": true, "launch": "...", "pages": ["/"]}}
+```
+
+---
+
+## Agent-artifact recovery (untracked-file preflight)
+
+Video 1: "agents go nuts in long-running sessions… return to a complete mess." A dead run's leftover
+untracked files (the agent's own `AGENT_LOG.md`, `capabilities/*`, `profiles/*`, `start_*.sh`, or
+anything under an explicit `.agent_artifacts/` sentinel) used to wedge the loop FOREVER — preflight
+refused to `git clean -fd` them as operator-work protection. Now a CONSERVATIVE recovery path: if
+EVERY untracked non-ignored file matches an agent-artifact heuristic (`_AGENT_ARTIFACT_PATTERNS`), the
+runner STAGES them on the `rsi/*` branch (never the base), runs the gate, and ships or reverts —
+exactly like a normal iteration. A single operator file among the set keeps the whole set protected
+(refuse + escalate, unchanged). The heuristic list is deliberately narrow (a false positive would
+destroy operator work); the bare `capabilities/` / `profiles/` dirs are NOT matched (they'd sweep any
+operator dir of that name).
+
+---
+
+## Dirty-repo self-recovery
+
+Review findings #2 (revert-failure wedge) + #3 (dirty-tree+live-loop deadlock):
+
+- **Runner self-stop on persistent dirty-BASE:** a dirty base tree blocks preflight every iteration
+  but the runner never stopped — it spun forever on the same refusal while the watchdog kept
+  restarting it. After N=3 (`_DIRTY_BASE_PERSISTENT_LIMIT`) consecutive dirty-BASE preflight bails,
+  the runner writes the `STOP` sentinel + records `status=error/phase=preflight/reason=dirty_base_persistent`
+  so `monitor.should_restart` leaves it alone and the operator is alerted. A dirty non-base branch
+  (an `rsi/*` leftover cleared by the forced preflight) does NOT count; a clean iteration RESETS the
+  counter (a transient dirty spell doesn't accumulate toward a false stop).
+- **`solomon.recover()` auto-reset for `revert_failed` when the loop is NOT live:** a dead iteration
+  left the repo on an un-revertable `rsi/*` branch and the loop halted; the runner never cleared it
+  itself. If `diagnose()==revert_failed` AND `control.is_running(repo)` is False, the supervisor
+  auto-runs `reset_to_base` (holding the supervisor lock so it never mutates git under a live
+  iteration) + `cleanup_worktrees` to drop the lingering `rsi/*` branches. This is RUNG-0
+  (reversible: `checkout --force` + `reset --hard origin/base` — never force-push, never merge). If
+  the loop IS live or the reset fails, it escalates.
+- **Auto-cleanup of `rsi/*` branches on a clean stop:** `control.stop()` now waits briefly for the
+  loop to confirm stopped, then auto-runs `cleanup_worktrees` to delete lingering `rsi/*` branches
+  left by local/push ship modes or dead runs (the observed `rsi/iter-...` leftover on sover).
+  Cleanup is best-effort; the guard inside `cleanup_worktrees` (never delete the current branch)
+  keeps it safe even if the loop is slow to exit.
+
+---
+
+## Ideate-lane external research
+
+Video 1: "agents hyperfocus, got stuck on a local minimum, never looked up new ideas on the
+internet." A repo may declare `ideate_research: true` in `repos.json` to PERMIT (but not require) the
+ideate agent to do web/docs lookup (Context7/webfetch-style) for novel ideas — to escape the local
+minimum and propose genuinely novel, high-leverage moves. Default false (the agent reads only the
+local repo — the existing behavior, preserved). The output is always REVIEWABLE backlog items: the
+runner sorts + prepends them, the agent NEVER edits its own menu (menu curation stays human-owned —
+the `agent-implements-under-contract` invariant is untouched).
+
+```json
+{"name": "maki", "ideate_research": true}
+```

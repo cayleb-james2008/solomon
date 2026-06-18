@@ -233,11 +233,47 @@ def recover(repo, allow_pi=False, allow_restart=True, auto_push=True):
     if cat == "ok":
         return {"ok": True, "category": "ok", "actions_taken": [], "escalate": False, "message": "healthy"}
 
-    # RUNG 2 — not auto-safe and not a code-fix candidate -> escalate, do nothing destructive
+    actions = []   # actions taken on this run (appended to supervisor.jsonl via _finish)
+
+    # RUNG 2 — not auto-safe and not a code-fix candidate -> escalate, do nothing destructive.
+    # EXCEPTION: revert_failed (review finding #2 — the revert-failure wedge). A dead iteration left
+    # the repo on an un-revertable rsi/* branch and the loop halted (status=error/phase=reverted); the
+    # runner will NEVER clear it itself. If the loop is confirmed NOT live, auto-run reset_to_base
+    # (holding the supervisor lock so we never mutate git under a live iteration) + cleanup_worktrees
+    # to drop the lingering rsi/* branches. This is RUNG-0 (reversible: checkout --force + reset --hard
+    # origin/base — never force-push, never merge). If the loop IS live or the reset fails, escalate.
+    if cat == "revert_failed":
+        if control.is_running(repo):
+            return _finish(repo, d, [], escalate=True,
+                           msg="loop is live — stop it before Solomon resets the un-reverted base")
+        ok, token = control.acquire_supervisor_lock(repo)
+        if not ok:
+            return _finish(repo, d, [], escalate=True,
+                           msg="loop lock could not be acquired — stop it before Solomon resets the "
+                               "un-reverted base")
+        try:
+            r = control.reset_to_base(repo)
+        finally:
+            control.release_supervisor_lock(repo, token)
+        actions.append("reset_to_base")
+        if not r.get("ok"):
+            return _finish(repo, d, actions, escalate=True,
+                          msg=(r.get("error") or "reset_to_base failed — escalate"))
+        # the reset succeeded: clean up the lingering rsi/* branches the dead iteration left behind
+        cw = control.cleanup_worktrees(repo)
+        actions.append("cleanup_worktrees")
+        if not cw.get("ok"):
+            # the reset itself succeeded (the wedge is cleared); a cleanup failure is best-effort —
+            # log it but don't re-escalate the already-recovered repo.
+            msg = f"recovered: reset_to_base (cleanup_worktrees: {cw.get('error', '?')})"
+        else:
+            removed = cw.get("removed") or []
+            msg = (f"recovered: reset_to_base, cleanup_worktrees (removed {len(removed)} rsi/* branch(es))")
+        return _finish(repo, d, actions, escalate=False, msg=msg)
+
     if not d["auto_safe"] and cat != "gate_red_streak":
         return _finish(repo, d, [], escalate=True, msg="escalated — operator action required")
 
-    actions = []
     if cat == "stale_lock":
         r = control.clear_lock(repo)
         actions.append("clear_lock")
