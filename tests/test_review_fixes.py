@@ -628,3 +628,35 @@ def test_control_is_running_run_id_mismatch_is_orphaned(tmp_path, monkeypatch):
     (rt / "lock").write_text("4242\nOLDrun", encoding="utf-8")     # lock from a prior runner
     (rt / "heartbeat.json").write_text(json.dumps({"updated_at": _iso(0), "run_id": "NEWrun"}), encoding="utf-8")
     assert control.is_running(repo) is False                       # fresh heartbeat under a DIFFERENT run-id
+
+
+# --------------------------------------------------------------------------- #
+# SEC-3 — _redact scrubs the BARE loaded provider key (Ollama keys aren't sk-/gh-shaped, so the
+# pattern rails miss a value the agent echoes without a NAME= prefix).
+# --------------------------------------------------------------------------- #
+def test_redact_scrubs_bare_loaded_provider_key(monkeypatch):
+    m = _load_runner()
+    monkeypatch.setenv("OLLAMA_API_KEY", "abcd1234efgh5678ijkl")    # bare value, not sk-/gh- shaped
+    assert "[REDACTED]" in m._redact("the model echoed abcd1234efgh5678ijkl mid-summary")
+    assert "abcd1234" not in m._redact("abcd1234efgh5678ijkl")
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    assert m._redact("ordinary summary text") == "ordinary summary text"   # no key set -> untouched
+
+
+# --------------------------------------------------------------------------- #
+# SHIP-1 — an UNVERIFIED push (rc=0 but the branch isn't on origin) blocks PR-open + records an error
+# (SOLOMON_RSI step 7) instead of silently proceeding to a failing gh pr create.
+# --------------------------------------------------------------------------- #
+def test_ship_push_unverified_blocks_pr(monkeypatch):
+    m = _load_runner()
+    m.SHIP = "auto-merge"
+    monkeypatch.setattr(m, "has_remote", lambda: True)
+    monkeypatch.setattr(m, "_gh_ready", lambda: True)
+    monkeypatch.setattr(m, "git", lambda *a: type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})())
+    monkeypatch.setattr(m, "_branch_on_remote", lambda b: False)   # push 'succeeded' but branch not on origin
+    monkeypatch.setattr(m, "heartbeat", lambda **k: None)
+    opened = []
+    monkeypatch.setattr(m, "_open_pr", lambda *a, **k: opened.append(a) or {"number": 1, "state": "open"})
+    pr = m._ship("rsi/iter-x", "t", "s", {"passed": 1})
+    assert pr["state"] == "push-unverified (failed)" and opened == []   # never opened a PR
+    assert m._ship_succeeded(pr) is False                              # and did not tick the item
