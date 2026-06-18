@@ -74,6 +74,7 @@ GITHUB_TOOLS = False                 # expose read-only github_* tools to the ag
 GITHUB_TOOLS_EXT = HERE / "github-tools.ts"  # gh-backed GitHub verification tools (pi extension)
 SOLOMON = False                      # supervisor fix-session — set from --solomon (runs the gate + ships a PR)
 PROVISION_MD = HERE / "provision.md" # one-shot contract-generation system prompt
+IDEATE_MD = HERE / "ideate.md"       # divergent ideation system prompt (anti-shallowness lane)
 SOLOMON_MD = HERE / "solomon.md"     # supervisor fix-session system prompt
 
 
@@ -102,25 +103,33 @@ def configure(repo: str, name: str, provider: str = "ollama-cloud",
     _hb["model"] = PI_MODEL
 
 
-def build_task(goal: str) -> str:
+def build_task(goal: str, tier: str = "chore") -> str:
     """Per-iteration instruction for the Pi coder. The full operating contract is injected
-    separately via --append-system-prompt (AGENT_MD); here we name the chosen item and, when set,
-    the operator's north-star GOAL so the change is steered toward it (and a missing capability may
-    be BUILT to serve it)."""
+    separately via --append-system-prompt (AGENT_MD); here we name the chosen item, its ambition
+    TIER (sizing the change to the opportunity), and the operator's north-star GOAL."""
     north_star = (
         f'NORTH-STAR GOAL (weigh above all): {GOAL}\nChoose the change with the most leverage toward '
         f'that goal; if it needs a capability the project lacks, BUILD that capability as this one '
         f'increment.\n\n' if GOAL else ""
     )
+    if tier == "chore":
+        sizing = ("Make the SMALLEST coherent change and add or update a pytest test for it; doing more "
+                  "than this one item is a regression.")
+    else:
+        sizing = (f"This is a {tier.upper()}-tier item — SIZE THE CHANGE TO THE OPPORTUNITY: a "
+                  "substantive, possibly multi-file change is expected and welcome; be ambitious and "
+                  "creative toward the goal, not minimal. It must still be ONE coherent, shippable "
+                  "improvement that passes the gate, with tests covering it. If it's genuinely too big "
+                  "for one iteration, implement the largest coherent first slice that's shippable now "
+                  "and note the rest in your summary.")
     return (
-        f'{north_star}Implement exactly ONE improvement in this repository: "{goal}". Make the smallest '
-        "coherent change and add or update a pytest test for it, then run the test suite "
-        "(`.venv/Scripts/python -m pytest`) yourself to confirm it is green. Do NOT run git or "
-        "gh — the runner commits and opens the pull request. If that item is already done or "
-        "unclear, instead fix one clear small bug or cleanup you find. End with a 2-4 sentence "
-        "summary of what you changed, then a FINAL line that is exactly `ITEM-STATUS: done` if you "
-        "implemented (or it was already fully done) the named item above, or `ITEM-STATUS: deviated` "
-        "if you instead changed something else."
+        f'{north_star}Implement exactly ONE improvement in this repository: "{goal}". {sizing} Then run '
+        "the test suite (`.venv/Scripts/python -m pytest`) yourself to confirm it is green. Do NOT run "
+        "git or gh — the runner commits and opens the pull request. If that item is already done or "
+        "unclear, instead fix one clear small bug or cleanup you find. End with a 2-4 sentence summary "
+        "of what you changed, then a FINAL line that is exactly `ITEM-STATUS: done` if you implemented "
+        "(or it was already fully done) the named item above, or `ITEM-STATUS: deviated` if you instead "
+        "changed something else."
     )
 
 
@@ -426,15 +435,29 @@ def run_gate() -> tuple:
 
 
 # ---- pr -------------------------------------------------------------------
-def _top_backlog_item() -> str:
+_TIERS = ("chore", "feature", "refactor", "architecture")
+
+
+def _strip_tier(text: str):
+    """Split a leading [chore|feature|refactor|architecture] ambition tag off a backlog item.
+    Returns (text_without_tag, tier). Default 'chore' = today's safe, smallest-change behavior, so an
+    untagged (legacy) backlog behaves byte-identically; higher tiers lift the smallest-change ceiling."""
+    m = re.match(r"\[(chore|feature|refactor|architecture)\]\s*", (text or "").strip(), re.I)
+    if m:
+        return ((text or "").strip()[m.end():].strip(), m.group(1).lower())
+    return ((text or "").strip(), "chore")
+
+
+def _top_backlog_item():
+    """(text, tier) of the first unchecked `- [ ]` item; tier from its leading tag, default 'chore'."""
     try:
         for line in BACKLOG.read_text(encoding="utf-8").splitlines():
             s = line.strip()
             if s.startswith("- [ ]"):
-                return s[5:].strip()
+                return _strip_tier(s[5:].strip())
     except OSError:
         pass
-    return "model-chosen improvement"
+    return "model-chosen improvement", "chore"
 
 
 def _mark_backlog_done(goal: str) -> None:
@@ -449,7 +472,7 @@ def _mark_backlog_done(goal: str) -> None:
         return
     for i, ln in enumerate(lines):
         s = ln.strip()
-        if s.startswith("- [ ]") and s[5:].strip() == goal.strip():
+        if s.startswith("- [ ]") and _strip_tier(s[5:].strip())[0] == goal.strip():
             lines[i] = ln.replace("- [ ]", "- [x]", 1)
             try:
                 BACKLOG.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -486,7 +509,7 @@ def _defer_backlog_item(goal: str) -> bool:
         return False
     for i, ln in enumerate(lines):
         s = ln.strip()
-        if s.startswith("- [ ]") and s[5:].strip() == goal.strip():
+        if s.startswith("- [ ]") and _strip_tier(s[5:].strip())[0] == goal.strip():
             item = lines.pop(i).rstrip()
             if "(deferred" not in item:
                 item += "  (deferred: agent could not implement after repeated tries)"
@@ -676,8 +699,8 @@ def one_iteration() -> None:
                 "presentation only — do NOT change any source code or behavior. Then stop.")
         system_md = BEAUTIFY_MD
     else:
-        goal = _top_backlog_item()
-        task = build_task(goal)
+        goal, tier = _top_backlog_item()
+        task = build_task(goal, tier)
         system_md = None
     heartbeat(status="iterating", phase="implement", goal=goal,
               last_pr=None, tests=None)
@@ -956,6 +979,59 @@ def provision() -> int:
     return 0
 
 
+# ---- ideate (divergent backlog generation — the anti-shallowness lane) -----
+def _parse_ideas(text: str):
+    """Parse the ideate lane's `[tier] | leverage | idea` lines into (leverage, tier, idea) tuples,
+    sorted by leverage descending (highest-leverage first). The agent emits candidates; PYTHON owns
+    the backlog write (same steering boundary as provision)."""
+    ideas = []
+    for ln in (text or "").splitlines():
+        m = re.match(r"\s*[-*]?\s*\[(feature|refactor|architecture)\]\s*\|\s*(\d)\s*\|\s*(.+)",
+                     ln.strip(), re.I)
+        if m:
+            ideas.append((int(m.group(2)), m.group(1).lower(), m.group(3).strip().rstrip("`").strip()))
+    ideas.sort(key=lambda t: -t[0])
+    return ideas
+
+
+def ideate() -> int:
+    """One-shot divergent pass: pi proposes ambitious, leverage-ranked, tier-tagged improvements; the
+    runner PREPENDS them (highest-leverage first) to the backlog as `- [ ] [tier] ...` items. No git,
+    no gate, no loop — the greedy gate-enforced loop executes them later. Prints one JSON line."""
+    goal_line = (f"\n\nNORTH-STAR GOAL (rank every idea by how much it advances THIS):\n{GOAL}\n"
+                 if GOAL else "\n\n(No north-star goal set — propose the highest-leverage improvements "
+                              "toward making this project excellent at what it's for.)\n")
+    task = ("Read this repository and propose its next batch of ambitious, high-leverage improvements "
+            "per ideate.md. Output ONLY the idea lines." + goal_line)
+    try:
+        p = run_pi(task, system_md=IDEATE_MD, timeout=600)
+    except subprocess.TimeoutExpired:
+        print(json.dumps({"ok": False, "error": "ideate timed out"}))
+        return 5
+    ideas = _parse_ideas(final_text(p.stdout) or "")
+    if not ideas:
+        print(json.dumps({"ok": False, "error": "ideate emitted no parseable ideas"}))
+        return 5
+    new_lines = [f"- [ ] [{tier}] {idea}" for _lev, tier, idea in ideas]
+    try:
+        existing = BACKLOG.read_text(encoding="utf-8") if BACKLOG.exists() else "# backlog\n"
+    except OSError:
+        existing = "# backlog\n"
+    # prepend ambitious items above the existing menu, after a header line if present
+    lines = existing.splitlines()
+    head = 1 if lines and lines[0].lstrip().startswith("#") else 0
+    merged = lines[:head] + ([""] if head else []) + new_lines + lines[head:]
+    try:
+        BACKLOG.parent.mkdir(parents=True, exist_ok=True)
+        BACKLOG.write_text("\n".join(merged).rstrip() + "\n", encoding="utf-8")
+    except OSError as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 5
+    print(json.dumps({"ok": True, "added": len(new_lines),
+                      "top": new_lines[0][:90] if new_lines else ""}))
+    return 0
+
+
 def _solomon_task() -> str:
     """Build the supervisor fix-session prompt from the recent (failing) iteration history."""
     hist = []
@@ -1007,6 +1083,8 @@ def main(argv=None) -> int:
                     help="one docs-only pass (README/banner/badges/Mermaid/About); skips the gate")
     ap.add_argument("--provision", action="store_true",
                     help="one-shot: generate this repo's AGENT.md + backlog.md, then exit (no loop)")
+    ap.add_argument("--ideate", action="store_true",
+                    help="one-shot: prepend ambitious, leverage-ranked, tier-tagged ideas to the backlog")
     ap.add_argument("--solomon", action="store_true",
                     help="supervisor fix-session: diagnose + fix a persistent gate failure (one iteration)")
     a = ap.parse_args(argv)
@@ -1027,6 +1105,8 @@ def main(argv=None) -> int:
     _load_env()
     if a.provision:                        # generate the contract files, then exit (no git/loop needed)
         return provision()
+    if a.ideate:                           # prepend ambitious ideas to the backlog, then exit
+        return ideate()
     if git("rev-parse", "--is-inside-work-tree").returncode != 0:
         print("ERROR: not a git repository.")
         return 2

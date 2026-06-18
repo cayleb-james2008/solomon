@@ -97,6 +97,32 @@ falls, the dial can move up — but PR review and the halt switch never go away.
 
 ---
 
+## Depth & creativity — explore, then exploit
+
+A pure greedy "commit if better" ratchet reliably climbs to a **shallow local optimum** — it can only
+accept changes that win immediately, so it favors trivial wins (add a test, dedup) and is structurally
+blocked from deep, multi-step, creative improvements (Karpathy's AutoResearch observation). Solomon
+counters this *upstream of the gate*, leaving the trustworthy ratchet untouched:
+
+- **Ideate lane (divergent / explore)** — an operator-triggered one-shot (`run_improver --ideate`,
+  `improver/ideate.md`) where the agent proposes **5–8 ambitious, non-obvious, leverage-ranked**
+  improvements toward the north-star goal — trivial chores explicitly forbidden — which the runner
+  sorts by leverage and **prepends to the backlog** (Python owns the write; the agent never edits its
+  own menu). This refills the menu with deep work so the loop isn't starved into incrementalism.
+- **Ambition tiers (exploit, sized to the opportunity)** — a backlog item may carry a leading
+  `[chore|feature|refactor|architecture]` tag. `chore` (the default, so legacy backlogs are
+  unchanged) keeps the smallest-coherent-change rule; higher tiers tell the agent to **size the
+  change to the opportunity** — a substantive, multi-file change is welcome — while it still must be
+  **one coherent, gate-green, PR-shipped** improvement. The gate and anti-gaming checks are unchanged:
+  a bolder change must still pass the same green gate and never drop the test count.
+
+The eval is the ceiling on depth ("evals are everything"): richer per-repo needles beyond unit tests
+(a benchmark command, the visual gate, real product metrics, an LLM depth-judge for non-chore tiers)
+are the planned next multiplier. Autonomy stays human-gated — ideation injects *reviewable* backlog
+items; only the gate-enforced PR loop mutates a managed repo.
+
+---
+
 ## Provisioning — how a project becomes loop-ready
 
 Before a project's first loop, Solomon **auto-provisions** it (never hand-written per-repo):

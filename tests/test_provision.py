@@ -102,6 +102,53 @@ def test_build_task_weaves_north_star_goal():
     assert "NORTH-STAR" not in m.build_task("Add a test")
 
 
+def test_strip_tier_and_top_item_tier(tmp_path, monkeypatch):
+    m = _load_runner()
+    assert m._strip_tier("[architecture] Build the genesis API") == ("Build the genesis API", "architecture")
+    assert m._strip_tier("Add a test") == ("Add a test", "chore")          # untagged -> chore (legacy-safe)
+    bl = tmp_path / "backlog.md"
+    bl.write_text("# b\n\n- [ ] [feature] Add live chat actions\n- [ ] Add a test\n", encoding="utf-8")
+    monkeypatch.setattr(m, "BACKLOG", bl)
+    assert m._top_backlog_item() == ("Add live chat actions", "feature")
+
+
+def test_build_task_tier_lifts_smallest_change_ceiling():
+    m = _load_runner()
+    m.GOAL = ""
+    chore = m.build_task("do x", "chore")
+    arch = m.build_task("do x", "architecture")
+    assert "SMALLEST coherent change" in chore and "regression" in chore
+    assert "SIZE THE CHANGE TO THE OPPORTUNITY" in arch and "ambitious" in arch.lower()
+
+
+def test_parse_ideas_sorts_by_leverage_and_drops_chores():
+    m = _load_runner()
+    out = ("[feature] | 3 | medium idea — why: ok\n"
+           "[architecture] | 5 | big idea — why: unlocks the goal\n"
+           "[chore] | 5 | add a test — why: nope\n"          # chore tier not allowed -> dropped
+           "noise line\n"
+           "[refactor] | 4 | refactor idea — why: cleaner\n")
+    ideas = m._parse_ideas(out)
+    assert [t for _l, t, _i in ideas] == ["architecture", "refactor", "feature"]   # sorted desc, no chore
+    assert ideas[0][2].startswith("big idea")
+
+
+def test_ideate_prepends_ambitious_items(tmp_path, monkeypatch):
+    m = _load_runner()
+    bl = tmp_path / "backlog.md"
+    bl.write_text("# sover backlog\n\n- [ ] Add a test\n", encoding="utf-8")
+    monkeypatch.setattr(m, "BACKLOG", bl)
+    canned = "[architecture] | 5 | Build the genesis profile-create API — why: unlocks the goal\n[feature] | 3 | Add chat read-context — why: real numbers\n"
+    monkeypatch.setattr(m, "run_pi", lambda task, system_md=None, timeout=600: type("R", (), {"stdout": canned})())
+    monkeypatch.setattr(m, "final_text", lambda s: s)
+    assert m.ideate() == 0
+    txt = bl.read_text(encoding="utf-8")
+    lines = [l for l in txt.splitlines() if l.startswith("- [ ]")]
+    assert lines[0] == "- [ ] [architecture] Build the genesis profile-create API — why: unlocks the goal"  # highest leverage first
+    assert lines[-1] == "- [ ] Add a test"                                          # legacy chore kept below
+    assert txt.splitlines()[0] == "# sover backlog"                                 # header preserved
+
+
 def test_render_no_github_para_when_local(tmp_path, monkeypatch):
     r = _repo(tmp_path, monkeypatch, name="loc", has_remote=False)
     agent, _ = control.render_default_contract(r)
@@ -229,7 +276,7 @@ def test_mark_backlog_done_ticks_item_and_advances(tmp_path, monkeypatch):
     m._mark_backlog_done("first item")
     txt = bl.read_text(encoding="utf-8")
     assert "- [x] first item" in txt and "- [ ] second item" in txt
-    assert m._top_backlog_item() == "second item"   # loop now advances
+    assert m._top_backlog_item()[0] == "second item"   # loop now advances
     m._mark_backlog_done("nonexistent")              # no-op, no crash
     assert bl.read_text(encoding="utf-8") == txt
 
@@ -253,12 +300,12 @@ def test_note_noop_defers_stuck_item_after_three_tries(tmp_path, monkeypatch):
     m.BEAUTIFY = False
     m.SOLOMON = False
     m._noop_counts.clear()
-    assert m._top_backlog_item() == "hard item"
+    assert m._top_backlog_item()[0] == "hard item"
     m._note_noop("hard item")
     m._note_noop("hard item")
-    assert m._top_backlog_item() == "hard item"          # 2 noops — not deferred yet
+    assert m._top_backlog_item()[0] == "hard item"          # 2 noops — not deferred yet
     m._note_noop("hard item")                            # 3rd noop — deferred to the bottom
-    assert m._top_backlog_item() == "easy item"
+    assert m._top_backlog_item()[0] == "easy item"
     assert "deferred" in bl.read_text(encoding="utf-8")
 
 

@@ -1074,6 +1074,39 @@ def enrich_contract(repo, background=False):
     return {"ok": False, "error": (r.stderr or r.stdout or "provision failed").strip()[:300]}
 
 
+def ideate(repo):
+    """Run a one-shot divergent ideation pass (run_improver.py --ideate): pi proposes ambitious,
+    leverage-ranked, tier-tagged improvements and the runner PREPENDS them to the repo's backlog.
+    Operator-triggered (not auto-run in the loop) — the more-ambitious items still ship only through
+    the gate-enforced PR loop. Blocks and returns the runner's JSON line {ok, added, top}."""
+    name, path = _repo_name(repo), _repo_path(repo)
+    if not name or not path:
+        return {"ok": False, "error": "repo has no name/path"}
+    prov = project_provider(repo)
+    if not keys_status().get(prov):
+        return {"ok": False, "error": f"{prov} API key not set (add it in Settings)"}
+    py = _venv_python(repo)
+    if not py or not os.path.exists(py):
+        py = sys.executable
+    runner = os.path.join(HERE, "improver", "run_improver.py")
+    if not os.path.exists(runner):
+        return {"ok": False, "error": "runner not found"}
+    args = [py, runner, "--repo", path, "--name", name, "--provider", prov,
+            "--model", project_model(repo), "--goal", project_goal(repo), "--ideate"]
+    try:
+        r = _run(args, cwd=path)
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    for line in reversed((r.stdout or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                break
+    return {"ok": False, "error": (r.stderr or r.stdout or "ideate failed").strip()[:300]}
+
+
 def metrics(repo):
     """Aggregate runtime/<name>/history.jsonl into headline counters + a test-pass series."""
     hist = read_history(repo, limit=1000)
