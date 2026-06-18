@@ -476,33 +476,62 @@ def run_gate() -> tuple:
         return int(m.group(1)) if m else 0
 
     passed, failed, errors = _n(r"(\d+) passed"), _n(r"(\d+) failed"), _n(r"(\d+) error")
+    skipped = _n(r"(\d+) skipped")
+    collected = _n(r"collected (\d+) item")
     if not passed and not failed and not errors:
         # unittest doesn't print pytest-style "N passed"; parse its own summary so unittest gates
         # (e.g. `python -m unittest discover`) report real counts in the heartbeat + PR body.
         ran = re.search(r"Ran (\d+) tests?", out)
         if ran:
             failed, errors = _n(r"failures=(\d+)"), _n(r"errors=(\d+)")
-            passed = max(int(ran.group(1)) - failed - errors, 0)
+            skipped = skipped or _n(r"skipped=(\d+)")
+            ran_n = int(ran.group(1))
+            passed = max(ran_n - failed - errors, 0)
+            collected = collected or ran_n
+    if not collected:                      # fall back to the sum so the anti-gaming collected-rail works
+        collected = passed + failed + errors + skipped
 
-    tests = {"passed": passed, "failed": failed, "errors": errors, "green": p.returncode == 0}
+    # collected = the spec-mandated discovered-test count (step 2); anti-gaming reverts a green change
+    # that dropped it (tests deleted) even when 'passed' is held steady by adding a trivial test.
+    tests = {"passed": passed, "failed": failed, "errors": errors,
+             "skipped": skipped, "collected": collected, "green": p.returncode == 0}
     return p.returncode == 0, tests, out[-1500:]
 
 
+# Every way a test can be neutered by a skip/xfail — not just the decorator form: the marker
+# decorators (skip/skipif/xfail), in-body pytest.skip()/xfail() calls, and unittest's skipTest /
+# raise SkipTest. A "green" gate that simply skipped the failing tests is gamed, so anti-gaming
+# watches for any of these being ADDED.
+_SKIP_MARKER_RE = re.compile(
+    r"pytest\.mark\.(?:skip|skipif|xfail)\b"
+    r"|pytest\.(?:skip|xfail)\s*\("
+    r"|unittest\.skip"
+    r"|\.skipTest\s*\("
+    r"|raise\s+(?:unittest\.)?SkipTest")
+
+
 def _new_skip_markers(diff_text: str) -> list:
-    """Added (+) lines in a unified diff that introduce a pytest/unittest skip or xfail marker.
-    Anti-gaming: a 'green' gate that weakened tests by skipping them is reverted even though it passed.
-    Pure function over diff text so the anti-gaming rule is testable without a real git repo."""
-    return [ln for ln in (diff_text or "").splitlines() if ln.startswith("+")
-            and re.search(r"@\s*(pytest\.mark\.(skip|xfail)|unittest\.skip)", ln)]
+    """Added (+) lines in a unified diff that introduce a pytest/unittest skip or xfail in ANY form
+    (decorator, in-body call, skipTest, raise SkipTest). Anti-gaming: a 'green' gate that weakened
+    tests by skipping them is reverted even though it passed. Pure over diff text so it's testable
+    without a real git repo. The '+++ ' file-header line is excluded (it is not added content)."""
+    return [ln for ln in (diff_text or "").splitlines()
+            if ln.startswith("+") and not ln.startswith("+++") and _SKIP_MARKER_RE.search(ln)]
 
 
 def _anti_gaming_reason(base_tests, tests, diff_text: str):
     """Why a GREEN gate should still be reverted as gamed, or None. Pure (no git/IO) so the rule is
     unit-tested directly: a dropped pass count (tests removed/weakened/skipped) or newly-introduced
     skip/xfail markers (weakening that need not drop the count)."""
-    if base_tests and tests and tests.get("passed", 0) < base_tests.get("passed", 0):
-        return (f"pass count fell {base_tests['passed']}→{tests['passed']} "
-                f"(tests removed/weakened/skipped)")
+    if base_tests and tests:
+        if tests.get("passed", 0) < base_tests.get("passed", 0):
+            return (f"pass count fell {base_tests['passed']}→{tests['passed']} "
+                    f"(tests removed/weakened/skipped)")
+        # spec: the COLLECTED count must not drop either — deleting real tests and adding one
+        # trivially-passing test can hold 'passed' steady while true coverage shrinks.
+        base_c, c = base_tests.get("collected"), tests.get("collected")
+        if base_c and c is not None and c < base_c:
+            return f"collected count fell {base_c}→{c} (tests removed)"
     skips = _new_skip_markers(diff_text)
     if skips:
         return f"introduced {len(skips)} skip/xfail marker(s)"
@@ -847,9 +876,13 @@ def one_iteration() -> None:
             _drop_branch(branch, "reverted",
                          f"Reverted — tests failed ({tests['failed']} failed). {summary}")
             return
-        # Anti-gaming: a GREEN gate that dropped the pass count or added skip/xfail markers means tests
-        # were removed/weakened — revert even though it is "green" (rule = the pure _anti_gaming_reason).
-        gamed = _anti_gaming_reason(base_tests, tests, git("diff", BASE_BRANCH).stdout or "")
+        # Anti-gaming: a GREEN gate that dropped the pass/collected count or added skip/xfail markers
+        # means tests were removed/weakened — revert even though it is "green". Stage first (git add -A)
+        # so the diff includes NEW UNTRACKED test files — `git diff <commit>` omits untracked files, so a
+        # skip/xfail added inside a brand-new test file (the common case: Pi writes new tests) would
+        # otherwise be invisible — then diff the staged tree against base.
+        git("add", "-A")
+        gamed = _anti_gaming_reason(base_tests, tests, git("diff", "--cached", BASE_BRANCH).stdout or "")
         if gamed:
             log(f"anti-gaming: {gamed} — reverting")
             _drop_branch(branch, "reverted", f"Reverted — anti-gaming: {gamed}. {summary}")
