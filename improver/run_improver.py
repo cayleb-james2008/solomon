@@ -175,6 +175,44 @@ def _clean_env() -> dict:
     return env
 
 
+# Secret-shaped patterns scrubbed from agent free-text before it reaches a commit, PR body,
+# history.jsonl, or the log. The pi agent runs with the provider key in its env and has read access
+# to the target repo, so a model that echoes a secret (its own key, a committed .env, a failing test's
+# token) must not leak it into a pushed PR or onto disk. Best-effort defense-in-depth, not a guarantee.
+_SECRET_TOKEN_PATTERNS = [
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),          # GitHub PAT/OAuth/server/refresh tokens
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),        # fine-grained PAT
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),               # OpenAI/Anthropic-style keys
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{20,}"),     # Authorization: Bearer <token>
+]
+# NAME<sep>value where NAME looks like a credential and value is secret-length. The separator is
+# captured (group 2) and preserved so legitimate text isn't punctuation-rewritten.
+_SECRET_KEYVAL_PATTERN = re.compile(
+    r"(?i)\b([A-Za-z0-9_]*(?:API_?KEY|ACCESS_TOKEN|AUTH_TOKEN|SECRET|PASSWORD|TOKEN))\b(\s*[=:]\s*)"
+    r"([A-Za-z0-9_\-\.]{8,})")
+
+
+def _redact_keyval(m) -> str:
+    """Redact the value of a NAME<sep>value match ONLY when it's a real credential assignment — the
+    value looks token-like (contains a digit) OR the NAME is an UPPERCASE env-var-style identifier.
+    Otherwise it's prose (e.g. 'token: validation logic') — return it untouched."""
+    name, sep, value = m.group(1), m.group(2), m.group(3)
+    looks_secret = any(c.isdigit() for c in value) or (name.isupper() and "_" in name)
+    return f"{name}{sep}[REDACTED]" if looks_secret else m.group(0)
+
+
+def _redact(text: str) -> str:
+    """Scrub secret-shaped strings, keeping any credential's NAME + separator but replacing its value.
+    Returns the input unchanged when there is nothing to redact; None/empty pass through."""
+    if not text:
+        return text
+    out = text
+    for pat in _SECRET_TOKEN_PATTERNS:
+        out = pat.sub("[REDACTED]", out)
+    out = _SECRET_KEYVAL_PATTERN.sub(_redact_keyval, out)
+    return out
+
+
 _ENV_KEYS = ("OLLAMA_API_KEY", "OLLAMA_BASE_URL", "OPENROUTER_API_KEY")
 
 
@@ -410,6 +448,9 @@ def run_gate() -> tuple:
     green = returncode 0 (pytest-style N passed/failed parsed when present, else
     passed/failed=0). Otherwise run the built-in pytest gate."""
     if GATE_CMD:
+        # GATE_CMD is a TRUSTED, operator-only shell command (set via repos.json / the Config UI). It is
+        # intentionally run with shell=True because real gates use compound syntax (`a && b`, pipes,
+        # `-s tests -t tests`). It is never agent- or PR-derived; do not feed untrusted input to --gate.
         p = subprocess.run(GATE_CMD, shell=True, cwd=REPO, capture_output=True,
                            text=True, env=_clean_env(), creationflags=_NO_WINDOW)
     else:
@@ -435,6 +476,27 @@ def run_gate() -> tuple:
 
     tests = {"passed": passed, "failed": failed, "errors": errors, "green": p.returncode == 0}
     return p.returncode == 0, tests, out[-1500:]
+
+
+def _new_skip_markers(diff_text: str) -> list:
+    """Added (+) lines in a unified diff that introduce a pytest/unittest skip or xfail marker.
+    Anti-gaming: a 'green' gate that weakened tests by skipping them is reverted even though it passed.
+    Pure function over diff text so the anti-gaming rule is testable without a real git repo."""
+    return [ln for ln in (diff_text or "").splitlines() if ln.startswith("+")
+            and re.search(r"@\s*(pytest\.mark\.(skip|xfail)|unittest\.skip)", ln)]
+
+
+def _anti_gaming_reason(base_tests, tests, diff_text: str):
+    """Why a GREEN gate should still be reverted as gamed, or None. Pure (no git/IO) so the rule is
+    unit-tested directly: a dropped pass count (tests removed/weakened/skipped) or newly-introduced
+    skip/xfail markers (weakening that need not drop the count)."""
+    if base_tests and tests and tests.get("passed", 0) < base_tests.get("passed", 0):
+        return (f"pass count fell {base_tests['passed']}→{tests['passed']} "
+                f"(tests removed/weakened/skipped)")
+    skips = _new_skip_markers(diff_text)
+    if skips:
+        return f"introduced {len(skips)} skip/xfail marker(s)"
+    return None
 
 
 # ---- pr -------------------------------------------------------------------
@@ -568,6 +630,24 @@ def _pr_checks(number) -> str | None:
     return "failure" if bad else ("pending" if pend else "success")
 
 
+def _await_pr_checks(number, attempts: int = 6, delay: float = 8.0) -> str | None:
+    """Poll a just-opened PR's checks so auto-merge does NOT merge in the empty-rollup window. A freshly
+    created PR usually reports an empty statusCheckRollup ('None') for several seconds before CI registers
+    its check runs; treating that transient None as 'no CI configured' and merging immediately would
+    bypass CI (defeating pr-only-shipping-with-auto-revert for the auto-merge path). Retry until a
+    concrete state appears, only concluding 'no CI configured' if it stays None for the whole window.
+    Returns 'success'|'pending'|'failure'|None. Only used on ship=auto-merge."""
+    last = None
+    for i in range(max(1, attempts)):
+        last = _pr_checks(number)
+        if last is not None:
+            return last
+        if STOP.exists() or i >= attempts - 1:
+            break
+        time.sleep(delay)
+    return last
+
+
 def _open_pr(branch: str, title: str, summary: str, tests: dict | None) -> dict:
     if BEAUTIFY:
         body = (f"Repo beautification (docs/presentation only — no code changes).\n\n{summary}\n\n"
@@ -680,9 +760,13 @@ def one_iteration() -> None:
     # touches anything, so a post-change "green" that actually dropped the pass count — deleted,
     # weakened, or skipped tests — is caught and reverted. Skipped for the docs-only/supervisor modes.
     base_tests = None
-    if not BEAUTIFY and not SOLOMON:
+    if not BEAUTIFY:
         bgreen, base_tests, _ = run_gate()
-        if not bgreen:
+        # A normal iteration needs a GREEN base to measure a gain. A SOLOMON fix-session runs ON a red
+        # base by definition (it is invoked precisely to fix the failing gate), so do NOT abort it on a
+        # red base — but still keep base_tests so the post-change pass-count anti-gaming check (below)
+        # applies to the fix-session too (a recovery path that edits managed code must not game the gate).
+        if not bgreen and not SOLOMON:
             heartbeat(status="error", phase="preflight",
                       last_summary=f"Base gate is RED before any change ({base_tests}). Fix the gate "
                                    f"command or the base; the loop can't measure a gain from a red base.")
@@ -690,6 +774,13 @@ def one_iteration() -> None:
             git("checkout", "--force", BASE_BRANCH)
             git("branch", "-D", branch)
             return
+        # A custom gate that exits 0 but prints no parseable counts yields passed=0, making the
+        # pass-count anti-gaming check (base 0 vs after 0) a silent no-op. Surface that the numeric rail
+        # is inactive for this gate (returncode + the skip/xfail-marker diff check still apply).
+        if base_tests and GATE_CMD and not any(base_tests.get(k) for k in ("passed", "failed", "errors")):
+            log("WARNING: custom gate emitted no parseable test counts — the pass-count anti-gaming "
+                "check is INACTIVE for this gate (only returncode + skip/xfail-marker detection apply). "
+                "Have the gate print a pytest-style 'N passed' or unittest 'Ran N tests' summary.")
 
     if SOLOMON:
         goal = "supervise: diagnose and fix the persistent gate failure"
@@ -717,7 +808,9 @@ def one_iteration() -> None:
         log("Pi session timed out")
         _drop_branch(branch, "noop", "Pi session timed out.")
         return
-    summary = final_text(p.stdout) or "(no summary returned)"
+    # Redact secret-shaped strings at the single source the commit body, PR body, history.jsonl, log,
+    # and heartbeat all derive from — so a model that echoed a secret can't leak it downstream (SEC-1).
+    summary = _redact(final_text(p.stdout)) or "(no summary returned)"
     summary, item_deviated = _split_item_status(summary)   # don't tick the item if the agent deviated
     log(f"Pi rc={p.returncode}: {summary[:200]}")
 
@@ -737,27 +830,16 @@ def one_iteration() -> None:
         heartbeat(tests=tests)
         log(f"gate: {'GREEN' if green else 'RED'} {tests}")
         if not green:
-            log(f"gate tail: {tail[-400:]}")
+            log(f"gate tail: {_redact(tail[-400:])}")   # SEC-5: failing test output can carry secrets
             _drop_branch(branch, "reverted",
                          f"Reverted — tests failed ({tests['failed']} failed). {summary}")
             return
-        # Anti-gaming: a GREEN gate that DROPPED the pass count means tests were removed/weakened/
-        # skipped — the gate was gamed. Revert even though it is "green".
-        if base_tests and tests["passed"] < base_tests["passed"]:
-            log(f"anti-gaming: pass count fell {base_tests['passed']} -> {tests['passed']} — reverting")
-            _drop_branch(branch, "reverted",
-                         f"Reverted — anti-gaming: pass count fell {base_tests['passed']}→"
-                         f"{tests['passed']} (tests removed/weakened/skipped). {summary}")
-            return
-        # ...and catch newly-introduced skip/xfail markers (weakening that needn't drop the count).
-        diff = git("diff", BASE_BRANCH).stdout or ""
-        new_skips = [ln for ln in diff.splitlines() if ln.startswith("+")
-                     and re.search(r"@\s*(pytest\.mark\.(skip|xfail)|unittest\.skip)", ln)]
-        if new_skips:
-            log(f"anti-gaming: {len(new_skips)} new skip/xfail marker(s) — reverting")
-            _drop_branch(branch, "reverted",
-                         f"Reverted — anti-gaming: introduced {len(new_skips)} skip/xfail "
-                         f"marker(s). {summary}")
+        # Anti-gaming: a GREEN gate that dropped the pass count or added skip/xfail markers means tests
+        # were removed/weakened — revert even though it is "green" (rule = the pure _anti_gaming_reason).
+        gamed = _anti_gaming_reason(base_tests, tests, git("diff", BASE_BRANCH).stdout or "")
+        if gamed:
+            log(f"anti-gaming: {gamed} — reverting")
+            _drop_branch(branch, "reverted", f"Reverted — anti-gaming: {gamed}. {summary}")
             return
 
     # commit anything Pi left uncommitted (it shouldn't commit, but be robust)
@@ -856,7 +938,11 @@ def _ship(branch: str, title: str, summary: str, tests: dict) -> dict:
     heartbeat(phase="pr")
     pr = _open_pr(branch, title, summary, tests)
     pr["verified"] = verified
-    pr["checks"] = _pr_checks(pr.get("number"))
+    # auto-merge must not merge before CI registers: poll so an empty rollup right after PR-create is
+    # treated as 'CI not reported yet' (retry), not 'no CI configured' (merge now). Other ship modes
+    # only display checks, so a single read is fine.
+    pr["checks"] = (_await_pr_checks(pr.get("number")) if SHIP == "auto-merge"
+                    else _pr_checks(pr.get("number")))
     log(f"opened PR: {pr.get('url')} (push {'verified' if verified else 'UNVERIFIED'}, CI {pr.get('checks') or 'none'})")
     if SHIP == "auto-merge":
         heartbeat(phase="merge")

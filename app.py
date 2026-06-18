@@ -33,13 +33,18 @@ _LEGACY_STATE_FILE = os.path.join(control.HERE, ".rsi-control.json")
 
 
 def _load_state() -> dict:
-    for path in (_STATE_FILE, _LEGACY_STATE_FILE):  # migrate the old name's theme/settings once
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (OSError, json.JSONDecodeError):
-            continue
-    return {}
+    """Persisted theme + global settings. One-time migration: only when .solomon.json is absent/unreadable
+    do we fall back to the legacy .rsi-control.json (older builds wrote that name)."""
+    try:
+        with open(_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        pass
+    try:                                    # legacy fallback ONLY when the current state file is missing
+        with open(_LEGACY_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def _save_state(state: dict) -> None:
@@ -89,7 +94,7 @@ class Api:
                 out.append({"name": r.get("name") or "?", "path": r.get("path"),
                             "provider": "ollama-cloud", "model": None,
                             "ship": "pr", "gate": None, "pr_target_branch": "main",
-                            "reasoning": "", "interval": 120, "max_iterations": 0,
+                            "reasoning": "", "goal": "", "interval": 120, "max_iterations": 0,
                             "is_git": bool(r.get("is_git")), "has_remote": bool(r.get("has_remote")),
                             "running": False, "heartbeat": None, "prs": [], "local_branches": [],
                             "contracts": {"agent": False, "backlog": False},
@@ -231,15 +236,16 @@ class Api:
 
     # ---- misc -----------------------------------------------------------
     def open_url(self, url):
+        # Only open real web links. os.startfile launches the shell association for ANY string
+        # (local .exe, UNC \\host\share, file://), so gate on an http(s) scheme and use webbrowser.open
+        # (itself scheme-limited) rather than os.startfile, to keep this bridge method narrow.
+        if not isinstance(url, str) or not url.lower().startswith(("http://", "https://")):
+            return {"ok": False, "error": "only http(s) URLs are allowed"}
         try:
-            if sys.platform == "win32":
-                os.startfile(url)  # noqa: S606
-            else:
-                webbrowser.open(url)
-            return {"ok": True}
-        except OSError:
             webbrowser.open(url)
             return {"ok": True}
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
 
     def get_theme(self):
         return self._state.get("theme", "dark")
