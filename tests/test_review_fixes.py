@@ -383,3 +383,36 @@ def test_dirty_blocks_only_on_base_branch():
     assert m._dirty_blocks_iteration(True, "rsi/iter-123", "main") is False  # dead-run leftover -> reset
     assert m._dirty_blocks_iteration(True, "HEAD", "main") is False          # detached -> reset, don't wedge
     assert m._dirty_blocks_iteration(False, "main", "main") is False         # clean -> never blocks
+
+
+# --------------------------------------------------------------------------- #
+# LOCK-2 — release_lock must only delete OUR lock; an unreadable/foreign lock is left alone
+# (the old except-branch unlinked unconditionally, which could steal another runner's lock).
+# --------------------------------------------------------------------------- #
+def test_release_lock_keeps_foreign_lock(tmp_path):
+    m = _runner_with_lock(tmp_path)
+    m.LOCK.write_text("999999", encoding="utf-8")        # another runner's pid (not ours)
+    m.release_lock()
+    assert m.LOCK.exists()                                # must NOT delete a lock we don't own
+    m.LOCK.write_text("not-a-pid", encoding="utf-8")     # corrupt/unparseable
+    m.release_lock()
+    assert m.LOCK.exists()                                # unreadable lock is left alone, not stolen
+    m.LOCK.write_text(str(os.getpid()), encoding="utf-8")
+    m.release_lock()
+    assert not m.LOCK.exists()                            # our own lock IS released
+
+
+# --------------------------------------------------------------------------- #
+# STOP-1 — start() on a LIVE loop must not revoke a pending Stop (halt-switch invariant).
+# --------------------------------------------------------------------------- #
+def test_start_does_not_revoke_pending_stop_on_live_loop(tmp_path, monkeypatch):
+    monkeypatch.setattr(control, "HERE", str(tmp_path))
+    rt = tmp_path / "runtime" / "x"
+    rt.mkdir(parents=True)
+    (rt / "stop").write_text("", encoding="utf-8")           # operator Stop pending
+    monkeypatch.setattr(control, "is_running", lambda repo: True)
+    monkeypatch.setattr(control, "ensure_contracts", lambda repo: {"ok": True, "created": []})
+    monkeypatch.setattr(control, "read_heartbeat", lambda repo: {"pid": 4242})
+    r = control.start({"name": "x", "path": str(tmp_path)})
+    assert r.get("already") and r.get("pid") == 4242
+    assert (rt / "stop").exists()                            # the live Stop was NOT silently revoked

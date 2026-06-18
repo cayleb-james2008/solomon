@@ -1041,14 +1041,16 @@ def acquire_lock() -> bool:
 
 
 def release_lock() -> None:
-    try:  # only unlink if the lock is still ours (don't delete one another process took)
-        if int((LOCK.read_text(encoding="utf-8") or "0").strip() or "0") == os.getpid():
+    # Only unlink the lock if it is still OURS. A read error / unparseable content must NOT trigger a
+    # delete — the old except-branch unlinked unconditionally, which could remove a lock another runner
+    # legitimately holds (re-opening two-runners-on-one-repo). A genuinely stale lock is reclaimed by
+    # acquire_lock's dead-pid takeover path instead. _read_lock_pid returns 0 on missing/empty/corrupt,
+    # so an unreadable lock is left untouched.
+    try:
+        if _read_lock_pid() == os.getpid():
             LOCK.unlink()
-    except (OSError, ValueError):
-        try:
-            LOCK.unlink()
-        except OSError:
-            pass
+    except OSError:
+        pass
 
 
 # ---- smoke ----------------------------------------------------------------
