@@ -697,3 +697,29 @@ def test_run_pi_prepends_agent_shims_to_path(tmp_path, monkeypatch):
     m.run_pi("do one thing")
     first = captured["env"].get("PATH", "").split(os.pathsep)[0]
     assert first == str(tmp_path / "agent_shims")              # the shim dir is FIRST in the agent's PATH
+
+
+# --------------------------------------------------------------------------- #
+# STOPPED-LOCK — a CLEANLY-STOPPED runner (heartbeat status='stopped') whose lock lingered + whose PID
+# was recycled must NOT read as live, or the loop can never be restarted (the exact wedge that made
+# sover/asmodeus un-restartable until the lock was cleared by hand).
+# --------------------------------------------------------------------------- #
+def test_control_is_running_false_on_stopped_heartbeat(tmp_path, monkeypatch):
+    repo, rt = _control_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(control, "_pid_alive", lambda pid: True)        # lock PID recycled-but-alive
+    (rt / "lock").write_text("4242\nrunabc", encoding="utf-8")
+    (rt / "heartbeat.json").write_text(
+        json.dumps({"updated_at": _iso(0), "run_id": "runabc", "status": "stopped"}), encoding="utf-8")
+    assert control.is_running(repo) is False                           # cleanly stopped -> not live (even fresh)
+    assert control.clear_lock(repo).get("removed") is True             # clearable so a restart can proceed
+
+
+def test_acquire_lock_takes_over_stopped_heartbeat_lock(tmp_path, monkeypatch):
+    m = _runner_with_lock(tmp_path)
+    m.INTERVAL = 120
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: True)             # recorded PID alive (recycled)
+    m.LOCK.write_text("99999\noldrun", encoding="utf-8")
+    m.HEARTBEAT.write_text(
+        json.dumps({"updated_at": _iso(0), "run_id": "oldrun", "status": "stopped"}), encoding="utf-8")
+    assert m.acquire_lock() is True                                    # cleanly-stopped holder -> take over
+    assert m._read_lock_pid() == os.getpid()

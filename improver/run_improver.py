@@ -1250,6 +1250,16 @@ def _heartbeat_stale(window: float) -> bool:
     return (datetime.now(timezone.utc) - last).total_seconds() > window
 
 
+def _heartbeat_is_stopped() -> bool:
+    """True if the lock holder's heartbeat reports a clean stop (status='stopped'). Such a runner has
+    EXITED even if its lock lingered with a since-recycled PID, so a restart may take the lock over."""
+    try:
+        hb = json.loads(HEARTBEAT.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(hb, dict) and hb.get("status") == "stopped"
+
+
 def acquire_lock() -> bool:
     """Single-flight: at most one improver per repo. Returns True iff WE now hold the lock.
 
@@ -1286,11 +1296,11 @@ def acquire_lock() -> bool:
         return True                      # already ours
     if pid == 0:
         return False                     # still empty after the grace window — a racer holds it
-    if _pid_alive(pid) and not _heartbeat_stale(max(3 * INTERVAL, 3600)):
-        return False                     # held by a live improver (PID alive AND heartbeat fresh)
+    if _pid_alive(pid) and not _heartbeat_stale(max(3 * INTERVAL, 3600)) and not _heartbeat_is_stopped():
+        return False                     # held by a live improver (PID alive, heartbeat fresh, not stopped)
     # Recorded pid is dead, OR alive-but-its-heartbeat-froze (a recycled PID whose original runner is
-    # gone) -> take over, then VERIFY we won (last os.replace wins; the loser must back off so a dead
-    # lock can't be adopted by two racers at once).
+    # gone), OR the heartbeat says the runner cleanly stopped (lingering lock) -> take over, then VERIFY
+    # we won (last os.replace wins; the loser must back off so a dead lock can't be adopted by two racers).
     try:
         tmp = RUNTIME / f"lock.{mypid}.tmp"
         tmp.write_text(f"{mypid}\n{RUN_ID}", encoding="utf-8")
