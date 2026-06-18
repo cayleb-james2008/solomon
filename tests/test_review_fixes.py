@@ -246,6 +246,73 @@ def test_preflight_refuses_unpushed_base_commit(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# CLEAN-1 — preflight must NOT delete operator untracked files (never-discard keystone)
+# --------------------------------------------------------------------------- #
+def test_untracked_non_ignored_files_parses_status(monkeypatch):
+    m = _load_runner()
+    status = " M tracked.py\n?? new_test.py\n?? scratch/notes.md\n## branch.main\n"
+    monkeypatch.setattr(m, "git", lambda *a: type("R", (), {"stdout": status, "returncode": 0})())
+    assert m._untracked_non_ignored_files() == ["new_test.py", "scratch/notes.md"]
+
+
+def test_untracked_non_ignored_files_empty_when_clean(monkeypatch):
+    m = _load_runner()
+    monkeypatch.setattr(m, "git", lambda *a: type("R", (), {"stdout": "", "returncode": 0})())
+    assert m._untracked_non_ignored_files() == []
+
+
+def test_preflight_refuses_to_delete_untracked_operator_files(tmp_path, monkeypatch):
+    """An untracked operator file on the base branch must NOT be silently `git clean -fd`-ed away —
+    the loop skip+escalates so the operator can commit/stash/remove it."""
+    m = _load_runner()
+    work = _mk_origin_clone(tmp_path)
+    (work / "operator_scratch.py").write_text("# my new test module")   # untracked, non-ignored
+    rt = tmp_path / "rt"; rt.mkdir()
+    monkeypatch.setattr(m, "REPO", work)
+    monkeypatch.setattr(m, "BASE_BRANCH", "main")
+    monkeypatch.setattr(m, "RUNTIME", rt)
+    monkeypatch.setattr(m, "HEARTBEAT", rt / "heartbeat.json")
+    monkeypatch.setattr(m, "STOP", rt / "stop")
+    monkeypatch.setattr(m, "LOG", rt / "improver.log")
+    monkeypatch.setattr(m, "BACKLOG", tmp_path / "backlog.md")
+    m._hb["iteration"] = 0
+    ran = {"pi": False}
+    monkeypatch.setattr(m, "run_pi", lambda *a, **k: ran.__setitem__("pi", True))
+
+    m.one_iteration()
+
+    assert m._hb["status"] == "error" and m._hb["phase"] == "preflight"
+    assert "Untracked" in m._hb["last_summary"] or "untracked" in m._hb["last_summary"]
+    assert ran["pi"] is False                                # never reached the agent
+    # the operator's untracked file must survive (not deleted by git clean -fd)
+    assert (work / "operator_scratch.py").exists()
+
+
+def test_preflight_cleans_and_proceeds_when_no_untracked_files(tmp_path, monkeypatch):
+    """A clean tree (no untracked non-ignored files) proceeds past the untracked-files guard — the
+    guard only blocks when there is something to destroy. (The iteration may still bail at base-gate-red
+    or reach the agent; the point is the untracked guard did NOT fire.)"""
+    m = _load_runner()
+    work = _mk_origin_clone(tmp_path)
+    rt = tmp_path / "rt"; rt.mkdir()
+    monkeypatch.setattr(m, "REPO", work)
+    monkeypatch.setattr(m, "BASE_BRANCH", "main")
+    monkeypatch.setattr(m, "RUNTIME", rt)
+    monkeypatch.setattr(m, "HEARTBEAT", rt / "heartbeat.json")
+    monkeypatch.setattr(m, "STOP", rt / "stop")
+    monkeypatch.setattr(m, "LOG", rt / "improver.log")
+    monkeypatch.setattr(m, "BACKLOG", tmp_path / "backlog.md")
+    m._hb["iteration"] = 0
+    ran = {"pi": False}
+    monkeypatch.setattr(m, "run_pi", lambda *a, **k: ran.__setitem__("pi", True))
+
+    m.one_iteration()
+
+    # the untracked-files guard did NOT fire (no "Untracked" in the summary); the iteration proceeded
+    summary = m._hb.get("last_summary", "")
+    assert "Untracked" not in summary and "untracked" not in summary
+
+# --------------------------------------------------------------------------- #
 # CTRL-1 — _pid_alive exact CSV match
 # --------------------------------------------------------------------------- #
 @pytest.mark.skipif(sys.platform != "win32", reason="tasklist/CSV match is win32-only")
