@@ -251,6 +251,13 @@ def _redact(text: str) -> str:
     for pat in _SECRET_TOKEN_PATTERNS:
         out = pat.sub("[REDACTED]", out)
     out = _SECRET_KEYVAL_PATTERN.sub(_redact_keyval, out)
+    # Exact-value pass: the agent runs with the active provider key in its env and could echo it BARE
+    # (no NAME= prefix). Ollama keys aren't sk-/gh-shaped, so the shape patterns above miss them — scrub
+    # the literal loaded value so the agent's OWN key can't leak into a commit/PR/log regardless of shape.
+    for _k in ("OLLAMA_API_KEY", "OPENROUTER_API_KEY"):
+        _v = os.environ.get(_k)
+        if _v and len(_v) >= 8:
+            out = out.replace(_v, "[REDACTED]")
     return out
 
 
@@ -1114,6 +1121,13 @@ def _ship(branch: str, title: str, summary: str, tests: dict) -> dict:
     verified = _branch_on_remote(branch)
     if not verified:
         log(f"WARNING: push reported success but '{branch}' is not visible on origin")
+        if SHIP in ("pr", "auto-merge"):
+            # SOLOMON_RSI step 7: verify the branch landed BEFORE opening a PR. An unverified push
+            # means gh pr create will fail anyway; record a non-landed ERROR state (don't tick the
+            # item, don't open a PR) so the supervisor surfaces it instead of a benign-looking state.
+            heartbeat(status="error", phase="ship")
+            return {"number": None, "url": None, "branch": branch,
+                    "state": "push-unverified (failed)", "verified": False}
 
     if SHIP == "push":
         log(f"ship=push — pushed {branch} (no PR){'' if verified else ' [UNVERIFIED]'}")
