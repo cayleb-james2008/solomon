@@ -439,12 +439,16 @@ def heartbeat(**fields) -> None:
         pass
 
 
-def _record_history(status: str, branch: str | None, summary: str) -> None:
+def _record_history(status: str, branch: str | None, summary: str, *, extra: dict | None = None) -> None:
     """Append one terminal-outcome line to runtime/<name>/history.jsonl (the dashboard's
-    timeline + metrics read it). Best-effort; never raises."""
+    timeline + metrics read it). Best-effort; never raises. `extra` (when given) is MERGED into the
+    record so a per-outcome diagnostic — e.g. the cross-repo gate results on a revert — lands in
+    history alongside the standard fields. Existing callers that omit `extra` are unchanged."""
     rec = {"ts": _now(), "iteration": _hb.get("iteration"), "status": status,
            "branch": branch, "tests": _hb.get("tests"), "pr": _hb.get("last_pr"),
            "summary": (summary or "")[:500]}
+    if extra:
+        rec.update(extra)
     try:
         RUNTIME.mkdir(parents=True, exist_ok=True)
         with open(RUNTIME / "history.jsonl", "a", encoding="utf-8") as f:
@@ -1699,9 +1703,8 @@ def one_iteration() -> None:
             _drop_branch(branch, "reverted",
                          f"Reverted — cross-repo gate RED on dep '{failed}'. {summary}")
             # record the cross-repo outcome in history even on a revert so the streak is diagnosable
-            _hb_cross = dict(_hb)
-            _hb_cross["cross_repo_gates"] = xrec.get("cross_repo_gates", {})
-            _record_history("reverted", branch, summary)
+            _record_history("reverted", branch, summary,
+                            extra={"cross_repo_gates": xrec.get("cross_repo_gates", {})})
             return
         if xrec.get("cross_repo_gates"):
             log(f"cross-repo gates GREEN for deps: {list(xrec['cross_repo_gates'].keys())}")
