@@ -622,6 +622,12 @@ def _lock_is_live(repo, rt=None):
         return True                          # lock + live PID, no heartbeat yet -> just-started, treat as live
     if run_id and hb.get("run_id") and hb.get("run_id") != run_id:
         return False                         # a newer runner owns the heartbeat; this lock is orphaned
+    if hb.get("status") == "stopped":
+        return False                         # the lock's runner CLEANLY EXITED (status=stopped). Even if
+                                             # its lock lingered (release_lock skipped it on a pid mismatch)
+                                             # and the recorded PID was recycled by an unrelated process,
+                                             # the runner is gone — else the loop could never be restarted.
+                                             # A fresh runner overwrites this status ~1s after acquiring.
     age = _heartbeat_age(hb)
     if age is None:
         return True                          # no usable timestamp -> don't declare a live PID dead on that alone
