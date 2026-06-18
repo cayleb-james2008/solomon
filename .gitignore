@@ -13,5 +13,9 @@ runtime/
 .solomon.json
 .rsi-control.json
 
+# managed-repo clones an operator may relocate under Solomon (repos.json path -> repos/<name>);
+# these are NOT Solomon source — keep them out of git and out of Solomon's own pytest collection
+repos/
+
 # generated icon verification scratch (icon.ico / icon.png are kept)
 web/assets/_exe_icon_verify.png
