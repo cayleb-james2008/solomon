@@ -1105,7 +1105,21 @@ def one_iteration() -> None:
 
     # commit anything Pi left uncommitted (it shouldn't commit, but be robust)
     heartbeat(phase="commit")
-    git("add", "-A")
+    add = git("add", "-A")
+    if add.returncode != 0:
+        # `git add` can fail outright — e.g. an untracked Windows reserved-name file (`nul`, `con`, …)
+        # that core.protectNTFS refuses — and then NOTHING stages: the iteration silently looks like a
+        # no-op while the agent's real work is dropped (observed: asmodeus no-op-spun for hours on a
+        # stray `nul` at its repo root). Surface it as an ERROR with the cause, not a silent no-op.
+        err = (add.stderr or "").strip()[:200]
+        log(f"git add -A failed: {err}")
+        _abort_branch(branch)
+        heartbeat(status="error", phase="commit",
+                  last_summary=f"git add failed — the agent's change could not be staged ({err}). If an "
+                               f"untracked Windows reserved-name file (e.g. `nul`) is in the tree, add it "
+                               f"to .git/info/exclude.")
+        _record_history("error", branch, summary)
+        return
     if git("diff", "--cached", "--quiet").returncode != 0:
         title = "beautify repo" if BEAUTIFY else _pr_title("" if item_deviated else goal, summary)
         prefix = "docs" if BEAUTIFY else "rsi"
