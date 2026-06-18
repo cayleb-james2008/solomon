@@ -37,7 +37,13 @@ human operator sets goals and reviews PRs — and **never hand-patches a managed
    on origin; capture the PR's CI rollup. On red — **local or CI** — revert/abandon the branch and
    never merge. Nothing reaches the integration branch except a green, PR-shipped change.
 8. **Compound + anti-gaming check.** Once **merged**, the change becomes the new base; gains compound.
-   The backlog item is ticked only when `origin/<base>` actually contains the change.
+   The backlog item is ticked when the iteration's change is **shipped**: for `pr` mode when the PR is
+   *opened*, for `auto-merge` when it merges, for `local` when the branch is kept. (Ticking on PR-open
+   in `pr` mode is deliberate — every iteration re-bases off the integration branch, which does **not**
+   yet contain in-flight PRs, so leaving the item open would re-ship a duplicate PR each cycle; true
+   merge/landed state is tracked via PR status, not the tick.) The item is **never** ticked on a
+   push/auth failure (it didn't land) or when the agent deviated to a different change (that item didn't
+   ship). Only a green, PR-merged change advances the compounding *base*, independent of the tick.
 9. **Supervise & recover (supervisor-authorized, laddered).** Solomon diagnoses health from files
    only and walks a **safe** ladder: **RUNG-0** deterministic, reversible auto-recovery that never
    discards un-pushed commits, never force-pushes, never merges; **RUNG-1** an *opt-in*, PR-gated pi
@@ -166,7 +172,9 @@ live instance auto-updates to its most recent verified-best version** — the vi
 The loop and its safety ladder are implemented in `control.py`, `improver/run_improver.py`, and
 `improver/solomon.py`. An ultra review (multi-agent, adversarially verified) produced a prioritized
 hardening backlog to make the invariants *mechanically enforced* rather than prose-only — chiefly:
-runner-side **baseline + anti-gaming** measurement (step 6), **CI-green-before-auto-merge** (step 7),
-backlog-advance only on **verified merge** (step 8), preflight **refuse-on-out-of-band-base-move**
+runner-side **baseline + anti-gaming** measurement (step 6, applied to supervisor fix-sessions too),
+**CI-green-before-auto-merge** (step 7, polling CI before an auto-merge so an empty post-create rollup
+isn't merged as "no CI"), backlog-advance on a **verified ship** (PR opened / merged / kept-local — not
+on a push/auth failure or agent deviation; step 8), preflight **refuse-on-out-of-band-base-move**
 (never-hand-patched keystone, step 1), and the **supervisor holding the single-flight lock** during
 recovery (step 9). These are tracked and landed as gated changes to Solomon's own harness code.

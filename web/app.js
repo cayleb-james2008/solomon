@@ -46,6 +46,14 @@ async function call(m, ...a) {
   if (!x || !x[m]) throw new Error("API not ready");
   return x[m](...a);
 }
+// Action-call wrapper: never let a thrown/rejected bridge call leave a button permanently disabled
+// with no feedback. Converts any error into a uniform {ok:false,error} so a handler's existing
+// `toast(x.ok ? … : x.error)` + refresh() always runs. Use for control/config methods (NOT for
+// get_state/read_* whose callers rely on call() throwing to keep prior state).
+async function act(m, ...a) {
+  try { return await call(m, ...a); }
+  catch (err) { return { ok: false, error: (err && err.message) || String(err) }; }
+}
 
 function toast(msg, type = "") {
   const t = el("div", "toast " + type, esc(msg)); $("#toasts").appendChild(t);
@@ -118,7 +126,7 @@ function diagState(r) {
   return { cls: "ok", label: "ok", flagged: false, esc: false, ev: d.evidence || "" };
 }
 async function doSupervise(name, allowPi) {
-  const x = await call("supervise", name, !!allowPi);
+  const x = await act("supervise", name, !!allowPi);
   if (!x || !x.ok) { toast("Supervise: " + ((x && x.error) || "unavailable"), "err"); return; }
   const res = x.results || [];
   const r = res.find(z => z.name === name) || res[0];
@@ -197,7 +205,7 @@ function repoCard(r) {
   tog.disabled = !canStart;
   tog.onclick = async (e) => {
     e.stopPropagation(); tog.disabled = true;
-    const x = r.running ? await call("stop", r.name) : await call("start", r.name);
+    const x = r.running ? await act("stop", r.name) : await act("start", r.name);
     toast(x.ok ? `${r.name}: ${r.running ? "stopping" : "started"}` : `Failed: ${x.error}`, x.ok ? "ok" : "err");
     refresh();
   };
@@ -240,12 +248,12 @@ function renderOnboarding(v) {
     </div>`;
   const ks = $("#obKeySave", v); if (ks) ks.onclick = async () => {
     const val = $("#obKey", v).value; if (!val) return toast("Enter a key first", "err");
-    const x = await call("set_key", $("#obProv", v).value, val);
+    const x = await act("set_key", $("#obProv", v).value, val);
     toast(x.ok ? "Key saved" : `Failed: ${x.error}`, x.ok ? "ok" : "err"); refresh();
   };
   const add = $("#obAdd", v); if (add) add.onclick = async () => {
     const spec = $("#obRepo", v).value.trim(); if (!spec) return;
-    const x = await call("add_project", spec, ($("#obGoal", v).value || "").trim());
+    const x = await act("add_project", spec, ($("#obGoal", v).value || "").trim());
     toast(x.ok ? `Added ${x.name}${x.enriching ? " — enriching contract…" : ""}` : `Failed: ${x.error}`, x.ok ? "ok" : "err"); refresh();
   };
 }
@@ -277,10 +285,10 @@ function prRow(p, selectable) {
       <button class="btn sm danger grow pr-c">${icon("x", 13)}Close</button>
     </div>`;
   $(".pr-m", row).onclick = async (e) => { e.stopPropagation(); e.target.closest("button").disabled = true;
-    const x = await call("merge", p.repo, p.number);
+    const x = await act("merge", p.repo, p.number);
     toast(x.ok ? `${p.repo} #${p.number} merged` : `Merge failed: ${x.error}`, x.ok ? "ok" : "err"); refresh(); };
   $(".pr-c", row).onclick = async (e) => { e.stopPropagation(); e.target.closest("button").disabled = true;
-    const x = await call("close", p.repo, p.number);
+    const x = await act("close", p.repo, p.number);
     toast(x.ok ? `${p.repo} #${p.number} closed` : `Close failed: ${x.error}`, x.ok ? "ok" : "err"); refresh(); };
   if (selectable) row.onclick = () => { state.selPR = p; renderApprovals($("#view")); };
   return row;
@@ -288,7 +296,7 @@ function prRow(p, selectable) {
 async function mergeAllGreen() {
   const green = allPRs().filter(p => p.checks === "success");
   if (!green.length) return toast("No green PRs to merge", "err");
-  let n = 0; for (const p of green) { const x = await call("merge", p.repo, p.number); if (x.ok) n++; }
+  let n = 0; for (const p of green) { const x = await act("merge", p.repo, p.number); if (x.ok) n++; }
   toast(`Merged ${n}/${green.length} green PR${green.length === 1 ? "" : "s"}`, "ok"); refresh();
 }
 
@@ -392,24 +400,24 @@ function renderSettings(v) {
   v.querySelectorAll("[data-prov]").forEach(b => b.onclick = async () => {
     const prov = b.dataset.prov; const inp = prov === "openrouter" ? $("#kOpen", v) : $("#kOllama", v);
     if (!inp.value) return toast("Enter a key first", "err");
-    const x = await call("set_key", prov, inp.value);
+    const x = await act("set_key", prov, inp.value);
     toast(x.ok ? `${PROVIDER_LABEL[prov]} key saved` : `Failed: ${x.error}`, x.ok ? "ok" : "err"); refresh();
   });
   $("#addRepoBtn", v).onclick = async () => {
     const spec = $("#addRepo", v).value.trim(); if (!spec) return;
-    const x = await call("add_project", spec);
+    const x = await act("add_project", spec);
     toast(x.ok ? `Added ${x.name}${x.enriching ? " — enriching contract…" : ""}` : `Failed: ${x.error}`, x.ok ? "ok" : "err"); refresh();
   };
   const aft = $("#aiFixToggle", v);
   if (aft) aft.onclick = async () => {
     const n = !state.auto_ai_fix; state.auto_ai_fix = n; aft.classList.toggle("on", n);
-    const x = await call("set_auto_ai_fix", n);
+    const x = await act("set_auto_ai_fix", n);
     if (!x || !x.ok) { state.auto_ai_fix = !n; aft.classList.toggle("on", !n); }
   };
   $("#cleanAll", v).onclick = () => confirmDialog("Clean up all worktrees?",
     "Prunes git worktrees and deletes leftover rsi/* iteration branches across every repo. The currently checked-out branch is never touched.",
     async () => {
-      let total = 0; for (const r of state.repos) { const x = await call("cleanup_worktrees", r.name); if (x && x.ok) total += (x.removed || []).length; }
+      let total = 0; for (const r of state.repos) { const x = await act("cleanup_worktrees", r.name); if (x && x.ok) total += (x.removed || []).length; }
       toast(`Pruned ${total} stale branch${total === 1 ? "" : "es"}`, "ok"); refresh();
     });
 }
@@ -448,17 +456,17 @@ function renderWorkspace() {
   </div>`;
   scrim.querySelectorAll(".ws-tab").forEach(t => t.onclick = () => { state.wsTab = t.dataset.tab; renderWsTab(r); });
   $("#wsClose").onclick = closeWorkspace;
-  $("#wsToggle").onclick = async () => { const x = r.running ? await call("stop", r.name) : await call("start", r.name);
+  $("#wsToggle").onclick = async () => { const x = r.running ? await act("stop", r.name) : await act("start", r.name);
     toast(x.ok ? `${r.name}: ${r.running ? "stopping" : "started"}` : `Failed: ${x.error}`, x.ok ? "ok" : "err"); refresh(); };
-  $("#wsOnce").onclick = async () => { const x = await call("start", r.name, true);
+  $("#wsOnce").onclick = async () => { const x = await act("start", r.name, true);
     toast(x.ok ? `${r.name}: running one iteration` : `Failed: ${x.error}`, x.ok ? "ok" : "err"); refresh(); };
-  $("#wsBeautify").onclick = async () => { const x = await call("beautify", r.name);
+  $("#wsBeautify").onclick = async () => { const x = await act("beautify", r.name);
     toast(x.ok ? `Beautifying ${r.name}…` : `Failed: ${x.error}`, x.ok ? "ok" : "err"); refresh(); };
   $("#wsClean").onclick = () => confirmDialog(`Clean up ${r.name} worktrees?`,
     "Prunes git worktrees and deletes leftover rsi/* iteration branches. The currently checked-out branch is never touched.",
-    async () => { const x = await call("cleanup_worktrees", r.name);
+    async () => { const x = await act("cleanup_worktrees", r.name);
       toast(x.ok ? `${r.name}: pruned ${(x.removed || []).length} stale branch${(x.removed || []).length === 1 ? "" : "es"}` : `Failed: ${x.error}`, x.ok ? "ok" : "err"); refresh(); });
-  const esd = $("#escDismiss"); if (esd) esd.onclick = async () => { await call("clear_escalation", r.name); refresh(); if (state.openRepo) renderWorkspace(); };
+  const esd = $("#escDismiss"); if (esd) esd.onclick = async () => { await act("clear_escalation", r.name); refresh(); if (state.openRepo) renderWorkspace(); };
   $("#wsSupervise").onclick = async () => {
     $("#wsSupervise").disabled = true;
     await doSupervise(r.name, $("#wsAllowPi") && $("#wsAllowPi").checked);
@@ -493,21 +501,21 @@ async function renderWsTab(r) {
       <button class="btn sm" id="wsIdeate" title="Divergent ideation: prepend ambitious, leverage-ranked ideas to the backlog (counters shallow incrementalism)">${icon("sparkle", 14)}Ideate</button></div>`;
     const res = await call("read_contract", r.name, which);
     $("#wsEditor", body).value = (res && res.text) || "";
-    $("#wsSaveDoc", body).onclick = async () => { const x = await call("write_contract", r.name, which, $("#wsEditor", body).value);
+    $("#wsSaveDoc", body).onclick = async () => { const x = await act("write_contract", r.name, which, $("#wsEditor", body).value);
       toast(x.ok ? "Saved" : `Failed: ${x.error}`, x.ok ? "ok" : "err"); };
     $("#wsEnrich", body).onclick = async () => {
       const b = $("#wsEnrich", body); b.disabled = true; b.textContent = "Enriching…";
-      const x = await call("enrich_contract", r.name);
+      const x = await act("enrich_contract", r.name);
       toast(x && x.ok ? `${r.name}: contract enriched` : `Enrich failed: ${(x && x.error) || "?"}`, x && x.ok ? "ok" : "err");
-      const res2 = await call("read_contract", r.name, which);
+      const res2 = await act("read_contract", r.name, which);
       if (res2 && typeof res2.text === "string") $("#wsEditor", body).value = res2.text;
       b.disabled = false; b.innerHTML = `${icon("sparkle", 14)}Enrich with AI`;
     };
     $("#wsIdeate", body).onclick = async () => {
       const b = $("#wsIdeate", body); b.disabled = true; b.textContent = "Ideating…";
-      const x = await call("ideate", r.name);
+      const x = await act("ideate", r.name);
       toast(x && x.ok ? `${r.name}: +${x.added} ambitious idea(s) on the backlog` : `Ideate failed: ${(x && x.error) || "?"}`, x && x.ok ? "ok" : "err");
-      const res2 = await call("read_contract", r.name, "backlog");
+      const res2 = await act("read_contract", r.name, "backlog");
       if (res2 && typeof res2.text === "string" && which === "backlog") $("#wsEditor", body).value = res2.text;
       b.disabled = false; b.innerHTML = `${icon("sparkle", 14)}Ideate`;
     };
@@ -527,7 +535,7 @@ async function renderWsTab(r) {
       <div class="cfg-field full"><button class="btn accent" id="cSave">Save configuration</button></div>
     </div>`;
     $("#cSave", body).onclick = async () => {
-      const x = await call("set_repo_config", r.name, $("#cP", body).value, $("#cM", body).value.trim(),
+      const x = await act("set_repo_config", r.name, $("#cP", body).value, $("#cM", body).value.trim(),
         $("#cS", body).value, $("#cG", body).value.trim(), $("#cB", body).value.trim() || "main",
         parseInt($("#cI", body).value) || 120, parseInt($("#cX", body).value) || 0, $("#cR", body).value,
         $("#cGoal", body).value.trim());
@@ -565,9 +573,9 @@ function openPalette() {
   NAV.forEach(([v, l]) => actions.push({ label: "Go to " + l, run: () => setView(v) }));
   state.repos.forEach(r => {
     actions.push({ label: `Open ${r.name}`, hint: "workspace", run: () => openWorkspace(r.name) });
-    actions.push({ label: `${r.running ? "Stop" : "Start"} ${r.name}`, run: async () => { await call(r.running ? "stop" : "start", r.name); refresh(); } });
-    actions.push({ label: `Run once: ${r.name}`, run: async () => { await call("start", r.name, true); refresh(); } });
-    actions.push({ label: `Clean up worktrees: ${r.name}`, run: async () => { const x = await call("cleanup_worktrees", r.name); toast(x.ok ? `${r.name}: pruned ${(x.removed || []).length}` : x.error, x.ok ? "ok" : "err"); } });
+    actions.push({ label: `${r.running ? "Stop" : "Start"} ${r.name}`, run: async () => { await act(r.running ? "stop" : "start", r.name); refresh(); } });
+    actions.push({ label: `Run once: ${r.name}`, run: async () => { await act("start", r.name, true); refresh(); } });
+    actions.push({ label: `Clean up worktrees: ${r.name}`, run: async () => { const x = await act("cleanup_worktrees", r.name); toast(x.ok ? `${r.name}: pruned ${(x.removed || []).length}` : x.error, x.ok ? "ok" : "err"); } });
   });
   scrim.innerHTML = `<div class="palette"><input id="palIn" placeholder="Search repos and actions…" autocomplete="off" /><div class="palette-list" id="palList"></div></div>`;
   document.body.appendChild(scrim);
@@ -606,16 +614,19 @@ let _poll = false;
 async function poll() { await refresh(); setTimeout(poll, 2500); }
 
 /* ---------- boot ---------- */
-let _tries = 0;
+let _tries = 0, _wired = false;
 async function boot() {
-  buildThemeRow(); buildRail();
-  $("#autoPush").onclick = async () => { const next = !state.auto_push; state.auto_push = next; syncTopbar();
-    const x = await call("set_auto_push", next); if (!x || !x.ok) { state.auto_push = !next; syncTopbar(); } };
-  $("#refreshBtn").onclick = () => { refresh(); toast("Refreshed"); };
-  document.addEventListener("keydown", (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
-    if (e.key === "Escape") { if ($("#palScrim")) $("#palScrim").remove(); else if (state.openRepo) closeWorkspace(); }
-  });
+  if (!_wired) {                          // one-time DOM wiring — boot() re-enters on the slow-API retry
+    _wired = true;                        // + the 800ms fallback, so guard against duplicate listeners
+    buildThemeRow(); buildRail();
+    $("#autoPush").onclick = async () => { const next = !state.auto_push; state.auto_push = next; syncTopbar();
+      const x = await act("set_auto_push", next); if (!x || !x.ok) { state.auto_push = !next; syncTopbar(); } };
+    $("#refreshBtn").onclick = () => { refresh(); toast("Refreshed"); };
+    document.addEventListener("keydown", (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
+      if (e.key === "Escape") { if ($("#palScrim")) $("#palScrim").remove(); else if (state.openRepo) closeWorkspace(); }
+    });
+  }
   try { await call("get_state"); } catch (e) { if (++_tries < 100) return setTimeout(boot, 250); }
   applyTheme(state.theme);
   if (!_poll) { _poll = true; poll(); }

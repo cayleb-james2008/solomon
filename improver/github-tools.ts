@@ -11,7 +11,10 @@ import { existsSync } from "node:fs";
 import { Type } from "@sinclair/typebox";
 
 function run(bin: string, args: string[]) {
-  const r = spawnSync(bin, args, { cwd: process.cwd(), encoding: "utf8", windowsHide: true });
+  // 30s timeout so a hung gh/git network call (e.g. ls-remote against an unreachable origin) fails fast
+  // instead of blocking the pi process for the whole iteration budget. On timeout r.error is ETIMEDOUT,
+  // surfaced via the err field below (and r.status is null -> code 1).
+  const r = spawnSync(bin, args, { cwd: process.cwd(), encoding: "utf8", windowsHide: true, timeout: 30000 });
   return { code: r.status ?? 1, out: r.stdout || "", err: r.stderr || (r.error ? String(r.error) : "") };
 }
 function gh(args: string[]) {
@@ -85,7 +88,8 @@ export default function (pi: any) {
       const b = (params && params.branch) || curBranch();
       const r = gh(["pr", "view", b, "--json", "number,state,url,mergeStateStatus,statusCheckRollup"]);
       if (r.code !== 0) return text(`No PR for '${b}': ${clip(r.err || r.out)}`);
-      let d: any = {}; try { d = JSON.parse(r.out); } catch { /* ignore */ }
+      let d: any;
+      try { d = JSON.parse(r.out); } catch { return text(`github_pr_status: could not parse gh output: ${clip(r.out)}`); }
       return { content: [{ type: "text", text:
         `PR #${d.number} [${d.state}] ${d.url}\nmergeable: ${d.mergeStateStatus}\nCI: ${summarizeChecks(d.statusCheckRollup)}` }],
         details: d };
@@ -115,7 +119,8 @@ export default function (pi: any) {
     async execute() {
       const r = gh(["pr", "list", "--state", "open", "--json", "number,title,headRefName,statusCheckRollup"]);
       if (r.code !== 0) return text(`gh pr list failed: ${clip(r.err || r.out)}`);
-      let arr: any[] = []; try { arr = JSON.parse(r.out); } catch { /* ignore */ }
+      let arr: any[];
+      try { arr = JSON.parse(r.out); } catch { return text(`github_list_prs: could not parse gh output: ${clip(r.out)}`); }
       const lines = arr.map((p) => `#${p.number} ${p.title} [${p.headRefName}] CI:${summarizeChecks(p.statusCheckRollup)}`);
       return text(lines.join("\n") || "(no open PRs)");
     },

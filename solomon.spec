@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for Solomon (onedir). Bundles the web folder and the
-repos.json registry. Mirrors maki.spec's webview collect_all + clr pattern."""
+"""PyInstaller spec for Solomon (onedir). Bundles ONLY the web UI folder; the operator data
+(repos.json, improver/, runtime/, .env) is NOT bundled — it lives in the real Solomon folder and is
+resolved at runtime by control._base_dir(). Mirrors maki.spec's webview collect_all + clr pattern."""
 from PyInstaller.utils.hooks import collect_all
 
 # Only the web UI is bundled. The operator data (repos.json, improver/, runtime/, .env)

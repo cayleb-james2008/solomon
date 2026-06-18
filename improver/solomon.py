@@ -183,8 +183,11 @@ def solomon_fix_session(repo):
             "--pr-target-branch", control.project_pr_target_branch(repo),
             "--reasoning", control.project_reasoning(repo) or "", "--solomon"]
     try:
+        # Match the other spawn sites (control.start/beautify/enrich_contract): strip the stale gh token
+        # + PYTHONPATH/PYTHONHOME at the boundary so the child venv python uses its own stdlib + keyring.
         proc = subprocess.Popen(args, cwd=path, creationflags=flags, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, close_fds=True)
+                                stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, close_fds=True,
+                                env=control._clean_subenv())
         return {"ok": True, "pid": proc.pid}
     except OSError as e:
         return {"ok": False, "error": str(e)}

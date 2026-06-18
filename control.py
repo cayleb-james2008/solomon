@@ -18,20 +18,30 @@ import subprocess
 import sys
 
 def _base_dir():
-    """The operator data dir (repos.json, improver/, runtime/, .env). When frozen, the
-    PyInstaller bundle does NOT contain improver/ — the operator data lives in the real
-    Solomon folder — so walk up from the exe to find it (marked by improver/), falling
-    back to the exe's own dir. Unfrozen: the directory of this source file."""
+    """The operator data dir (repos.json, improver/, runtime/, .env). When frozen, the PyInstaller
+    bundle does NOT contain improver/ — the operator data lives in the real Solomon folder. Resolution
+    order, frozen: an explicit SOLOMON_HOME env var, then improver/ beside the exe, then a walk UP from
+    the exe (so a dist/Solomon nested inside the source tree still resolves), else the exe's own dir —
+    and in that last case warn to stderr so a relocated exe whose operator data is missing fails loudly
+    rather than silently showing zero repos. Unfrozen: the directory of this source file."""
     if getattr(sys, "frozen", False):
+        home = os.environ.get("SOLOMON_HOME")
+        if home and os.path.isdir(os.path.join(home, "improver")):
+            return home
         d = os.path.dirname(os.path.abspath(sys.executable))
         probe = d
-        for _ in range(6):
+        for _ in range(6):                       # first iteration probes beside the exe
             if os.path.isdir(os.path.join(probe, "improver")):
                 return probe
             parent = os.path.dirname(probe)
             if parent == probe:
                 break
             probe = parent
+        if sys.stderr:                           # windowed frozen exe (console=False) has stderr == None
+            sys.stderr.write(
+                f"Solomon: operator data (improver/, repos.json) not found next to {d}, in any ancestor, "
+                f"or via SOLOMON_HOME — the dashboard will show no repos and start/supervise will fail. "
+                f"Keep Solomon.exe beside the operator data folder, or set SOLOMON_HOME to it.\n")
         return d
     return os.path.dirname(os.path.abspath(__file__))
 
@@ -259,6 +269,20 @@ def _runtime_dir(repo):
 def _venv_python(repo):
     p = _repo_path(repo)
     return os.path.join(p, ".venv", "Scripts", "python.exe") if p else None
+
+
+def _runner_python(repo):
+    """The interpreter to spawn run_improver.py with: the repo's own .venv python when it exists, else
+    the current interpreter — but NEVER when frozen. When frozen, sys.executable is Solomon.exe, and
+    spawning [Solomon.exe, run_improver.py, ...] would fall through to main() and launch a ghost
+    dashboard window instead of running the provisioner. Returns a path, or None when frozen with no
+    repo .venv (so the caller fails loudly instead of spawning a stray GUI)."""
+    py = _venv_python(repo)
+    if py and os.path.exists(py):
+        return py
+    if getattr(sys, "frozen", False):
+        return None
+    return sys.executable
 
 
 def _clean_subenv():
@@ -525,8 +549,11 @@ def _pid_alive(pid):
     if not pid:
         return False
     if sys.platform == "win32":
-        r = _run(["tasklist", "/FI", f"PID eq {int(pid)}"])
-        return str(pid) in (r.stdout or "")
+        # /NH /FO CSV so the PID appears only as a quoted field — an exact match, not a substring of
+        # some other column/PID in tasklist's formatted table (the substring form gave false 'alive',
+        # wedging start()/clear_lock()). Mirrors run_improver._pid_alive.
+        r = _run(["tasklist", "/FI", f"PID eq {int(pid)}", "/NH", "/FO", "CSV"])
+        return f'"{int(pid)}"' in (r.stdout or "")
     try:
         os.kill(int(pid), 0)
         return True
@@ -1041,9 +1068,9 @@ def enrich_contract(repo, background=False):
     prov = project_provider(repo)
     if not keys_status().get(prov):
         return {"ok": False, "error": f"{prov} API key not set (add it in Settings)"}
-    py = _venv_python(repo)
-    if not py or not os.path.exists(py):
-        py = sys.executable
+    py = _runner_python(repo)
+    if not py:
+        return {"ok": False, "error": f"{name} has no .venv python — create the repo's .venv first"}
     runner = os.path.join(HERE, "improver", "run_improver.py")
     if not os.path.exists(runner):
         return {"ok": False, "error": "runner not found"}
@@ -1085,9 +1112,9 @@ def ideate(repo):
     prov = project_provider(repo)
     if not keys_status().get(prov):
         return {"ok": False, "error": f"{prov} API key not set (add it in Settings)"}
-    py = _venv_python(repo)
-    if not py or not os.path.exists(py):
-        py = sys.executable
+    py = _runner_python(repo)
+    if not py:
+        return {"ok": False, "error": f"{name} has no .venv python — create the repo's .venv first"}
     runner = os.path.join(HERE, "improver", "run_improver.py")
     if not os.path.exists(runner):
         return {"ok": False, "error": "runner not found"}
