@@ -42,7 +42,7 @@ CONTROL = HERE.parent                             # Solomon (operator infra, not
 # Keep in sync with control.py _PROVIDER_DEFAULT_MODEL.
 PROVIDERS = {
     "ollama-cloud": {"ext": "maki-cloud.ts", "pi_provider": "maki-cloud",
-                     "default_model": "kimi-k2.7-code"},
+                     "default_model": "glm-5.2"},
     "openrouter": {"ext": "openrouter.ts", "pi_provider": "openrouter",
                    "default_model": "qwen/qwen3-coder"},
 }
@@ -63,7 +63,7 @@ BACKLOG = HERE / NAME / "backlog.md"
 VENV_PY = REPO / ".venv" / "Scripts" / ("python.exe" if os.name == "nt" else "python")
 
 PI_PROVIDER = "maki-cloud"
-PI_MODEL = "kimi-k2.7-code"
+PI_MODEL = "glm-5.2"
 
 # Per-process identity token written into the lock file's 2nd line + the heartbeat, so a recycled OS
 # PID can't masquerade as this live runner (Windows reuses PIDs aggressively). See acquire_lock /
@@ -134,7 +134,7 @@ def _refresh_config_from_registry() -> None:
     PI_EXT = HERE / prov["ext"]
     PI_MODEL = row.get("model") or prov["default_model"]
     GATE_CMD = (row.get("gate") or "").strip()
-    REASONING = row.get("reasoning") or ""
+    REASONING = row.get("reasoning") or "xhigh"   # max reasoning by default
     GOAL = (row.get("goal") or "").strip()
     _hb["model"] = PI_MODEL
 
@@ -1512,6 +1512,7 @@ def main(argv=None) -> int:
     GOAL = (a.goal or "").strip()
     BEAUTIFY = a.beautify
     SOLOMON = a.solomon
+    REASONING = REASONING or "xhigh"     # default to max reasoning when not explicitly set
     INTERVAL = max(1, a.interval)        # the cooldown AND the lock-staleness base (acquire_lock takeover)
     if BEAUTIFY or SOLOMON:
         a.once = True  # beautify + the supervisor fix-session are single-shot

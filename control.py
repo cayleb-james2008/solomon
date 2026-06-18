@@ -59,7 +59,7 @@ _NO_WINDOW = 0x08000000  # subprocess.CREATE_NO_WINDOW (win32)
 
 # provider defaults — keep in sync with improver/run_improver.py PROVIDERS
 _PROVIDER_DEFAULT_MODEL = {
-    "ollama-cloud": "kimi-k2.7-code",
+    "ollama-cloud": "glm-5.2",
     "openrouter": "qwen/qwen3-coder",
 }
 
@@ -193,9 +193,10 @@ def effective_ship(repo, auto_push=True):
 
 
 def project_reasoning(repo):
-    """Agent thinking/reasoning level (pi --thinking): off|minimal|low|medium|high|xhigh,
-    or '' (unset -> the model/pi default)."""
-    return (repo or {}).get("reasoning") or ""
+    """Agent thinking/reasoning level (pi --thinking): off|minimal|low|medium|high|xhigh.
+    Default is 'xhigh' (max reasoning) — every repo runs the agent at full reasoning unless an
+    operator explicitly lowers it."""
+    return (repo or {}).get("reasoning") or "xhigh"
 
 
 def project_goal(repo):
