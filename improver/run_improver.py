@@ -1456,10 +1456,14 @@ def _parse_ideas(text: str):
     the backlog write (same steering boundary as provision)."""
     ideas = []
     for ln in (text or "").splitlines():
-        m = re.match(r"\s*[-*]?\s*\[(feature|refactor|architecture)\]\s*\|\s*(\d)\s*\|\s*(.+)",
-                     ln.strip(), re.I)
-        if m:
-            ideas.append((int(m.group(2)), m.group(1).lower(), m.group(3).strip().rstrip("`").strip()))
+        # tolerant of how a model actually formats it: leading bullets / numbers / markdown bold,
+        # optional brackets around the tier, the 'chore' tier, |/:/-/— separators, multi-digit (or
+        # absent -> 3) leverage. The tier must lead the line so prose ("this feature is nice") is ignored.
+        m = re.match(r"^[\s\-*\d.)#>]*\**\[?\s*(feature|refactor|architecture)\s*\]?\**"
+                     r"\s*[|:\-–—]*\s*(\d+)?\s*[|:\-–—]*\s*(.+?)\s*$", ln.strip(), re.I)
+        if m and len(m.group(3).strip()) > 8:          # a real idea, not a bare tier/header line (chore dropped)
+            lev = min(5, max(1, int(m.group(2)))) if m.group(2) else 3
+            ideas.append((lev, m.group(1).lower(), m.group(3).strip().rstrip("`").strip()))
     ideas.sort(key=lambda t: -t[0])
     return ideas
 
@@ -1478,8 +1482,10 @@ def ideate() -> int:
     except subprocess.TimeoutExpired:
         print(json.dumps({"ok": False, "error": "ideate timed out"}))
         return 5
-    ideas = _parse_ideas(final_text(p.stdout) or "")
+    raw = final_text(p.stdout) or ""
+    ideas = _parse_ideas(raw)
     if not ideas:
+        log(f"ideate: no parseable ideas. Raw agent output (first 800 chars):\n{raw[:800]}")
         print(json.dumps({"ok": False, "error": "ideate emitted no parseable ideas"}))
         return 5
     new_lines = [f"- [ ] [{tier}] {idea}" for _lev, tier, idea in ideas]
