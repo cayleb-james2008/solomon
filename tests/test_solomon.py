@@ -76,6 +76,24 @@ def test_diagnose_gate_red_streak(tmp_path, monkeypatch):
     assert d["category"] == "gate_red_streak" and not d["auto_safe"]
 
 
+def test_diagnose_ci_red_streak(tmp_path, monkeypatch):
+    # auto-merge repo whose last 3 PRs all shipped but are CI-red and unmerged -> escalate.
+    rt = _rt(tmp_path, monkeypatch)
+    _hb(rt, status="sleeping")
+    _hist(rt, [{"status": "shipped", "pr": {"number": 7, "state": "open (CI red — not merged)"}} for _ in range(3)])
+    d = solomon.diagnose(_repo(tmp_path, ship="auto-merge"))
+    assert d["category"] == "ci_red_streak" and not d["auto_safe"]
+
+
+def test_diagnose_ci_red_not_flagged_in_pr_mode(tmp_path, monkeypatch):
+    # In pr mode a red PR is the operator's to merge — Solomon does NOT escalate it as a streak.
+    rt = _rt(tmp_path, monkeypatch)
+    _hb(rt, status="sleeping")
+    _hist(rt, [{"status": "shipped", "pr": {"number": 7, "state": "open (CI red — not merged)"}} for _ in range(3)])
+    d = solomon.diagnose(_repo(tmp_path, ship="pr"))
+    assert d["category"] == "ok"
+
+
 def test_diagnose_no_key(tmp_path, monkeypatch):
     rt = _rt(tmp_path, monkeypatch)
     _hb(rt, status="error", last_summary="OLLAMA_API_KEY not set — add it to Solomon/.env")

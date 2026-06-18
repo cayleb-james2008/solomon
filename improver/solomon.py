@@ -86,6 +86,15 @@ def diagnose(repo):
     elif len(hist) >= 3 and all(r.get("status") in ("reverted", "error") for r in hist[-3:]):
         cat, ev, rec, safe = ("gate_red_streak", "last 3 iterations reverted/errored — the gate keeps failing",
                               ["run a Solomon fix-session (opt-in)"], False)
+    elif (control.project_ship(repo) == "auto-merge" and len(hist) >= 3
+          and all(r.get("status") == "shipped" and isinstance(r.get("pr"), dict)
+                  and "ci red" in (r["pr"].get("state") or "").lower() for r in hist[-3:])):
+        # auto-merge owns landing the PR; a streak of shipped-but-CI-red PRs means they pile up open
+        # and NEVER merge with no other signal (the gate is green locally, so gate_red_streak misses
+        # it). Surface it so the operator fixes the CI cause instead of red PRs accumulating silently.
+        cat, ev, rec, safe = ("ci_red_streak",
+                              "last 3 auto-merge PRs are CI-red and unmerged — CI keeps failing on shipped PRs",
+                              ["review the failing CI on the open rsi/* PRs and fix the cause"], False)
 
     # anti-thrash: same auto category fixed >= 3 times recently -> escalate instead of looping forever
     if safe and cat != "ok":
@@ -111,6 +120,10 @@ def _suggested_steps(repo, cat):
     if cat == "stuck":
         return [cd, "# find the hung improver PID then stop it manually (Solomon will not force-kill):",
                 "taskkill /F /T /PID <pid>   # Windows", "# or:  kill <pid>   # Unix"]
+    if cat == "ci_red_streak":
+        return [cd, "gh pr list --state open            # the CI-red rsi/* PRs that won't merge",
+                "gh pr checks <number>                  # which check failed",
+                "# fix the failing-CI cause (or close the bad PRs); tick 'Allow AI fix' for a fix-session"]
     return [cd, "git status"]
 
 
