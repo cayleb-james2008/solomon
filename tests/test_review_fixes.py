@@ -506,6 +506,36 @@ def test_start_does_not_revoke_pending_stop_on_live_loop(tmp_path, monkeypatch):
     assert (rt / "stop").exists()                            # the live Stop was NOT silently revoked
 
 
+def test_start_re_reads_repo_when_gate_just_auto_set(tmp_path, monkeypatch):
+    """ensure_contracts may auto-set a detected gate via repos.json; start() must re-read the live
+    config so the freshly-detected gate is used on the very first launch — NOT the stale '' from the
+    dict passed in (which would spawn the runner with the wrong built-in pytest gate)."""
+    monkeypatch.setattr(control, "HERE", str(tmp_path))
+    rt = tmp_path / "runtime" / "x"; rt.mkdir(parents=True)
+    os.makedirs(os.path.join(tmp_path, "improver"), exist_ok=True)
+    open(os.path.join(tmp_path, "improver", "run_improver.py"), "w").close()
+    fake_py = os.path.join(tmp_path, "py.exe"); open(fake_py, "w").close()
+    monkeypatch.setattr(control, "_venv_python", lambda repo: fake_py)
+    monkeypatch.setattr(control, "is_running", lambda repo: False)
+    monkeypatch.setattr(control, "ensure_contracts",
+                        lambda repo: {"ok": True, "created": [], "gate_set": ".venv\\Scripts\\python -m unittest discover"})
+    # the live repos.json now carries the detected gate
+    monkeypatch.setattr(control, "load_repos",
+                        lambda: [{"name": "x", "path": str(tmp_path),
+                                  "gate": ".venv\\Scripts\\python -m unittest discover"}])
+    captured = {}
+    class _FakeProc:
+        pid = 999
+    def fake_popen(args, **kw):
+        captured["gate"] = next(a for i, a in enumerate(args) if i > 0 and args[i-1] == "--gate")
+        return _FakeProc()
+    monkeypatch.setattr(control.subprocess, "Popen", fake_popen)
+    r = control.start({"name": "x", "path": str(tmp_path), "gate": ""})  # stale dict, gate=""
+    assert r.get("ok") and r.get("pid") == 999
+    # the runner was spawned with the DETECTED gate, not the stale ''
+    assert "unittest" in captured["gate"]
+
+
 # --------------------------------------------------------------------------- #
 # DUP-PR — _open_pr ADOPTS an existing PR on 'already exists' instead of falling to push-only.
 # Regression for the live sover dup-PR spin: the agent opened the PR itself, the runner's
