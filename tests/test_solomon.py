@@ -277,11 +277,46 @@ def test_recover_gate_red_streak_optin(tmp_path, monkeypatch):
 def test_recover_dirty_tree_refuses_under_live_loop(tmp_path, monkeypatch):
     rt = _rt(tmp_path, monkeypatch)
     _hb(rt, status="error", phase="preflight", last_summary="Working tree is dirty — commit or stash")
-    monkeypatch.setattr(control, "is_running", lambda repo: True)
+    monkeypatch.setattr(control, "acquire_supervisor_lock", lambda repo: (False, None))  # a live runner holds the lock
     resets = []
     monkeypatch.setattr(control, "reset_to_base", lambda repo: resets.append(repo) or {"ok": True})
     res = solomon.recover(_repo(tmp_path), allow_pi=False)
     assert res["escalate"] and resets == []            # never hard-reset git under a live iteration
+
+
+def test_recover_dirty_tree_holds_lock_then_resets(tmp_path, monkeypatch):
+    rt = _rt(tmp_path, monkeypatch)
+    _hb(rt, status="error", phase="preflight", last_summary="Working tree is dirty — commit or stash")
+    monkeypatch.setattr(control, "acquire_supervisor_lock", lambda repo: (True, "sup-tok"))
+    released = []
+    monkeypatch.setattr(control, "release_supervisor_lock", lambda repo, token: released.append(token))
+    resets = []
+    monkeypatch.setattr(control, "reset_to_base", lambda repo: resets.append(repo) or {"ok": True})
+    res = solomon.recover(_repo(tmp_path), allow_pi=False)
+    assert not res["escalate"] and "reset_to_base" in res["actions_taken"]
+    assert len(resets) == 1 and released == ["sup-tok"]   # held the lock across the reset, then released it
+
+
+def test_supervisor_lock_acquire_release_roundtrip(tmp_path, monkeypatch):
+    rt = _rt(tmp_path, monkeypatch)
+    ok, token = control.acquire_supervisor_lock(_repo(tmp_path))
+    assert ok and token and (rt / "lock").exists()
+    ok2, _ = control.acquire_supervisor_lock(_repo(tmp_path))   # we already hold it -> a 2nd acquire is refused
+    assert ok2 is False
+    control.release_supervisor_lock(_repo(tmp_path), token)
+    assert not (rt / "lock").exists()
+
+
+def test_supervisor_lock_refuses_when_live_runner_holds(tmp_path, monkeypatch):
+    rt = _rt(tmp_path, monkeypatch)
+    (rt / "lock").write_text("4242\nrunnerabc", encoding="utf-8")
+    from datetime import datetime, timezone
+    fresh = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _hb(rt, status="iterating", run_id="runnerabc", updated_at=fresh)
+    monkeypatch.setattr(control, "_pid_alive", lambda pid: True)        # runner pid alive + heartbeat fresh
+    ok, token = control.acquire_supervisor_lock(_repo(tmp_path))
+    assert ok is False and token is None                               # never take a live runner's lock
+    assert (rt / "lock").read_text(encoding="utf-8").splitlines()[1] == "runnerabc"   # untouched
 
 
 def test_recover_gate_red_streak_refuses_under_live_loop(tmp_path, monkeypatch):
