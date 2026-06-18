@@ -966,8 +966,10 @@ def _auto_merge(pr: dict) -> dict:
 
 # ---- iteration ------------------------------------------------------------
 def one_iteration() -> None:
-    _hb["iteration"] += 1
-    n = _hb["iteration"]
+    # The iteration counter is incremented ONLY when the iteration actually reaches the implement
+    # phase (after preflight + base-gate succeed). A preflight bail (dirty tree, out-of-band base,
+    # base-gate RED, untracked files) is a no-op wedge, not a real iteration — incrementing here
+    # would burn --max-iterations on zero-progress skips and inflate the 'iterations' metric.
     branch = (f"rsi/beautify-{_stamp()}" if BEAUTIFY
               else f"rsi/solomon-{_stamp()}" if SOLOMON
               else f"rsi/iter-{_stamp()}")
@@ -1050,7 +1052,7 @@ def one_iteration() -> None:
             heartbeat(status="error", phase="preflight",
                       last_summary=f"Base gate is RED before any change ({base_tests}). Fix the gate "
                                    f"command or the base; the loop can't measure a gain from a red base.")
-            log(f"base gate RED — skipping iteration {n}")
+            log(f"base gate RED — skipping (preflight bail, not counted as an iteration)")
             git("checkout", "--force", BASE_BRANCH)
             git("branch", "-D", branch)
             return
@@ -1078,6 +1080,10 @@ def one_iteration() -> None:
         goal, tier = _top_backlog_item()
         task = build_task(goal, tier)
         system_md = None
+    # preflight + base-gate succeeded — this is a REAL iteration; count it now (not at the top, so
+    # preflight no-op wedges don't burn --max-iterations on zero-progress skips).
+    _hb["iteration"] += 1
+    n = _hb["iteration"]
     heartbeat(status="iterating", phase="implement", goal=goal,
               last_pr=None, tests=None)
     log(f"iteration {n}: branch {branch} — Pi ({PI_MODEL}) working"

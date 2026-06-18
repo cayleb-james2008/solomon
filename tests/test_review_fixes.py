@@ -243,6 +243,8 @@ def test_preflight_refuses_unpushed_base_commit(tmp_path, monkeypatch):
     assert ran["pi"] is False                                # never reached the agent
     # the operator's un-pushed commit must survive (not hard-reset away)
     assert _git(work, "rev-list", "--count", "origin/main..main").stdout.strip() == "1"
+    # a preflight bail must NOT increment the iteration counter (it's a no-op wedge, not a real iter)
+    assert m._hb["iteration"] == 0
 
 
 # --------------------------------------------------------------------------- #
