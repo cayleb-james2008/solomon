@@ -357,6 +357,7 @@ def _runner_with_lock(tmp_path):
     m = _load_runner()
     m.RUNTIME = tmp_path
     m.LOCK = tmp_path / "lock"
+    m.HEARTBEAT = tmp_path / "heartbeat.json"   # nonexistent by default -> _heartbeat_stale() is False
     return m
 
 
@@ -381,14 +382,14 @@ def test_acquire_lock_takes_over_dead_holder(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "_pid_alive", lambda pid: False)   # recorded pid is dead
     m.LOCK.write_text("99999", encoding="utf-8")
     assert m.acquire_lock() is True
-    assert m.LOCK.read_text(encoding="utf-8").strip() == str(os.getpid())
+    assert m._read_lock_pid() == os.getpid()                  # lock now holds '<pid>\n<run_id>'
 
 
 def test_acquire_lock_creates_with_pid(tmp_path):
     m = _runner_with_lock(tmp_path)
     assert not m.LOCK.exists()
     assert m.acquire_lock() is True
-    assert m.LOCK.read_text(encoding="utf-8").strip() == str(os.getpid())  # never created empty
+    assert m._read_lock_pid() == os.getpid()                               # pid on line 1, never empty
     assert m.acquire_lock() is True                                        # idempotent for our own pid
 
 
@@ -533,3 +534,97 @@ def test_refresh_config_tolerates_missing_or_torn_file(tmp_path, monkeypatch):
     (tmp_path / "repos.json").write_text("{ this is not json", encoding="utf-8")
     m._refresh_config_from_registry()                  # torn/invalid -> no change, no raise
     assert m.PI_MODEL == "keep-me"
+
+
+# --------------------------------------------------------------------------- #
+# PID-1 — recycled-PID-proof liveness (run-id identity token + heartbeat freshness).
+# Windows recycles PIDs; the old _pid_alive-only check pinned a dead loop 'running' forever and
+# let clear_lock refuse a recycled-pid lock. The runner now writes '<pid>\n<run_id>' and takes over
+# a lock whose holder's heartbeat froze; control.is_running/clear_lock corroborate freshness+run-id.
+# --------------------------------------------------------------------------- #
+import datetime as _dt
+
+
+def _iso(offset_s=0):
+    return (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=offset_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_acquire_lock_writes_pid_and_run_id(tmp_path):
+    m = _runner_with_lock(tmp_path)
+    assert m.acquire_lock() is True
+    pid_line, run_line = m.LOCK.read_text(encoding="utf-8").splitlines()
+    assert pid_line.strip() == str(os.getpid())
+    assert run_line.strip() == m.RUN_ID                  # identity token persisted on the 2nd line
+    assert m._read_lock_pid() == os.getpid()             # first line still parses as the pid
+
+
+def test_read_lock_pid_parses_multiline_and_legacy(tmp_path):
+    m = _runner_with_lock(tmp_path)
+    m.LOCK.write_text("4242\nsomerunid", encoding="utf-8")
+    assert m._read_lock_pid() == 4242                    # multi-line: pid from the first line
+    m.LOCK.write_text("4242", encoding="utf-8")
+    assert m._read_lock_pid() == 4242                    # legacy single-line still works
+    m.LOCK.write_text("garbage\nx", encoding="utf-8")
+    assert m._read_lock_pid() == 0                        # corrupt first line -> 0
+
+
+def test_acquire_lock_takes_over_recycled_pid_with_stale_heartbeat(tmp_path, monkeypatch):
+    m = _runner_with_lock(tmp_path)
+    m.INTERVAL = 120
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: True)      # the recorded PID is ALIVE (recycled)
+    m.LOCK.write_text("99999\noldrunid", encoding="utf-8")
+    m.HEARTBEAT.write_text(json.dumps({"updated_at": _iso(-99999), "run_id": "oldrunid"}), encoding="utf-8")
+    assert m.acquire_lock() is True                              # stale heartbeat -> holder is dead, take over
+    assert m._read_lock_pid() == os.getpid()
+
+
+def test_acquire_lock_refuses_live_holder_with_fresh_heartbeat(tmp_path, monkeypatch):
+    m = _runner_with_lock(tmp_path)
+    m.INTERVAL = 120
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: True)
+    m.LOCK.write_text("99999\notherrun", encoding="utf-8")
+    m.HEARTBEAT.write_text(json.dumps({"updated_at": _iso(0), "run_id": "otherrun"}), encoding="utf-8")
+    assert m.acquire_lock() is False                            # genuinely live (fresh heartbeat) -> back off
+    assert m.LOCK.read_text(encoding="utf-8").splitlines()[0] == "99999"
+
+
+def _control_repo(tmp_path, monkeypatch):
+    repo = {"name": "x", "path": str(tmp_path)}
+    rt = tmp_path / "rt"; rt.mkdir()
+    monkeypatch.setattr(control, "_runtime_dir", lambda r: str(rt))
+    return repo, rt
+
+
+def test_control_is_running_false_on_recycled_pid_stale_heartbeat(tmp_path, monkeypatch):
+    repo, rt = _control_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(control, "_pid_alive", lambda pid: True)   # PID alive (recycled by an unrelated proc)
+    (rt / "lock").write_text("4242\nrunabc", encoding="utf-8")
+    (rt / "heartbeat.json").write_text(json.dumps({"updated_at": _iso(-99999), "run_id": "runabc"}), encoding="utf-8")
+    assert control.is_running(repo) is False                       # stale heartbeat -> dead despite a live PID
+    assert control.clear_lock(repo).get("removed") is True         # and clear_lock CAN now remove it
+    assert not (rt / "lock").exists()
+
+
+def test_control_is_running_true_and_clear_lock_refuses_on_fresh(tmp_path, monkeypatch):
+    repo, rt = _control_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(control, "_pid_alive", lambda pid: True)
+    (rt / "lock").write_text("4242\nrunabc", encoding="utf-8")
+    (rt / "heartbeat.json").write_text(json.dumps({"updated_at": _iso(0), "run_id": "runabc"}), encoding="utf-8")
+    assert control.is_running(repo) is True
+    assert control.clear_lock(repo).get("ok") is False             # refuses to clear a live runner's lock
+    assert (rt / "lock").exists()
+
+
+def test_control_is_running_legacy_pid_only_lock(tmp_path, monkeypatch):
+    repo, rt = _control_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(control, "_pid_alive", lambda pid: True)
+    (rt / "lock").write_text("4242", encoding="utf-8")             # legacy: no run-id, no heartbeat
+    assert control.is_running(repo) is True                        # back-compat: a live PID is enough
+
+
+def test_control_is_running_run_id_mismatch_is_orphaned(tmp_path, monkeypatch):
+    repo, rt = _control_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(control, "_pid_alive", lambda pid: True)
+    (rt / "lock").write_text("4242\nOLDrun", encoding="utf-8")     # lock from a prior runner
+    (rt / "heartbeat.json").write_text(json.dumps({"updated_at": _iso(0), "run_id": "NEWrun"}), encoding="utf-8")
+    assert control.is_running(repo) is False                       # fresh heartbeat under a DIFFERENT run-id

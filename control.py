@@ -9,13 +9,14 @@ Heartbeat schema (written by the runner — read-only contract, do NOT change):
     {repo, status, phase, pid, iteration, goal, model,
      tests:{passed,failed,errors,skipped,collected,green}|null,
      last_pr:{number,url,branch,state}|null,
-     last_summary, started_at, updated_at, log_tail:[...]}
+     last_summary, started_at, updated_at, log_tail:[...], run_id (optional identity token)}
 """
 import json
 import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 def _base_dir():
     """The operator data dir (repos.json, improver/, runtime/, .env). When frozen, the PyInstaller
@@ -566,17 +567,69 @@ def _pid_alive(pid):
         return False
 
 
-def is_running(repo):
-    """True if the PID in <path>/.rsi/lock is a live process."""
-    rsi = _runtime_dir(repo)
-    if not rsi:
-        return False
+def _read_lock(rt):
+    """Parse runtime/<name>/lock -> (pid:int, run_id:str|None). The lock is '<pid>' (legacy) or
+    '<pid>\\n<run_id>' — a per-run identity token so a recycled OS PID can't masquerade as the live
+    loop. Returns (0, None) on missing/empty/corrupt."""
     try:
-        with open(os.path.join(rsi, "lock"), "r", encoding="utf-8") as f:
-            pid = int((f.read() or "").strip())
-    except (OSError, ValueError):
+        with open(os.path.join(rt, "lock"), "r", encoding="utf-8") as f:
+            raw = (f.read() or "").strip()
+    except OSError:
+        return 0, None
+    if not raw:
+        return 0, None
+    lines = raw.splitlines()
+    try:
+        pid = int(lines[0].strip())
+    except (ValueError, IndexError):
+        return 0, None
+    run_id = lines[1].strip() if len(lines) > 1 and lines[1].strip() else None
+    return pid, run_id
+
+
+def _heartbeat_age(hb):
+    """Seconds since the heartbeat's updated_at, or None if absent/unparseable."""
+    ts = (hb or {}).get("updated_at")
+    if not ts:
+        return None
+    try:
+        last = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+    return (datetime.now(timezone.utc) - last).total_seconds()
+
+
+def _lock_is_live(repo, rt=None):
+    """Whether runtime/<name>/lock is held by a LIVE runner — not merely a process that happens to own
+    the recorded PID. Windows recycles PIDs aggressively, so a dead loop's PID can be reused by an
+    unrelated process and pin the loop 'running' forever — a wedge the supervisor's stale_lock recovery
+    could never clear (clear_lock refused the 'live' PID). Liveness now requires, beyond a live PID:
+      - if BOTH the lock and the heartbeat carry a run-id, they must MATCH (a fresh heartbeat under a
+        different run-id means a newer runner owns the loop and this lock is orphaned); and
+      - the heartbeat must not be STALE beyond a generous window (>= the longest agent session, so a
+        runner mid-session is never mistaken for dead). A missing/unparseable heartbeat is NOT treated
+        as dead — a just-spawned runner hasn't written one yet."""
+    rt = rt or _runtime_dir(repo)
+    if not rt:
         return False
-    return _pid_alive(pid)
+    pid, run_id = _read_lock(rt)
+    if not pid or not _pid_alive(pid):
+        return False
+    hb = read_heartbeat(repo)
+    if not isinstance(hb, dict):
+        return True                          # lock + live PID, no heartbeat yet -> just-started, treat as live
+    if run_id and hb.get("run_id") and hb.get("run_id") != run_id:
+        return False                         # a newer runner owns the heartbeat; this lock is orphaned
+    age = _heartbeat_age(hb)
+    if age is None:
+        return True                          # no usable timestamp -> don't declare a live PID dead on that alone
+    return age <= max(3 * project_interval(repo), 3600)
+
+
+def is_running(repo):
+    """True if runtime/<name>/lock is held by a LIVE runner (PID alive + run-id/heartbeat-freshness
+    corroborated, so a recycled OS PID can't pin a dead loop 'running' forever)."""
+    return _lock_is_live(repo)
 
 
 # --------------------------------------------------------------------------- #
@@ -1210,19 +1263,19 @@ def cleanup_worktrees(repo):
 # supervisor primitives — small, reversible recovery actions (used by improver/solomon.py)
 # --------------------------------------------------------------------------- #
 def clear_lock(repo):
-    """Remove a STALE runtime/<name>/lock (its PID is dead). REFUSES if the PID is live.
-    Returns {ok, removed:bool} / {ok:false, error}."""
+    """Remove a STALE runtime/<name>/lock (no LIVE runner holds it). REFUSES if a live runner holds it.
+    Uses the same liveness test as is_running (PID alive + run-id/heartbeat-freshness), so a recycled-PID
+    lock — which the old _pid_alive-only guard refused to clear, leaving the loop wedged forever — is now
+    clearable. Returns {ok, removed:bool} / {ok:false, error}."""
     rt = _runtime_dir(repo)
     if not rt:
         return {"ok": False, "error": "repo has no 'path'"}
     lock = os.path.join(rt, "lock")
-    try:
-        with open(lock, "r", encoding="utf-8") as f:
-            pid = int((f.read() or "0").strip() or "0")
-    except (OSError, ValueError):
-        return {"ok": True, "removed": False}   # no/invalid lock — nothing to clear
-    if pid and _pid_alive(pid):
-        return {"ok": False, "error": f"lock held by live pid {pid}"}
+    if not os.path.exists(lock):
+        return {"ok": True, "removed": False}   # nothing to clear
+    if _lock_is_live(repo, rt):
+        pid, _ = _read_lock(rt)
+        return {"ok": False, "error": f"lock held by live runner (pid {pid})"}
     try:
         os.remove(lock)
         return {"ok": True, "removed": True}

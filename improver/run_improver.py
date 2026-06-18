@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -63,6 +64,12 @@ VENV_PY = REPO / ".venv" / "Scripts" / ("python.exe" if os.name == "nt" else "py
 
 PI_PROVIDER = "maki-cloud"
 PI_MODEL = "kimi-k2.7-code"
+
+# Per-process identity token written into the lock file's 2nd line + the heartbeat, so a recycled OS
+# PID can't masquerade as this live runner (Windows reuses PIDs aggressively). See acquire_lock /
+# control._lock_is_live. INTERVAL (set from --interval in main) is the cooldown AND the lock-staleness base.
+RUN_ID = uuid.uuid4().hex
+INTERVAL = 120
 
 SHIP = "pr"           # local|push|pr|auto-merge — set from --ship
 GATE_CMD = ""         # optional custom shell test-command — set from --gate (empty = built-in pytest)
@@ -180,7 +187,7 @@ _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 BASE_BRANCH = "main"  # the repo's integration branch; re-resolved from the launch branch in main()
 
 _hb = {
-    "repo": "maki", "status": "starting", "phase": None, "pid": os.getpid(),
+    "repo": "maki", "status": "starting", "phase": None, "pid": os.getpid(), "run_id": RUN_ID,
     "iteration": 0, "goal": None, "model": PI_MODEL, "tests": None, "last_pr": None,
     "last_summary": None, "started_at": None, "updated_at": None, "log_tail": [],
 }
@@ -1150,16 +1157,35 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _read_lock_pid() -> int:
-    """The pid recorded in LOCK: a positive int, or 0 when the lock is missing, empty (a
-    racer created it but has not written its pid yet), or corrupt. Never raises."""
+    """The pid on the FIRST line of LOCK ('<pid>' or '<pid>\\n<run_id>'): a positive int, or 0 when the
+    lock is missing, empty (a racer created it but has not written its pid yet), or corrupt. Never raises."""
     try:
-        raw = LOCK.read_text(encoding="utf-8").strip()
+        raw = LOCK.read_text(encoding="utf-8")
     except OSError:
         return 0
+    first = raw.splitlines()[0].strip() if raw.strip() else ""
     try:
-        return int(raw) if raw else 0
+        return int(first) if first else 0
     except ValueError:
         return 0
+
+
+def _heartbeat_stale(window: float) -> bool:
+    """True only with POSITIVE evidence the lock holder is dead: its heartbeat's updated_at is older than
+    `window` seconds (>= the longest agent session, so a runner mid-session is never mistaken for dead).
+    A missing/unparseable heartbeat returns False — no evidence, so we never steal a possibly-live lock."""
+    try:
+        hb = json.loads(HEARTBEAT.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    ts = hb.get("updated_at") if isinstance(hb, dict) else None
+    if not ts:
+        return False
+    try:
+        last = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return False
+    return (datetime.now(timezone.utc) - last).total_seconds() > window
 
 
 def acquire_lock() -> bool:
@@ -1181,7 +1207,7 @@ def acquire_lock() -> bool:
     try:  # atomic exclusive create WITH the pid written before the handle closes (no empty window)
         fd = os.open(str(LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         try:
-            os.write(fd, str(mypid).encode("ascii"))
+            os.write(fd, f"{mypid}\n{RUN_ID}".encode("ascii"))   # pid + identity token (no empty window)
         finally:
             os.close(fd)
         return True
@@ -1198,13 +1224,14 @@ def acquire_lock() -> bool:
         return True                      # already ours
     if pid == 0:
         return False                     # still empty after the grace window — a racer holds it
-    if _pid_alive(pid):
-        return False                     # held by a live improver
-    # Recorded pid is dead -> take over, then VERIFY we won (last os.replace wins; the loser
-    # must back off so a dead lock can't be adopted by two racers at once).
+    if _pid_alive(pid) and not _heartbeat_stale(max(3 * INTERVAL, 3600)):
+        return False                     # held by a live improver (PID alive AND heartbeat fresh)
+    # Recorded pid is dead, OR alive-but-its-heartbeat-froze (a recycled PID whose original runner is
+    # gone) -> take over, then VERIFY we won (last os.replace wins; the loser must back off so a dead
+    # lock can't be adopted by two racers at once).
     try:
         tmp = RUNTIME / f"lock.{mypid}.tmp"
-        tmp.write_text(str(mypid), encoding="utf-8")
+        tmp.write_text(f"{mypid}\n{RUN_ID}", encoding="utf-8")
         os.replace(tmp, LOCK)
     except OSError:
         return False
@@ -1406,13 +1433,14 @@ def main(argv=None) -> int:
                     help="supervisor fix-session: diagnose + fix a persistent gate failure (one iteration)")
     a = ap.parse_args(argv)
     configure(a.repo, a.name or Path(a.repo).name, a.provider, a.model)
-    global SHIP, GATE_CMD, REASONING, GOAL, BEAUTIFY, SOLOMON
+    global SHIP, GATE_CMD, REASONING, GOAL, BEAUTIFY, SOLOMON, INTERVAL
     SHIP = a.ship
     GATE_CMD = a.gate or ""
     REASONING = a.reasoning or ""
     GOAL = (a.goal or "").strip()
     BEAUTIFY = a.beautify
     SOLOMON = a.solomon
+    INTERVAL = max(1, a.interval)        # the cooldown AND the lock-staleness base (acquire_lock takeover)
     if BEAUTIFY or SOLOMON:
         a.once = True  # beautify + the supervisor fix-session are single-shot
 
