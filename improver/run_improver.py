@@ -1101,15 +1101,22 @@ def one_iteration() -> None:
     log(f"Pi rc={p.returncode}: {summary[:200]}")
 
     if not tree_dirty() and head_sha() == base:
-        if _narrated_without_writing(summary):
-            log("WARNING: Pi narrated a change but wrote nothing to a clean tree — the model likely "
-                "hallucinated its file edits; counting as a no-op")
-            summary = "[narrated-but-unwritten] " + summary
-        else:
-            log("Pi made no changes — dropping branch")
-        _note_noop(goal)          # defer this item if the agent keeps failing to implement it
-        _drop_branch(branch, "noop", summary)
-        return
+        # An agent that writes ONLY a new untracked file (no tracked changes, no commit) looks like a
+        # noop to tree_dirty() (tracked-only) + head_sha()==base — but the untracked file IS real work.
+        # Check for untracked non-ignored files the agent created; if any exist, this is NOT a noop
+        # (proceed to the gate so the work is tested/committed/shipped, not discarded).
+        agent_untracked = _untracked_non_ignored_files()
+        if not agent_untracked:
+            if _narrated_without_writing(summary):
+                log("WARNING: Pi narrated a change but wrote nothing to a clean tree — the model likely "
+                    "hallucinated its file edits; counting as a no-op")
+                summary = "[narrated-but-unwritten] " + summary
+            else:
+                log("Pi made no changes — dropping branch")
+            _note_noop(goal)          # defer this item if the agent keeps failing to implement it
+            _drop_branch(branch, "noop", summary)
+            return
+        log(f"Pi wrote {len(agent_untracked)} new untracked file(s) — not a noop (proceeding to gate)")
 
     if BEAUTIFY:
         # docs-only pass — there is nothing to test; do NOT run the pytest/custom gate.

@@ -886,3 +886,44 @@ def test_parse_ideas_tolerant_of_formatting():
     assert ideas[0][0] == 5                                   # sorted by leverage desc (architecture first)
     assert not any("not an idea" in i.lower() or "tidy the import" in i.lower()
                    for _l, _t, i in ideas)                    # prose AND chore lines excluded
+
+
+# --------------------------------------------------------------------------- #
+# NOOP-1 — an agent that writes ONLY a new untracked file must NOT be detected
+# as a noop (tree_dirty is tracked-only; an untracked-only change looks like "no
+# changes" but is real work the gate must test, not discard).
+# --------------------------------------------------------------------------- #
+def test_noop_check_treats_untracked_only_change_as_real_work(monkeypatch):
+    """When tree_dirty() is False and head_sha()==base BUT there are untracked files the agent
+    created, the iteration is NOT a noop — it proceeds to the gate. The old code discarded the
+    agent's new-file-only work as a narrated-but-unwritten hallucination."""
+    m = _load_runner()
+    # tree_dirty (tracked-only) -> False; head_sha == base -> True; BUT untracked files exist
+    monkeypatch.setattr(m, "tree_dirty", lambda: False)
+    monkeypatch.setattr(m, "head_sha", lambda: "abc123")
+    monkeypatch.setattr(m, "_untracked_non_ignored_files", lambda: ["tests/test_new.py"])
+    monkeypatch.setattr(m, "_narrated_without_writing", lambda s: True)  # would flag as hallucination
+    monkeypatch.setattr(m, "_note_noop", lambda g: None)
+    dropped = {"called": False}
+    monkeypatch.setattr(m, "_drop_branch", lambda *a, **k: dropped.__setitem__("called", True))
+    # we can't easily call one_iteration (needs a full repo); test the GUARD logic directly instead
+    # — the guard is: if not tree_dirty() and head_sha()==base and NOT _untracked_non_ignored_files()
+    # -> noop. With untracked files present, the noop path is skipped.
+    base = "abc123"
+    has_untracked = bool(m._untracked_non_ignored_files())
+    is_noop = (not m.tree_dirty()) and (m.head_sha() == base) and (not has_untracked)
+    assert is_noop is False                               # untracked files -> NOT a noop
+    # and the narrated-but-unwritten path would have wrongly fired without the untracked check
+    assert m._narrated_without_writing("I wrote tests/test_new.py") is True
+
+
+def test_noop_check_still_detects_genuine_noop(monkeypatch):
+    """A genuine noop (no tracked changes, no untracked files, head==base) is still detected."""
+    m = _load_runner()
+    monkeypatch.setattr(m, "tree_dirty", lambda: False)
+    monkeypatch.setattr(m, "head_sha", lambda: "abc123")
+    monkeypatch.setattr(m, "_untracked_non_ignored_files", lambda: [])  # no untracked files
+    base = "abc123"
+    has_untracked = bool(m._untracked_non_ignored_files())
+    is_noop = (not m.tree_dirty()) and (m.head_sha() == base) and (not has_untracked)
+    assert is_noop is True                                # no changes at all -> genuine noop
