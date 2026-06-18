@@ -110,6 +110,26 @@ def test_anti_gaming_reason_pass_count_drop_and_skips():
     assert m._anti_gaming_reason({"passed": 10}, {"passed": 12}, "+    assert ok\n") is None
     # no baseline (e.g. nothing to compare) -> not gamed by count
     assert m._anti_gaming_reason(None, {"passed": 0}, "") is None
+    # COLLECTED count drop is gamed even when 'passed' is held steady (tests deleted + a trivial one added)
+    assert "collected count fell" in m._anti_gaming_reason(
+        {"passed": 10, "collected": 10}, {"passed": 10, "collected": 7}, "")
+    # collected held steady -> not gamed
+    assert m._anti_gaming_reason({"passed": 10, "collected": 10},
+                                 {"passed": 10, "collected": 10}, "") is None
+
+
+def test_new_skip_markers_catches_non_decorator_forms():
+    m = _load_runner()
+    diff = ("+    pytest.skip('wip')\n"            # in-body call
+            "+    pytest.xfail()\n"
+            "+    @pytest.mark.skipif(True, reason='x')\n"
+            "+        self.skipTest('nope')\n"
+            "+    raise unittest.SkipTest\n"
+            "+    raise SkipTest('bare')\n"
+            "+    assert real()\n"                  # NOT a skip
+            "+++ b/tests/new_test.py\n")            # file header, must be ignored
+    skips = m._new_skip_markers(diff)
+    assert len(skips) == 6                          # all six skip forms, header + real assertion excluded
 
 
 def test_solomon_fix_session_keeps_anti_gaming_baseline():

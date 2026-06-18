@@ -7,7 +7,7 @@ drives GitHub PR accept/deny via the `gh` CLI.
 
 Heartbeat schema (written by the runner — read-only contract, do NOT change):
     {repo, status, phase, pid, iteration, goal, model,
-     tests:{passed,failed,errors,green}|null,
+     tests:{passed,failed,errors,skipped,collected,green}|null,
      last_pr:{number,url,branch,state}|null,
      last_summary, started_at, updated_at, log_tail:[...]}
 """
