@@ -964,28 +964,67 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _read_lock_pid() -> int:
+    """The pid recorded in LOCK: a positive int, or 0 when the lock is missing, empty (a
+    racer created it but has not written its pid yet), or corrupt. Never raises."""
+    try:
+        raw = LOCK.read_text(encoding="utf-8").strip()
+    except OSError:
+        return 0
+    try:
+        return int(raw) if raw else 0
+    except ValueError:
+        return 0
+
+
 def acquire_lock() -> bool:
+    """Single-flight: at most one improver per repo. Returns True iff WE now hold the lock.
+
+    Two improvers were once observed running on one repo (sover) because the old code
+    created the lock file EMPTY (``open(LOCK, "x")``) and wrote the pid in a SECOND step:
+    a racer that hit FileExistsError inside that window read the still-empty file as pid 0,
+    mistook it for a stale lock, and stole it via ``os.replace``. The fix has three parts:
+      1. the create writes the pid in the SAME exclusive ``os.open`` (O_CREAT|O_EXCL), so the
+         file is never observed empty by our own create;
+      2. an EXISTING lock that reads empty is treated as HELD by a mid-write racer — we back
+         off, never treat empty as stale;
+      3. only a lock whose recorded pid is a confirmed-DEAD process is taken over, and the
+         takeover is verified by reading our pid back, so two racers cannot both adopt the
+         same stale lock."""
     RUNTIME.mkdir(parents=True, exist_ok=True)
-    try:  # atomic create — only one racer can ever win the lock (closes the TOCTOU window)
-        with open(LOCK, "x", encoding="utf-8") as f:
-            f.write(str(os.getpid()))
+    mypid = os.getpid()
+    try:  # atomic exclusive create WITH the pid written before the handle closes (no empty window)
+        fd = os.open(str(LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(fd, str(mypid).encode("ascii"))
+        finally:
+            os.close(fd)
         return True
     except FileExistsError:
         pass
+    # The lock exists. Resolve who holds it, tolerating a racer's just-created-but-empty file.
+    pid = 0
+    for _ in range(10):                  # ~0.5s grace for a racing creator to write its pid
+        pid = _read_lock_pid()
+        if pid:
+            break
+        time.sleep(0.05)
+    if pid == mypid:
+        return True                      # already ours
+    if pid == 0:
+        return False                     # still empty after the grace window — a racer holds it
+    if _pid_alive(pid):
+        return False                     # held by a live improver
+    # Recorded pid is dead -> take over, then VERIFY we won (last os.replace wins; the loser
+    # must back off so a dead lock can't be adopted by two racers at once).
     try:
-        pid = int((LOCK.read_text(encoding="utf-8") or "0").strip() or "0")
-    except (ValueError, OSError):
-        pid = 0
-    if pid and pid != os.getpid() and _pid_alive(pid):
-        return False
-    # lock is stale (its recorded pid is dead) — take it over atomically
-    try:
-        tmp = RUNTIME / "lock.tmp"
-        tmp.write_text(str(os.getpid()), encoding="utf-8")
+        tmp = RUNTIME / f"lock.{mypid}.tmp"
+        tmp.write_text(str(mypid), encoding="utf-8")
         os.replace(tmp, LOCK)
-        return True
     except OSError:
         return False
+    time.sleep(0.1)                      # let any co-racer's replace land before we read back
+    return _read_lock_pid() == mypid
 
 
 def release_lock() -> None:
