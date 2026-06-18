@@ -13,15 +13,21 @@ import monitor  # noqa: E402
 
 
 def test_restart_crashed_loop():
-    # not running, last status was a live phase (finally never ran) -> crash -> restart
+    # not running, last status was a LIVE phase (finally never ran) -> crash -> restart
     assert monitor.should_restart(running=False, hb={"status": "sleeping"}, paused=False, stop_pending=False) is True
     assert monitor.should_restart(running=False, hb={"status": "iterating"}, paused=False, stop_pending=False) is True
-    assert monitor.should_restart(running=False, hb={"status": "error"}, paused=False, stop_pending=False) is True
+    assert monitor.should_restart(running=False, hb={"status": "idle"}, paused=False, stop_pending=False) is True
 
 
 def test_leave_clean_stop_alone():
     # a clean exit (operator Stop / max-iterations) sets status="stopped" -> do NOT restart
     assert monitor.should_restart(running=False, hb={"status": "stopped"}, paused=False, stop_pending=False) is False
+
+
+def test_leave_error_state_for_supervisor():
+    # an error state (halt-on-revert-failure, missing key, dirty base) needs operator/supervisor
+    # attention — a blind restart just re-hits it, so the watchdog leaves it alone.
+    assert monitor.should_restart(running=False, hb={"status": "error"}, paused=False, stop_pending=False) is False
 
 
 def test_never_restart_running():

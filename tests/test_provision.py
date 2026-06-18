@@ -281,6 +281,22 @@ def test_mark_backlog_done_ticks_item_and_advances(tmp_path, monkeypatch):
     assert bl.read_text(encoding="utf-8") == txt
 
 
+def test_note_deviation_defers_item_after_limit(tmp_path, monkeypatch):
+    # the agent keeps shipping something OTHER than the named item -> after `limit` deviations the
+    # item is deferred to the bottom so the loop advances (instead of re-shipping unrelated PRs).
+    m = _load_runner()
+    bl = tmp_path / "backlog.md"
+    bl.write_text("# x backlog\n\n- [ ] target item\n- [ ] next item\n", encoding="utf-8")
+    monkeypatch.setattr(m, "BACKLOG", bl)
+    m._deviation_counts.clear()
+    for _ in range(2):
+        m._note_deviation("target item", limit=3)
+    assert m._top_backlog_item()[0] == "target item"        # not deferred yet (< limit)
+    m._note_deviation("target item", limit=3)               # 3rd deviation -> defer
+    txt = bl.read_text(encoding="utf-8")
+    assert "(deferred" in txt and m._top_backlog_item()[0] == "next item"
+
+
 def test_split_item_status_marks_deviation_and_strips_marker():
     m = _load_runner()
     s, dev = m._split_item_status("Implemented the named item.\nITEM-STATUS: done")

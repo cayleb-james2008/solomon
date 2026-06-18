@@ -77,12 +77,25 @@ def diagnose(repo):
                               ["attempt a reset of the base branch to origin", "else manual cleanup"], False)
     elif status == "error" and phase == "preflight" and "dirty" in summary.lower():
         cat, ev, rec, safe = "dirty_tree", summary[:160], ["reset the base branch to origin"], True
+    elif status == "error" and phase == "preflight" and (
+            "out-of-band" in summary.lower() or "refusing to hard-reset" in summary.lower()):
+        # the never-hand-patched keystone refused to hard-reset a base ahead of origin (an operator
+        # hand-patch or a dead run's local commit). The runner reports it but keeps spinning the same
+        # refusal every iteration; without this branch diagnose() called it 'ok' (reported healthy
+        # while wedged). Surface + escalate so the operator pushes or reverts.
+        cat, ev, rec, safe = ("base_out_of_band", summary[:200],
+                              ["base has un-pushed / out-of-band commits — push or revert them "
+                               "(the loop changes a repo only via gated PRs)"], False)
     elif has_lock and not running:
         cat, ev, rec, safe = "stale_lock", "lock file present but no live improver PID", ["clear the stale lock"], True
     elif has_stop and not running:
         cat, ev, rec, safe = "stop_lingering", "stop sentinel present, no live loop", ["clear the stop sentinel"], True
-    elif running and phase == "implement" and _stale(hb, repo):
-        cat, ev, rec, safe = "stuck", "no heartbeat update for a long time while implementing", ["stop and restart the loop"], True
+    elif running and phase not in (None, "sleep") and _stale(hb, repo):
+        # a hang can freeze the heartbeat in ANY active phase (test/commit/ship/pr/merge — e.g. a
+        # gate or gh call that wedges), not only 'implement'. Any non-sleep phase that goes stale
+        # while the process is still alive is stuck.
+        cat, ev, rec, safe = ("stuck", f"no heartbeat update for a long time while in phase '{phase}'",
+                              ["stop and restart the loop"], True)
     elif len(hist) >= 3 and all(r.get("status") in ("reverted", "error") for r in hist[-3:]):
         cat, ev, rec, safe = ("gate_red_streak", "last 3 iterations reverted/errored — the gate keeps failing",
                               ["run a Solomon fix-session (opt-in)"], False)
@@ -120,6 +133,10 @@ def _suggested_steps(repo, cat):
     if cat == "stuck":
         return [cd, "# find the hung improver PID then stop it manually (Solomon will not force-kill):",
                 "taskkill /F /T /PID <pid>   # Windows", "# or:  kill <pid>   # Unix"]
+    if cat == "base_out_of_band":
+        return [cd, f"git log origin/{base}..{base} --oneline   # the un-pushed / out-of-band commits",
+                f"git push origin {base}                  # if they're wanted, OR (destructive):",
+                f"git reset --hard origin/{base}           # discard them — the loop ships only via gated PRs"]
     if cat == "ci_red_streak":
         return [cd, "gh pr list --state open            # the CI-red rsi/* PRs that won't merge",
                 "gh pr checks <number>                  # which check failed",

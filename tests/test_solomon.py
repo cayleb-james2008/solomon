@@ -101,6 +101,27 @@ def test_diagnose_no_key(tmp_path, monkeypatch):
     assert d["category"] == "no_key" and not d["auto_safe"]
 
 
+def test_diagnose_base_out_of_band(tmp_path, monkeypatch):
+    # the never-hand-patched keystone refused to hard-reset an out-of-band base; must be surfaced
+    # (escalate), not reported healthy while the loop spins the same refusal.
+    rt = _rt(tmp_path, monkeypatch)
+    _hb(rt, status="error", phase="preflight",
+        last_summary="main has 2 commit(s) not on origin (out-of-band / un-pushed base change). "
+                      "Refusing to hard-reset — push or revert them")
+    d = solomon.diagnose(_repo(tmp_path))
+    assert d["category"] == "base_out_of_band" and not d["auto_safe"]
+
+
+def test_diagnose_stuck_covers_any_active_phase(tmp_path, monkeypatch):
+    # a hang in test/commit/ship/pr/merge (not just implement) that goes stale while alive is stuck.
+    rt = _rt(tmp_path, monkeypatch)
+    monkeypatch.setattr(control, "is_running", lambda repo: True)
+    (rt / "lock").write_text("1", encoding="utf-8")
+    _hb(rt, status="iterating", phase="test", updated_at="2020-01-01T00:00:00Z")  # ancient -> stale
+    d = solomon.diagnose(_repo(tmp_path))
+    assert d["category"] == "stuck" and d["auto_safe"]
+
+
 def test_anti_thrash_flips_to_escalate(tmp_path, monkeypatch):
     rt = _rt(tmp_path, monkeypatch)
     (rt / "lock").write_text("999999", encoding="utf-8")

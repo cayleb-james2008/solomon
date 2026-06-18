@@ -43,14 +43,18 @@ def should_restart(running: bool, hb: dict, paused: bool, stop_pending: bool) ->
     """Restart only a CRASHED loop. Pure (no IO) so the decision is unit-tested directly.
 
     True iff: not running, NOT explicitly paused, NO pending stop sentinel, and the repo has a
-    heartbeat whose status is not the clean-exit ``"stopped"``. A repo that never ran (no
-    heartbeat) is left alone — the watchdog keeps enabled loops alive, it does not auto-enable
-    new ones."""
+    heartbeat whose status is a LIVE phase (iterating/sleeping/idle) — i.e. it died unexpectedly.
+    Left alone:
+      - ``"stopped"`` — a clean exit (operator Stop / max-iterations);
+      - ``"error"``   — a state that needs operator/supervisor attention (a halt on revert failure,
+                        a missing key, a dirty base, an out-of-band base move); a blind restart would
+                        just re-hit the error, so the supervisor escalates it instead;
+      - no heartbeat  — a repo that never ran (the watchdog keeps enabled loops alive, it does not
+                        auto-enable new ones)."""
     if running or paused or stop_pending:
         return False
-    if not hb:
-        return False
-    return hb.get("status") != "stopped"
+    status = (hb or {}).get("status")
+    return bool(status) and status not in ("stopped", "error")
 
 
 def _auto_push() -> bool:

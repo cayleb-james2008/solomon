@@ -66,6 +66,7 @@ PI_MODEL = "kimi-k2.7-code"
 
 SHIP = "pr"           # local|push|pr|auto-merge — set from --ship
 GATE_CMD = ""         # optional custom shell test-command — set from --gate (empty = built-in pytest)
+GATE_TIMEOUT = 900    # seconds before a hung gate is force-failed (so it can't freeze the loop)
 REASONING = ""        # pi --thinking level (off|minimal|low|medium|high|xhigh) — set from --reasoning
 GOAL = ""             # operator north-star goal, weighted heavily into every task — set from --goal
 BEAUTIFY = False      # one docs-only beautify pass — set from --beautify (skips the gate)
@@ -155,6 +156,11 @@ _hb = {
     "iteration": 0, "goal": None, "model": PI_MODEL, "tests": None, "last_pr": None,
     "last_summary": None, "started_at": None, "updated_at": None, "log_tail": [],
 }
+
+# Set True when an iteration could not revert its branch (a known-bad tree): the loop HALTS rather
+# than letting the next preflight bulldoze it, and keeps its status=error so the supervisor escalates
+# (revert_failed) and the watchdog does not blindly restart it.
+_HALTED = False
 
 
 # ---- time / env -----------------------------------------------------------
@@ -369,6 +375,8 @@ def _drop_branch(branch: str, phase: str, summary: str, status: str = "sleeping"
         heartbeat(status=status, phase=phase, last_summary=summary)
         _record_history(phase, branch, summary)
     else:
+        global _HALTED
+        _HALTED = True                     # halt the loop — don't bulldoze a known-bad tree next preflight
         heartbeat(status="error", phase="reverted",
                   last_summary=f"REVERT FAILED — {branch} needs manual cleanup before the loop "
                                f"can safely continue. {summary}")
@@ -456,19 +464,31 @@ def run_gate() -> tuple:
 
     If a custom GATE_CMD was supplied (--gate), run THAT via the shell in REPO;
     green = returncode 0 (pytest-style N passed/failed parsed when present, else
-    passed/failed=0). Otherwise run the built-in pytest gate."""
-    if GATE_CMD:
-        # GATE_CMD is a TRUSTED, operator-only shell command (set via repos.json / the Config UI). It is
-        # intentionally run with shell=True because real gates use compound syntax (`a && b`, pipes,
-        # `-s tests -t tests`). It is never agent- or PR-derived; do not feed untrusted input to --gate.
-        p = subprocess.run(GATE_CMD, shell=True, cwd=REPO, capture_output=True,
-                           text=True, env=_clean_env(), creationflags=_NO_WINDOW)
-    else:
-        py = str(VENV_PY) if VENV_PY.exists() else sys.executable
-        # `-o addopts=` clears any repo ini addopts (e.g. a stray `-q`, which combined with
-        # our own would become `-qq` and SUPPRESS the "N passed" summary line we parse below).
-        p = subprocess.run([py, "-m", "pytest", "-o", "addopts="], cwd=REPO, capture_output=True,
-                           text=True, env=_clean_env(), creationflags=_NO_WINDOW)
+    passed/failed=0). Otherwise run the built-in pytest gate.
+
+    A hung gate (an infinite loop in a test, a test that waits on input) would otherwise
+    freeze the iteration forever with the lock held; GATE_TIMEOUT bounds it — on timeout the
+    gate is reported RED so the iteration reverts instead of hanging."""
+    try:
+        if GATE_CMD:
+            # GATE_CMD is a TRUSTED, operator-only shell command (set via repos.json / the Config UI).
+            # It is intentionally run with shell=True because real gates use compound syntax (`a && b`,
+            # pipes, `-s tests -t tests`). It is never agent- or PR-derived; do not feed untrusted --gate.
+            p = subprocess.run(GATE_CMD, shell=True, cwd=REPO, capture_output=True,
+                               text=True, env=_clean_env(), creationflags=_NO_WINDOW, timeout=GATE_TIMEOUT)
+        else:
+            py = str(VENV_PY) if VENV_PY.exists() else sys.executable
+            # `-o addopts=` clears any repo ini addopts (e.g. a stray `-q`, which combined with
+            # our own would become `-qq` and SUPPRESS the "N passed" summary line we parse below).
+            p = subprocess.run([py, "-m", "pytest", "-o", "addopts="], cwd=REPO, capture_output=True,
+                               text=True, env=_clean_env(), creationflags=_NO_WINDOW, timeout=GATE_TIMEOUT)
+    except subprocess.TimeoutExpired as e:
+        partial = ((e.stdout or "") if isinstance(e.stdout, str) else "") + \
+                  ((e.stderr or "") if isinstance(e.stderr, str) else "")
+        log(f"gate TIMED OUT after {GATE_TIMEOUT}s — reporting RED so the iteration reverts")
+        tests = {"passed": 0, "failed": 0, "errors": 1, "skipped": 0, "collected": 0,
+                 "green": False, "timeout": True}
+        return False, tests, (partial + f"\n[gate timed out after {GATE_TIMEOUT}s]")[-1500:]
     out = (p.stdout or "") + (p.stderr or "")
 
     def _n(pat):
@@ -600,6 +620,23 @@ def _note_noop(goal: str, limit: int = 3) -> None:
         if _defer_backlog_item(goal):
             log(f"item noop'd {limit}x — deferred to bottom of backlog: {goal[:60]}")
         _noop_counts[goal] = 0
+
+
+_deviation_counts: dict = {}   # per-goal consecutive-deviation tally, for this loop process's lifetime
+
+
+def _note_deviation(goal: str, limit: int = 3) -> None:
+    """Track consecutive iterations where the agent DEVIATED from a backlog goal (shipped a real
+    change, but to something OTHER than the named item). Deviations don't tick the item and aren't
+    noops, so without this the loop re-selects the same item forever and keeps shipping unrelated PRs
+    under its name. After `limit` deviations, defer the item so the loop ADVANCES."""
+    if not goal or BEAUTIFY or SOLOMON or goal.lower() == "model-chosen improvement":
+        return
+    _deviation_counts[goal] = _deviation_counts.get(goal, 0) + 1
+    if _deviation_counts[goal] >= limit:
+        if _defer_backlog_item(goal):
+            log(f"item deviated {limit}x — deferred to bottom of backlog: {goal[:60]}")
+        _deviation_counts[goal] = 0
 
 
 def _defer_backlog_item(goal: str) -> bool:
@@ -927,8 +964,11 @@ def one_iteration() -> None:
     # FAILURE or an auto-merge PR left un-merged on red CI (item lost without landing), and never
     # when the agent DEVIATED to a different change (the item didn't ship under its own name).
     landed = _ship_succeeded(pr)
-    if not BEAUTIFY and not SOLOMON and landed and not item_deviated:
-        _mark_backlog_done(goal)
+    if not BEAUTIFY and not SOLOMON and landed:
+        if item_deviated:
+            _note_deviation(goal)         # defer the item if the agent keeps shipping something ELSE
+        else:
+            _mark_backlog_done(goal)
     heartbeat(status="sleeping", phase="sleep", last_pr=pr, last_summary=summary)
     # 'shipped' only when the change actually landed (or is in-flight to merge); an auto-merge PR
     # left un-merged on red/awaiting CI, or a failed push, records 'blocked' so it is not counted as
@@ -1363,6 +1403,10 @@ def main(argv=None) -> int:
                 log("stop flag set — exiting")
                 break
             one_iteration()
+            if _HALTED:
+                log("halted after an unrecoverable revert failure — operator action required "
+                    "(the repo is left at status=error/reverted for the supervisor to escalate)")
+                break
             if a.once:
                 break
             if a.max_iterations and _hb["iteration"] >= a.max_iterations:
@@ -1375,7 +1419,10 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         log("interrupted")
     finally:
-        heartbeat(status="stopped", phase=None)
+        # Preserve the error/reverted heartbeat on a halt so the supervisor still diagnoses
+        # revert_failed (and the watchdog leaves it alone); a normal exit reports 'stopped'.
+        if not _HALTED:
+            heartbeat(status="stopped", phase=None)
         release_lock()
         try:
             STOP.unlink()
