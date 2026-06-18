@@ -332,3 +332,37 @@ _Adversarial multi-agent review (7 dimensions + verify), 53 unique findings. Gen
 - **problem:** The runner's preflight counts `rev-list --count origin/BASE..BASE` (any ahead commit refuses). reset_to_base instead checks `log --oneline origin/BASE..BASE` non-empty. These usually agree, but reset_to_base runs `git fetch` only AFTER the ahead-check (line 1253), so on first invocation origin/BASE may be a stale ref: a base that was actually fast-forwarded to match a freshly-pushed origin can still show as 'ahead' against the stale local origin ref, causing reset_to_base to refuse with 'un-pushed commits' and escalate spuriously � or, conversely, miss genuinely un-pushed commits if origin/BASE is stale-ahead. The runner's preflight correctly fetches BEFORE counting (line 735); reset_to_base does not, so the supervisor's recovery and the runner's guard can disagree on whether the base is safe to reset.
 - **fix:** Run `git fetch origin` before the un-pushed-commit check in reset_to_base, matching the runner's preflight ordering, so the guard compares against current origin truth.
 
+
+---
+
+## Remediation status (2026-06-18 overnight session)
+
+**Fixed + tested this session (committed to Solomon; 134 tests green):**
+- Lock TOCTOU double-runner; release_lock steal; Start revokes live Stop.
+- reset_to_base destroying uncommitted operator WIP (watchdog-safety keystone).
+- Dirty-tree wedge: skip only on the BASE branch; auto-heal dead-run rsi/* litter.
+- Ship-accounting: tick only a LANDED ship; auto-merge CI-red records 'blocked' (not 'shipped'),
+  ship=push ticks on a verified push; STOP during the CI poll no longer merges an un-CI'd PR.
+- Anti-gaming: stage before the diff (catch skips in NEW untracked tests); collected-count rail;
+  broadened skip-form detection.
+- Wedge/hang detection: gate timeout; 'stuck' covers any active phase; 'base_out_of_band' diagnosis;
+  deviation deferral; revert-failure HALT; watchdog leaves 'error' states for the supervisor.
+- Supervisor: ci_red_streak escalation; fix-session honors auto_push (effective_ship).
+- Robustness: atomic repos.json write; pytest scoped to tests/; gitignore relocated repo clones.
+- New: overnight watchdog (monitor.py + SolomonWatchdog scheduled task) restarts crashed loops.
+
+**Deferred (documented for a follow-up session — higher blast-radius / lower urgency):**
+- **PID-reuse identity token** (HIGH): `_pid_alive` only checks PID existence; a reused PID can pin a
+  dead loop "running" forever or let `clear_lock` remove a fresh lock. Robust fix needs a run-id token
+  (PID + creation-time, or a heartbeat run-id) cross-checked in is_running/clear_lock/acquire_lock —
+  invasive; partial fixes risk new wedges, so left whole.
+- **Supervisor holds the runner's single-flight lock during git mutation** (HIGH): recover() guards
+  with a non-atomic `is_running()` check rather than acquiring the lock; a race with a starting
+  iteration is possible. Needs the supervisor to acquire/release runtime/<name>/lock around recovery.
+- **`git clean -fd` in preflight deletes operator UNTRACKED files on base** (MEDIUM): intentional
+  dropped-iteration cleanup, but it can eat operator scratch files. Scope it to rsi/* branches or
+  skip+escalate when untracked non-ignored files look operator-authored.
+- **gate_red_streak anti-thrash ceiling** (MEDIUM): a fix-session can respawn each sweep under
+  auto_ai_fix+unattended (the unattended watchdog uses allow_pi=False, so it escalates — not affected).
+- **push-unverified should block PR-open / surface an error** (MEDIUM); **first-Start stale-dict gate**
+  (MEDIUM, config drift); **bare loaded-key redaction + parser nits** (LOW).
