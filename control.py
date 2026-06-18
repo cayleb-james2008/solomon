@@ -657,6 +657,16 @@ def start(repo, auto_push=True, once=False):
     prov = ensure_contracts(repo)          # auto-provision the agent contract before the first loop
     if not prov.get("ok"):
         return {"ok": False, "error": prov["error"]}
+    # ensure_contracts may have just auto-set the gate (via set_repo_config -> repos.json) when the
+    # operator hadn't set one. The `repo` dict passed in is now STALE — project_gate(repo) would still
+    # be '' and the runner would be spawned with the built-in pytest gate, which reds out every
+    # iteration on a non-pytest project (e.g. unittest-only) until the operator stop+restarts. Re-read
+    # the live config so the freshly-detected gate is used on the very first launch.
+    if prov.get("gate_set"):
+        for r in load_repos():
+            if _repo_name(r) == _repo_name(repo):
+                repo = r
+                break
 
     if is_running(repo):
         hb = read_heartbeat(repo) or {}
@@ -1369,6 +1379,11 @@ def reset_to_base(repo):
                              "(won't auto-discard operator work; commit or stash first)"}
         has_origin = g("remote", "get-url", "origin").returncode == 0
         if has_origin:
+            # fetch BEFORE the un-pushed check so origin/{base} is current truth — the runner's
+            # preflight fetches before counting too; without this a stale local origin ref can make
+            # reset_to_base spuriously refuse ("un-pushed") on a base that already matches origin,
+            # or miss genuinely un-pushed commits if origin/{base} is stale-ahead.
+            g("fetch", "origin", "--quiet")
             ahead = g("log", "--oneline", f"origin/{base}..{base}")
             if ahead.returncode == 0 and (ahead.stdout or "").strip():
                 return {"ok": False,
@@ -1379,7 +1394,6 @@ def reset_to_base(repo):
                     "error": (co.stderr or co.stdout or f"checkout {base} failed").strip()[:200]}
         g("reset", "--hard")
         if has_origin:
-            g("fetch", "origin", "--quiet")
             g("reset", "--hard", f"origin/{base}")
     except OSError as e:
         return {"ok": False, "error": str(e)}
