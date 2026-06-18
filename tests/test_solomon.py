@@ -101,6 +101,30 @@ def test_diagnose_no_key(tmp_path, monkeypatch):
     assert d["category"] == "no_key" and not d["auto_safe"]
 
 
+def test_solomon_fix_session_honors_auto_push(tmp_path, monkeypatch):
+    # a fix-session must ship LOCAL-only when the global auto_push gate is off (no push/merge),
+    # and the repo's configured ship mode when it's on.
+    monkeypatch.setattr(control, "HERE", str(tmp_path))
+    (tmp_path / "improver").mkdir()
+    (tmp_path / "improver" / "run_improver.py").write_text("", encoding="utf-8")
+    pyfake = tmp_path / "py.exe"
+    pyfake.write_text("", encoding="utf-8")
+    monkeypatch.setattr(control, "_venv_python", lambda repo: str(pyfake))
+    captured = {}
+
+    class _P:
+        pid = 123
+
+    monkeypatch.setattr(solomon.subprocess, "Popen", lambda args, **k: captured.update(args=args) or _P())
+    repo = {"name": "x", "path": str(tmp_path), "ship": "auto-merge"}
+    solomon.solomon_fix_session(repo, auto_push=False)
+    a = captured["args"]
+    assert a[a.index("--ship") + 1] == "local"        # gate off -> local, never push/merge
+    solomon.solomon_fix_session(repo, auto_push=True)
+    a = captured["args"]
+    assert a[a.index("--ship") + 1] == "auto-merge"    # gate on -> the repo's configured ship mode
+
+
 def test_diagnose_base_out_of_band(tmp_path, monkeypatch):
     # the never-hand-patched keystone refused to hard-reset an out-of-band base; must be surfaced
     # (escalate), not reported healthy while the loop spins the same refusal.
@@ -239,7 +263,8 @@ def test_recover_gate_red_streak_optin(tmp_path, monkeypatch):
     _hb(rt, status="sleeping")
     _hist(rt, [{"status": "reverted"}, {"status": "reverted"}, {"status": "reverted"}])
     calls = []
-    monkeypatch.setattr(solomon, "solomon_fix_session", lambda repo: (calls.append(repo), {"ok": True, "pid": 1})[1])
+    monkeypatch.setattr(solomon, "solomon_fix_session",
+                        lambda repo, auto_push=True: (calls.append(repo), {"ok": True, "pid": 1})[1])
     # without allow_pi -> escalate, no spawn
     res = solomon.recover(_repo(tmp_path), allow_pi=False)
     assert res["escalate"] and calls == []
@@ -291,7 +316,7 @@ def test_auto_ai_fix_only_on_unattended_sweep(monkeypatch):
     monkeypatch.setattr(app.control, "load_repos", lambda: [fake])
     seen = {}
     monkeypatch.setattr(solomon, "recover",
-                        lambda repo, allow_pi=False, allow_restart=True:
+                        lambda repo, allow_pi=False, allow_restart=True, auto_push=True:
                         (seen.__setitem__("allow_pi", allow_pi),
                          {"ok": True, "category": "ok", "actions_taken": [], "escalate": False, "message": "x"})[1])
     api.supervise("z", allow_pi=False)                      # manual button: global must NOT auto-fire a pi fix
