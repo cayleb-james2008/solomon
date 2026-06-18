@@ -585,13 +585,7 @@ def start(repo, auto_push=True, once=False):
     rsi = _runtime_dir(repo)
     if not rsi:
         return {"ok": False, "error": "repo has no 'path'"}
-    # Clear any stop sentinel FIRST (idempotent) so a Start ALWAYS means "do not stop" —
-    # even if a Stop is still pending against a loop that's mid-iteration.
     os.makedirs(rsi, exist_ok=True)
-    try:
-        os.remove(os.path.join(rsi, "stop"))
-    except OSError:
-        pass
 
     prov = ensure_contracts(repo)          # auto-provision the agent contract before the first loop
     if not prov.get("ok"):
@@ -600,6 +594,15 @@ def start(repo, auto_push=True, once=False):
     if is_running(repo):
         hb = read_heartbeat(repo) or {}
         return {"ok": True, "pid": hb.get("pid"), "already": True}
+
+    # Only NOW (we are about to spawn a fresh runner) clear any stop sentinel, so a Start that
+    # actually starts means "run". Doing this BEFORE the is_running check — as the old code did —
+    # silently revoked a pending Stop against a LIVE loop that hadn't yet polled the sentinel
+    # (violating the halt-switch invariant "Start must not silently revoke a live stop").
+    try:
+        os.remove(os.path.join(rsi, "stop"))
+    except OSError:
+        pass
 
     py = _venv_python(repo)
     runner = os.path.join(HERE, "improver", "run_improver.py")
