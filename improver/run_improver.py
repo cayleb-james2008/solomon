@@ -286,7 +286,10 @@ def _github_ready() -> tuple:
 
 
 def tree_dirty() -> bool:
-    return bool(git("status", "--porcelain").stdout.strip())
+    """True if the operator has uncommitted changes to TRACKED files — work the loop must not clobber.
+    Untracked files are NOT counted: they're typically leftovers from a dropped iteration, and the
+    preflight `git clean -fd` removes them (so a stray file can't wedge the loop forever)."""
+    return bool(git("status", "--porcelain", "--untracked-files=no").stdout.strip())
 
 
 def head_sha() -> str:
@@ -645,7 +648,9 @@ def one_iteration() -> None:
                   last_summary=f"Could not checkout {BASE_BRANCH}: {(co.stderr or '').strip()[:200]}")
         log(f"checkout {BASE_BRANCH} failed — skipping iteration")
         return
-    git("reset", "--hard")  # drop any leftover working-tree changes from a dead run
+    git("reset", "--hard")    # drop tracked changes from a dead run
+    git("clean", "-fd")       # remove UNTRACKED leftovers (e.g. a test a dropped iteration created)
+                              # — non-ignored only, so .venv/data/dist survive; keeps the base clean
     if has_remote():
         git("fetch", "origin", "--quiet")
         # never-hand-patched keystone (enforced, not prose): REFUSE to adopt a base that moved
