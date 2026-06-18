@@ -43,18 +43,23 @@ def should_restart(running: bool, hb: dict, paused: bool, stop_pending: bool) ->
     """Restart only a CRASHED loop. Pure (no IO) so the decision is unit-tested directly.
 
     True iff: not running, NOT explicitly paused, NO pending stop sentinel, and the repo has a
-    heartbeat whose status is a LIVE phase (iterating/sleeping/idle) — i.e. it died unexpectedly.
-    Left alone:
-      - ``"stopped"`` — a clean exit (operator Stop / max-iterations);
-      - ``"error"``   — a state that needs operator/supervisor attention (a halt on revert failure,
-                        a missing key, a dirty base, an out-of-band base move); a blind restart would
-                        just re-hit the error, so the supervisor escalates it instead;
-      - no heartbeat  — a repo that never ran (the watchdog keeps enabled loops alive, it does not
-                        auto-enable new ones)."""
+    heartbeat whose status is anything except a deliberate stop/halt. Restarted: a live-phase crash
+    (iterating/sleeping/idle) AND a transient/retryable error (e.g. a flaky red base gate). Left alone:
+      - ``"stopped"``                  — a clean exit (operator Stop / max-iterations);
+      - ``"error"`` + ``phase=reverted`` — a revert-failure HALT that needs operator cleanup (a blind
+                                          restart just re-hits the known-bad tree);
+      - no heartbeat                   — a repo that never ran (the watchdog keeps enabled loops
+                                          alive, it does not auto-enable new ones).
+    A persistent error (no key, dirty base) restarts, re-errors immediately, and the supervisor's
+    diagnose/anti-thrash escalates it — so it surfaces without the watchdog having to classify it."""
     if running or paused or stop_pending:
         return False
     status = (hb or {}).get("status")
-    return bool(status) and status not in ("stopped", "error")
+    if not status or status == "stopped":
+        return False
+    if status == "error" and (hb or {}).get("phase") == "reverted":
+        return False                     # the revert-failure HALT — operator cleanup, not a restart
+    return True
 
 
 def _auto_push() -> bool:
