@@ -182,3 +182,88 @@ def test_cross_repo_gate_uses_dep_gate_command(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "NAME", "a")
     res = m._run_cross_repo_gates({})
     assert res["ok"] is True                       # the cross-repo gate used b's (green) gate, not a's
+
+
+# ---- history records the cross-repo outcome on revert (MEDIUM review finding) --------------
+# Bug: the cross-repo revert path built a `_hb_cross` dict (with cross_repo_gates results) but
+# never passed it to _record_history, so the reverted history line lost the cross-repo diagnostic.
+# Fix: _record_history gained an optional `extra` kwarg that MERGES into the record; the revert
+# path threads the cross-repo results in via extra={"cross_repo_gates": ...}.
+
+
+def test_record_history_merges_extra_dict(tmp_path, monkeypatch):
+    """_record_history(status, branch, summary, extra={...}) MERGES the extra fields into the history
+    line so the cross-repo gate results (and any other per-outcome diagnostic) land in history.jsonl.
+    Existing callers that omit `extra` are unchanged."""
+    m = _load_runner()
+    rt = tmp_path / "rt"
+    monkeypatch.setattr(m, "RUNTIME", rt)
+    m._hb["iteration"] = 7
+    m._hb["tests"] = {"passed": 5, "failed": 0}
+    m._hb["last_pr"] = None
+
+    cross = {"b": {"green": False, "tests": {"passed": 0, "failed": 1}, "tail": "boom"}}
+    m._record_history("reverted", "rsi/iter-x", "Reverted — cross-repo gate RED on dep 'b'.",
+                      extra={"cross_repo_gates": cross})
+
+    import json as _json
+    lines = (rt / "history.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    rec = _json.loads(lines[0])
+    assert rec["status"] == "reverted"
+    assert rec["branch"] == "rsi/iter-x"
+    assert rec["iteration"] == 7
+    assert rec["tests"] == {"passed": 5, "failed": 0}
+    # the diagnostic must be present on the reverted line (the fix — the bug dropped it)
+    assert rec["cross_repo_gates"] == cross
+    assert rec["cross_repo_gates"]["b"]["green"] is False
+
+
+def test_record_history_unchanged_when_extra_omitted(tmp_path, monkeypatch):
+    """Backward compatibility: callers that omit `extra` produce the same record shape as before
+    (no extra key, no crash)."""
+    m = _load_runner()
+    rt = tmp_path / "rt"
+    monkeypatch.setattr(m, "RUNTIME", rt)
+    m._hb["iteration"] = 1
+
+    m._record_history("shipped", "rsi/iter-y", "landed")
+
+    import json as _json
+    rec = _json.loads((rt / "history.jsonl").read_text(encoding="utf-8").strip())
+    assert rec["status"] == "shipped"
+    assert rec["branch"] == "rsi/iter-y"
+    assert "cross_repo_gates" not in rec           # no extra -> no new key
+
+
+def test_cross_repo_revert_records_gates_in_history(tmp_path, monkeypatch):
+    """End-to-end of the revert path's history wiring: a cross-repo gate RED must record the per-dep
+    results on the 'reverted' history line (the live bug — _hb_cross was built but never used)."""
+    m = _load_runner()
+    a = _mk_repo(tmp_path / "a")
+    b = _mk_repo(tmp_path / "b")
+    repos_json = tmp_path / "repos.json"
+    repos_json.write_text(json.dumps([
+        {"name": "a", "path": str(a), "cross_repo_deps": ["b"]},
+        {"name": "b", "path": str(b), "gate": "exit 1"},      # dep always red -> revert path
+    ]), encoding="utf-8")
+    rt = tmp_path / "rt"
+    monkeypatch.setattr(m, "CONTROL", tmp_path)
+    monkeypatch.setattr(m, "REPO", a)
+    monkeypatch.setattr(m, "NAME", "a")
+    monkeypatch.setattr(m, "RUNTIME", rt)
+
+    # drive the exact revert path: run the cross-repo gates, then record history the way the
+    # runner does on a RED dep (this mirrors lines ~1693-1704 of run_improver.py).
+    xrec = {}
+    xres = m._run_cross_repo_gates(xrec)
+    assert xres["ok"] is False and xres["failed_repo"] == "b"
+    summary = f"Reverted — cross-repo gate RED on dep 'b'. summary"
+    m._record_history("reverted", "rsi/iter-z", summary,
+                      extra={"cross_repo_gates": xrec.get("cross_repo_gates", {})})
+
+    import json as _json
+    rec = _json.loads((rt / "history.jsonl").read_text(encoding="utf-8").strip())
+    assert rec["status"] == "reverted"
+    assert "b" in rec["cross_repo_gates"]
+    assert rec["cross_repo_gates"]["b"]["green"] is False   # the failing dep's outcome survived
