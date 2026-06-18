@@ -415,9 +415,21 @@ def _github_ready() -> tuple:
 
 def tree_dirty() -> bool:
     """True if the operator has uncommitted changes to TRACKED files — work the loop must not clobber.
-    Untracked files are NOT counted: they're typically leftovers from a dropped iteration, and the
-    preflight `git clean -fd` removes them (so a stray file can't wedge the loop forever)."""
+    Untracked files are NOT counted here (a separate _untracked_non_ignored_files() guard protects them
+    from the preflight clean — see one_iteration)."""
     return bool(git("status", "--porcelain", "--untracked-files=no").stdout.strip())
+
+
+def _untracked_non_ignored_files() -> list:
+    """Non-ignored UNTRACKED files in the working tree (git '??' entries). These are either operator
+    scratch files (a new test, a not-yet-added module) or a dead run's leftovers — indistinguishable
+    after a checkout, and ALL of them are potential operator work the loop must not silently delete.
+    Pure (delegates to git()) so the guard rule is unit-testable without a real repo."""
+    out = []
+    for line in (git("status", "--porcelain", "--untracked-files=normal").stdout or "").splitlines():
+        if line.startswith("?? "):
+            out.append(line[3:].strip())
+    return out
 
 
 def _dirty_blocks_iteration(dirty: bool, cur_branch: str, base_branch: str) -> bool:
@@ -981,8 +993,24 @@ def one_iteration() -> None:
         log(f"checkout {BASE_BRANCH} failed — skipping iteration")
         return
     git("reset", "--hard")    # drop tracked changes from a dead run
-    git("clean", "-fd")       # remove UNTRACKED leftovers (e.g. a test a dropped iteration created)
-                              # — non-ignored only, so .venv/data/dist survive; keeps the base clean
+    # `git clean -fd` deletes ALL non-ignored untracked files — but on the base branch those files are
+    # either operator scratch work (a new test, a not-yet-added module) or a dead run's leftovers, and
+    # the two are indistinguishable after the checkout. Silently deleting operator files every iteration
+    # is a data-loss path that violates the never-discard-operator-work keystone. GUARD: if there are
+    # untracked non-ignored files, skip+escalate instead of cleaning (the operator commits/stashes/removes
+    # them; the loop self-resumes once the tree is clean). A dead run's leftovers are surfaced the same
+    # way — preserved, not destroyed. Only clean when there is nothing to destroy (a safe no-op).
+    untracked = _untracked_non_ignored_files()
+    if untracked:
+        heartbeat(status="error", phase="preflight",
+                  last_summary=f"Untracked non-ignored files on '{BASE_BRANCH}' would be deleted by "
+                               f"the preflight clean — the loop won't destroy possible operator work. "
+                               f"Commit, stash, or remove them: {', '.join(untracked[:8])}"
+                               + (f" (+{len(untracked)-8} more)" if len(untracked) > 8 else ""))
+        log(f"REFUSE preflight clean: {len(untracked)} untracked non-ignored file(s) on {BASE_BRANCH} "
+            f"— skip+escalate (won't destroy operator work)")
+        return
+    git("clean", "-fd")       # safe now: no untracked non-ignored files to destroy
     if has_remote():
         git("fetch", "origin", "--quiet")
         # never-hand-patched keystone (enforced, not prose): REFUSE to adopt a base that moved
