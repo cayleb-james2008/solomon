@@ -140,7 +140,7 @@ def test_load_repos_merges_discovery_and_json(tmp_path, monkeypatch):
 
 def test_project_provider_model_defaults():
     assert control.project_provider({}) == "ollama-cloud"
-    assert control.project_model({}) == "kimi-k2.7-code"
+    assert control.project_model({}) == "glm-5.2"
     assert control.project_provider({"provider": "openrouter"}) == "openrouter"
     assert control.project_model({"provider": "openrouter"}) == "qwen/qwen3-coder"
     assert control.project_model({"provider": "openrouter", "model": "x/y"}) == "x/y"
@@ -300,8 +300,8 @@ def test_project_pr_target_branch_default_and_override():
 
 
 def test_project_reasoning_default_and_override():
-    assert control.project_reasoning({}) == ""
-    assert control.project_reasoning(None) == ""
+    assert control.project_reasoning({}) == "xhigh"          # max reasoning by default
+    assert control.project_reasoning(None) == "xhigh"
     assert control.project_reasoning({"reasoning": "high"}) == "high"
 
 
