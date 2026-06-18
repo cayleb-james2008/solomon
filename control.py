@@ -16,6 +16,8 @@ import os
 import shutil
 import subprocess
 import sys
+import time
+import uuid
 from datetime import datetime, timezone
 
 def _base_dir():
@@ -1281,6 +1283,54 @@ def clear_lock(repo):
         return {"ok": True, "removed": True}
     except OSError as e:
         return {"ok": False, "error": str(e)}
+
+
+def acquire_supervisor_lock(repo):
+    """Take the repo's single-flight runtime lock for a git-mutating recovery (reset_to_base), so the
+    supervisor is mutually exclusive with a runner iteration — the SOLOMON_RSI 'supervisor holds the
+    runner's lock during recovery' invariant. Replaces a racy is_running() snapshot (a runner writes its
+    lock late in main(), a multi-second window where is_running is False). Returns (ok, token): ok False
+    means a LIVE runner holds the lock (caller escalates). Mirrors run_improver.acquire_lock's atomic
+    create + recycled/stale takeover. Release with release_supervisor_lock(repo, token)."""
+    rt = _runtime_dir(repo)
+    if not rt:
+        return False, None
+    os.makedirs(rt, exist_ok=True)
+    lock = os.path.join(rt, "lock")
+    token = "sup-" + uuid.uuid4().hex
+    content = f"{os.getpid()}\n{token}"
+    try:                                            # atomic exclusive create — no lock present at all
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(fd, content.encode("ascii"))
+        finally:
+            os.close(fd)
+        return True, token
+    except FileExistsError:
+        pass
+    if _lock_is_live(repo, rt):                     # a live runner holds it — do NOT mutate git under it
+        return False, None
+    try:                                            # stale/recycled lock — take it over, then verify we won
+        tmp = os.path.join(rt, f"lock.sup.{os.getpid()}.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp, lock)
+    except OSError:
+        return False, None
+    time.sleep(0.1)
+    return (_read_lock(rt)[1] == token), token
+
+
+def release_supervisor_lock(repo, token):
+    """Release a supervisor lock only if WE still hold it (its run-id equals `token`)."""
+    rt = _runtime_dir(repo)
+    if not rt or not token:
+        return
+    if _read_lock(rt)[1] == token:
+        try:
+            os.remove(os.path.join(rt, "lock"))
+        except OSError:
+            pass
 
 
 def reset_to_base(repo):

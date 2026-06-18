@@ -251,12 +251,18 @@ def recover(repo, allow_pi=False, allow_restart=True, auto_push=True):
             pass
         actions.append("clear_stop")
     elif cat == "dirty_tree":
-        # supervisor-authorized-recovery: never hard-reset git UNDER a live iteration (that dirty
-        # tree may be the running loop's in-progress work). Refuse + escalate while it's alive.
-        if control.is_running(repo):
+        # supervisor-authorized-recovery: HOLD the runner's single-flight lock so we never hard-reset
+        # git UNDER a live iteration (that dirty tree may be the running loop's in-progress work). The
+        # atomic lock acquire replaces the old racy is_running() snapshot — a runner writes its lock
+        # late in main(), a window where is_running() is False but a reset would still race it.
+        ok, token = control.acquire_supervisor_lock(repo)
+        if not ok:
             return _finish(repo, d, actions, escalate=True,
                            msg="loop is live — stop it before Solomon resets the working tree")
-        r = control.reset_to_base(repo)
+        try:
+            r = control.reset_to_base(repo)
+        finally:
+            control.release_supervisor_lock(repo, token)
         actions.append("reset_to_base")
         if not r.get("ok"):
             return _finish(repo, d, actions, escalate=True, msg=r.get("error"))
