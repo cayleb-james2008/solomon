@@ -88,7 +88,7 @@ def sweep() -> dict:
                            else f"restart {name} FAILED: {res.get('error')}")
         # RUNG-0 deterministic recovery (never a pi fix here: allow_pi=False)
         try:
-            rec = solomon.recover(r, allow_pi=False, allow_restart=auto_push)
+            rec = solomon.recover(r, allow_pi=False, allow_restart=auto_push, auto_push=auto_push)
             if rec.get("actions_taken"):
                 actions.append(f"{name} recover: {','.join(rec['actions_taken'])}")
             if rec.get("escalate"):

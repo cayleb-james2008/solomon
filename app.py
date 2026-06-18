@@ -217,8 +217,9 @@ class Api:
         if name is not None and not targets:
             return {"ok": False, "error": "unknown repo"}
         allow = bool(allow_pi) or (unattended and self.get_auto_ai_fix())
+        auto_push = self.get_auto_push()
         results = [{"name": r.get("name"),
-                    **solomon.recover(r, allow_pi=allow, allow_restart=self.get_auto_push())}
+                    **solomon.recover(r, allow_pi=allow, allow_restart=auto_push, auto_push=auto_push)}
                    for r in targets]
         return {"ok": True, "results": results}
 

@@ -191,10 +191,11 @@ def _finish(repo, d, actions, escalate, msg):
             "escalate": escalate, "message": msg}
 
 
-def solomon_fix_session(repo):
+def solomon_fix_session(repo, auto_push=True):
     """Spawn a one-shot, detached pi Solomon fix-session (run_improver.py --solomon). It runs through
     the normal branch + gate + PR path, so a Solomon fix is itself a reviewable PR — never a direct
-    write to base, never bypassing the gate or the operator's merge."""
+    write to base, never bypassing the gate or the operator's merge. Honors the global auto_push gate
+    (effective_ship): when auto_push is off the fix-session ships LOCAL only, never pushing/merging."""
     path, name = control._repo_path(repo), control._repo_name(repo)
     if not path or not name:
         return {"ok": False, "error": "repo has no name/path"}
@@ -209,7 +210,7 @@ def solomon_fix_session(repo):
         flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
     args = [py, runner, "--repo", path, "--name", name,
             "--provider", control.project_provider(repo), "--model", control.project_model(repo),
-            "--ship", control.project_ship(repo),
+            "--ship", control.effective_ship(repo, auto_push),
             "--pr-target-branch", control.project_pr_target_branch(repo),
             "--reasoning", control.project_reasoning(repo) or "", "--solomon"]
     try:
@@ -223,9 +224,10 @@ def solomon_fix_session(repo):
         return {"ok": False, "error": str(e)}
 
 
-def recover(repo, allow_pi=False, allow_restart=True):
+def recover(repo, allow_pi=False, allow_restart=True, auto_push=True):
     """Walk the recovery ladder for one repo. Returns
-    {ok, category, actions_taken:[...], escalate:bool, message}."""
+    {ok, category, actions_taken:[...], escalate:bool, message}. auto_push threads the global gate so
+    a restart / fix-session ships LOCAL-only when pushing is disabled."""
     d = diagnose(repo)
     cat = d["category"]
     if cat == "ok":
@@ -269,7 +271,7 @@ def recover(repo, allow_pi=False, allow_restart=True):
             return _finish(repo, d, actions, escalate=True,
                            msg="loop would not stop — manual kill required (Solomon will not force-kill)")
         if allow_restart:
-            control.start(repo)
+            control.start(repo, auto_push=auto_push)
             actions.append("restart")
     elif cat == "gate_red_streak":
         if not (allow_pi and control.keys_status().get(control.project_provider(repo))):
@@ -280,7 +282,7 @@ def recover(repo, allow_pi=False, allow_restart=True):
         if control.is_running(repo):
             return _finish(repo, d, actions, escalate=True,
                            msg="loop is live — stop it before running a Solomon fix-session")
-        r = solomon_fix_session(repo)
+        r = solomon_fix_session(repo, auto_push=auto_push)
         actions.append("solomon_fix_session")
         return _finish(repo, d, actions, escalate=not r.get("ok"),
                        msg=("launched Solomon fix-session" if r.get("ok") else r.get("error")))

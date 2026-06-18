@@ -240,8 +240,13 @@ def set_repo_config(name, provider=None, model=None, ship=None, gate=None,
     if goal is not None:
         entry["goal"] = goal
     try:
-        with open(REPOS_JSON, "w", encoding="utf-8") as f:
+        # atomic write (tmp + os.replace): a crash or a concurrent reader/writer must never see a
+        # half-written repos.json — a truncate-in-place that fails mid-write would drop EVERY repo's
+        # config. The operator may be editing this file in parallel, so never truncate in place.
+        tmp = REPOS_JSON + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(entries, f, indent=2)
+        os.replace(tmp, REPOS_JSON)
         return {"ok": True}
     except OSError as e:
         return {"ok": False, "error": str(e)}
