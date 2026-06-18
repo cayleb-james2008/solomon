@@ -370,3 +370,16 @@ def test_acquire_lock_creates_with_pid(tmp_path):
     assert m.acquire_lock() is True
     assert m.LOCK.read_text(encoding="utf-8").strip() == str(os.getpid())  # never created empty
     assert m.acquire_lock() is True                                        # idempotent for our own pid
+
+
+# --------------------------------------------------------------------------- #
+# WEDGE-1 — a dirty tree skips the iteration ONLY on the base branch. A dead run that died
+# mid-iteration leaves the tree dirty on an rsi/* branch; that must NOT wedge the loop forever
+# (it must fall through to the forced preflight reset that clears it).
+# --------------------------------------------------------------------------- #
+def test_dirty_blocks_only_on_base_branch():
+    m = _load_runner()
+    assert m._dirty_blocks_iteration(True, "main", "main") is True          # dirty base -> protect, skip
+    assert m._dirty_blocks_iteration(True, "rsi/iter-123", "main") is False  # dead-run leftover -> reset
+    assert m._dirty_blocks_iteration(True, "HEAD", "main") is False          # detached -> reset, don't wedge
+    assert m._dirty_blocks_iteration(False, "main", "main") is False         # clean -> never blocks

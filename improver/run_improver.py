@@ -330,6 +330,16 @@ def tree_dirty() -> bool:
     return bool(git("status", "--porcelain", "--untracked-files=no").stdout.strip())
 
 
+def _dirty_blocks_iteration(dirty: bool, cur_branch: str, base_branch: str) -> bool:
+    """Whether a dirty tree must SKIP the iteration. ONLY a dirty BASE branch is protected operator
+    work the loop must never clobber; a dirty ``rsi/*`` (or any non-base / detached) branch is a
+    previous run's mid-iteration leftover (a killed/crashed runner) that the forced preflight reset
+    clears — it must NOT wedge the loop forever (which it did: a dead run left the tree dirty on an
+    rsi/* branch and every subsequent start skipped on `tree_dirty()`). Pure so the rule is
+    unit-tested without a real repo."""
+    return dirty and cur_branch == base_branch
+
+
 def head_sha() -> str:
     return git("rev-parse", "HEAD").stdout.strip()
 
@@ -711,12 +721,15 @@ def one_iteration() -> None:
               else f"rsi/solomon-{_stamp()}" if SOLOMON
               else f"rsi/iter-{_stamp()}")
 
-    if tree_dirty():
+    cur_branch = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if _dirty_blocks_iteration(tree_dirty(), cur_branch, BASE_BRANCH):
         heartbeat(status="error", phase="preflight",
-                  last_summary="Working tree is dirty — commit or stash your changes; "
-                               "the loop resumes once it's clean.")
-        log("SKIP iteration: working tree dirty")
+                  last_summary=f"Working tree is dirty on the base branch '{BASE_BRANCH}' — commit or "
+                               "stash your changes; the loop won't clobber base-branch work.")
+        log(f"SKIP iteration: working tree dirty on base branch '{BASE_BRANCH}'")
         return
+    # (a dirty rsi/* or detached/other branch is a dead run's mid-iteration leftover — the forced
+    #  preflight reset below discards it, so a killed runner can't wedge the loop forever)
 
     # Robust preflight: a previous run that died mid-iteration can leave the repo on a stray
     # rsi/* branch with the base diverged from origin. FORCE back to the base branch and
