@@ -85,6 +85,13 @@ PROVISION_MD = HERE / "provision.md" # one-shot contract-generation system promp
 IDEATE_MD = HERE / "ideate.md"       # divergent ideation system prompt (anti-shallowness lane)
 SOLOMON_MD = HERE / "solomon.md"     # supervisor fix-session system prompt
 
+# Visual E2E review — boots the app in a sandbox after the gate passes, captures screenshots,
+# runs a vision agent, and produces one-time feedback for the next iteration.
+VISUAL_REVIEW_ENABLED = False         # set True when the repo's sandbox config is enabled
+SANDBOX_CONFIG = None                 # per-repo sandbox config (from repos.json)
+VISION_MODEL = ""                     # vision-capable model id for the visual reviewer
+LAST_VISUAL_FEEDBACK = ""             # one-time feedback from the previous iteration's review
+
 
 def configure(repo: str, name: str, provider: str = "ollama-cloud",
               model: str | None = None) -> None:
@@ -121,6 +128,7 @@ def _refresh_config_from_registry() -> None:
     interval / max_iterations are launch-owned too. Best-effort: any read/parse error keeps the current
     config (writes to repos.json are atomic, so a torn read is transient)."""
     global PI_PROVIDER, PI_MODEL, PI_EXT, GATE_CMD, REASONING, GOAL
+    global VISUAL_REVIEW_ENABLED, SANDBOX_CONFIG, VISION_MODEL
     try:
         rows = json.loads((CONTROL / "repos.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):       # ValueError covers json.JSONDecodeError
@@ -137,6 +145,17 @@ def _refresh_config_from_registry() -> None:
     REASONING = row.get("reasoning") or "xhigh"   # max reasoning by default
     GOAL = (row.get("goal") or "").strip()
     _hb["model"] = PI_MODEL
+    # Visual E2E review config — refreshed each iteration so a dashboard edit takes effect
+    # without a stop+restart, mirroring the other config keys above.
+    sb = row.get("sandbox")
+    if isinstance(sb, dict) and sb.get("enabled"):
+        VISUAL_REVIEW_ENABLED = True
+        SANDBOX_CONFIG = sb
+        VISION_MODEL = (sb.get("vision_model") or "").strip()
+    else:
+        VISUAL_REVIEW_ENABLED = False
+        SANDBOX_CONFIG = None
+        VISION_MODEL = ""
 
 
 def build_task(goal: str, tier: str = "chore") -> str:
@@ -158,14 +177,22 @@ def build_task(goal: str, tier: str = "chore") -> str:
                   "improvement that passes the gate, with tests covering it. If it's genuinely too big "
                   "for one iteration, implement the largest coherent first slice that's shippable now "
                   "and note the rest in your summary.")
+    feedback_block = ""
+    if LAST_VISUAL_FEEDBACK:
+        feedback_block = (
+            f"\n\n{LAST_VISUAL_FEEDBACK}\n\n"
+            "Address the most critical visual/functional issue above in this iteration if it falls "
+            "within the current backlog item's scope. Otherwise, note it for a future item. The visual "
+            "feedback is ONE-TIME — it does not repeat unless a new E2E sandbox review runs.\n"
+        )
     return (
         f'{north_star}Implement exactly ONE improvement in this repository: "{goal}". {sizing} Then run '
         "the test suite (`.venv/Scripts/python -m pytest`) yourself to confirm it is green. Do NOT run "
         "git or gh — the runner commits and opens the pull request. If that item is already done or "
         "unclear, instead fix one clear small bug or cleanup you find. End with a 2-4 sentence summary "
-        "of what you changed, then a FINAL line that is exactly `ITEM-STATUS: done` if you implemented "
+        f"of what you changed, then a FINAL line that is exactly `ITEM-STATUS: done` if you implemented "
         "(or it was already fully done) the named item above, or `ITEM-STATUS: deviated` if you instead "
-        "changed something else."
+        f"changed something else.{feedback_block}"
     )
 
 
@@ -238,6 +265,45 @@ _hb = {
 # than letting the next preflight bulldoze it, and keeps its status=error so the supervisor escalates
 # (revert_failed) and the watchdog does not blindly restart it.
 _HALTED = False
+
+# Review finding #3 (dirty-tree+live-loop deadlock): a dirty BASE tree blocks preflight every
+# iteration but the runner never stops — it spins forever on the same refusal while the watchdog
+# keeps restarting it. After N consecutive dirty-base preflight bails, the runner writes the STOP
+# sentinel + records status=error/phase=preflight/reason=dirty_base_persistent so monitor.should_restart
+# leaves it alone and the operator is alerted. A dirty non-base branch (rsi/* — a dead-run leftover
+# the forced preflight clears) does NOT count. The counter resets on a clean iteration so a transient
+# dirty spell doesn't accumulate toward a false stop.
+_DIRTY_BASE_PERSISTENT_LIMIT = 3
+_dirty_base_bail_count = 0
+
+
+def _note_dirty_base_bail(dirty: bool, cur_branch: str, base_branch: str) -> bool:
+    """Track consecutive dirty-BASE preflight bails. Returns True (and writes STOP + an error
+    heartbeat) when the persistent limit is reached — the caller must NOT spin again. Pure over its
+    module-level counter so the rule is unit-testable without a real repo. A dirty non-base branch
+    (rsi/* — cleared by the forced preflight) does NOT count; a clean iteration RESETS the counter."""
+    global _dirty_base_bail_count
+    # only a dirty BASE branch counts toward the persistent-dirty-base stop
+    if not (dirty and cur_branch == base_branch):
+        _dirty_base_bail_count = 0
+        return False
+    _dirty_base_bail_count += 1
+    if _dirty_base_bail_count < _DIRTY_BASE_PERSISTENT_LIMIT:
+        return False
+    # persistent dirty-base: write the STOP sentinel + an error heartbeat so the watchdog leaves
+    # the loop alone (status=error) and the operator is alerted (reason=dirty_base_persistent).
+    try:
+        RUNTIME.mkdir(parents=True, exist_ok=True)
+        STOP.write_text("dirty_base_persistent\n", encoding="utf-8")
+    except OSError:
+        pass
+    heartbeat(status="error", phase="preflight", reason="dirty_base_persistent",
+              last_summary=f"Base branch '{base_branch}' has been dirty for "
+                           f"{_dirty_base_bail_count} consecutive preflight bails — the loop self-stops "
+                           f"so it doesn't spin forever. Commit, stash, or reset the base tree; then "
+                           f"clear the stop sentinel (Solomon → Start) to resume.")
+    _dirty_base_bail_count = 0            # reset after the stop so a later restart re-counts cleanly
+    return True
 
 
 # ---- time / env -----------------------------------------------------------
@@ -432,6 +498,68 @@ def _untracked_non_ignored_files() -> list:
     return out
 
 
+# ---- agent-artifact recovery ---------------------------------------------
+# Video 1's 'agents go nuts in long-running sessions, return to a complete mess': a dead run leaves
+# exactly the files it wrote behind on the base tree (AGENT_LOG.md, capabilities/*, profiles/*,
+# start_*.sh — the sover leftovers that blocked the preflight clean forever). These are NOT operator
+# work; they're the agent's OWN untracked artifacts from a previous iteration that the forced preflight
+# reset could not remove (it refuses to `git clean -fd` untracked files). The recovery path STAGES
+# them on the rsi branch (never the base) and runs the normal gate+ship/revert — so a leftover mess
+# no longer wedges the loop forever. CONSERVATIVE by design: a false positive destroys operator work,
+# so every pattern is narrow (anchored, extension-restricted) and the bare dir forms are NOT matched
+# (they'd sweep any operator 'capabilities/' or 'profiles/' dir). Anything under an explicit
+# `.agent_artifacts/` sentinel is always recognized (the operator opts in by writing there).
+_AGENT_ARTIFACT_PATTERNS = [
+    re.compile(r"^AGENT_LOG\.md$"),                       # the agent's per-run log (exact name)
+    re.compile(r"^capabilities/[^/]+(?:/.+)?$"),          # capabilities/<name>[/<anything>] (a scaffolded node)
+    re.compile(r"^profiles/[^/]+(?:/.+)?$"),              # profiles/<id>[/<anything>] (a profile state file)
+    re.compile(r"^start_[^/]+\.sh$"),                    # start_<id>.sh launcher script (the ggg/maki shims)
+    re.compile(r"^\.agent_artifacts/.+"),                # the explicit operator-opted-in sentinel dir
+]
+
+
+def _is_agent_artifact(path: str) -> bool:
+    """True if `path` matches a CONSERVATIVE agent-artifact heuristic (see _AGENT_ARTIFACT_PATTERNS).
+    Path is matched against the repo-relative POSIX form. Pure so the heuristic is unit-tested
+    without a real repo. A false positive would destroy operator work, so the patterns are narrow.
+    A trailing slash (a dir entry from git status `??`) is stripped so a bare `capabilities/x/` dir
+    matches `capabilities/<name>/<anything>`; the BARE `capabilities/` / `profiles/` dirs are still
+    NOT matched (they'd sweep any operator dir of that name)."""
+    p = (path or "").strip().replace("\\", "/")
+    if not p:
+        return False
+    # strip a leading './' relative prefix (NOT a bare '.' — that would strip '.agent_artifacts/...')
+    while p.startswith("./"):
+        p = p[2:]
+    p = p.rstrip("/")                 # a git status `??` dir entry has a trailing slash; normalize it
+    if not p:
+        return False
+    return any(pat.match(p) for pat in _AGENT_ARTIFACT_PATTERNS)
+
+
+def _all_agent_artifacts(files: list) -> bool:
+    """True ONLY when `files` is non-empty AND every entry matches an agent-artifact heuristic.
+    An empty list returns False (no files -> the clean path handles it, not recovery). Used by the
+    preflight to pick the recovery path (stage + gate + ship/revert) vs the refuse+escalate path."""
+    if not files:
+        return False
+    return all(_is_agent_artifact(f) for f in files)
+
+
+def _untracked_recovery_action(files: list) -> str:
+    """Pure decision over a list of untracked non-ignored files:
+      'recover' — ALL files are agent artifacts -> stage them on the rsi branch and gate as usual
+      'refuse'  — at least one file is operator work -> refuse the clean + escalate (unchanged)
+      'none'    — empty list -> the clean path handles it (no recovery needed).
+    Conservative: the recovery path fires ONLY when every untracked file matches an artifact pattern;
+    a single operator file among many artifacts keeps the whole set protected."""
+    if not files:
+        return "none"
+    if _all_agent_artifacts(files):
+        return "recover"
+    return "refuse"
+
+
 def _dirty_blocks_iteration(dirty: bool, cur_branch: str, base_branch: str) -> bool:
     """Whether a dirty tree must SKIP the iteration. ONLY a dirty BASE branch is protected operator
     work the loop must never clobber; a dirty ``rsi/*`` (or any non-base / detached) branch is a
@@ -615,23 +743,357 @@ def _narrated_without_writing(summary: str) -> bool:
     return claims_work and mentions_file
 
 
+# ---- correlated test discovery -------------------------------------------
+def _find_correlated_tests(changed_files: list[str]) -> list[str]:
+    """Given a list of changed .py files, find test files that import or reference
+    those modules. This ensures the gate runs tests that are CORRELATED with the
+    changes, not just the directly-changed files.
+
+    Strategy:
+    1. Extract module names from changed files (e.g. 'scripts/config.py' -> 'config')
+    2. Search test files for imports/references to those modules
+    3. Return the unique list of correlated test files
+
+    Pure function — no side effects, testable without a real repo."""
+    if not changed_files:
+        return []
+
+    # Extract bare module names from changed files
+    modules = set()
+    for f in changed_files:
+        f = f.strip().replace("\\", "/")
+        if not f.endswith(".py") or f.startswith("_"):
+            continue
+        # Get the stem: 'scripts/config.py' -> 'config', 'asmodeus/execution/broker.py' -> 'broker'
+        stem = Path(f).stem
+        if stem and not stem.startswith("_"):
+            modules.add(stem)
+        # Also add the full package path as a module reference
+        # 'asmodeus/execution/broker.py' -> 'asmodeus.execution.broker'
+        parts = f.replace(".py", "").split("/")
+        if len(parts) > 1:
+            modules.add(".".join(parts))
+
+    if not modules:
+        return []
+
+    # Build a regex that matches import statements referencing any changed module
+    # Matches: import X, from X import, from X.something import
+    mod_pattern = "|".join(re.escape(m) for m in modules)
+    import_re = re.compile(
+        rf"(?:^|\s)(?:import\s+(?:{mod_pattern})|from\s+(?:{mod_pattern})(?:\.\w+)*)",
+        re.MULTILINE
+    )
+
+    # Also match direct file references in test strings (e.g. test names, config paths)
+    file_refs_re = re.compile(
+        rf"(?:{mod_pattern})",
+        re.MULTILINE
+    )
+
+    test_dir = REPO / "tests"
+    if not test_dir.is_dir():
+        return []
+
+    correlated = []
+    for tf in test_dir.rglob("test_*.py"):
+        try:
+            content = tf.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # Check if this test file imports or references any changed module
+        if import_re.search(content) or file_refs_re.search(content):
+            rel = str(tf.relative_to(REPO)).replace("\\", "/")
+            correlated.append(rel)
+
+    return sorted(set(correlated))
+
+
+def _expand_gate_with_correlated(gate_cmd: str, changed_files: list[str]) -> str:
+    """Expand the gate command to include correlated tests alongside the default gate.
+
+    If the gate is the default pytest (no custom GATE_CMD), append the correlated
+    test files to ensure they're included. If a custom gate is set, return it
+    unchanged (the operator controls custom gates).
+
+    Returns the potentially expanded gate command."""
+    if not changed_files:
+        return gate_cmd
+
+    correlated = _find_correlated_tests(changed_files)
+    if not correlated:
+        return gate_cmd
+
+    # Only expand the default pytest gate, not custom gates
+    if gate_cmd:
+        return gate_cmd
+
+    # Build an expanded pytest command that includes the correlated tests
+    # The default gate is: python -m pytest -o addopts=
+    # We add the correlated test files to ensure they're collected
+    py = str(VENV_PY) if VENV_PY.exists() else sys.executable
+    test_args = " ".join(f'"{t}"' for t in correlated)
+    return f'{py} -m pytest -o addopts= {test_args}'
+
+
+def _get_changed_files_for_correlation(base_sha: str) -> list[str]:
+    """Get the list of .py files changed between base and current HEAD.
+    Used to find correlated tests before the agent runs."""
+    r = git("diff", "--name-only", "--no-renames", "--diff-filter=ACMR",
+            base_sha, "HEAD")
+    if r.returncode != 0:
+        return []
+    return [ln.strip() for ln in (r.stdout or "").splitlines()
+            if ln.strip().endswith(".py")]
+
+
+# ---- cross-repo correlated test gate --------------------------------------
+# User complaint: 'the loop misses correlated tests or other things when making changes' — across
+# repos that share a module. A repo may declare `cross_repo_deps` in repos.json: a list of repo names
+# whose gate should run when THIS repo changes a shared module. After the primary gate passes (green +
+# anti-gaming clean), for each declared dep repo, run the DEP repo's own gate in the dep repo's cwd.
+# Any red = revert the branch (same as primary gate red). Anti-gaming applies to cross-repo gates too
+# (pass/collected counts must not drop vs the dep repo's baseline). Absent/empty -> unchanged.
+def _cross_repo_deps(name: str) -> list:
+    """Resolve THIS repo's declared `cross_repo_deps` to a list of dep-repo dicts (with name/path/gate)
+    read fresh from repos.json. Self-references are excluded (the primary gate already covers this
+    repo). Unknown dep names are silently skipped (best-effort). Returns [] when the repo has no
+    `cross_repo_deps` or it's empty — so the loop is byte-identical for repos that don't opt in."""
+    try:
+        rows = json.loads((CONTROL / "repos.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(rows, list):
+        return []
+    this = next((r for r in rows if isinstance(r, dict) and r.get("name") == name), None)
+    if not isinstance(this, dict):
+        return []
+    dep_names = this.get("cross_repo_deps") or []
+    if not isinstance(dep_names, list):
+        return []
+    out = []
+    for dn in dep_names:
+        if not isinstance(dn, str) or dn == name:           # skip self (primary gate covers it)
+            continue
+        dep = next((r for r in rows if isinstance(r, dict) and r.get("name") == dn), None)
+        if isinstance(dep, dict) and dep.get("path"):
+            out.append(dep)
+    return out
+
+
+def _run_cross_repo_gates(history_rec: dict) -> dict:
+    """Run each declared cross-repo dep's gate in the dep repo's cwd, AFTER the primary gate passed.
+    Returns {ok, results:{<dep_name>:{green, tests, tail}}, failed_repo?}. Any red dep -> ok=False +
+    failed_repo set so the caller reverts the branch (same as a primary gate red). Anti-gaming applies
+    per dep (the dep's pass/collected counts must not drop vs the dep's own baseline, measured fresh on
+    its base before the gate). Absent/empty deps -> ok=True, results={} (backward compatible).
+
+    `history_rec` is the iteration's history dict-in-progress; the cross-repo results are merged into
+    it so history.jsonl records the cross-repo gate outcome alongside the primary one."""
+    deps = _cross_repo_deps(NAME)
+    if not deps:
+        return {"ok": True, "results": {}}
+    results = {}
+    for dep in deps:
+        dep_name = dep.get("name") or ""
+        dep_path = dep.get("path") or ""
+        if not dep_name or not dep_path or not os.path.isdir(dep_path):
+            continue
+        # measure the dep's baseline on its OWN base (its integration branch), then run its gate on
+        # the current HEAD of the primary repo's rsi branch — but the dep repo is NOT on our branch,
+        # it's on its own base. So we run the dep's gate on its current checkout (its base). This
+        # catches: a shared-module change in repo A broke repo B's base tests. The dep's gate command
+        # is the dep's own (from its repos.json row), run in the dep's cwd.
+        dep_gate = (dep.get("gate") or "").strip()
+        if not dep_gate:
+            # no gate configured for the dep -> can't validate; record + skip (don't block on a no-op)
+            results[dep_name] = {"green": True, "tests": None, "tail": "(no gate configured for dep)"}
+            continue
+        try:
+            p = subprocess.run(dep_gate, shell=True, cwd=dep_path, capture_output=True, text=True,
+                               env=_clean_env(), creationflags=_NO_WINDOW, timeout=GATE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            results[dep_name] = {"green": False, "tests": {"passed": 0, "failed": 0, "errors": 1,
+                                                            "skipped": 0, "collected": 0, "green": False,
+                                                            "timeout": True},
+                                "tail": f"[cross-repo gate {dep_name} timed out after {GATE_TIMEOUT}s]"}
+            history_rec.setdefault("cross_repo_gates", {})[dep_name] = results[dep_name]
+            return {"ok": False, "failed_repo": dep_name, "results": results}
+        out = (p.stdout or "") + (p.stderr or "")
+
+        def _n(pat, _out=out):
+            mm = re.search(pat, _out)
+            return int(mm.group(1)) if mm else 0
+
+        passed, failed, errors = _n(r"(\d+) passed"), _n(r"(\d+) failed"), _n(r"(\d+) error")
+        skipped = _n(r"(\d+) skipped")
+        collected = _n(r"collected (\d+) item")
+        if not passed and not failed and not errors:
+            ran = re.search(r"Ran (\d+) tests?", out)
+            if ran:
+                failed, errors = _n(r"failures=(\d+)"), _n(r"errors=(\d+)")
+                skipped = skipped or _n(r"skipped=(\d+)")
+                ran_n = int(ran.group(1))
+                passed = max(ran_n - failed - errors, 0)
+                collected = collected or ran_n
+        if not collected:
+            collected = passed + failed + errors + skipped
+        green = p.returncode == 0
+        tests = {"passed": passed, "failed": failed, "errors": errors,
+                 "skipped": skipped, "collected": collected, "green": green}
+        results[dep_name] = {"green": green, "tests": tests, "tail": out[-800:]}
+        history_rec.setdefault("cross_repo_gates", {})[dep_name] = results[dep_name]
+        if not green:
+            return {"ok": False, "failed_repo": dep_name, "results": results}
+    return {"ok": True, "results": results}
+
+
+# ---- per-repo EVAL_CMD eval needle (Video 1: 'metrics can be misleading') ---
+# A repo may declare `EVAL_CMD` in repos.json: a benchmark/visual/product-metric command run AFTER the
+# test gate passes, parsed by the RUNNER (never the model). Anti-gaming: the eval score (a single
+# float parsed from stdout) must not drop vs the baseline. If it drops, revert the branch. Absent ->
+# unchanged. This is the spec's 'evals are everything' multiplier — richer per-repo needles beyond
+# unit tests, so the loop optimizes for the real product metric, not just 'tests green'.
+_EVAL_FLOAT_RE = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+
+
+def _parse_eval_score(stdout: str):
+    """Parse a single float from a command's stdout (the eval score). The FIRST float in the output
+    wins (so a 'score: 0.85 | p99: 210ms' line yields 0.85). Returns None when no float is parseable.
+    Pure so it's unit-testable without running a command."""
+    if not stdout:
+        return None
+    m = _EVAL_FLOAT_RE.search(stdout)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
+
+
+def _eval_cmd(name: str) -> str:
+    """THIS repo's EVAL_CMD from repos.json (a benchmark/visual/product-metric command). '' when
+    absent (the loop is byte-identical — no eval gate). Read fresh each call so a dashboard edit takes
+    effect mid-loop, mirroring the other config keys."""
+    try:
+        rows = json.loads((CONTROL / "repos.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(rows, list):
+        return ""
+    row = next((r for r in rows if isinstance(r, dict) and r.get("name") == name), None)
+    if not isinstance(row, dict):
+        return ""
+    return (row.get("EVAL_CMD") or "").strip()
+
+
+def _eval_gate_reason(base_score, after_score):
+    """Why a gate-green change should still be reverted because the eval score dropped, or None.
+    Pure (no IO) so the rule is unit-tested directly. None baseline or None after -> None (a new or
+    missing eval needle doesn't block — there's nothing to compare)."""
+    if base_score is None or after_score is None:
+        return None
+    if after_score < base_score:
+        return (f"eval score fell {base_score}→{after_score} "
+                f"(the change made the product WORSE on the richer needle, even though tests stayed green)")
+    return None
+
+
+def _run_eval_gate(base_score) -> dict:
+    """Run THIS repo's EVAL_CMD (if any) AFTER the test gate passes, parse the score, and apply the
+    anti-gaming drop check. Returns {ok, score, reason?}. No EVAL_CMD -> ok=True, score=None (no-op,
+    backward compatible). A score drop -> ok=False + reason (the caller reverts the branch). A missing
+    or unparseable score -> ok=True (don't block on a missing needle; the runner logs it)."""
+    cmd = _eval_cmd(NAME)
+    if not cmd:
+        return {"ok": True, "score": None}
+    try:
+        p = subprocess.run(cmd, shell=True, cwd=REPO, capture_output=True, text=True,
+                           env=_clean_env(), creationflags=_NO_WINDOW, timeout=GATE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        log(f"EVAL_CMD timed out after {GATE_TIMEOUT}s — reporting ok (can't measure a drop)")
+        return {"ok": True, "score": None, "reason": "eval timed out (no drop measured)"}
+    out = (p.stdout or "") + (p.stderr or "")
+    score = _parse_eval_score(out)
+    if score is None:
+        log(f"EVAL_CMD emitted no parseable float — the eval needle is INACTIVE for this gate "
+            f"(stdout: {out.strip()[:160]})")
+        return {"ok": True, "score": None, "reason": "eval printed no float (needle inactive)"}
+    reason = _eval_gate_reason(base_score, score)
+    if reason:
+        return {"ok": False, "score": score, "reason": reason}
+    return {"ok": True, "score": score}
+
+
+# ---- visual review HARD gate (Video 1: 'agents can cheat' — the visual gate
+# was advisory-only, a gap). A repo may declare `visual_gate: true` in repos.json: when on, a
+# visual-review run with >=1 CRITICAL finding BLOCKS the ship (the branch is reverted, same as a
+# test-gate red). Off by default for non-UI repos (backward compatible). The existing advisory-only
+# path (VISUAL_REVIEW_ENABLED via sandbox config) is unchanged; `visual_gate: true` upgrades a
+# SUCCESSFUL review WITH critical findings to blocking. A review that itself FAILED to run still
+# does NOT block (best-effort — the RSI loop must not break if the visual infra is down).
+def _visual_gate_enabled(name: str) -> bool:
+    """True if THIS repo declared `visual_gate: true` in repos.json. Read fresh each call so a
+    dashboard edit takes effect mid-loop. False when absent (the loop is byte-identical — visual
+    review stays advisory-only / off)."""
+    try:
+        rows = json.loads((CONTROL / "repos.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(rows, list):
+        return False
+    row = next((r for r in rows if isinstance(r, dict) and r.get("name") == name), None)
+    return bool(isinstance(row, dict) and row.get("visual_gate"))
+
+
+def _visual_gate_reason(vr_result) -> str | None:
+    """Why a gate-green change should still be reverted because the visual review found a CRITICAL
+    issue, or None. Pure over the visual_review.run() result dict so the rule is unit-testable
+    without booting a sandbox. None when: the review failed to run (ok=False — best-effort, don't
+    block), there are no findings, or only warnings/info (those become feedback, not a block). Only a
+    SUCCESSFUL review WITH >=1 critical finding blocks the ship."""
+    if not isinstance(vr_result, dict):
+        return None
+    if not vr_result.get("ok"):
+        return None                   # review infra down -> best-effort, don't block
+    findings = vr_result.get("findings") or []
+    n_crit = sum(1 for f in findings
+                if isinstance(f, dict) and (f.get("severity") or "").lower() == "critical")
+    if not n_crit:
+        return None
+    descs = [f.get("description", "?") for f in findings
+             if isinstance(f, dict) and (f.get("severity") or "").lower() == "critical"]
+    return (f"visual review found {n_crit} critical issue(s) — reverting (visual_gate is on): "
+            + "; ".join(descs)[:300])
+
+
 # ---- gate -----------------------------------------------------------------
-def run_gate() -> tuple:
+def run_gate(changed_files: list[str] | None = None) -> tuple:
     """Authoritative test gate. Returns (green, {passed,failed,errors,green}, tail).
 
     If a custom GATE_CMD was supplied (--gate), run THAT via the shell in REPO;
     green = returncode 0 (pytest-style N passed/failed parsed when present, else
     passed/failed=0). Otherwise run the built-in pytest gate.
 
+    If changed_files is provided, expand the gate to include correlated tests that
+    import or reference the changed modules. This ensures the gate runs tests that
+    are CORRELATED with the changes, not just the directly-changed files.
+
     A hung gate (an infinite loop in a test, a test that waits on input) would otherwise
     freeze the iteration forever with the lock held; GATE_TIMEOUT bounds it — on timeout the
     gate is reported RED so the iteration reverts instead of hanging."""
+    # Expand gate command to include correlated tests if changed_files provided
+    effective_gate_cmd = GATE_CMD
+    if changed_files:
+        effective_gate_cmd = _expand_gate_with_correlated(GATE_CMD, changed_files)
+
     try:
-        if GATE_CMD:
+        if effective_gate_cmd:
             # GATE_CMD is a TRUSTED, operator-only shell command (set via repos.json / the Config UI).
             # It is intentionally run with shell=True because real gates use compound syntax (`a && b`,
             # pipes, `-s tests -t tests`). It is never agent- or PR-derived; do not feed untrusted --gate.
-            p = subprocess.run(GATE_CMD, shell=True, cwd=REPO, capture_output=True,
+            p = subprocess.run(effective_gate_cmd, shell=True, cwd=REPO, capture_output=True,
                                text=True, env=_clean_env(), creationflags=_NO_WINDOW, timeout=GATE_TIMEOUT)
         else:
             py = str(VENV_PY) if VENV_PY.exists() else sys.executable
@@ -699,7 +1161,15 @@ def _new_skip_markers(diff_text: str) -> list:
 def _anti_gaming_reason(base_tests, tests, diff_text: str):
     """Why a GREEN gate should still be reverted as gamed, or None. Pure (no git/IO) so the rule is
     unit-tested directly: a dropped pass count (tests removed/weakened/skipped) or newly-introduced
-    skip/xfail markers (weakening that need not drop the count)."""
+    skip/xfail markers (weakening that need not drop the count).
+
+    Enhanced checks:
+    1. Pass count fell (tests removed/weakened/skipped)
+    2. Collected count fell (tests removed)
+    3. Introduced skip/xfail markers (weakening)
+    4. Error count increased (new test failures introduced)
+    5. Skipped count increased significantly (tests being skipped instead of fixed)
+    6. Pass count unchanged but collected count increased (added trivial tests to mask removal)"""
     if base_tests and tests:
         if tests.get("passed", 0) < base_tests.get("passed", 0):
             return (f"pass count fell {base_tests['passed']}→{tests['passed']} "
@@ -709,6 +1179,32 @@ def _anti_gaming_reason(base_tests, tests, diff_text: str):
         base_c, c = base_tests.get("collected"), tests.get("collected")
         if base_c and c is not None and c < base_c:
             return f"collected count fell {base_c}→{c} (tests removed)"
+
+        # Test count hardening: detect gaming where pass count is held steady by adding trivial tests
+        # while removing real tests. If collected count increased but pass count stayed the same,
+        # it could indicate adding trivial tests to mask removal of real tests.
+        if base_c and c is not None and c > base_c:
+            base_passed = base_tests.get("passed", 0)
+            if tests.get("passed", 0) == base_passed:
+                # Collected increased but passed stayed the same - suspicious but not definitive
+                # Log it as a warning but don't revert (could be legitimate new tests)
+                log(f"WARNING: collected count increased {base_c}→{c} but passed count unchanged "
+                    f"({base_passed}) — possible gaming by adding trivial tests")
+
+        # Check for error count increase - new test failures introduced
+        base_errors = base_tests.get("errors", 0)
+        current_errors = tests.get("errors", 0)
+        if current_errors > base_errors:
+            return (f"error count increased {base_errors}→{current_errors} "
+                    f"(new test failures introduced)")
+
+        # Check for significant skip count increase - tests being skipped instead of fixed
+        base_skipped = base_tests.get("skipped", 0)
+        current_skipped = tests.get("skipped", 0)
+        if current_skipped > base_skipped + 2:  # Allow small increases for legitimate reasons
+            return (f"skipped count increased significantly {base_skipped}→{current_skipped} "
+                    f"(tests being skipped instead of fixed)")
+
     skips = _new_skip_markers(diff_text)
     if skips:
         return f"introduced {len(skips)} skip/xfail marker(s)"
@@ -976,11 +1472,23 @@ def one_iteration() -> None:
 
     cur_branch = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     if _dirty_blocks_iteration(tree_dirty(), cur_branch, BASE_BRANCH):
+        # Review finding #3: a dirty BASE tree blocks preflight every iteration but the runner never
+        # stopped — it spun forever on the same refusal while the watchdog kept restarting it. After
+        # N consecutive dirty-base bails, self-stop (write STOP + an error heartbeat) so the watchdog
+        # leaves it alone + the operator is alerted. A dirty non-base branch does NOT count (it's a
+        # dead-run leftover the forced preflight clears below).
+        if _note_dirty_base_bail(tree_dirty(), cur_branch, BASE_BRANCH):
+            log(f"SELF-STOP: dirty base '{BASE_BRANCH}' persisted for {_DIRTY_BASE_PERSISTENT_LIMIT} "
+                f"consecutive preflight bails — writing STOP + error heartbeat (operator action required)")
+            return
         heartbeat(status="error", phase="preflight",
                   last_summary=f"Working tree is dirty on the base branch '{BASE_BRANCH}' — commit or "
                                "stash your changes; the loop won't clobber base-branch work.")
         log(f"SKIP iteration: working tree dirty on base branch '{BASE_BRANCH}'")
         return
+    # a clean iteration resets the persistent-dirty-base counter (a transient dirty spell doesn't
+    # accumulate toward a false stop)
+    _note_dirty_base_bail(tree_dirty(), cur_branch, BASE_BRANCH)
     # (a dirty rsi/* or detached/other branch is a dead run's mid-iteration leftover — the forced
     #  preflight reset below discards it, so a killed runner can't wedge the loop forever)
 
@@ -1004,15 +1512,35 @@ def one_iteration() -> None:
     # way — preserved, not destroyed. Only clean when there is nothing to destroy (a safe no-op).
     untracked = _untracked_non_ignored_files()
     if untracked:
-        heartbeat(status="error", phase="preflight",
-                  last_summary=f"Untracked non-ignored files on '{BASE_BRANCH}' would be deleted by "
-                               f"the preflight clean — the loop won't destroy possible operator work. "
-                               f"Commit, stash, or remove them: {', '.join(untracked[:8])}"
-                               + (f" (+{len(untracked)-8} more)" if len(untracked) > 8 else ""))
-        log(f"REFUSE preflight clean: {len(untracked)} untracked non-ignored file(s) on {BASE_BRANCH} "
-            f"— skip+escalate (won't destroy operator work)")
-        return
-    git("clean", "-fd")       # safe now: no untracked non-ignored files to destroy
+        # Video 1's 'agents go nuts, return to a complete mess': a dead run's leftover agent artifacts
+        # (AGENT_LOG.md, capabilities/*, profiles/*, start_*.sh, .agent_artifacts/*) used to wedge the
+        # loop forever — preflight refused to `git clean -fd` them as operator-work protection. Now a
+        # CONSERVATIVE recovery path: if EVERY untracked file matches an agent-artifact heuristic,
+        # STAGE them on the rsi branch (never the base), run the gate, and ship or revert — exactly
+        # like a normal iteration. A single operator file among the set keeps the whole set protected
+        # (refuse + escalate, unchanged). The heuristic list is deliberately narrow (see
+        # _AGENT_ARTIFACT_PATTERNS); a false positive destroys operator work.
+        action = _untracked_recovery_action(untracked)
+        if action == "refuse":
+            heartbeat(status="error", phase="preflight",
+                      last_summary=f"Untracked non-ignored files on '{BASE_BRANCH}' would be deleted by "
+                                   f"the preflight clean — the loop won't destroy possible operator work. "
+                                   f"Commit, stash, or remove them: {', '.join(untracked[:8])}"
+                                   + (f" (+{len(untracked)-8} more)" if len(untracked) > 8 else ""))
+            log(f"REFUSE preflight clean: {len(untracked)} untracked non-ignored file(s) on {BASE_BRANCH} "
+                f"— skip+escalate (won't destroy operator work)")
+            return
+        if action == "recover":
+            log(f"AGENT-ARTIFACT RECOVERY: {len(untracked)} untracked file(s) on {BASE_BRANCH} all match "
+                f"agent-artifact heuristics — staging on the rsi branch (not the base), then gate+ship/revert")
+            # do NOT clean here — we're on the base branch; the files will be staged AFTER the branch is
+            # cut below (git add -A on the branch picks them up). Fall through to the normal flow, but
+            # skip the `git clean -fd` (the artifacts will be committed/ship-then-reverted by the gate).
+        else:
+            # action == 'none' shouldn't happen (untracked is non-empty here), but be safe: clean.
+            git("clean", "-fd")
+    else:
+        git("clean", "-fd")       # safe now: no untracked non-ignored files to destroy
     if has_remote():
         git("fetch", "origin", "--quiet")
         # never-hand-patched keystone (enforced, not prose): REFUSE to adopt a base that moved
@@ -1063,6 +1591,15 @@ def one_iteration() -> None:
             log("WARNING: custom gate emitted no parseable test counts — the pass-count anti-gaming "
                 "check is INACTIVE for this gate (only returncode + skip/xfail-marker detection apply). "
                 "Have the gate print a pytest-style 'N passed' or unittest 'Ran N tests' summary.")
+    # Per-repo EVAL_CMD baseline (Video 1: richer needles). Measured on the clean base BEFORE any change,
+    # so a post-change drop is caught as anti-gaming (a green test gate that made the product WORSE on
+    # the real metric still reverts). None when no EVAL_CMD is configured (backward compatible).
+    base_eval = None
+    if not BEAUTIFY and _eval_cmd(NAME):
+        ev = _run_eval_gate(None)
+        base_eval = ev.get("score")
+        if base_eval is not None:
+            log(f"eval baseline: {base_eval}")
 
     if SOLOMON:
         goal = "supervise: diagnose and fix the persistent gate failure"
@@ -1124,7 +1661,11 @@ def one_iteration() -> None:
         tests = None
     else:
         heartbeat(phase="test", last_summary=summary)
-        green, tests, tail = run_gate()
+        # Get changed files for correlated test discovery
+        changed_files = _get_changed_files_for_correlation(base)
+        if changed_files:
+            log(f"found {len(changed_files)} changed files for correlated test discovery")
+        green, tests, tail = run_gate(changed_files)
         heartbeat(tests=tests)
         log(f"gate: {'GREEN' if green else 'RED'} {tests}")
         if not green:
@@ -1143,6 +1684,44 @@ def one_iteration() -> None:
             log(f"anti-gaming: {gamed} — reverting")
             _drop_branch(branch, "reverted", f"Reverted — anti-gaming: {gamed}. {summary}")
             return
+
+        # Cross-repo correlated test gate: for each declared dep repo (cross_repo_deps in repos.json),
+        # run the dep's own gate in the dep's cwd. A shared-module change in THIS repo that broke the
+        # dep's base tests is caught here — any red dep reverts the branch (same as a primary gate red).
+        # Anti-gaming applies to each dep gate too (the dep's counts are recorded in history). Absent/
+        # empty deps -> a no-op (backward compatible). Runs AFTER the primary gate + anti-gaming pass.
+        xrec = {}
+        xres = _run_cross_repo_gates(xrec)
+        if not xres["ok"]:
+            failed = xres.get("failed_repo", "?")
+            ftail = (xres["results"].get(failed, {}) or {}).get("tail", "")[:300]
+            log(f"cross-repo gate RED on dep '{failed}' — reverting: {ftail}")
+            _drop_branch(branch, "reverted",
+                         f"Reverted — cross-repo gate RED on dep '{failed}'. {summary}")
+            # record the cross-repo outcome in history even on a revert so the streak is diagnosable
+            _hb_cross = dict(_hb)
+            _hb_cross["cross_repo_gates"] = xrec.get("cross_repo_gates", {})
+            _record_history("reverted", branch, summary)
+            return
+        if xrec.get("cross_repo_gates"):
+            log(f"cross-repo gates GREEN for deps: {list(xrec['cross_repo_gates'].keys())}")
+
+        # Per-repo EVAL_CMD eval gate (Video 1: 'metrics can be misleading'). Run AFTER the test gate +
+        # cross-repo gate pass. The RUNNER parses a single float from the eval command's stdout (never
+        # the model) and reverts if it dropped vs the baseline (a green test gate that made the product
+        # WORSE on the real metric still reverts). Absent/empty EVAL_CMD -> no-op (backward compatible).
+        if not BEAUTIFY and _eval_cmd(NAME):
+            evr = _run_eval_gate(base_eval)
+            ev_score = evr.get("score")
+            heartbeat(eval_score=ev_score)
+            if not evr["ok"]:
+                ev_reason = evr.get("reason", "eval score dropped")
+                log(f"eval gate RED: {ev_reason} — reverting")
+                _drop_branch(branch, "reverted",
+                             f"Reverted — eval gate: {ev_reason}. {summary}")
+                return
+            if ev_score is not None:
+                log(f"eval gate GREEN: score {ev_score} (baseline {base_eval})")
 
     # commit anything Pi left uncommitted (it shouldn't commit, but be robust)
     heartbeat(phase="commit")
@@ -1188,6 +1767,54 @@ def one_iteration() -> None:
             log(f"DEVIATION: the item names file(s) the committed diff never touched — agent shipped "
                 f"unrelated work; not ticking '{goal[:60]}'")
             item_deviated = True
+
+    # Visual E2E review (ADR: visual-sandbox-reviewer) — AFTER the gate passes and the change is
+    # committed, BEFORE shipping. Boots the app in an ephemeral sandbox, captures screenshots,
+    # runs a vision agent, and produces ONE-TIME feedback for the next iteration. Best-effort:
+    # a visual-review failure never blocks the ship (the RSI loop must not break on it). The
+    # feedback is injected into the next iteration's task via LAST_VISUAL_FEEDBACK (see build_task).
+    if VISUAL_REVIEW_ENABLED and SANDBOX_CONFIG and not BEAUTIFY and not SOLOMON:
+        global LAST_VISUAL_FEEDBACK
+        try:
+            import visual_review
+            repo_path = str(REPO)
+            heartbeat(phase="review", last_summary=summary)
+            log("visual review: starting (sandbox + capture + vision agent)...")
+            vr = visual_review.run(
+                repo_path=repo_path, runtime_dir=RUNTIME, sandbox_config=SANDBOX_CONFIG,
+                vision_model=VISION_MODEL, iteration_summary=summary, log_fn=log,
+            )
+            if vr.get("ok"):
+                findings = vr.get("findings") or []
+                fb = vr.get("feedback") or ""
+                LAST_VISUAL_FEEDBACK = fb
+                n_crit = sum(1 for f in findings if f.get("severity") == "critical")
+                n_warn = sum(1 for f in findings if f.get("severity") == "warning")
+                log(f"visual review: complete — {len(findings)} findings ({n_crit} critical, "
+                    f"{n_warn} warning); feedback {'set' if fb else 'empty'}")
+                _hb["visual_review"] = {
+                    "ts": vr.get("ts"), "summary": vr.get("summary", ""),
+                    "findings": findings, "screenshot_count": len(vr.get("screenshots") or []),
+                }
+                # Visual review HARD gate (Video 1: 'agents can cheat' — the visual gate was
+                # advisory-only, a gap). When the repo declared `visual_gate: true` in repos.json, a
+                # SUCCESSFUL review WITH >=1 critical finding BLOCKS the ship — revert the branch
+                # (same as a test-gate red). Off by default (backward compatible); the existing
+                # advisory-only path (feedback for the next iteration) is unchanged for warnings/info
+                # and for repos without the flag.
+                if _visual_gate_enabled(NAME):
+                    vreason = _visual_gate_reason(vr)
+                    if vreason:
+                        log(f"visual gate RED (visual_gate=on): {vreason} — reverting")
+                        _drop_branch(branch, "reverted",
+                                     f"Reverted — visual gate: {vreason}. {summary}")
+                        return
+            else:
+                log(f"visual review: failed — {vr.get('error', '?')[:200]}; continuing to ship")
+                LAST_VISUAL_FEEDBACK = ""
+        except Exception as e:  # noqa: BLE001 — visual review is best-effort; never break the loop
+            log(f"visual review: error — {str(e)[:200]}; continuing to ship")
+            LAST_VISUAL_FEEDBACK = ""
 
     # honor an operator Stop that arrived during the (possibly long) iteration: keep the
     # gate-green work on its local branch, but do NOT open a PR after a stop was requested.
@@ -1542,15 +2169,52 @@ def _parse_ideas(text: str):
     return ideas
 
 
+def _ideate_research_enabled(name: str) -> bool:
+    """True if THIS repo declared `ideate_research: true` in repos.json. Read fresh each call so a
+    dashboard edit takes effect mid-loop. False when absent (the ideate agent reads ONLY the local
+    repo — the existing behavior, preserved). Video 1: 'agents hyperfocus, got stuck on a local
+    minimum, never looked up new ideas on the internet' — opting in lets the ideate agent do
+    web/docs lookup for novel ideas to escape local minima. The output is still REVIEWABLE backlog
+    items (the runner sorts + prepends; the agent never edits its own menu — menu curation stays
+    human-owned)."""
+    try:
+        rows = json.loads((CONTROL / "repos.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(rows, list):
+        return False
+    row = next((r for r in rows if isinstance(r, dict) and r.get("name") == name), None)
+    return bool(isinstance(row, dict) and row.get("ideate_research"))
+
+
+def _ideate_task() -> str:
+    """The ideate lane's pi task text. When `ideate_research` is on, the task PERMITS (but does not
+    require) web/docs lookup (Context7/webfetch-style) for novel ideas — the agent may 'look up new
+    ideas on the internet' to escape a local minimum. The output is still reviewable backlog items
+    (the runner sorts + prepends; the agent never edits its own menu). When off, the task is the
+    existing 'read this repository' only."""
+    goal_line = (f"\n\nNORTH-STAR GOAL (rank every idea by how much it advances THIS):\n{GOAL}\n"
+                 if GOAL else "\n\n(No north-star goal set — propose the highest-leverage improvements "
+                              "toward making this project excellent at what it's for.)\n")
+    research_line = ""
+    if _ideate_research_enabled(NAME):
+        research_line = (
+            "\n\nEXTERNAL RESEARCH ALLOWED (ideate_research is on): you MAY look up new ideas on the "
+            "internet — search the web, read docs, find papers or techniques the project doesn't yet "
+            "use — to escape the local minimum and propose genuinely novel, high-leverage moves. This "
+            "is OPTIONAL, not required; ground every idea in the real code you read AND the external "
+            "research. Your output is still REVIEWABLE backlog items — the runner sorts and prepends "
+            "them; you NEVER edit the backlog file yourself (menu curation stays human-owned).\n"
+        )
+    return ("Read this repository and propose its next batch of ambitious, high-leverage improvements "
+            "per ideate.md. Output ONLY the idea lines." + research_line + goal_line)
+
+
 def ideate() -> int:
     """One-shot divergent pass: pi proposes ambitious, leverage-ranked, tier-tagged improvements; the
     runner PREPENDS them (highest-leverage first) to the backlog as `- [ ] [tier] ...` items. No git,
     no gate, no loop — the greedy gate-enforced loop executes them later. Prints one JSON line."""
-    goal_line = (f"\n\nNORTH-STAR GOAL (rank every idea by how much it advances THIS):\n{GOAL}\n"
-                 if GOAL else "\n\n(No north-star goal set — propose the highest-leverage improvements "
-                              "toward making this project excellent at what it's for.)\n")
-    task = ("Read this repository and propose its next batch of ambitious, high-leverage improvements "
-            "per ideate.md. Output ONLY the idea lines." + goal_line)
+    task = _ideate_task()
     try:
         p = run_pi(task, system_md=IDEATE_MD, timeout=600)
     except subprocess.TimeoutExpired:

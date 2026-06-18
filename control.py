@@ -206,9 +206,52 @@ def project_goal(repo):
     return ((repo or {}).get("goal") or "").strip()
 
 
+def project_sandbox(repo):
+    """Per-repo sandbox config for visual E2E review, or None (review disabled).
+
+    Schema (stored as the `sandbox` key in repos.json):
+        enabled: bool — master switch; off => visual review is skipped
+        launch: str — shell command to start the app in the branch cwd
+        port_env: str — env var name to inject the ephemeral port as
+        state_env: str — env var name to inject the temp state dir as
+        extra_env: dict — sandbox-only env vars (disposable profile, auto-post off, etc.)
+        health: str — path to poll for 200 (default "/")
+        pages: list — page paths to capture (e.g. ["/", "/dashboard/cockpit/"])
+        vision_model: str — vision-capable model id for the reviewer agent
+    """
+    sb = (repo or {}).get("sandbox")
+    if not isinstance(sb, dict) or not sb.get("enabled"):
+        return None
+    return sb
+
+
+def read_visual_review(repo):
+    """Read the latest visual review report from runtime/<name>/visual_review/report.json.
+    Returns the report dict (with screenshot paths) or None if no review has been run."""
+    rt = _runtime_dir(repo)
+    if not rt:
+        return None
+    p = os.path.join(rt, "visual_review", "report.json")
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            report = json.load(f)
+        # also list screenshot files so the UI can serve them
+        shot_dir = os.path.join(rt, "visual_review")
+        shots = []
+        if os.path.isdir(shot_dir):
+            for fn in sorted(os.listdir(shot_dir)):
+                if fn.endswith(".png"):
+                    shots.append(fn)
+        if isinstance(report, dict):
+            report["screenshot_files"] = shots
+        return report
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def set_repo_config(name, provider=None, model=None, ship=None, gate=None,
                     pr_target_branch=None, interval=None, max_iterations=None,
-                    reasoning=None, goal=None):
+                    reasoning=None, goal=None, sandbox=None):
     """Upsert the repos.json entry for `name`, setting any passed (non-None) keys.
     Creates the entry (carrying its discovered path) if it doesn't exist."""
     if not name:
@@ -243,6 +286,8 @@ def set_repo_config(name, provider=None, model=None, ship=None, gate=None,
         entry["reasoning"] = reasoning
     if goal is not None:
         entry["goal"] = goal
+    if sandbox is not None:
+        entry["sandbox"] = sandbox
     try:
         # atomic write (tmp + os.replace): a crash or a concurrent reader/writer must never see a
         # half-written repos.json — a truncate-in-place that fails mid-write would drop EVERY repo's
@@ -768,7 +813,12 @@ def beautify(repo, auto_push=True):
 
 
 def stop(repo):
-    """Write an empty <path>/.rsi/stop sentinel; the runner polls it and exits."""
+    """Write an empty <path>/.rsi/stop sentinel; the runner polls it and exits.
+
+    After writing the sentinel, wait briefly for the loop to confirm stopped (is_running False), then
+    auto-run cleanup_worktrees to delete lingering rsi/* branches left by local/push ship modes or dead
+    runs (the observed rsi/iter-... leftover on sover). Cleanup is best-effort — a failure is logged but
+    does not block the stop (the sentinel was already written). Never force-kills the process."""
     rsi = _runtime_dir(repo)
     if not rsi:
         return {"ok": False, "error": "repo has no 'path'"}
@@ -776,9 +826,29 @@ def stop(repo):
         os.makedirs(rsi, exist_ok=True)
         with open(os.path.join(rsi, "stop"), "w", encoding="utf-8") as f:
             f.write("")
-        return {"ok": True}
     except OSError as e:
         return {"ok": False, "error": str(e)}
+    # the loop polls the sentinel every second; give it a short grace window to exit cleanly before
+    # cleaning branches (so we don't delete a branch a still-live runner is standing on). Best-effort:
+    # if the loop is slow to exit, cleanup_worktrees' own guard (never delete the current branch) keeps
+    # it safe, and a later stop/Supervise sweep will catch stragglers.
+    try:
+        for _ in range(5):
+            if not is_running(repo):
+                break
+            time.sleep(1)
+    except Exception:
+        pass
+    try:
+        cw = cleanup_worktrees(repo)
+        # cleanup is best-effort: a failure (e.g. git not found) does NOT block the stop — the sentinel
+        # was already written and the loop will exit. The guard inside cleanup_worktrees (never delete
+        # the current branch) keeps it safe even if the loop is slow to exit.
+        if not cw.get("ok"):
+            pass   # intentionally swallowed; the stop itself succeeded
+    except Exception:
+        pass
+    return {"ok": True}
 
 
 # --------------------------------------------------------------------------- #

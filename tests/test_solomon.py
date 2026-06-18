@@ -247,9 +247,13 @@ def test_recover_rung0_stale_lock(tmp_path, monkeypatch):
     assert (rt / "supervisor.jsonl").exists()
 
 
-def test_recover_revert_failed_escalates_no_spawn(tmp_path, monkeypatch):
+def test_recover_revert_failed_escalates_no_spawn_when_loop_live(tmp_path, monkeypatch):
+    # revert_failed now auto-resets when the loop is NOT live (review finding #2 — the wedge). But
+    # when the loop IS live, it must still ESCALATE (never hard-reset git under a running iteration)
+    # and never spawn a pi fix-session (revert_failed is not a code-fix candidate).
     rt = _rt(tmp_path, monkeypatch)
     _hb(rt, status="error", phase="reverted", last_summary="REVERT FAILED")
+    monkeypatch.setattr(control, "is_running", lambda repo: True)          # loop IS live -> escalate
     spawned = []
     monkeypatch.setattr(solomon, "solomon_fix_session", lambda repo: spawned.append(repo) or {"ok": True})
     res = solomon.recover(_repo(tmp_path), allow_pi=True)
