@@ -489,7 +489,8 @@ async function renderWsTab(r) {
       : "<b>backlog.md</b> — the queue of improvements the agent pulls from, top first."}</p>
       <textarea class="textarea" id="wsEditor">loading…</textarea>
       <div style="margin-top:10px"><button class="btn sm accent" id="wsSaveDoc">Save ${which === "agent" ? "AGENT.md" : "backlog.md"}</button>
-      <button class="btn sm" id="wsEnrich" title="Read the repo and rewrite this contract tailored to it (uses your API key)">${icon("sparkle", 14)}Enrich with AI</button></div>`;
+      <button class="btn sm" id="wsEnrich" title="Read the repo and rewrite this contract tailored to it (uses your API key)">${icon("sparkle", 14)}Enrich with AI</button>
+      <button class="btn sm" id="wsIdeate" title="Divergent ideation: prepend ambitious, leverage-ranked ideas to the backlog (counters shallow incrementalism)">${icon("sparkle", 14)}Ideate</button></div>`;
     const res = await call("read_contract", r.name, which);
     $("#wsEditor", body).value = (res && res.text) || "";
     $("#wsSaveDoc", body).onclick = async () => { const x = await call("write_contract", r.name, which, $("#wsEditor", body).value);
@@ -501,6 +502,14 @@ async function renderWsTab(r) {
       const res2 = await call("read_contract", r.name, which);
       if (res2 && typeof res2.text === "string") $("#wsEditor", body).value = res2.text;
       b.disabled = false; b.innerHTML = `${icon("sparkle", 14)}Enrich with AI`;
+    };
+    $("#wsIdeate", body).onclick = async () => {
+      const b = $("#wsIdeate", body); b.disabled = true; b.textContent = "Ideating…";
+      const x = await call("ideate", r.name);
+      toast(x && x.ok ? `${r.name}: +${x.added} ambitious idea(s) on the backlog` : `Ideate failed: ${(x && x.error) || "?"}`, x && x.ok ? "ok" : "err");
+      const res2 = await call("read_contract", r.name, "backlog");
+      if (res2 && typeof res2.text === "string" && which === "backlog") $("#wsEditor", body).value = res2.text;
+      b.disabled = false; b.innerHTML = `${icon("sparkle", 14)}Ideate`;
     };
     return;
   }
@@ -669,6 +678,7 @@ const mock = (() => {
     cleanup_worktrees: () => ({ ok: true, pruned: true, removed: ["rsi/iter-old1", "rsi/iter-old2", "rsi/iter-old3"] }),
     ensure_contracts: () => ({ ok: true, created: [] }),
     enrich_contract: (n) => ({ ok: true, agent_written: 1400, backlog_written: 320, summary: "# " + n + " self-improvement contract" }),
+    ideate: () => ({ ok: true, added: 6, top: "- [ ] [architecture] Build the genesis profile-create API" }),
     supervise: (n, allowPi) => {
       const cat = ((find(n) || {}).diagnosis || {}).category || "ok";
       if (cat === "revert_failed") return { ok: true, results: [{ name: n, category: cat, actions_taken: ["reset_to_base"], escalate: true, message: "un-pushed commits on main — escalate" }] };

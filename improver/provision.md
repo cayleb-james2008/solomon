@@ -27,6 +27,10 @@ The AGENT.md must follow this five-section shape:
 5. `## Map of the code` — the REAL entry points, key directories, and what each does, FROM WHAT YOU
    READ. This is the most important section: it teaches the next agent where things live.
 
-The backlog.md must be `# <name> backlog` followed by 5–10 concrete improvement items grounded in
-REAL gaps you observed (missing tests, rough error handling, undocumented setup, small refactors).
-Each item is one line starting exactly with `- [ ] `.
+The backlog.md must be `# <name> backlog` followed by 6–10 concrete items grounded in REAL gaps you
+observed, **ordered to advance the GOAL** and **tagged by ambition tier**. Each item is one line,
+exactly: `- [ ] [<tier>] <improvement>` where `<tier>` ∈ `feature | refactor | architecture | chore`.
+Lead with the **highest-leverage `feature`/`architecture`** items that genuinely move the goal (build
+the capabilities it needs) — NOT a list of trivial chores. Reserve `chore` for the few small
+hygiene items; do not fill the backlog with "add a test"/"tighten error handling"/"improve the
+README" — those are low-leverage and the loop will find them on its own.

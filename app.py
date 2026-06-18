@@ -194,6 +194,10 @@ class Api:
         r = self._repo(name)
         return control.enrich_contract(r) if r else {"ok": False, "error": "unknown repo"}
 
+    def ideate(self, name):
+        r = self._repo(name)
+        return control.ideate(r) if r else {"ok": False, "error": "unknown repo"}
+
     def supervise(self, name=None, allow_pi=False, unattended=False):
         """Diagnose + recover one repo (name) or all (name=None). RUNG-0 deterministic recovery runs
         immediately. A pi fix-session runs ONLY when explicitly allowed: allow_pi (the per-action
