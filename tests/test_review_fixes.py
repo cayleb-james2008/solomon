@@ -660,3 +660,40 @@ def test_ship_push_unverified_blocks_pr(monkeypatch):
     pr = m._ship("rsi/iter-x", "t", "s", {"passed": 1})
     assert pr["state"] == "push-unverified (failed)" and opened == []   # never opened a PR
     assert m._ship_succeeded(pr) is False                              # and did not tick the item
+
+
+# --------------------------------------------------------------------------- #
+# AGENT-PATH — the agent subprocess gets a PATH that blocks gh (any) + git push/pull/merge/rebase,
+# the operations a too-eager model uses to escape the runner's sandbox (sover dup-PRs, maki's
+# conflicted main) despite the explicit contract. Read-only git + pi's own git pass through.
+# --------------------------------------------------------------------------- #
+def test_agent_shim_dir_blocks_gh_and_mutating_git(tmp_path):
+    m = _load_runner()
+    m.RUNTIME = tmp_path
+    d = m._agent_shim_dir()
+    assert d is not None
+    gh = (d / "gh").read_text(encoding="utf-8")
+    assert "exit 1" in gh and "github_*" in gh                 # gh fully blocked
+    assert (d / "gh.cmd").exists()
+    if (d / "git").exists():                                   # only when a real git is on PATH (dev/CI both)
+        git = (d / "git").read_text(encoding="utf-8")
+        assert "push|pull|merge|rebase" in git                 # only the escaping verbs are blocked
+        assert "exec" in git                                   # everything else passes through to the real git
+        assert (d / "git.cmd").exists()
+
+
+def test_run_pi_prepends_agent_shims_to_path(tmp_path, monkeypatch):
+    m = _load_runner()
+    m.RUNTIME = tmp_path
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+        def communicate(self, timeout=None):
+            return ("", "")
+    monkeypatch.setattr(m.subprocess, "Popen",
+                        lambda args, **k: captured.update(env=k.get("env") or {}) or _Proc())
+    monkeypatch.setattr(m, "pi_exe", lambda: "pi")
+    m.run_pi("do one thing")
+    first = captured["env"].get("PATH", "").split(os.pathsep)[0]
+    assert first == str(tmp_path / "agent_shims")              # the shim dir is FIRST in the agent's PATH
