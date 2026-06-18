@@ -183,6 +183,48 @@ def _split_item_status(summary: str):
             continue   # strip the marker line from the PR/commit body
         kept.append(ln)
     return ("\n".join(kept).strip() or summary), deviated
+
+
+# Files a backlog item explicitly mandates EDITING — a backticked code/config path that DIRECTLY follows
+# an edit verb (edit/change/rewrite/modify/replace/create) within a few chars. This deliberately EXCLUDES
+# files named only as inputs/context/examples ("using `data/x.json`", "see `README.md`", a "(a/b/c)"
+# candidate list, a generated artifact) — the dominant item shape, which must NOT trigger a false
+# deviation. Bounded quantifiers (no catastrophic backtracking). Used to catch an agent that reports
+# ITEM-STATUS: done while shipping UNRELATED work (touching none of the files it was told to edit).
+_EDIT_MANDATE_RE = re.compile(
+    r"\b(?:edit|edits|editing|change|changes|changed|rewrite|rewrites|rewriting|modif\w+|"
+    r"replace|replaces|recreate|create|creates)\b"
+    r"[^.\n`]{0,15}?`([^`]{1,80}?\.(?:py|ts|tsx|js|jsx|json|toml|md|ya?ml|cfg|ini|txt|html|css|svg|rs|go|sh))`",
+    re.I)
+
+
+def _norm_path(p: str) -> str:
+    return re.sub(r"^[./\\]+", "", (p or "").strip().replace("\\", "/")).lower()
+
+
+def _edit_mandated_files(text: str) -> set:
+    """Normalized relative paths the item explicitly mandates EDITING (a backticked code/config file just
+    after an edit verb). Empty when the item gives no explicit edit mandate — then the agent's
+    self-reported ITEM-STATUS stands, exactly as before (no false positives on data-driven items)."""
+    return {_norm_path(m.group(1)) for m in _EDIT_MANDATE_RE.finditer(text or "")}
+
+
+def _deviated_from_named_files(goal: str, changed_files: str) -> bool:
+    """True when the item explicitly mandates editing >=1 file but the committed diff touched NONE of them
+    (matched by path SUFFIX so a named `scripts/scheduler.py` isn't satisfied by a decoy `docs/scheduler.py`)
+    — the agent shipped something other than the named edit, whatever its ITEM-STATUS said. Conservative:
+    fires ONLY on an explicit edit mandate, never on files named as inputs/context, so honest data-driven
+    iterations are never mis-flagged."""
+    named = _edit_mandated_files(goal)
+    if not named:
+        return False
+    touched = [_norm_path(ln) for ln in (changed_files or "").splitlines() if ln.strip()]
+    for n in named:
+        if any(t == n or t.endswith("/" + n) for t in touched):
+            return False                         # touched at least one mandated file -> not a deviation
+    return True                                  # mandated files exist but the diff touched none of them
+
+
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 BASE_BRANCH = "main"  # the repo's integration branch; re-resolved from the launch branch in main()
 
@@ -1079,6 +1121,18 @@ def one_iteration() -> None:
         log("no commits ahead after gate — dropping branch")
         _drop_branch(branch, "noop", summary)
         return
+
+    # Catch a DEVIATING agent that reports ITEM-STATUS: done while shipping UNRELATED work: when the
+    # backlog item names concrete files and the committed diff touched NONE of them, the agent did
+    # something other than the named item — don't trust its self-report (live: sover's privacy item
+    # named pyproject.toml and the beautify item named README.md/banner.svg/CONTRIBUTING.md, yet both
+    # shipped capability_plan/chat changes and claimed done, silently consuming the item). Mark it
+    # deviated so it is NOT ticked — it defers after a few tries instead of being lost as 'done'.
+    if not BEAUTIFY and not SOLOMON and not item_deviated:
+        if _deviated_from_named_files(goal, git("diff", "--name-only", "--no-renames", f"{BASE_BRANCH}..{branch}").stdout):
+            log(f"DEVIATION: the item names file(s) the committed diff never touched — agent shipped "
+                f"unrelated work; not ticking '{goal[:60]}'")
+            item_deviated = True
 
     # honor an operator Stop that arrived during the (possibly long) iteration: keep the
     # gate-green work on its local branch, but do NOT open a PR after a stop was requested.

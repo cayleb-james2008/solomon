@@ -723,3 +723,46 @@ def test_acquire_lock_takes_over_stopped_heartbeat_lock(tmp_path, monkeypatch):
         json.dumps({"updated_at": _iso(0), "run_id": "oldrun", "status": "stopped"}), encoding="utf-8")
     assert m.acquire_lock() is True                                    # cleanly-stopped holder -> take over
     assert m._read_lock_pid() == os.getpid()
+
+
+# --------------------------------------------------------------------------- #
+# DEVIATION — the agent reports ITEM-STATUS: done but ships UNRELATED work (touching none of the files
+# the item names). Live: sover's privacy item named pyproject.toml + the beautify item named
+# README/banner/CONTRIBUTING, yet both shipped capability_plan/chat changes and were mis-ticked as done.
+# --------------------------------------------------------------------------- #
+def test_edit_mandated_files_only_on_explicit_edit_verbs():
+    m = _load_runner()
+    # explicit edit mandates -> captured (normalized relative paths)
+    assert m._edit_mandated_files("change `pyproject.toml` `authors`") == {"pyproject.toml"}
+    assert m._edit_mandated_files("edit ONLY `README.md`, `assets/banner.svg`") == {"readme.md"}  # the file right after the edit verb
+    assert m._edit_mandated_files("create `scripts/setup.py` for the route") == {"scripts/setup.py"}
+    assert m._edit_mandated_files("rewrite `pi/CONTROL.md` to be honest") == {"pi/control.md"}
+    # files named as INPUTS / CONTEXT / EXAMPLES -> NOT captured (the dominant false-positive vector)
+    assert m._edit_mandated_files("Bias the scheduler using `data/attribution.json` and `data/scoreboard.json`") == set()
+    assert m._edit_mandated_files("Make `creative_lane.py` conditioned by feeding `data/scoreboard.json`") == set()
+    assert m._edit_mandated_files("clarify the install section (see `README.md`)") == set()
+    assert m._edit_mandated_files("wire the readiness check into (bin/sover_app.py / standalone.py)") == set()
+    assert m._edit_mandated_files("call `obj.method()` more often") == set()   # not a file extension
+
+
+def test_deviated_only_on_edit_mandate_with_suffix_match():
+    m = _load_runner()
+    privacy = "Privacy: change `pyproject.toml` `authors` to remove the personal name"
+    beautify = "Beautify the README — edit ONLY `README.md`, `assets/banner.svg`, and `CONTRIBUTING.md`"
+    # the two LIVE deviations: item mandates editing files the diff never touched -> flagged
+    assert m._deviated_from_named_files(privacy, "scripts/capability_plan.py\nscripts/api/routes/chat.py\n") is True
+    assert m._deviated_from_named_files(beautify, "CHANGELOG.md\npi/SYSTEM.md\nscripts/capability_plan.py\n") is True
+    # honest work: touched a mandated file -> NOT flagged
+    assert m._deviated_from_named_files(privacy, "pyproject.toml\nCHANGELOG.md\n") is False
+    assert m._deviated_from_named_files(beautify, "README.md\n") is False
+    # NO false positive on a data-driven item (the dominant sover shape) — names files only as inputs
+    assert m._deviated_from_named_files(
+        "Bias `scripts/scheduler.py` using `data/attribution.json`", "scripts/scheduler.py\n") is False  # touched the edit target
+    assert m._deviated_from_named_files(
+        "Replace static best_hours with a scheduler reading `data/attribution.json`", "scripts/scheduler.py\n") is False  # json is context, not mandated
+    # suffix match: a same-basename decoy in another dir does NOT satisfy a path-qualified mandate
+    assert m._deviated_from_named_files("rewrite `scripts/scheduler.py`", "docs/scheduler.py\n") is True
+    assert m._deviated_from_named_files("rewrite `scripts/scheduler.py`", "scripts/scheduler.py\n") is False
+    # vague item (no edit mandate) -> never flagged
+    assert m._deviated_from_named_files("Improve the scheduling heuristic", "scripts/scheduler.py\n") is False
+    assert m._deviated_from_named_files("", "x.py\n") is False
