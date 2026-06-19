@@ -95,6 +95,19 @@ SANDBOX_CONFIG = None                 # per-repo sandbox config (from repos.json
 VISION_MODEL = ""                     # vision-capable model id for the visual reviewer
 LAST_VISUAL_FEEDBACK = ""             # one-time feedback from the previous iteration's review
 
+# Per-phase model/provider/reasoning ("model/reasoning/provider selection for each part of the RSI
+# loop"). PHASE is derived from the launch flags (implement|ideate|beautify|recovery|provision).
+# repos.json may carry an optional `phases.<PHASE>: {provider?, model?, reasoning?}` that overrides the
+# repo-level config for THIS phase's process. Smart defaults: the deep phases keep the repo's strong
+# model + reasoning unchanged; the light phases (beautify/e2e) drop to the provider's cheap worker
+# model + low reasoning. Any phase is fully overridable via `phases.<phase>` in repos.json.
+PHASE = "implement"
+_PHASE_DEFAULTS = {
+    "beautify": {"reasoning": "low", "cheap": True},
+    "e2e": {"reasoning": "low", "cheap": True},
+}
+_CHEAP_MODEL = {"ollama-cloud": "minimax-m3", "openrouter": "qwen/qwen3-coder"}
+
 
 def configure(repo: str, name: str, provider: str = "ollama-cloud",
               model: str | None = None) -> None:
@@ -162,6 +175,42 @@ def _refresh_config_from_registry() -> None:
         VISUAL_REVIEW_ENABLED = False
         SANDBOX_CONFIG = None
         VISION_MODEL = ""
+    _apply_phase_config(row)   # per-phase provider/model/reasoning override for THIS phase's process
+
+
+def _apply_phase_config(row=None) -> None:
+    """Override the active provider/model/reasoning with PHASE-specific config from repos.json
+    (`phases.<PHASE>`) + smart defaults. Precedence: explicit `phases.<phase>.X` > smart per-phase
+    default > the repo-level config already set. Deep phases (implement/ideate/recovery/provision)
+    have no smart default, so they keep the repo's strong model + reasoning unchanged; the light
+    phases (beautify/e2e) drop to the provider's cheap worker model + low reasoning. Called for every
+    phase process — the implement loop (via _refresh) and the one-shot ideate/beautify/recovery."""
+    global PI_PROVIDER, PI_MODEL, PI_EXT, REASONING
+    if row is None:
+        try:
+            rows = json.loads((CONTROL / "repos.json").read_text(encoding="utf-8"))
+            row = (next((r for r in rows if isinstance(r, dict) and r.get("name") == NAME), {})
+                   if isinstance(rows, list) else {})
+        except (OSError, ValueError):
+            row = {}
+    phases = row.get("phases") if isinstance(row.get("phases"), dict) else {}
+    pcfg = phases.get(PHASE) if isinstance(phases.get(PHASE), dict) else {}
+    dflt = _PHASE_DEFAULTS.get(PHASE, {})
+    repo_prov = row.get("provider") or "ollama-cloud"
+    prov_name = pcfg.get("provider")
+    if prov_name and prov_name in PROVIDERS:
+        prov = PROVIDERS[prov_name]
+        PI_PROVIDER, PI_EXT = prov["pi_provider"], HERE / prov["ext"]
+        PI_MODEL = (pcfg.get("model")
+                    or (_CHEAP_MODEL.get(prov_name) if dflt.get("cheap") else None)
+                    or prov["default_model"])
+    elif pcfg.get("model"):
+        PI_MODEL = pcfg["model"]
+    elif dflt.get("cheap"):
+        PI_MODEL = _CHEAP_MODEL.get(repo_prov, PI_MODEL)
+    REASONING = pcfg.get("reasoning") or dflt.get("reasoning") or REASONING or "xhigh"
+    _hb["model"] = PI_MODEL
+    _hb["phase"] = PHASE
 
 
 def build_task(goal: str, tier: str = "chore") -> str:
@@ -2495,7 +2544,7 @@ def main(argv=None) -> int:
                     help="supervisor fix-session: diagnose + fix a persistent gate failure (one iteration)")
     a = ap.parse_args(argv)
     configure(a.repo, a.name or Path(a.repo).name, a.provider, a.model)
-    global SHIP, GATE_CMD, REASONING, GOAL, BEAUTIFY, SOLOMON, INTERVAL
+    global SHIP, GATE_CMD, REASONING, GOAL, BEAUTIFY, SOLOMON, INTERVAL, PHASE
     SHIP = a.ship
     GATE_CMD = a.gate or ""
     REASONING = a.reasoning or ""
@@ -2503,6 +2552,9 @@ def main(argv=None) -> int:
     BEAUTIFY = a.beautify
     SOLOMON = a.solomon
     REASONING = REASONING or "xhigh"     # default to max reasoning when not explicitly set
+    PHASE = ("beautify" if a.beautify else "recovery" if a.solomon
+             else "ideate" if a.ideate else "provision" if a.provision else "implement")
+    _apply_phase_config()   # per-phase model/provider/reasoning (one-shot phases + the initial loop)
     INTERVAL = max(1, a.interval)        # the cooldown AND the lock-staleness base (acquire_lock takeover)
     if BEAUTIFY or SOLOMON:
         a.once = True  # beautify + the supervisor fix-session are single-shot
