@@ -58,6 +58,7 @@ class AgentBrowser:
         self._last_title = ""
         self._last_refs: list[dict] = []
         self._closed = False
+        self._started = False        # set True after the first successful CLI call (for _probe_alive)
 
     def __enter__(self):
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -133,6 +134,7 @@ class AgentBrowser:
             return {"ok": False, "error": str(error or stderr or stdout or
                                                 "agent-browser command failed")[:300]}
         data = payload.get("data")
+        self._started = True   # a successful CLI call proves a live session exists (liveness probe)
         return {"ok": True, "data": data if isinstance(data, dict) else {"value": data}}
 
     def _fail(self, error: str, action: dict | None = None) -> dict:
@@ -141,10 +143,41 @@ class AgentBrowser:
                                  current_action=action)
         return state
 
+    # ---- process health (heartbeat / respawn) ----------------------------
+    def _probe_alive(self) -> bool:
+        """Lightweight liveness check of the underlying agent-browser session. Before the session is
+        established (no successful CLI call yet) there is nothing to probe — return True (the action
+        itself starts it) WITHOUT spawning a process. Once started, run a cheap ``get url`` and report
+        whether the session/child answered. Never raises (delegates to _run_cli, which catches)."""
+        if not self._started:
+            return True
+        return bool(self._run_cli(["get", "url"], timeout=10).get("ok"))
+
+    def _reinit_session(self) -> dict:
+        """Re-establish a crashed session exactly once: best-effort close the dead session, then reset
+        the per-session counters so the NEXT action re-creates it. Returns a status dict; never raises."""
+        self._run_cli(["close"], timeout=10)
+        self._seq = 0
+        self._last_refs = []
+        self._started = False
+        return {"ok": True, "reinit": True}
+
+    def _guard_alive(self) -> None:
+        """Before each action: if the session crashed, atomically record it ({ok:false,
+        status:'crashed'} — so the dashboard panel shows it's dead, not a stale frame) and attempt
+        EXACTLY ONE re-init; the upcoming action then re-creates the session. Synchronous per-action
+        (no polling thread — keeps it simple). Never raises into the RSI loop (best-effort contract)."""
+        if self._probe_alive():
+            return
+        self.write_state(ok=False, status="crashed", phase="error",
+                         error="agent-browser session is not responding (process crashed)")
+        self._reinit_session()
+
     def navigate(self, url: str) -> dict:
         if not self._url_allowed(url):
             return self._fail("navigation is outside the allowed sandbox origins",
                               {"kind": "navigate", "url": str(url)})
+        self._guard_alive()         # respawn a crashed session before navigating
         result = self._run_cli(["open", str(url)])
         if not result.get("ok"):
             return self._fail(result.get("error", "navigation failed"), {"kind": "navigate"})
@@ -195,6 +228,7 @@ class AgentBrowser:
     def act(self, action: dict) -> dict:
         if not isinstance(action, dict):
             return self._fail("action must be an object")
+        self._guard_alive()         # respawn a crashed session before acting
         kind = str(action.get("kind") or "")
         observation_seq = action.get("observation_seq")
         if observation_seq is not None and int(observation_seq) != self._seq:

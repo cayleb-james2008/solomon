@@ -103,3 +103,54 @@ def test_agent_browser_rejects_stale_ref(tmp_path):
     ab._seq = 7
     out = ab.act({"kind": "click", "ref": "@e1", "observation_seq": 6})
     assert out["ok"] is False and "stale" in out["error"].lower()
+
+
+# ---- process health: liveness probe + one-shot respawn (Feature: agent-browser heartbeat) ----
+def test_agent_browser_probe_alive_semantics(tmp_path, monkeypatch):
+    """Before a session is established there is nothing to probe -> alive WITHOUT spawning a process;
+    an established-but-dead session reports not-alive; an established-and-live session reports alive."""
+    ab = agent_browser.AgentBrowser(repo_path=str(tmp_path), runtime_dir=tmp_path / "rt")
+    calls = []
+    monkeypatch.setattr(ab, "_run_cli", lambda *a, **k: calls.append(a) or {"ok": False})
+    assert ab._probe_alive() is True          # not started -> alive
+    assert calls == []                        # and WITHOUT a subprocess
+    ab._started = True
+    assert ab._probe_alive() is False         # established but dead (`get url` -> ok:false)
+    assert calls and "get" in calls[-1][0]
+    monkeypatch.setattr(ab, "_run_cli", lambda *a, **k: {"ok": True, "data": {"url": "http://x/"}})
+    assert ab._probe_alive() is True          # established and live
+
+
+def test_agent_browser_dead_session_reinits_once(tmp_path, monkeypatch):
+    """A dead-session guard writes ok:false/status:crashed to the panel state and triggers EXACTLY
+    ONE re-init attempt (synchronous per-action, no polling thread)."""
+    (tmp_path / "rt").mkdir(parents=True, exist_ok=True)
+    ab = agent_browser.AgentBrowser(repo_path=str(tmp_path), runtime_dir=tmp_path / "rt")
+    monkeypatch.setattr(ab, "_probe_alive", lambda: False)       # session is dead
+    reinits = []
+    monkeypatch.setattr(ab, "_reinit_session", lambda: reinits.append(1) or {"ok": True})
+    ab._guard_alive()
+    assert reinits == [1]                                        # exactly one re-init
+    snap = json.loads((tmp_path / "rt" / "browser_state.json").read_text(encoding="utf-8"))
+    assert snap["ok"] is False and snap["status"] == "crashed"
+
+
+def test_agent_browser_guard_noop_when_alive(tmp_path, monkeypatch):
+    """When the session is alive the guard does nothing — no crashed state, no re-init."""
+    ab = agent_browser.AgentBrowser(repo_path=str(tmp_path), runtime_dir=tmp_path / "rt")
+    monkeypatch.setattr(ab, "_probe_alive", lambda: True)
+    reinits = []
+    monkeypatch.setattr(ab, "_reinit_session", lambda: reinits.append(1) or {"ok": True})
+    ab._guard_alive()
+    assert reinits == []
+
+
+def test_agent_browser_reinit_resets_session_state(tmp_path, monkeypatch):
+    """_reinit_session closes the dead session (best-effort) and resets counters so the NEXT action
+    re-creates the session."""
+    ab = agent_browser.AgentBrowser(repo_path=str(tmp_path), runtime_dir=tmp_path / "rt")
+    monkeypatch.setattr(ab, "_run_cli", lambda *a, **k: {"ok": False})   # close is best-effort
+    ab._started = True
+    ab._seq = 5
+    ab._reinit_session()
+    assert ab._started is False and ab._seq == 0
