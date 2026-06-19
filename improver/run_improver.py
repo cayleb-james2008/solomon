@@ -1083,9 +1083,10 @@ def _visual_gate_reason(vr_result) -> str | None:
     block), there are no findings, or only warnings/info (those become feedback, not a block). Only a
     SUCCESSFUL review WITH >=1 critical finding blocks the ship."""
     if not isinstance(vr_result, dict):
-        return None
+        return "visual review unavailable: no review result"
     if not vr_result.get("ok"):
-        return None                   # review infra down -> best-effort, don't block
+        detail = str(vr_result.get("error") or "review infrastructure failed")[:240]
+        return f"visual review unavailable: {detail}"
     findings = vr_result.get("findings") or []
     n_crit = sum(1 for f in findings
                 if isinstance(f, dict) and (f.get("severity") or "").lower() == "critical")

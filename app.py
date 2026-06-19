@@ -86,6 +86,9 @@ class Api:
                     "heartbeat": control.read_heartbeat(r),
                     "prs": control.list_prs(r) if gh_ready else [],
                     "local_branches": control.local_rsi_branches(r),
+                    "worktrees": control.list_worktrees(r),
+                    "frontend": control.has_frontend(r),
+                    "browser": control.browser_state(r),
                     "contracts": control.contracts_present(r),
                     "diagnosis": (solomon.diagnose(r) if solomon else {"category": "ok", "healthy": True}),
                     "escalation": (solomon.read_escalation(r) if solomon else None),
@@ -155,6 +158,12 @@ class Api:
                 r = {**r, "enriching": True}
         return r
 
+    def connect_project(self, spec, goal=None, ship="pr", visual_gate=None):
+        return control.connect_project(spec, goal=goal, ship=ship, visual_gate=visual_gate)
+
+    def github_login_start(self):
+        return control.github_login_start()
+
     def publish(self, name, private=True):
         return control.publish_to_github(name, private=private)
 
@@ -189,6 +198,32 @@ class Api:
     def cleanup_worktrees(self, name):
         r = self._repo(name)
         return control.cleanup_worktrees(r) if r else {"ok": False, "error": "unknown repo"}
+
+    def list_worktrees(self, name):
+        r = self._repo(name)
+        return control.list_worktrees(r) if r else []
+
+    def start_app_test(self, name):
+        r = self._repo(name)
+        return control.start_app_test(r) if r else {"ok": False, "error": "unknown repo"}
+
+    def stop_app_test(self, name):
+        r = self._repo(name)
+        return control.stop_app_test(r) if r else {"ok": False, "error": "unknown repo"}
+
+    def app_test_state(self, name, after_seq=0):
+        r = self._repo(name)
+        return control.app_test_state(r, after_seq=after_seq) if r else {
+            "ok": False, "error": "unknown repo"}
+
+    def app_test_frame(self, name, after_seq=0):
+        r = self._repo(name)
+        return control.app_test_frame(r, after_seq=after_seq) if r else {
+            "ok": False, "error": "unknown repo"}
+
+    def read_app_test_report(self, name):
+        r = self._repo(name)
+        return control.read_app_test_report(r) if r else {"ok": False, "error": "unknown repo"}
 
     # ---- provisioning + Solomon supervisor ------------------------------
     def ensure_contracts(self, name):

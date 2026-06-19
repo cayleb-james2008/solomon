@@ -375,7 +375,7 @@ the agent's browser *only* through the panel's screenshot stream + the rendered 
 This is the "agent control only, visible to the user through a panel" requirement, satisfied
 mechanically.
 
-- **Bridge:** `improver/agent_browser.py` (Python) + `improver/agent_browser_driver.js`
+- **Bridge:** `improver/agent_browser.py` wraps pinned `agent-browser` 0.27.0 sessions.
   (node/Playwright). The bridge owns a persistent Chromium user-data-dir per repo (login
   state persists across actions within a session) and exposes `navigate / click / type /
   scroll / screenshot` actions for the agent's action loop.

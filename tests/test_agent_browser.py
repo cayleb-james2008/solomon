@@ -47,25 +47,59 @@ def test_agent_browser_context_manager(tmp_path):
     assert not (rt / "browser_state.json").exists()
 
 
-def test_agent_browser_run_driver_missing_node(tmp_path, monkeypatch):
+def test_agent_browser_missing_cli_fails_closed(tmp_path, monkeypatch):
     """When node is not installed, _run_driver writes {ok:false} to the panel state and
     returns a clear error — never raises into the RSI loop."""
     monkeypatch.setattr(agent_browser.shutil, "which", lambda name: None)
     ab = agent_browser.AgentBrowser(repo_path=str(tmp_path), runtime_dir=tmp_path / "rt")
     out = ab.navigate("http://x/")
     assert out["ok"] is False
-    assert "node" in out["error"]
+    assert "agent-browser" in out["error"]
     # the panel state reflects the failure
     snap = json.loads((tmp_path / "rt" / "browser_state.json").read_text(encoding="utf-8"))
     assert snap["ok"] is False
 
 
-def test_agent_browser_run_driver_missing_driver_script(tmp_path, monkeypatch):
-    """When the driver script is missing, the bridge writes {ok:false} and returns."""
-    monkeypatch.setattr(agent_browser.shutil, "which", lambda name: "node" if name == "node" else None)
-    ab = agent_browser.AgentBrowser(repo_path=str(tmp_path), runtime_dir=tmp_path / "rt")
-    # point HERE at an empty dir so the driver script isn't found
-    monkeypatch.setattr(agent_browser, "__file__", str(tmp_path / "agent_browser.py"))
-    out = ab.navigate("http://x/")
-    assert out["ok"] is False
-    assert "driver" in out["error"].lower()
+def test_agent_browser_reuses_named_session_and_sequences_observations(tmp_path, monkeypatch):
+    calls = []
+
+    class Result:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps({"success": True, "data": {"url": "http://127.0.0.1:8000/",
+                                                         "title": "Fixture", "refs": {},
+                                                         "snapshot": "(no interactive elements)"}})
+
+    monkeypatch.setattr(agent_browser.shutil, "which", lambda name: "agent-browser.exe")
+    monkeypatch.setattr(agent_browser.subprocess, "run",
+                        lambda args, **kwargs: calls.append(args) or Result())
+    ab = agent_browser.AgentBrowser(str(tmp_path), tmp_path / "rt",
+                                    allowed_origins=["http://127.0.0.1:8000"])
+    first = ab.navigate("http://127.0.0.1:8000/")
+    second = ab.observe()
+    assert first["ok"] and second["ok"]
+    assert second["seq"] > first["seq"]
+    assert calls and all("--session" in call and ab.session_id in call for call in calls)
+
+
+def test_agent_browser_rejects_external_navigation_without_spawning(tmp_path, monkeypatch):
+    called = False
+    monkeypatch.setattr(agent_browser.shutil, "which", lambda name: "agent-browser.exe")
+
+    def run(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(agent_browser.subprocess, "run", run)
+    ab = agent_browser.AgentBrowser(str(tmp_path), tmp_path / "rt",
+                                    allowed_origins=["http://127.0.0.1:8000"])
+    out = ab.navigate("https://example.com/")
+    assert out["ok"] is False and "allowed" in out["error"].lower()
+    assert called is False
+
+
+def test_agent_browser_rejects_stale_ref(tmp_path):
+    ab = agent_browser.AgentBrowser(str(tmp_path), tmp_path / "rt")
+    ab._seq = 7
+    out = ab.act({"kind": "click", "ref": "@e1", "observation_seq": 6})
+    assert out["ok"] is False and "stale" in out["error"].lower()
