@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
-_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+from winproc import hidden_subprocess_kwargs
 
 
 def _now() -> str:
@@ -115,7 +115,7 @@ class AgentBrowser:
                 result = subprocess.run(
                     command + args, stdout=stdout_file, stderr=stderr_file, text=True,
                     stdin=subprocess.DEVNULL, timeout=timeout, cwd=self.repo_path,
-                    env=_clean_env(), creationflags=_NO_WINDOW, close_fds=True,
+                    env=_clean_env(), close_fds=True, **hidden_subprocess_kwargs(),
                 )
                 stdout_file.seek(0); stderr_file.seek(0)
                 stdout = getattr(result, "stdout", None) or stdout_file.read()

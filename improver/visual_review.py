@@ -19,12 +19,12 @@ import base64
 import json
 import os
 import subprocess
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from improver.agent_browser import AgentBrowser
+from winproc import hidden_subprocess_kwargs
 
 # Import sibling modules — visual_review.py lives in improver/, same as run_improver.py
 HERE = Path(__file__).resolve().parent
@@ -34,8 +34,6 @@ CONTROL = HERE.parent
 VISUAL_REVIEW_MD = HERE / "visual_review.md"
 VISION_EXT = HERE / "provider.ts"   # unified provider shim; RSI_PROVIDER=vision-cloud selects the vision config
 CAPTURE_JS = HERE / "capture.js"  # legacy helper path; the active capture function uses AgentBrowser
-
-_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 
 def _now() -> str:
@@ -58,7 +56,7 @@ def _legacy_playwright_capture(base_url: str, pages: list, timeout: int = 60) ->
         p = subprocess.run(
             [node, str(CAPTURE_JS), base_url, pages_json],
             capture_output=True, text=True, timeout=timeout,
-            env=_clean_env_for_capture(), creationflags=_NO_WINDOW,
+            env=_clean_env_for_capture(), **hidden_subprocess_kwargs(),
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
@@ -351,7 +349,7 @@ def _run_vision_agent(task: str, vision_model: str, sandbox_config: dict,
     for timeout in (120, 180):
         try:
             p = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
-                               errors="replace", env=env, timeout=timeout, creationflags=_NO_WINDOW)
+                               errors="replace", env=env, timeout=timeout, **hidden_subprocess_kwargs())
         except (subprocess.TimeoutExpired, OSError):
             continue
         text = _final_text(p.stdout or "")

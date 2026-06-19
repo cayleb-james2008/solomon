@@ -36,6 +36,8 @@ import sys
 import time
 from pathlib import Path
 
+from winproc import hidden_subprocess_kwargs
+
 # The venv python used to build Solomon (same as build.ps1). Override with SOLOMON_BUILD_PY.
 _BUILD_PY_DEFAULT = r"C:\Users\Cayleb\Desktop\workspace\projects\maki\.venv\Scripts\python.exe"
 
@@ -73,9 +75,7 @@ def _run(cmd: list[str], cwd: str | None = None, check: bool = False) -> subproc
     """Run a subprocess, capturing output. CREATE_NO_WINDOW on win32 so the updater's own
     console is the only window the operator sees."""
     kw = {"capture_output": True, "text": True, "cwd": cwd}
-    if sys.platform == "win32":
-        kw["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
-    return subprocess.run(cmd, **kw)
+    return subprocess.run(cmd, **kw, **hidden_subprocess_kwargs())
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
@@ -175,7 +175,7 @@ def _launch(repo: Path) -> bool:
         return False
     try:
         subprocess.Popen([str(exe)], close_fds=True,
-                         creationflags=(0x08000000 if sys.platform == "win32" else 0))
+                         **hidden_subprocess_kwargs(detached=True))
         _log(f"Launched Solomon: {exe}")
         return True
     except OSError as e:

@@ -21,6 +21,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from winproc import hidden_subprocess_kwargs
+
 def _base_dir():
     """The operator data dir (repos.json, improver/, runtime/, .env). When frozen, the PyInstaller
     bundle does NOT contain improver/ — the operator data lives in the real Solomon folder. Resolution
@@ -56,7 +58,6 @@ REPOS_JSON = os.path.join(HERE, "repos.json")
 PROJECTS_DIR = os.path.join(os.path.dirname(HERE), "projects")
 
 _GH_FALLBACK = r"C:\Program Files\GitHub CLI\gh.exe"
-_NO_WINDOW = 0x08000000  # subprocess.CREATE_NO_WINDOW (win32)
 
 # provider defaults — keep in sync with improver/run_improver.py PROVIDERS
 _PROVIDER_DEFAULT_MODEL = {
@@ -363,11 +364,9 @@ def _clean_subenv():
 
 
 def _run(args, cwd=None):
-    """Run a subprocess, capturing output. CREATE_NO_WINDOW on win32; broken gh token stripped."""
+    """Run a subprocess, capturing output. Window-hidden on win32 (no console popup); broken gh token stripped."""
     kw = {"capture_output": True, "text": True, "cwd": cwd, "env": _clean_subenv()}
-    if sys.platform == "win32":
-        kw["creationflags"] = _NO_WINDOW
-    return subprocess.run(args, **kw)
+    return subprocess.run(args, **kw, **hidden_subprocess_kwargs())
 
 
 def _which_gh():
@@ -499,11 +498,10 @@ def github_login_start():
         return {"ok": True, "already": True, "login": status.get("login")}
     try:
         kw = {"cwd": HERE, "env": _clean_subenv()}
-        if sys.platform == "win32":
-            kw["creationflags"] = _NO_WINDOW
         subprocess.Popen(
             [gh, "auth", "login", "--hostname", "github.com", "--git-protocol", "https", "--web"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, **kw,
+            **hidden_subprocess_kwargs(),
         )
         return {"ok": True, "started": True}
     except OSError as e:
@@ -871,9 +869,6 @@ def start(repo, auto_push=True, once=False):
     if not os.path.exists(runner):
         return {"ok": False, "error": f"runner not found: {runner}"}
 
-    flags = 0
-    if sys.platform == "win32":
-        flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
     args = [py, runner, "--repo", _repo_path(repo), "--name", _repo_name(repo),
             "--provider", project_provider(repo), "--model", project_model(repo),
             "--ship", effective_ship(repo, auto_push), "--gate", project_gate(repo) or "",
@@ -888,12 +883,12 @@ def start(repo, auto_push=True, once=False):
         proc = subprocess.Popen(
             args,
             cwd=_repo_path(repo),
-            creationflags=flags,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
             close_fds=True,
             env=_clean_subenv(),   # strip stale gh token + PYTHONPATH so the repo venv python is clean
+            **hidden_subprocess_kwargs(detached=True),
         )
         return {"ok": True, "pid": proc.pid}
     except OSError as e:
@@ -926,9 +921,6 @@ def beautify(repo, auto_push=True):
     if not os.path.exists(runner):
         return {"ok": False, "error": f"runner not found: {runner}"}
 
-    flags = 0
-    if sys.platform == "win32":
-        flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
     try:
         proc = subprocess.Popen(
             [py, runner, "--repo", path, "--name", _repo_name(repo),
@@ -938,12 +930,12 @@ def beautify(repo, auto_push=True):
              "--reasoning", project_reasoning(repo),
              "--beautify", "--once"],
             cwd=path,
-            creationflags=flags,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
             close_fds=True,
             env=_clean_subenv(),
+            **hidden_subprocess_kwargs(detached=True),
         )
         return {"ok": True, "pid": proc.pid}
     except OSError as e:
@@ -1365,13 +1357,10 @@ def enrich_contract(repo, background=False):
     args = [py, runner, "--repo", path, "--name", name, "--provider", prov,
             "--model", project_model(repo), "--goal", project_goal(repo), "--provision"]
     if background:
-        flags = 0
-        if sys.platform == "win32":
-            flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
         try:
-            subprocess.Popen(args, cwd=path, creationflags=flags, stdout=subprocess.DEVNULL,
+            subprocess.Popen(args, cwd=path, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, close_fds=True,
-                             env=_clean_subenv())
+                             env=_clean_subenv(), **hidden_subprocess_kwargs(detached=True))
             return {"ok": True, "started": True}
         except OSError as e:
             return {"ok": False, "error": str(e)}

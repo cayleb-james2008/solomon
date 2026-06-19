@@ -39,6 +39,13 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent            # Solomon/improver
 CONTROL = HERE.parent                             # Solomon (operator infra, not published)
 
+# Run either as a module (control.py imports improver.run_improver) or as a script
+# (control.py spawns `python <abs>/improver/run_improver.py`). In the script case sys.path[0]
+# is improver/, not the repo root, so winproc (at the repo root) isn't importable until we add it.
+if str(CONTROL) not in sys.path:
+    sys.path.insert(0, str(CONTROL))
+from winproc import hidden_subprocess_kwargs  # noqa: E402  (needs CONTROL on sys.path first)
+
 # Provider map — chosen by --provider; sets the pi extension, pi provider name, default model.
 # Keep in sync with control.py _PROVIDER_DEFAULT_MODEL. All providers share ONE parameterized pi
 # extension (improver/provider.ts); it registers the provider named by RSI_PROVIDER (set in run_pi),
@@ -314,7 +321,6 @@ def _deviated_from_named_files(goal: str, changed_files: str) -> bool:
     return True                                  # mandated files exist but the diff touched none of them
 
 
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 BASE_BRANCH = "main"  # the repo's integration branch; re-resolved from the launch branch in main()
 
 _hb = {
@@ -533,7 +539,7 @@ def _record_history(status: str, branch: str | None, summary: str, *, extra: dic
 # ---- git ------------------------------------------------------------------
 def git(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True,
-                          env=_clean_env(), creationflags=_NO_WINDOW)
+                          env=_clean_env(), **hidden_subprocess_kwargs())
 
 
 def has_remote() -> bool:
@@ -778,7 +784,7 @@ def _kill_tree(pid: int) -> None:
     """Force-kill a process and ALL its children (pi spawns a node child)."""
     if sys.platform == "win32":
         subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                       capture_output=True, creationflags=_NO_WINDOW)
+                       capture_output=True, **hidden_subprocess_kwargs())
     else:
         import os as _os
         import signal as _sig
@@ -852,13 +858,12 @@ def run_pi(task: str, timeout: int = 1800, system_md: Path | None = None) -> sub
     # Popen (not subprocess.run): subprocess.run's timeout only kills the direct child, and
     # pi's node grandchild holding the stdout pipe makes the read block forever — that froze a
     # run for 5h. We force-kill the whole tree on timeout, then re-raise so the caller reverts.
-    flags = _NO_WINDOW | (subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0)
     # encoding="utf-8": pi emits UTF-8 (em-dashes, smart quotes). Without this, text=True
     # decodes with the platform default (cp1252 on Windows) and mangles non-ASCII into mojibake
     # — which then gets written verbatim into the provisioned AGENT.md/backlog.md.
     proc = subprocess.Popen(args, cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, encoding="utf-8", errors="replace", env=env,
-                            creationflags=flags)
+                            **hidden_subprocess_kwargs(new_group=True))
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -1078,7 +1083,7 @@ def _run_cross_repo_gates(history_rec: dict) -> dict:
             continue
         try:
             p = subprocess.run(dep_gate, shell=True, cwd=dep_path, capture_output=True, text=True,
-                               env=_clean_env(), creationflags=_NO_WINDOW, timeout=GATE_TIMEOUT)
+                               env=_clean_env(), timeout=GATE_TIMEOUT, **hidden_subprocess_kwargs())
         except subprocess.TimeoutExpired:
             results[dep_name] = {"green": False, "tests": {"passed": 0, "failed": 0, "errors": 1,
                                                             "skipped": 0, "collected": 0, "green": False,
@@ -1177,7 +1182,7 @@ def _run_eval_gate(base_score) -> dict:
         return {"ok": True, "score": None}
     try:
         p = subprocess.run(cmd, shell=True, cwd=REPO, capture_output=True, text=True,
-                           env=_clean_env(), creationflags=_NO_WINDOW, timeout=GATE_TIMEOUT)
+                           env=_clean_env(), timeout=GATE_TIMEOUT, **hidden_subprocess_kwargs())
     except subprocess.TimeoutExpired:
         log(f"EVAL_CMD timed out after {GATE_TIMEOUT}s — reporting ok (can't measure a drop)")
         return {"ok": True, "score": None, "reason": "eval timed out (no drop measured)"}
@@ -1287,13 +1292,13 @@ def run_gate(changed_files: list[str] | None = None) -> tuple:
             # It is intentionally run with shell=True because real gates use compound syntax (`a && b`,
             # pipes, `-s tests -t tests`). It is never agent- or PR-derived; do not feed untrusted --gate.
             p = subprocess.run(effective_gate_cmd, shell=True, cwd=REPO, capture_output=True,
-                               text=True, env=_clean_env(), creationflags=_NO_WINDOW, timeout=GATE_TIMEOUT)
+                               text=True, env=_clean_env(), timeout=GATE_TIMEOUT, **hidden_subprocess_kwargs())
         else:
             py = str(VENV_PY) if VENV_PY.exists() else sys.executable
             # `-o addopts=` clears any repo ini addopts (e.g. a stray `-q`, which combined with
             # our own would become `-qq` and SUPPRESS the "N passed" summary line we parse below).
             p = subprocess.run([py, "-m", "pytest", "-o", "addopts="], cwd=REPO, capture_output=True,
-                               text=True, env=_clean_env(), creationflags=_NO_WINDOW, timeout=GATE_TIMEOUT)
+                               text=True, env=_clean_env(), timeout=GATE_TIMEOUT, **hidden_subprocess_kwargs())
     except subprocess.TimeoutExpired as e:
         partial = ((e.stdout or "") if isinstance(e.stdout, str) else "") + \
                   ((e.stderr or "") if isinstance(e.stderr, str) else "")
@@ -1521,7 +1526,7 @@ def _pr_title(goal: str, summary: str = "") -> str:
 
 def _gh_ready() -> bool:
     p = subprocess.run([gh_exe(), "auth", "status"], capture_output=True, text=True,
-                       env=_clean_env(), creationflags=_NO_WINDOW)
+                       env=_clean_env(), **hidden_subprocess_kwargs())
     return p.returncode == 0
 
 
@@ -1530,7 +1535,7 @@ def _pr_checks(number) -> str | None:
     if not number:
         return None
     p = subprocess.run([gh_exe(), "pr", "view", str(number), "--json", "statusCheckRollup"],
-                       cwd=REPO, capture_output=True, text=True, env=_clean_env(), creationflags=_NO_WINDOW)
+                       cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
     if p.returncode != 0:
         return None
     try:
@@ -1577,7 +1582,7 @@ def _existing_open_pr(branch: str) -> tuple:
     so the loop re-ships the same backlog item forever (the live sover dup-PR spin)."""
     p = subprocess.run([gh_exe(), "pr", "list", "--head", branch, "--state", "open",
                         "--json", "number,url"],
-                       cwd=REPO, capture_output=True, text=True, env=_clean_env(), creationflags=_NO_WINDOW)
+                       cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
     if p.returncode != 0:
         return None, None
     try:
@@ -1603,7 +1608,7 @@ def _open_pr(branch: str, title: str, summary: str, tests: dict | None) -> dict:
         pr_title = f"rsi: {title}"
     p = subprocess.run([gh_exe(), "pr", "create", "--base", BASE_BRANCH, "--head", branch,
                         "--title", pr_title, "--body", body],
-                       cwd=REPO, capture_output=True, text=True, env=_clean_env(), creationflags=_NO_WINDOW)
+                       cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
     if p.returncode != 0:
         stderr = (p.stderr or "").strip()
         # The agent may have already opened a PR for this branch (it's told NOT to run gh, but a
@@ -1640,13 +1645,13 @@ def _auto_merge(pr: dict) -> dict:
         return {**pr, "state": "open (CI red — not merged)"}
     if checks == "pending":
         am = subprocess.run([gh_exe(), "pr", "merge", str(num), "--auto", "--squash", "--delete-branch"],
-                            cwd=REPO, capture_output=True, text=True, env=_clean_env(), creationflags=_NO_WINDOW)
+                            cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
         if am.returncode == 0:
             return {**pr, "state": "auto-merge queued (awaiting CI)"}
         log(f"auto-merge: CI pending and native --auto unavailable on PR {num} — leaving open until CI resolves")
         return {**pr, "state": "open (awaiting CI)"}
     m = subprocess.run([gh_exe(), "pr", "merge", str(num), "--squash", "--delete-branch"],
-                       cwd=REPO, capture_output=True, text=True, env=_clean_env(), creationflags=_NO_WINDOW)
+                       cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
     if m.returncode == 0:
         return {**pr, "state": "merged"}
     log(f"gh pr merge {num} failed: {(m.stderr or '').strip()[:200]} — PR left open")
@@ -1675,21 +1680,21 @@ def _wait_for_ci_then_merge(pr: dict) -> dict:
         checks = _pr_checks(num)
         if checks in ("success", None):
             m = subprocess.run([gh_exe(), "pr", "merge", str(num), "--squash", "--delete-branch"],
-                               cwd=REPO, capture_output=True, text=True, env=_clean_env(), creationflags=_NO_WINDOW)
+                               cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
             if m.returncode == 0:
                 return {**pr, "state": "merged"}
             log(f"gh pr merge {num} failed: {(m.stderr or '').strip()[:200]} — PR left open")
             return {**pr, "state": "open (merge failed)"}
         if checks == "failure":
             subprocess.run([gh_exe(), "pr", "close", str(num), "--delete-branch"],
-                           cwd=REPO, capture_output=True, text=True, env=_clean_env(), creationflags=_NO_WINDOW)
+                           cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
             log(f"CI RED on PR {num} — closed PR + deleted branch (auto-revert)")
             return {**pr, "state": "reverted (CI red)"}
         if STOP.exists():
             return {**pr, "state": "open (stopped before merge)"}
         if time.time() >= deadline:
             am = subprocess.run([gh_exe(), "pr", "merge", str(num), "--auto", "--squash", "--delete-branch"],
-                                cwd=REPO, capture_output=True, text=True, env=_clean_env(), creationflags=_NO_WINDOW)
+                                cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
             return {**pr, "state": "auto-merge queued (awaiting CI)" if am.returncode == 0 else "open (awaiting CI)"}
         time.sleep(CI_POLL_DELAY_S)
 
@@ -2273,7 +2278,7 @@ def _ship(branch: str, title: str, summary: str, tests: dict) -> dict:
 def _pid_alive(pid: int) -> bool:
     if sys.platform == "win32":
         out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
-                             capture_output=True, text=True, creationflags=_NO_WINDOW).stdout
+                             capture_output=True, text=True, **hidden_subprocess_kwargs()).stdout
         return f'"{pid}"' in (out or "")  # CSV quotes the PID field — exact, no substring FP
     try:
         os.kill(pid, 0)
@@ -2404,7 +2409,7 @@ def smoke() -> int:
     env["RSI_MODEL"] = PI_MODEL  # the extension registers exactly this model id
     try:
         p = subprocess.run(args, cwd=REPO, capture_output=True, text=True,
-                           env=env, timeout=120, creationflags=_NO_WINDOW)
+                           env=env, timeout=120, **hidden_subprocess_kwargs())
     except subprocess.TimeoutExpired:
         print("SMOKE: FAIL — timed out")
         return 1

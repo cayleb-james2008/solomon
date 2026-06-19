@@ -13,11 +13,11 @@ discards un-pushed commits, pushes, or merges.
 import json
 import os
 import subprocess
-import sys
 import time
 from datetime import datetime, timezone
 
 import control
+from winproc import hidden_subprocess_kwargs
 
 _AUTO_SAFE = {"stale_lock", "stop_lingering", "dirty_tree", "stuck"}
 
@@ -205,9 +205,6 @@ def solomon_fix_session(repo, auto_push=True):
         return {"ok": False, "error": f"venv python not found: {py}"}
     if not os.path.exists(runner):
         return {"ok": False, "error": "runner not found"}
-    flags = 0
-    if sys.platform == "win32":
-        flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
     args = [py, runner, "--repo", path, "--name", name,
             "--provider", control.project_provider(repo), "--model", control.project_model(repo),
             "--ship", control.effective_ship(repo, auto_push),
@@ -216,9 +213,9 @@ def solomon_fix_session(repo, auto_push=True):
     try:
         # Match the other spawn sites (control.start/beautify/enrich_contract): strip the stale gh token
         # + PYTHONPATH/PYTHONHOME at the boundary so the child venv python uses its own stdlib + keyring.
-        proc = subprocess.Popen(args, cwd=path, creationflags=flags, stdout=subprocess.DEVNULL,
+        proc = subprocess.Popen(args, cwd=path, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, close_fds=True,
-                                env=control._clean_subenv())
+                                env=control._clean_subenv(), **hidden_subprocess_kwargs(detached=True))
         return {"ok": True, "pid": proc.pid}
     except OSError as e:
         return {"ok": False, "error": str(e)}
