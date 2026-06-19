@@ -706,6 +706,34 @@ async function refresh() {
 let _poll = false;
 async function poll() { await refresh(); setTimeout(poll, 2500); }
 
+/* ---------- in-app updater (source-rebuild) ---------- */
+function renderUpdate(u) {
+  const box = $("#updateBox"), msg = $("#updateMsg"), btn = $("#updateBtn");
+  if (!box) return;
+  box.hidden = false;
+  if (!u || !u.ok) { msg.textContent = "Update check unavailable"; box.classList.remove("avail"); btn.hidden = true; return; }
+  if (u.available) {
+    msg.textContent = `Update available (${u.behind} commit${u.behind === 1 ? "" : "s"} behind)`;
+    box.classList.add("avail"); btn.hidden = false;
+  } else {
+    msg.textContent = u.dirty ? "Up to date (local changes)" : "Up to date";
+    box.classList.remove("avail"); btn.hidden = true;
+  }
+}
+async function wireUpdater() {
+  try { const sha = await call("current_sha"); if (sha) $("#brandVer").textContent = sha; } catch (e) { /* optional */ }
+  // Show the launch-time check result if it's ready; otherwise run a live check.
+  let u = null;
+  try { u = await call("cached_update_status"); } catch (e) { /* fall through */ }
+  if (!u) { try { u = await call("update_status"); } catch (e) { /* fall through */ } }
+  renderUpdate(u);
+  $("#updateBtn").onclick = async () => {
+    $("#updateBtn").disabled = true; $("#updateMsg").textContent = "Updating — rebuilding & restarting…";
+    const x = await act("apply_update");
+    if (!x || !x.ok || !x.started) { $("#updateBtn").disabled = false; toast(`Update failed: ${(x && x.error) || "?"}`, "err"); renderUpdate(u); }
+  };
+}
+
 /* ---------- boot ---------- */
 let _tries = 0, _wired = false;
 async function boot() {
@@ -715,6 +743,7 @@ async function boot() {
     $("#autoPush").onclick = async () => { const next = !state.auto_push; state.auto_push = next; syncTopbar();
       const x = await act("set_auto_push", next); if (!x || !x.ok) { state.auto_push = !next; syncTopbar(); } };
     $("#refreshBtn").onclick = () => { refresh(); toast("Refreshed"); };
+    wireUpdater();
     document.addEventListener("keydown", (e) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
       if (e.key === "Escape") { if ($("#palScrim")) $("#palScrim").remove(); else if (state.openRepo) closeWorkspace(); }
@@ -799,5 +828,9 @@ const mock = (() => {
     read_supervisor_log: () => [{ ts: "2026-06-17T12:05:00Z", category: "stale_lock", rung: 0, actions: ["clear_lock"], escalate: false, message: "recovered" }],
     read_escalation: (n) => (find(n) || {}).escalation || null,
     clear_escalation: (n) => { const r = find(n); if (r) r.escalation = null; return { ok: true }; },
+    current_sha: () => "a1b2c3d",
+    cached_update_status: () => ({ ok: true, available: true, behind: 3, dirty: false, currentSha: "a1b2c3d", branch: "main" }),
+    update_status: () => ({ ok: true, available: true, behind: 3, dirty: false, currentSha: "a1b2c3d", branch: "main" }),
+    apply_update: () => ({ ok: true, started: true, mode: "exe" }),
   };
 })();

@@ -76,6 +76,15 @@ a:hover{text-decoration:underline}
   background:var(--clay); color:var(--oncolor); font-size:21px; font-weight:600; line-height:1;
   box-shadow:var(--shadow-sm); font-family:var(--sans)}
 .brand-name{font-family:var(--serif); font-size:20px; letter-spacing:.04em}
+.brand-ver{font-family:var(--mono,monospace); font-size:11px; color:var(--ink-3); padding:1px 6px;
+  border:1px solid var(--line); border-radius:6px; letter-spacing:.02em}
+.brand-ver:empty{display:none}
+.update-box{display:flex; align-items:center; gap:10px; margin-right:auto; font-size:12.5px; color:var(--ink-2)}
+.update-box.avail .update-msg{color:var(--warn); font-weight:600}
+.update-btn{font-size:12px; padding:5px 11px; border-radius:7px; border:1px solid var(--clay);
+  background:var(--clay); color:var(--oncolor); cursor:pointer; transition:.15s var(--ease)}
+.update-btn:hover{filter:brightness(1.06)}
+.update-btn:disabled{opacity:.6; cursor:default}
 .topbar-actions{display:flex; align-items:center; gap:16px}
 .ap-toggle{display:flex; align-items:center; gap:9px; font-size:12.5px; color:var(--ink-2)}
 .switch{width:34px; height:18px; border-radius:999px; background:var(--line-2); position:relative;
