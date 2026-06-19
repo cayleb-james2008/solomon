@@ -611,7 +611,12 @@ async function updateAppTest(r, body, afterSeq) {
     const frame = await act("app_test_frame", r.name, Math.max(0, seq - 1));
     if (frame && frame.ok && frame.data) { const img = $("#appTestFrame", body); img.src = `data:${frame.mime || "image/jpeg"};base64,${frame.data}`; img.hidden = false; $("#appTestEmpty", body).hidden = true; }
     const cursor = snapshot.cursor || {}; const dot = $("#appTestCursor", body);
-    if (dot && cursor.x != null && cursor.y != null) { dot.hidden = false; dot.style.left = `${cursor.x}%`; dot.style.top = `${cursor.y}%`; }
+    if (dot && cursor.x != null && cursor.y != null) {
+      const viewport = snapshot.page?.viewport || snapshot.viewport || { width: 1, height: 1 };
+      dot.hidden = false;
+      dot.style.left = `${Math.max(0, Math.min(100, 100 * cursor.x / viewport.width))}%`;
+      dot.style.top = `${Math.max(0, Math.min(100, 100 * cursor.y / viewport.height))}%`;
+    }
   } else if (snapshot && !snapshot.ok) {
     const events = $("#appTestEvents", body); if (events) events.textContent = snapshot.error || "No active app test.";
   }

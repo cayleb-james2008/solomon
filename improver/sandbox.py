@@ -24,6 +24,86 @@ _SAFE_INHERITED_ENV = {
 }
 
 
+def _create_kill_on_close_job():
+    """Create a Windows Job Object that owns the complete preview process tree."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class BasicLimit(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class ExtendedLimit(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", BasicLimit),
+            ("IoInfo", IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+    ]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    limits = ExtendedLimit()
+    limits.BasicLimitInformation.LimitFlags = 0x00002000  # KILL_ON_JOB_CLOSE
+    if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+        kernel32.CloseHandle(job)
+        return None
+    return job
+
+
+def _assign_to_job(job, proc: subprocess.Popen) -> bool:
+    if not job or sys.platform != "win32":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    try:
+        process_handle = proc._handle
+    except AttributeError:
+        return False
+    return bool(kernel32.AssignProcessToJobObject(job, wintypes.HANDLE(process_handle)))
+
+
+def _close_job(job) -> None:
+    if job and sys.platform == "win32":
+        import ctypes
+        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(job)
+
+
 def _free_port() -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -86,6 +166,7 @@ class Sandbox:
         self.stderr_path: str | None = None
         self._stdout = None
         self._stderr = None
+        self._job_handle = None
 
     def _create_isolation_root(self) -> None:
         self.tmp_dir = tempfile.mkdtemp(prefix="solomon-sandbox-")
@@ -139,6 +220,10 @@ class Sandbox:
             stdout=self._stdout, stderr=self._stderr, stdin=subprocess.DEVNULL,
             creationflags=flags, close_fds=True,
         )
+        self._job_handle = _create_kill_on_close_job()
+        if self._job_handle and not _assign_to_job(self._job_handle, self.proc):
+            _close_job(self._job_handle)
+            self._job_handle = None
         try:
             self._wait_health()
         except Exception:
@@ -179,9 +264,14 @@ class Sandbox:
 
     def _terminate_process_tree(self) -> None:
         if not self.proc or self.proc.poll() is not None:
+            _close_job(self._job_handle)
+            self._job_handle = None
             return
         try:
-            if sys.platform == "win32":
+            if self._job_handle:
+                _close_job(self._job_handle)
+                self._job_handle = None
+            elif sys.platform == "win32":
                 subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
                                capture_output=True, creationflags=_NO_WINDOW, timeout=10)
             else:
@@ -221,3 +311,4 @@ class Sandbox:
         self.tmp_dir = None
         self.work_dir = None
         self.state_dir = None
+        self._job_handle = None

@@ -51,6 +51,7 @@ class AgentBrowser:
         self.profile_dir = self.runtime_dir / "browser-profile"
         self.viewport = tuple(viewport)
         self.session_id = session_id or f"solomon-{uuid.uuid4().hex[:12]}"
+        self.owner = {"app": "solomon", "projectId": Path(self.repo_path).name}
         self.allowed_origins = {self._origin(value) for value in (allowed_origins or []) if value}
         self._seq = 0
         self._last_url = ""
@@ -158,7 +159,8 @@ class AgentBrowser:
         elements = []
         if isinstance(refs, dict):
             for ref, value in refs.items():
-                item = {"ref": ref if str(ref).startswith("@") else f"@{ref}"}
+                item = {"ref": str(ref).removeprefix("@"), "role": "element", "name": "",
+                        "observationSeq": self._seq + 1}
                 if isinstance(value, dict):
                     item.update({k: value.get(k) for k in ("role", "name") if value.get(k) is not None})
                 else:
@@ -179,9 +181,8 @@ class AgentBrowser:
                           (request.get("failure") or int(request.get("status") or 0) >= 400)]
         cursor = {}
         if action and action.get("x") is not None and action.get("y") is not None:
-            cursor = {"x": round(100 * float(action["x"]) / self.viewport[0], 2),
-                      "y": round(100 * float(action["y"]) / self.viewport[1], 2),
-                      "click": action.get("kind") == "click"}
+            cursor = {"x": float(action["x"]), "y": float(action["y"]),
+                      "kind": str(action.get("kind") or "move")}
         self._seq += 1
         self._last_refs = elements
         return self.write_state(
@@ -205,7 +206,8 @@ class AgentBrowser:
         if kind == "click":
             ref = action.get("ref")
             if ref:
-                result = self._run_cli(["click", str(ref)])
+                target = str(ref) if str(ref).startswith("@") else f"@{ref}"
+                result = self._run_cli(["click", target])
             elif action.get("x") is not None and action.get("y") is not None:
                 result = self._run_cli(["mouse", "move", str(int(action["x"])), str(int(action["y"]))])
                 if result.get("ok"):
@@ -216,11 +218,14 @@ class AgentBrowser:
                 return self._fail("click requires a ref or x/y coordinates", action)
         elif kind == "type":
             ref, text = action.get("ref"), str(action.get("text") or "")
-            result = self._run_cli(["fill", str(ref), text]) if ref else self._run_cli(["keyboard", "type", text])
+            target = str(ref) if str(ref).startswith("@") else f"@{ref}"
+            result = self._run_cli(["fill", target, text]) if ref else self._run_cli(["keyboard", "type", text])
         elif kind == "key":
             result = self._run_cli(["press", str(action.get("key") or "")])
         elif kind == "select":
-            result = self._run_cli(["select", str(action.get("ref") or ""), str(action.get("value") or "")])
+            ref = str(action.get("ref") or "")
+            target = ref if ref.startswith("@") else f"@{ref}"
+            result = self._run_cli(["select", target, str(action.get("value") or "")])
         elif kind == "scroll":
             direction = str(action.get("direction") or "down")
             result = self._run_cli(["scroll", direction, str(int(action.get("pixels") or 300))])
@@ -254,12 +259,17 @@ class AgentBrowser:
             "schemaVersion": 1, "sessionId": self.session_id, "seq": self._seq,
             "ok": bool(ok), "url": url or self._last_url, "title": self._last_title,
             "viewport": {"width": self.viewport[0], "height": self.viewport[1]},
+            "owner": self.owner,
+            "page": {"url": url or self._last_url, "title": self._last_title,
+                     "viewport": {"width": self.viewport[0], "height": self.viewport[1]}},
             "elements": elements if elements is not None else self._last_refs,
+            "refs": [item.get("ref") for item in (elements if elements is not None else self._last_refs)],
             "cursor": cursor or {}, "currentAction": current_action or {},
             "consoleErrors": console_errors or [], "networkErrors": network_errors or [],
             "status": status, "phase": phase, "ts": _now(),
-            "frame": {"seq": self._seq, "mime": "image/jpeg", "available": bool(frame_ok)},
         }
+        if frame_ok:
+            state["frame"] = {"seq": self._seq, "mime": "image/jpeg", "available": True}
         if screenshot_b64:  # compatibility with older tests/state readers
             state["screenshot_b64"] = screenshot_b64
         if error:
