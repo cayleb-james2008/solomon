@@ -5,6 +5,7 @@ protection). Now the runner recognizes a conservative set of agent-artifact patt
 on the rsi branch (not the base), runs the gate, and ships or reverts — instead of wedging. Operator
 work (anything NOT matching the heuristics) stays protected (refuse + escalate)."""
 import importlib.util
+import json
 import os
 import sys
 
@@ -105,3 +106,64 @@ def test_untracked_recovery_decision_helper():
     assert m._untracked_recovery_action(["notes.txt", "new.py"]) == "refuse"
     # empty -> no-action (the clean path handles empty)
     assert m._untracked_recovery_action([]) == "none"
+
+
+# ---- per-repo config-driven extra patterns (agent_artifacts in repos.json) -
+def test_compile_artifact_pattern_glob_and_regex():
+    """A glob entry (contains * ? [) is translated via fnmatch; any other entry is a regex;
+    an empty/uncompilable entry is skipped (None) so a bad pattern never crashes the preflight."""
+    m = _load_runner()
+    g = m._compile_artifact_pattern("*.log")
+    assert g is not None and g.match("lane.log") and not g.match("lane.txt")
+    r = m._compile_artifact_pattern(r"heartbeat_\d+\.json")
+    assert r is not None and r.match("heartbeat_12.json") and not r.match("heartbeat_x.json")
+    assert m._compile_artifact_pattern("") is None
+    assert m._compile_artifact_pattern("   ") is None
+    assert m._compile_artifact_pattern("(") is None        # uncompilable regex -> skipped, not raised
+
+
+def test_repo_artifact_patterns_from_repos_json(tmp_path, monkeypatch):
+    """A per-repo `agent_artifacts` list WIDENS recovery for that repo WITHOUT loosening the global
+    default — a new-shape artifact (e.g. pi_runner_heartbeat.json, *.log) is recognized only with the
+    extra patterns applied."""
+    m = _load_runner()
+    (tmp_path / "repos.json").write_text(json.dumps([
+        {"name": "ggg", "agent_artifacts": ["pi_runner_heartbeat.json", "*.log", "scaffold_*/"]},
+        {"name": "other", "agent_artifacts": ["should-not-pick"]},
+    ]), encoding="utf-8")
+    monkeypatch.setattr(m, "CONTROL", tmp_path)
+    extra = m._repo_artifact_patterns("ggg")
+    assert extra
+    # recognized WITH the extra patterns
+    assert m._is_agent_artifact("pi_runner_heartbeat.json", extra) is True
+    assert m._is_agent_artifact("lane_state.log", extra) is True
+    assert m._is_agent_artifact("scaffold_x/inner.py", extra) is True
+    # NOT recognized by the narrow global default alone (operator-work protection unchanged)
+    assert m._is_agent_artifact("pi_runner_heartbeat.json") is False
+    assert m._is_agent_artifact("lane_state.log") is False
+
+
+def test_repo_artifact_patterns_absent_or_torn_is_empty(tmp_path, monkeypatch):
+    """No `agent_artifacts` key -> []; a torn/missing repos.json -> [] (never raises)."""
+    m = _load_runner()
+    (tmp_path / "repos.json").write_text(json.dumps([{"name": "ggg"}]), encoding="utf-8")
+    monkeypatch.setattr(m, "CONTROL", tmp_path)
+    assert m._repo_artifact_patterns("ggg") == []
+    (tmp_path / "repos.json").write_text("{ not json", encoding="utf-8")
+    assert m._repo_artifact_patterns("ggg") == []
+
+
+def test_recovery_action_with_extra_patterns(tmp_path, monkeypatch):
+    """With per-repo extra patterns: an all-artifact set (global + new shapes) -> 'recover'; a single
+    operator file among them STILL forces 'refuse' (operator work protected, the conservative default)."""
+    m = _load_runner()
+    (tmp_path / "repos.json").write_text(json.dumps([
+        {"name": "ggg", "agent_artifacts": ["pi_runner_heartbeat.json", "*.log"]},
+    ]), encoding="utf-8")
+    monkeypatch.setattr(m, "CONTROL", tmp_path)
+    extra = m._repo_artifact_patterns("ggg")
+    assert m._untracked_recovery_action(
+        ["AGENT_LOG.md", "pi_runner_heartbeat.json", "lane.log"], extra) == "recover"
+    # a non-matching operator file among the artifacts -> refuse
+    assert m._untracked_recovery_action(
+        ["pi_runner_heartbeat.json", "my_real_module.py"], extra) == "refuse"

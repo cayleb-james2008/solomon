@@ -635,6 +635,32 @@ def test_refresh_config_tolerates_missing_or_torn_file(tmp_path, monkeypatch):
     assert m.PI_MODEL == "keep-me"
 
 
+def test_refresh_config_logs_on_torn_read(tmp_path, monkeypatch):
+    """A torn/failed repos.json read is no longer silent — the runner logs that the refresh was
+    skipped + kept the current config, so an operator edit that never took effect is visible."""
+    m = _load_runner()
+    monkeypatch.setattr(m, "CONTROL", tmp_path)
+    monkeypatch.setattr(m, "NAME", "asmodeus")
+    m.PI_MODEL = "keep-me"
+    logged = []
+    monkeypatch.setattr(m, "log", lambda msg: logged.append(msg))
+    (tmp_path / "repos.json").write_text("{ this is not json", encoding="utf-8")
+    m._refresh_config_from_registry()
+    assert m.PI_MODEL == "keep-me"                      # best-effort: stale config kept, no raise
+    assert any("config refresh skipped" in s for s in logged)
+
+
+def test_provider_shim_unified():
+    """§4.2: the three near-identical provider shims collapsed into one parameterized provider.ts —
+    both providers point at it and the old shims are gone."""
+    m = _load_runner()
+    assert m.PROVIDERS["ollama-cloud"]["ext"] == "provider.ts"
+    assert m.PROVIDERS["openrouter"]["ext"] == "provider.ts"
+    assert (m.HERE / "provider.ts").exists()
+    for old in ("maki-cloud.ts", "openrouter.ts", "vision-cloud.ts"):
+        assert not (m.HERE / old).exists()
+
+
 # --------------------------------------------------------------------------- #
 # PID-1 — recycled-PID-proof liveness (run-id identity token + heartbeat freshness).
 # Windows recycles PIDs; the old _pid_alive-only check pinned a dead loop 'running' forever and
