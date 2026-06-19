@@ -539,24 +539,44 @@ _AGENT_ARTIFACT_PATTERNS = [
 ]
 
 
+# Canonical operator files that must NEVER be classified as agent artifacts. A per-repo
+# `agent_artifacts` entry that matches ANY of these is too broad (e.g. `*`, `*.py`, `.+`) — it would
+# route real operator work into the recovery path (staged on the rsi branch, then discarded by the
+# gate-red base reset). Such an entry is rejected so the per-repo widening can NEVER re-open the
+# data loss the narrow global default exists to prevent.
+_ARTIFACT_CANARY_PATHS = ("README.md", "main.py", "app.py", "setup.py", "pyproject.toml",
+                          "src/app.py", "tests/test_x.py", "index.js", "package.json", "notes.txt")
+
+
 def _compile_artifact_pattern(spec: str):
-    """Compile ONE operator-supplied `agent_artifacts` entry (from repos.json) to a regex matched
-    the same way as _AGENT_ARTIFACT_PATTERNS (against the repo-relative POSIX path via `.match`).
-    An entry containing a glob metachar (`*?[`) is translated via fnmatch (the friendly default — an
-    operator widens recovery with `pi_runner_heartbeat.json`, `*.log`, `scaffold_*/`); any other entry
-    is treated as a regex. Returns None for an empty/uncompilable entry (skipped — a bad pattern never
-    crashes the preflight). Anchored via `.match`, so an entry is implicitly start-anchored."""
+    """Compile ONE operator-supplied `agent_artifacts` entry (from repos.json) to a fully-anchored
+    regex matched the same way as _AGENT_ARTIFACT_PATTERNS (against the repo-relative POSIX path via
+    `.match`). An entry containing a glob metachar (`*` or `?`) is translated via fnmatch (the friendly
+    default — `pi_runner_heartbeat.json`, `*.log`, `scaffold_*/`); any OTHER entry is a regex (so a
+    char class like ``lane_[0-9]+\\.json`` is NOT mis-routed to glob and corrupted — only `*`/`?` signal
+    a glob, since `[` is valid in both syntaxes). Both forms are END-anchored (`\\Z`) for parity with
+    the global `^...$` patterns, so a bare ``heartbeat`` does not also match
+    ``heartbeat_operator_secret.json``. Returns None for an empty/uncompilable entry, OR for a too-broad
+    entry that would match a canonical operator file (a false positive destroys operator work) — a
+    rejected entry is skipped, never crashing the preflight."""
     s = (spec or "").strip()
     if not s:
         return None
     try:
-        if any(ch in s for ch in "*?["):
+        if any(ch in s for ch in "*?"):
             # glob: normalize path separators to POSIX (matched paths are POSIX), drop a trailing
-            # slash (matched dir entries are rstripped), then translate to an anchored regex
-            return re.compile(fnmatch.translate(s.replace("\\", "/").rstrip("/")))
-        return re.compile(s)   # regex: backslashes are escapes (\d, \.), leave them untouched
+            # slash (matched dir entries are rstripped); fnmatch.translate end-anchors with \Z
+            pat = re.compile(fnmatch.translate(s.replace("\\", "/").rstrip("/")))
+        else:
+            # regex: backslashes are escapes (\d, \.); end-anchor for parity with the global patterns
+            pat = re.compile((s[:-1] if s.endswith("$") else s) + r"\Z")
     except re.error:
         return None
+    # breadth guard: a pattern that matches a canonical operator file is too broad — reject it so an
+    # over-broad `agent_artifacts` entry can't sweep real operator work into the recovery path
+    if any(pat.match(c) for c in _ARTIFACT_CANARY_PATHS):
+        return None
+    return pat
 
 
 def _repo_artifact_patterns(name: str) -> list:

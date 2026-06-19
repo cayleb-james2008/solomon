@@ -228,11 +228,14 @@ class AgentBrowser:
     def act(self, action: dict) -> dict:
         if not isinstance(action, dict):
             return self._fail("action must be an object")
-        self._guard_alive()         # respawn a crashed session before acting
         kind = str(action.get("kind") or "")
         observation_seq = action.get("observation_seq")
         if observation_seq is not None and int(observation_seq) != self._seq:
             return self._fail(f"stale element reference: expected observation {self._seq}", action)
+        # respawn a crashed session before acting — but navigate() self-guards, so skip the probe
+        # here when delegating to it (avoids a redundant double-probe for an act(navigate)).
+        if kind != "navigate":
+            self._guard_alive()
         if kind == "navigate":
             return self.navigate(str(action.get("url") or ""))
         if kind == "observe":

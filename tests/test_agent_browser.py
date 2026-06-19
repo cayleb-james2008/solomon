@@ -154,3 +154,30 @@ def test_agent_browser_reinit_resets_session_state(tmp_path, monkeypatch):
     ab._seq = 5
     ab._reinit_session()
     assert ab._started is False and ab._seq == 0
+
+
+def test_agent_browser_run_cli_sets_started_on_success(tmp_path, monkeypatch):
+    """The probe's `_started` flag is wired to the REAL _run_cli code path: a successful CLI call sets
+    it True (the session is now established); a failed one leaves it False."""
+    monkeypatch.setattr(agent_browser.shutil, "which", lambda name: "agent-browser.exe")
+
+    class Ok:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps({"success": True, "data": {"url": "http://x/"}})
+
+    ab = agent_browser.AgentBrowser(str(tmp_path), tmp_path / "rt")
+    assert ab._started is False
+    monkeypatch.setattr(agent_browser.subprocess, "run", lambda *a, **k: Ok())
+    assert ab._run_cli(["get", "url"])["ok"] is True
+    assert ab._started is True
+
+    class Fail:
+        returncode = 1
+        stderr = "boom"
+        stdout = ""
+
+    ab2 = agent_browser.AgentBrowser(str(tmp_path), tmp_path / "rt2")
+    monkeypatch.setattr(agent_browser.subprocess, "run", lambda *a, **k: Fail())
+    assert ab2._run_cli(["get", "url"])["ok"] is False
+    assert ab2._started is False

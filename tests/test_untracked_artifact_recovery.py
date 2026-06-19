@@ -110,16 +110,47 @@ def test_untracked_recovery_decision_helper():
 
 # ---- per-repo config-driven extra patterns (agent_artifacts in repos.json) -
 def test_compile_artifact_pattern_glob_and_regex():
-    """A glob entry (contains * ? [) is translated via fnmatch; any other entry is a regex;
+    """A glob entry (contains * or ?) is translated via fnmatch; any other entry is a regex;
     an empty/uncompilable entry is skipped (None) so a bad pattern never crashes the preflight."""
     m = _load_runner()
     g = m._compile_artifact_pattern("*.log")
     assert g is not None and g.match("lane.log") and not g.match("lane.txt")
     r = m._compile_artifact_pattern(r"heartbeat_\d+\.json")
     assert r is not None and r.match("heartbeat_12.json") and not r.match("heartbeat_x.json")
+    # a char-class regex must NOT be mis-routed to glob and corrupted (only * ? signal a glob)
+    cc = m._compile_artifact_pattern(r"lane_[0-9]+\.json")
+    assert cc is not None and cc.match("lane_5.json") and not cc.match("lane_x.json")
+    # regex entries are END-anchored (parity with the global ^...$ patterns): a bare prefix does NOT
+    # also match a longer operator filename
+    hb = m._compile_artifact_pattern("heartbeat")
+    assert hb is not None and hb.match("heartbeat") and not hb.match("heartbeat_operator_secret.json")
     assert m._compile_artifact_pattern("") is None
     assert m._compile_artifact_pattern("   ") is None
     assert m._compile_artifact_pattern("(") is None        # uncompilable regex -> skipped, not raised
+
+
+def test_compile_artifact_pattern_rejects_too_broad():
+    """A catch-all entry that would sweep canonical operator files into recovery is rejected (None) —
+    the per-repo widening can never re-open the data loss the narrow global default prevents."""
+    m = _load_runner()
+    for broad in ("*", "**", "*.py", "*/", "*.*", ".+"):
+        assert m._compile_artifact_pattern(broad) is None, f"should reject too-broad: {broad}"
+    # a specific entry is still accepted
+    assert m._compile_artifact_pattern("pi_runner_heartbeat.json") is not None
+
+
+def test_repo_artifact_patterns_drops_too_broad(tmp_path, monkeypatch):
+    """An over-broad `agent_artifacts` entry is dropped; the conservative 'one operator file -> refuse'
+    protection holds even when the operator added a catch-all alongside a specific pattern."""
+    m = _load_runner()
+    (tmp_path / "repos.json").write_text(json.dumps([
+        {"name": "ggg", "agent_artifacts": ["*", "pi_runner_heartbeat.json"]},
+    ]), encoding="utf-8")
+    monkeypatch.setattr(m, "CONTROL", tmp_path)
+    pats = m._repo_artifact_patterns("ggg")
+    assert len(pats) == 1                                    # the catch-all "*" was rejected
+    # README.md is NOT swept even though "*" was configured -> operator work still forces refuse
+    assert m._untracked_recovery_action(["README.md", "pi_runner_heartbeat.json"], pats) == "refuse"
 
 
 def test_repo_artifact_patterns_from_repos_json(tmp_path, monkeypatch):

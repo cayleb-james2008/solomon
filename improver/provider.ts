@@ -39,10 +39,11 @@ const PROVIDERS: Record<string, {
 export default function (pi: any) {
   const which = process.env.RSI_PROVIDER || "maki-cloud";
   const cfg = PROVIDERS[which] || PROVIDERS["maki-cloud"];
+  // vision-cloud takes its id ONLY from RSI_VISION_MODEL (byte-faithful to the deleted vision-cloud.ts
+  // — it never consulted the coder RSI_MODEL); the coder providers take it from RSI_MODEL.
   const modelId =
-    (which === "vision-cloud"
-      ? process.env.RSI_VISION_MODEL || process.env.RSI_MODEL
-      : process.env.RSI_MODEL) || cfg.defaultModel;
+    (which === "vision-cloud" ? process.env.RSI_VISION_MODEL : process.env.RSI_MODEL) ||
+    cfg.defaultModel;
   pi.registerProvider(which, {
     baseUrl: cfg.baseUrl,
     apiKey: cfg.apiKey,
