@@ -343,6 +343,23 @@ def test_set_repo_config_persists_new_fields(tmp_path, monkeypatch):
     assert control.project_max_iterations(alpha) == 10
 
 
+def test_set_repo_config_persists_phases(tmp_path, monkeypatch):
+    _projects(tmp_path, monkeypatch, "alpha")
+    _repos_json(tmp_path, monkeypatch, [])
+    phases = {"review": {"provider": "openrouter", "model": "qwen/qwen3-coder", "reasoning": "xhigh"},
+              "beautify": {"reasoning": "low"}}
+    r = control.set_repo_config("alpha", model="glm-5.2", phases=phases)
+    assert r["ok"] is True
+    alpha = next(x for x in control.load_repos() if x["name"] == "alpha")
+    assert alpha["phases"]["review"]["provider"] == "openrouter"
+    assert alpha["phases"]["beautify"]["reasoning"] == "low"
+    # all-empty per-phase entries are dropped, clearing the key; the model is preserved
+    control.set_repo_config("alpha", phases={"review": {}, "plan": {}})
+    alpha = next(x for x in control.load_repos() if x["name"] == "alpha")
+    assert "phases" not in alpha
+    assert control.project_model(alpha) == "glm-5.2"
+
+
 def test_rollup_state():
     assert control._rollup_state(None) is None
     assert control._rollup_state([]) is None
