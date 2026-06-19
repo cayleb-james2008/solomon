@@ -167,6 +167,39 @@ live instance auto-updates to its most recent verified-best version** — the vi
 
 ---
 
+## RSI loop overhaul — branch hygiene, auto-condense-to-main, role pipeline, per-phase models
+
+A 2026 hardening pass (grounded in the RSI video + current multi-agent-RSI practice) adds four
+mechanically-enforced behaviors on top of the loop above:
+
+- **Branch hygiene — at most ONE `rsi/*` branch, never a dirty worktree.** Preflight prunes any
+  leftover `rsi/*` branches (dead-run / local-ship residue) while on the clean base, and the
+  iteration branch is force-deleted after every ship outcome, with a clean-tree tripwire — the base
+  is always pristine for the next iteration. (`_prune_stale_rsi_branches`.)
+- **Auto-condense to main BEFORE the loop finishes.** With `ship: auto-merge` (now the default for
+  managed repos), each iteration opens a PR, polls CI up to a bounded ceiling, then MERGES on green /
+  CLOSES + reverts on red (auto-revert applied to CI) / hands off to GitHub native auto-merge if CI
+  is slow. The iteration does not finish until the change lands on the integration branch or is
+  cleanly reverted. (`_wait_for_ci_then_merge`.)
+- **Role-agent pipeline** — each iteration runs an ordered set of bounded phases:
+  `PLAN → IMPLEMENT → GATE → REVIEW(judge) → E2E(visual) → CLEANUP`. PLAN (read-only, `plan.md`)
+  drafts a short plan injected into the implementer. REVIEW (adversarial judge, `review.md`) runs
+  AFTER the objective gate + commit and BEFORE ship: it inspects the committed diff for
+  reward-hacking / scope-creep / regressions / goal-miss and REVERTS on reject (fail-open if it can't
+  run — the objective gate already passed). This is the Proposer/Solver/Judge anti-reward-hacking loop
+  and the safety gate for fully-automatic merge-to-main. CLEANUP is the deterministic branch hygiene
+  above; E2E is the existing visual review. PLAN/REVIEW are opt-in per repo via `pipeline: {plan,
+  review}` in repos.json (default off = legacy).
+- **Per-phase model / provider / reasoning.** repos.json may carry `phases.<phase>: {provider?,
+  model?, reasoning?}` (plan, implement, review, e2e, beautify, ideate, recovery), overriding the
+  repo-level config for that phase's process. Smart defaults route the light phases (beautify/e2e) to
+  the provider's cheap worker model (minimax-m3 on Ollama Cloud) at low reasoning while the deep
+  phases keep the repo's strong model — AlphaEvolve's breadth-vs-depth split applied to the loop.
+  (`_apply_phase_config`.)
+
+repos.json knobs (all default to prior behavior when absent): `ship` (local|push|pr|auto-merge),
+`pipeline: {plan, review}`, `phases.<phase>.{provider,model,reasoning}`.
+
 ## Status & hardening
 
 The loop and its safety ladder are implemented in `control.py`, `improver/run_improver.py`, and
