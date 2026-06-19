@@ -472,3 +472,112 @@ def test_clean_subenv_strips_pythonpath(monkeypatch):
     monkeypatch.setenv("PYTHONHOME", "C:/some/3.11")
     env = control._clean_subenv()
     assert "PYTHONPATH" not in env and "PYTHONHOME" not in env
+
+
+# --------------------------------------------------------------------------- #
+# Feature 4: connect_project (one-call clone/register + config + provision)
+# Feature 5: github_login_start (one-click login)
+# Feature 2: list_worktrees (worktree visualization)
+# --------------------------------------------------------------------------- #
+def test_connect_project_registers_local_path(tmp_path, monkeypatch):
+    """connect_project with a local path registers it in repos.json + sets the goal."""
+    monkeypatch.setattr(control, "HERE", str(tmp_path))
+    monkeypatch.setattr(control, "REPOS_JSON", str(tmp_path / "repos.json"))
+    monkeypatch.setattr(control, "PROJECTS_DIR", str(tmp_path / "projects"))
+    repo_dir = tmp_path / "myrepo"; repo_dir.mkdir()
+    (repo_dir / "main.py").write_text("print('hi')", encoding="utf-8")
+    # stub out the background enrichment + provision paths that need a venv/pi
+    monkeypatch.setattr(control, "enrich_contract", lambda repo, background=False: {"ok": False})
+    monkeypatch.setattr(control, "ensure_contracts", lambda repo: {"ok": True})
+    monkeypatch.setattr(control, "keys_status", lambda: {"ollama-cloud": True})
+    monkeypatch.setattr(control, "project_provider", lambda repo: "ollama-cloud")
+    monkeypatch.setattr(control, "project_sandbox", lambda repo: None)
+    monkeypatch.setattr(control, "has_frontend", lambda repo: False)
+    out = control.connect_project(str(repo_dir), goal="make it fast", ship="pr")
+    assert out["ok"] is True
+    assert out["name"] == "myrepo"
+    # the repos.json entry now exists with the goal + ship mode
+    entries = control._read_repos_json(str(tmp_path / "repos.json"))
+    row = next(r for r in entries if r["name"] == "myrepo")
+    assert row["goal"] == "make it fast" and row["ship"] == "pr"
+
+
+def test_connect_project_auto_enables_visual_gate_for_frontend(tmp_path, monkeypatch):
+    """connect_project auto-enables visual_gate when the repo has a frontend and the operator
+    didn't explicitly answer the visual-gate question (Feature 1a)."""
+    monkeypatch.setattr(control, "HERE", str(tmp_path))
+    monkeypatch.setattr(control, "REPOS_JSON", str(tmp_path / "repos.json"))
+    monkeypatch.setattr(control, "PROJECTS_DIR", str(tmp_path / "projects"))
+    repo_dir = tmp_path / "webrepo"; repo_dir.mkdir()
+    (repo_dir / "index.html").write_text("<html></html>", encoding="utf-8")
+    monkeypatch.setattr(control, "enrich_contract", lambda repo, background=False: {"ok": False})
+    monkeypatch.setattr(control, "ensure_contracts", lambda repo: {"ok": True})
+    monkeypatch.setattr(control, "keys_status", lambda: {"ollama-cloud": True})
+    monkeypatch.setattr(control, "project_provider", lambda repo: "ollama-cloud")
+    monkeypatch.setattr(control, "project_sandbox", lambda repo: None)
+    monkeypatch.setattr(control, "has_frontend", lambda repo: True)
+    out = control.connect_project(str(repo_dir), goal="ui", visual_gate=None)
+    assert out["ok"] is True
+    assert out.get("visual_gate") is True
+
+
+def test_connect_project_explicit_visual_gate_false_honored_for_frontend(tmp_path, monkeypatch):
+    """An explicit visual_gate=False opt-out is honored even for a frontend repo — the flag
+    is written to repos.json so the runner sees the explicit False and doesn't fall back to
+    frontend auto-detection (the major bug the code review caught)."""
+    monkeypatch.setattr(control, "HERE", str(tmp_path))
+    monkeypatch.setattr(control, "REPOS_JSON", str(tmp_path / "repos.json"))
+    monkeypatch.setattr(control, "PROJECTS_DIR", str(tmp_path / "projects"))
+    repo_dir = tmp_path / "webrepo"; repo_dir.mkdir()
+    (repo_dir / "index.html").write_text("<html></html>", encoding="utf-8")
+    monkeypatch.setattr(control, "enrich_contract", lambda repo, background=False: {"ok": False})
+    monkeypatch.setattr(control, "ensure_contracts", lambda repo: {"ok": True})
+    monkeypatch.setattr(control, "keys_status", lambda: {"ollama-cloud": True})
+    monkeypatch.setattr(control, "project_provider", lambda repo: "ollama-cloud")
+    monkeypatch.setattr(control, "project_sandbox", lambda repo: None)
+    monkeypatch.setattr(control, "has_frontend", lambda repo: True)
+    out = control.connect_project(str(repo_dir), goal="ui", visual_gate=False)
+    assert out["ok"] is True
+    # the repos.json entry has visual_gate=False (explicit opt-out, not dropped)
+    entries = control._read_repos_json(str(tmp_path / "repos.json"))
+    row = next(r for r in entries if r["name"] == "webrepo")
+    assert row.get("visual_gate") is False
+
+
+def test_github_login_start_no_gh(monkeypatch):
+    """github_login_start returns a clear error when gh is not installed."""
+    monkeypatch.setattr(control, "_which_gh", lambda: None)
+    out = control.github_login_start()
+    assert out["ok"] is False and "gh not found" in out["error"]
+
+
+def test_github_login_start_already_authed(monkeypatch):
+    """github_login_start is idempotent — returns {already:true,login} when already authed."""
+    monkeypatch.setattr(control, "_which_gh", lambda: "gh")
+    monkeypatch.setattr(control, "gh_ready", lambda: True)
+    monkeypatch.setattr(control, "github_status", lambda: {"ready": True, "login": "me"})
+    out = control.github_login_start()
+    assert out["ok"] is True and out["already"] is True and out["login"] == "me"
+
+
+def test_list_worktrees_empty_when_no_git(tmp_path, monkeypatch):
+    monkeypatch.setattr(control, "_which_git", lambda: None)
+    assert control.list_worktrees({"name": "x", "path": str(tmp_path)}) == []
+
+
+def test_browser_state_missing_file_returns_not_ok(tmp_path, monkeypatch):
+    """browser_state returns {ok:false} (not raises) when no session file exists — UI shows empty."""
+    _runtime(tmp_path, monkeypatch, name="x")
+    out = control.browser_state({"name": "x", "path": str(tmp_path)})
+    assert out["ok"] is False
+
+
+def test_browser_state_reads_snapshot(tmp_path, monkeypatch):
+    """browser_state reads the live snapshot from runtime/<name>/browser_state.json."""
+    rt = _runtime(tmp_path, monkeypatch, name="x")
+    snap = {"ok": True, "url": "http://127.0.0.1:1/", "screenshot_b64": "abc",
+            "cursor": {"x": 50, "y": 50, "click": False}, "status": "live", "phase": "active"}
+    (rt / "browser_state.json").write_text(json.dumps(snap), encoding="utf-8")
+    out = control.browser_state({"name": "x", "path": str(tmp_path)})
+    assert out["ok"] is True and out["url"] == "http://127.0.0.1:1/"
+    assert out["cursor"]["x"] == 50

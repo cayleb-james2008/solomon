@@ -1038,9 +1038,23 @@ def _run_eval_gate(base_score) -> dict:
 # SUCCESSFUL review WITH critical findings to blocking. A review that itself FAILED to run still
 # does NOT block (best-effort — the RSI loop must not break if the visual infra is down).
 def _visual_gate_enabled(name: str) -> bool:
-    """True if THIS repo declared `visual_gate: true` in repos.json. Read fresh each call so a
-    dashboard edit takes effect mid-loop. False when absent (the loop is byte-identical — visual
-    review stays advisory-only / off)."""
+    """True if THIS repo should run the mandatory visual testing phase. Read fresh each call so
+    a dashboard edit takes effect mid-loop.
+
+    Rules (Feature 1a — mandatory visual testing for frontend repos):
+      1. `visual_gate: true` in repos.json → on (explicit opt-in, unchanged).
+      2. `visual_gate: false` in repos.json → OFF even if a frontend is detected (explicit
+         opt-out — e.g. a headless API repo that happens to have a templates/ dir).
+      3. `visual_gate` ABSENT and the repo has a detected frontend → ON (mandatory). This is
+         the new behavior: frontend repos get a mandatory visual test phase after each RSI loop.
+      4. `visual_gate` ABSENT and no frontend → off (byte-identical to the legacy behavior for
+         non-UI repos).
+
+    A frontend is detected via control.has_frontend (index.html, SPA framework in package.json,
+    public/ or dist/ build dir, templates/ for server-rendered). The sandbox must still be
+    configured (launch command) for the visual review to actually run — if it isn't, the
+    review fails to run and best-effort doesn't block, but the gate is still *enabled* so the
+    operator sees it's expected and configures the sandbox."""
     try:
         rows = json.loads((CONTROL / "repos.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -1048,7 +1062,18 @@ def _visual_gate_enabled(name: str) -> bool:
     if not isinstance(rows, list):
         return False
     row = next((r for r in rows if isinstance(r, dict) and r.get("name") == name), None)
-    return bool(isinstance(row, dict) and row.get("visual_gate"))
+    if not isinstance(row, dict):
+        return False
+    if "visual_gate" in row:
+        return bool(row.get("visual_gate"))
+    # absent: mandatory for detected frontends. Import control lazily to avoid a circular import
+    # at module load (run_improver.py is imported by control.py's enrich/ideate paths).
+    try:
+        import control
+        repo_path = row.get("path") or ""
+        return bool(repo_path and control.has_frontend({"path": repo_path}))
+    except Exception:  # noqa: BLE001 — never let frontend detection break the gate
+        return False
 
 
 def _visual_gate_reason(vr_result) -> str | None:

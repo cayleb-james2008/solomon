@@ -363,3 +363,114 @@ the `agent-implements-under-contract` invariant is untouched).
 ```json
 {"name": "maki", "ideate_research": true}
 ```
+
+---
+
+## In-app agent browser panel + visible cursor (Feature 1)
+
+A long-lived, **agent-controlled** browser whose live state (screenshot + cursor position +
+URL) is rendered in a dashboard panel so the operator can watch the agent browse. The browser
+is launched **headless** so it never steals the operator's cursor/focus — the operator sees
+the agent's browser *only* through the panel's screenshot stream + the rendered visible cursor.
+This is the "agent control only, visible to the user through a panel" requirement, satisfied
+mechanically.
+
+- **Bridge:** `improver/agent_browser.py` (Python) + `improver/agent_browser_driver.js`
+  (node/Playwright). The bridge owns a persistent Chromium user-data-dir per repo (login
+  state persists across actions within a session) and exposes `navigate / click / type /
+  scroll / screenshot` actions for the agent's action loop.
+- **Live state:** after each action the bridge atomically writes
+  `runtime/<name>/browser_state.json` (`{ok, url, screenshot_b64, cursor:{x,y,click},
+  status, phase, ts}`). `control.browser_state(repo)` reads it; the dashboard's Browser tab
+  renders the screenshot + an animated cursor at the reported viewport-percentage position.
+- **Image-native model required:** the agent is given the screenshot and must output the
+  next action (click at x/y, type text, scroll) — this bridge executes it. The cursor
+  position is the last action's target, so the operator sees where the agent "is."
+- **Best-effort, never breaks the loop:** every failure path writes `{ok:false}` and
+  returns an error dict — `agent_browser.py` never raises into the RSI loop. A missing
+  node/playwright or a crashed driver shows the panel's empty state, not a dashboard crash.
+- **Agent-only control:** the operator never drives the browser directly. The panel is
+  observe-only; the visible cursor is the agent's, not the operator's.
+
+---
+
+## Mandatory visual testing phase for frontend repos (Feature 1a)
+
+The visual hard-gate (`visual_gate: true`) was opt-in per repo. It is now **mandatory by
+default for repos with a detected frontend**, closing the "green gate but broken UI" gap for
+UI repos without requiring the operator to remember to set the flag.
+
+- **Detection:** `control.has_frontend(repo)` probes for `index.html` (root/web/public/src),
+  SPA frameworks in `package.json` (react/vue/next/vite/svelte/astro/solid/preact/lit/angular),
+  `public/` / `dist/` / `web/dist/` / `static/` build dirs, or a `templates/` (Jinja) dir.
+- **Resolution (`run_improver._visual_gate_enabled`):**
+  1. `visual_gate: true` in repos.json → on (explicit opt-in, unchanged).
+  2. `visual_gate: false` in repos.json → **OFF** even if a frontend is detected (explicit
+     opt-out — e.g. a headless API repo with a stray `templates/` dir).
+  3. `visual_gate` **absent** and the repo has a detected frontend → **ON** (mandatory).
+  4. `visual_gate` absent and no frontend → off (byte-identical to legacy non-UI behavior).
+- **Flow unchanged:** the existing post-gate visual review runs; a SUCCESSFUL review with
+  ≥1 critical finding reverts the branch (visual gate red) and the feedback drives the next
+  iteration via `LAST_VISUAL_FEEDBACK` — the agent gets one more iteration to address the
+  findings and finish. The sandbox must still be configured (launch command) for the review
+  to actually run; if it isn't, the review fails-to-run and best-effort doesn't block, but
+  the gate is still *enabled* so the operator sees it's expected and configures the sandbox.
+- **Connect flow:** `connect_project(visual_gate=None)` auto-detects and defaults the gate
+  ON for frontend repos; an explicit `visual_gate=False` is always honored (the flag is
+  written to repos.json so the runner sees the explicit opt-out, not a missing key).
+
+---
+
+## One-click connect + GitHub login (Features 4 & 5)
+
+- **`connect_project(spec, goal, ship, provider, reasoning, interval, max_iterations,
+  visual_gate)`** — a single backend call that clones (GitHub spec) or registers (local
+  path) a repo, sets the north-star goal + config in repos.json, auto-detects the gate,
+  triggers background contract enrichment, and sets the visual gate. The dashboard's
+  Connect modal asks the handful of configuration questions up-front (goal, ship mode,
+  reasoning level, cadence, visual testing) so the operator presses Connect and is ready
+  to press Start — no round-trip through the workspace Config tab.
+- **`github_login_start()`** — one-click GitHub login. Launches `gh auth login --web` in a
+  new console window (device-code flow) so the operator can complete the interactive login
+  without leaving Solomon. Idempotent: returns `{already:true, login}` if already authed.
+  The dashboard polls `github_status` after launch so the Connect modal updates live.
+
+---
+
+## Worktree visualization (Feature 2)
+
+- **`list_worktrees(repo)`** — structured view of the repo's git worktrees + local branches:
+  `{kind: 'worktree'|'branch', name, path, branch, head_short, is_current, is_rsi, dirty}`.
+  Rendered in the workspace's **Worktrees** tab with current/rsi/dirty/stale tags and
+  springy row hover. `dirty` is a best-effort `git status --porcelain` check.
+- **One-click cleanup:** the existing `cleanup_worktrees(repo)` (prune + delete leftover
+  `rsi/*` branches, never the current branch) is surfaced as a button in the Worktrees tab
+  and the Settings "Clean up all worktrees" action. The visualization refreshes after cleanup.
+
+---
+
+## Airy / modern / hyperinteractive UX (Feature 3)
+
+Refined the visual language toward cleaner paneling and springy micro-interactions — **no
+flashy glows**. Added spring easing tokens (`--ease-spring`, `--ease-out-soft`), springy
+button/card/rail hover with `--lift`/`--tap`, cross-fade view transitions, a soft toast
+float-in, a softer workspace drawer slide, a skeleton shimmer for async panels, and a
+softer (non-flashy) pulse for live indicators. The existing 5 themes + tokens are
+preserved; the polish is additive CSS over the same classes.
+
+---
+
+## One-click updater (separate exe)
+
+`updater.py` + `updater.spec` build a standalone **`SolomonUpdater.exe`** (console) that
+is the "update + open" entry point: double-click it and it (1) finds the solomon source
+repo (`SOLOMON_HOME` or walks up from its own location), (2) `git pull --ff-only origin
+<branch>` if the tree is clean and behind, (3) rebuilds `Solomon.exe` via PyInstaller if
+the pull updated the tree or the exe is missing, then (4) launches `dist/Solomon/Solomon.exe`.
+
+Safety: never force-pushes/resets/discards local commits (`--ff-only` fails loudly on
+divergence); never pulls over a dirty tree (warns + rebuilds with the current tree); stops
+a running `Solomon.exe` before rebuilding so the file isn't locked; on a build failure,
+launches the previous exe if present so the operator isn't stranded. Build python is the
+maki venv (same as `build.ps1`); override with `SOLOMON_BUILD_PY`. `build.ps1` now builds
+both exes.

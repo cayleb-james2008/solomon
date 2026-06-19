@@ -96,3 +96,74 @@ def test_visual_gate_decision_handles_missing_findings_key():
     assert m._visual_gate_reason({"ok": True}) is None
     assert m._visual_gate_reason({}) is None
     assert m._visual_gate_reason(None) is None
+
+
+# ---- Feature 1a: mandatory visual testing for frontend repos -------------
+def test_visual_gate_auto_on_for_frontend_repo(tmp_path, monkeypatch):
+    """When visual_gate is ABSENT and the repo has a detected frontend (index.html), the gate
+    is ON by default — mandatory visual testing phase for frontend repos."""
+    m = _load_runner()
+    repo_dir = tmp_path / "a"
+    repo_dir.mkdir()
+    (repo_dir / "index.html").write_text("<!DOCTYPE html><html></html>", encoding="utf-8")
+    repos_json = tmp_path / "repos.json"
+    repos_json.write_text(json.dumps([{"name": "a", "path": str(repo_dir)}]), encoding="utf-8")
+    monkeypatch.setattr(m, "CONTROL", tmp_path)
+    assert m._visual_gate_enabled("a") is True
+
+
+def test_visual_gate_explicit_false_overrides_frontend(tmp_path, monkeypatch):
+    """visual_gate: false in repos.json is an explicit opt-out that wins over frontend detection
+    — e.g. a headless API repo that happens to have a templates/ dir."""
+    m = _load_runner()
+    repo_dir = tmp_path / "a"
+    repo_dir.mkdir()
+    (repo_dir / "index.html").write_text("<!DOCTYPE html>", encoding="utf-8")
+    repos_json = tmp_path / "repos.json"
+    repos_json.write_text(json.dumps([
+        {"name": "a", "path": str(repo_dir), "visual_gate": False},
+    ]), encoding="utf-8")
+    monkeypatch.setattr(m, "CONTROL", tmp_path)
+    assert m._visual_gate_enabled("a") is False
+
+
+def test_visual_gate_off_for_non_frontend(tmp_path, monkeypatch):
+    """A repo with no frontend markers and no visual_gate flag stays OFF — byte-identical to the
+    legacy behavior for non-UI repos (libraries, CLIs, headless services)."""
+    m = _load_runner()
+    repo_dir = tmp_path / "a"
+    repo_dir.mkdir()
+    (repo_dir / "main.py").write_text("print('hi')", encoding="utf-8")
+    repos_json = tmp_path / "repos.json"
+    repos_json.write_text(json.dumps([{"name": "a", "path": str(repo_dir)}]), encoding="utf-8")
+    monkeypatch.setattr(m, "CONTROL", tmp_path)
+    assert m._visual_gate_enabled("a") is False
+
+
+# ---- control.has_frontend (Feature 1a frontend detector) -------------------
+def test_has_frontend_detects_index_html(tmp_path):
+    import control
+    d = tmp_path / "repo"; d.mkdir()
+    (d / "index.html").write_text("<html></html>", encoding="utf-8")
+    assert control.has_frontend({"path": str(d)}) is True
+
+
+def test_has_frontend_detects_react_in_package_json(tmp_path):
+    import control
+    d = tmp_path / "repo"; d.mkdir()
+    (d / "package.json").write_text(json.dumps({"dependencies": {"react": "^18"}}), encoding="utf-8")
+    assert control.has_frontend({"path": str(d)}) is True
+
+
+def test_has_frontend_detects_templates_dir(tmp_path):
+    import control
+    d = tmp_path / "repo"; d.mkdir()
+    (d / "templates").mkdir()
+    assert control.has_frontend({"path": str(d)}) is True
+
+
+def test_has_frontend_false_for_headless_repo(tmp_path):
+    import control
+    d = tmp_path / "repo"; d.mkdir()
+    (d / "main.py").write_text("print('hi')", encoding="utf-8")
+    assert control.has_frontend({"path": str(d)}) is False
