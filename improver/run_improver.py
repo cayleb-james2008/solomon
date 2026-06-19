@@ -24,6 +24,7 @@ Usage (generic; the Solomon dashboard supplies --repo/--name):
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -39,15 +40,17 @@ HERE = Path(__file__).resolve().parent            # Solomon/improver
 CONTROL = HERE.parent                             # Solomon (operator infra, not published)
 
 # Provider map — chosen by --provider; sets the pi extension, pi provider name, default model.
-# Keep in sync with control.py _PROVIDER_DEFAULT_MODEL.
+# Keep in sync with control.py _PROVIDER_DEFAULT_MODEL. All providers share ONE parameterized pi
+# extension (improver/provider.ts); it registers the provider named by RSI_PROVIDER (set in run_pi),
+# selecting base-URL/api-key/model from the env the runner already exports.
 PROVIDERS = {
-    "ollama-cloud": {"ext": "maki-cloud.ts", "pi_provider": "maki-cloud",
+    "ollama-cloud": {"ext": "provider.ts", "pi_provider": "maki-cloud",
                      "default_model": "glm-5.2"},
-    "openrouter": {"ext": "openrouter.ts", "pi_provider": "openrouter",
+    "openrouter": {"ext": "provider.ts", "pi_provider": "openrouter",
                    "default_model": "qwen/qwen3-coder"},
 }
 
-PI_EXT = HERE / "maki-cloud.ts"                   # shared pi provider (set by configure)
+PI_EXT = HERE / "provider.ts"                     # shared pi provider (set by configure)
 
 # Per-run config, set by configure() from --repo/--name. The runner is generic and lives
 # OUTSIDE the target repo, so the product itself stays completely RSI-free.
@@ -131,7 +134,10 @@ def _refresh_config_from_registry() -> None:
     global VISUAL_REVIEW_ENABLED, SANDBOX_CONFIG, VISION_MODEL
     try:
         rows = json.loads((CONTROL / "repos.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):       # ValueError covers json.JSONDecodeError
+    except (OSError, ValueError) as exc:       # ValueError covers json.JSONDecodeError
+        # An operator edit to repos.json that never takes effect (a torn/failed read keeps the stale
+        # config) used to be silent — surface it so the operator can see the refresh was skipped.
+        log(f"config refresh skipped: {exc}; keeping current config")
         return
     row = (next((r for r in rows if isinstance(r, dict) and r.get("name") == NAME), None)
            if isinstance(rows, list) else None)
@@ -415,28 +421,44 @@ def gh_exe() -> str:
 
 
 # ---- logging / heartbeat --------------------------------------------------
-def log(msg: str) -> None:
-    line = f"{_now()} {msg}"
-    print(line, flush=True)
-    RUNTIME.mkdir(parents=True, exist_ok=True)
+# All three telemetry writers (log/heartbeat/_record_history) share the same mechanics: ensure the
+# RUNTIME dir exists and never raise on OSError (telemetry must not break the loop). Factored here so
+# the contract lives in one place; the three keep their DISTINCT outputs (the dashboard reads each
+# file's specific shape) — only the write plumbing is DRY'd, not the payloads.
+def _runtime_append(path: Path, line: str) -> None:
+    """Append one line to a runtime text/jsonl file (the dashboard tails improver.log + history.jsonl).
+    Best-effort: ensures RUNTIME exists, never raises on OSError."""
     try:
-        with open(LOG, "a", encoding="utf-8") as f:
+        RUNTIME.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except OSError:
         pass
+
+
+def _runtime_atomic_write(path: Path, text: str) -> None:
+    """Atomically (tmp + os.replace) write a runtime file the dashboard reads whole (heartbeat.json).
+    Best-effort: ensures RUNTIME exists, never raises on OSError."""
+    try:
+        RUNTIME.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def log(msg: str) -> None:
+    line = f"{_now()} {msg}"
+    print(line, flush=True)
+    _runtime_append(LOG, line)
     _hb["log_tail"] = (_hb.get("log_tail") or [])[-19:] + [line]
 
 
 def heartbeat(**fields) -> None:
     _hb.update(fields)
     _hb["updated_at"] = _now()
-    RUNTIME.mkdir(parents=True, exist_ok=True)
-    tmp = HEARTBEAT.with_suffix(".tmp")
-    try:
-        tmp.write_text(json.dumps(_hb, indent=2), encoding="utf-8")
-        os.replace(tmp, HEARTBEAT)
-    except OSError:
-        pass
+    _runtime_atomic_write(HEARTBEAT, json.dumps(_hb, indent=2))
 
 
 def _record_history(status: str, branch: str | None, summary: str, *, extra: dict | None = None) -> None:
@@ -449,12 +471,7 @@ def _record_history(status: str, branch: str | None, summary: str, *, extra: dic
            "summary": (summary or "")[:500]}
     if extra:
         rec.update(extra)
-    try:
-        RUNTIME.mkdir(parents=True, exist_ok=True)
-        with open(RUNTIME / "history.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec) + "\n")
-    except OSError:
-        pass
+    _runtime_append(RUNTIME / "history.jsonl", json.dumps(rec))
 
 
 # ---- git ------------------------------------------------------------------
@@ -522,13 +539,82 @@ _AGENT_ARTIFACT_PATTERNS = [
 ]
 
 
-def _is_agent_artifact(path: str) -> bool:
-    """True if `path` matches a CONSERVATIVE agent-artifact heuristic (see _AGENT_ARTIFACT_PATTERNS).
+# Canonical operator files that must NEVER be classified as agent artifacts. A per-repo
+# `agent_artifacts` entry that matches ANY of these is too broad (e.g. `*`, `*.py`, `.+`) — it would
+# route real operator work into the recovery path (staged on the rsi branch, then discarded by the
+# gate-red base reset). Such an entry is rejected so the per-repo widening can NEVER re-open the
+# data loss the narrow global default exists to prevent.
+_ARTIFACT_CANARY_PATHS = ("README.md", "main.py", "app.py", "setup.py", "pyproject.toml",
+                          "src/app.py", "tests/test_x.py", "index.js", "package.json", "notes.txt")
+
+
+def _compile_artifact_pattern(spec: str):
+    """Compile ONE operator-supplied `agent_artifacts` entry (from repos.json) to a fully-anchored
+    regex matched the same way as _AGENT_ARTIFACT_PATTERNS (against the repo-relative POSIX path via
+    `.match`). An entry containing a glob metachar (`*` or `?`) is translated via fnmatch (the friendly
+    default — `pi_runner_heartbeat.json`, `*.log`, `scaffold_*/`); any OTHER entry is a regex (so a
+    char class like ``lane_[0-9]+\\.json`` is NOT mis-routed to glob and corrupted — only `*`/`?` signal
+    a glob, since `[` is valid in both syntaxes). Both forms are END-anchored (`\\Z`) for parity with
+    the global `^...$` patterns, so a bare ``heartbeat`` does not also match
+    ``heartbeat_operator_secret.json``. Returns None for an empty/uncompilable entry, OR for a too-broad
+    entry that would match a canonical operator file (a false positive destroys operator work) — a
+    rejected entry is skipped, never crashing the preflight."""
+    s = (spec or "").strip()
+    if not s:
+        return None
+    try:
+        if any(ch in s for ch in "*?"):
+            # glob: normalize path separators to POSIX (matched paths are POSIX), drop a trailing
+            # slash (matched dir entries are rstripped); fnmatch.translate end-anchors with \Z
+            pat = re.compile(fnmatch.translate(s.replace("\\", "/").rstrip("/")))
+        else:
+            # regex: backslashes are escapes (\d, \.); end-anchor for parity with the global patterns
+            pat = re.compile((s[:-1] if s.endswith("$") else s) + r"\Z")
+    except re.error:
+        return None
+    # breadth guard: a pattern that matches a canonical operator file is too broad — reject it so an
+    # over-broad `agent_artifacts` entry can't sweep real operator work into the recovery path
+    if any(pat.match(c) for c in _ARTIFACT_CANARY_PATHS):
+        return None
+    return pat
+
+
+def _repo_artifact_patterns(name: str) -> list:
+    """Per-repo EXTRA agent-artifact patterns from THIS repo's `agent_artifacts` list in repos.json
+    (glob/regex strings), read fresh each call like _eval_cmd so a dashboard edit takes effect mid-loop.
+    Lets the operator WIDEN recovery for one repo (a new artifact shape a dead run leaves) WITHOUT
+    loosening the narrow global default that protects operator work across all repos. Returns [] when
+    absent/empty/torn (byte-identical default behavior) — never raises."""
+    try:
+        rows = json.loads((CONTROL / "repos.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(rows, list):
+        return []
+    row = next((r for r in rows if isinstance(r, dict) and r.get("name") == name), None)
+    if not isinstance(row, dict):
+        return []
+    raw = row.get("agent_artifacts")
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for entry in raw:
+        if isinstance(entry, str):
+            pat = _compile_artifact_pattern(entry)
+            if pat is not None:
+                out.append(pat)
+    return out
+
+
+def _is_agent_artifact(path: str, extra_patterns: list | None = None) -> bool:
+    """True if `path` matches a CONSERVATIVE agent-artifact heuristic (see _AGENT_ARTIFACT_PATTERNS),
+    OR one of the per-repo `extra_patterns` an operator opted into via repos.json `agent_artifacts`.
     Path is matched against the repo-relative POSIX form. Pure so the heuristic is unit-tested
-    without a real repo. A false positive would destroy operator work, so the patterns are narrow.
-    A trailing slash (a dir entry from git status `??`) is stripped so a bare `capabilities/x/` dir
-    matches `capabilities/<name>/<anything>`; the BARE `capabilities/` / `profiles/` dirs are still
-    NOT matched (they'd sweep any operator dir of that name)."""
+    without a real repo. A false positive would destroy operator work, so the global patterns are
+    narrow; the extra patterns are operator-chosen per repo (widen recovery without loosening the
+    default). A trailing slash (a dir entry from git status `??`) is stripped so a bare
+    `capabilities/x/` dir matches `capabilities/<name>/<anything>`; the BARE `capabilities/` /
+    `profiles/` dirs are still NOT matched (they'd sweep any operator dir of that name)."""
     p = (path or "").strip().replace("\\", "/")
     if not p:
         return False
@@ -538,28 +624,31 @@ def _is_agent_artifact(path: str) -> bool:
     p = p.rstrip("/")                 # a git status `??` dir entry has a trailing slash; normalize it
     if not p:
         return False
-    return any(pat.match(p) for pat in _AGENT_ARTIFACT_PATTERNS)
+    patterns = (*_AGENT_ARTIFACT_PATTERNS, *extra_patterns) if extra_patterns else _AGENT_ARTIFACT_PATTERNS
+    return any(pat.match(p) for pat in patterns)
 
 
-def _all_agent_artifacts(files: list) -> bool:
-    """True ONLY when `files` is non-empty AND every entry matches an agent-artifact heuristic.
-    An empty list returns False (no files -> the clean path handles it, not recovery). Used by the
-    preflight to pick the recovery path (stage + gate + ship/revert) vs the refuse+escalate path."""
+def _all_agent_artifacts(files: list, extra_patterns: list | None = None) -> bool:
+    """True ONLY when `files` is non-empty AND every entry matches an agent-artifact heuristic (global
+    or operator-supplied `extra_patterns`). An empty list returns False (no files -> the clean path
+    handles it, not recovery). Used by the preflight to pick the recovery path (stage + gate +
+    ship/revert) vs the refuse+escalate path."""
     if not files:
         return False
-    return all(_is_agent_artifact(f) for f in files)
+    return all(_is_agent_artifact(f, extra_patterns) for f in files)
 
 
-def _untracked_recovery_action(files: list) -> str:
+def _untracked_recovery_action(files: list, extra_patterns: list | None = None) -> str:
     """Pure decision over a list of untracked non-ignored files:
       'recover' — ALL files are agent artifacts -> stage them on the rsi branch and gate as usual
       'refuse'  — at least one file is operator work -> refuse the clean + escalate (unchanged)
       'none'    — empty list -> the clean path handles it (no recovery needed).
-    Conservative: the recovery path fires ONLY when every untracked file matches an artifact pattern;
-    a single operator file among many artifacts keeps the whole set protected."""
+    Conservative: the recovery path fires ONLY when every untracked file matches an artifact pattern
+    (global default OR the per-repo `extra_patterns` an operator opted into); a single operator file
+    among many artifacts keeps the whole set protected."""
     if not files:
         return "none"
-    if _all_agent_artifacts(files):
+    if _all_agent_artifacts(files, extra_patterns):
         return "recover"
     return "refuse"
 
@@ -681,6 +770,7 @@ def run_pi(task: str, timeout: int = 1800, system_md: Path | None = None) -> sub
         args += ["-e", str(GITHUB_TOOLS_EXT)]   # read-only github_* tools for remote repos
     args += ["--append-system-prompt", str(system_md or AGENT_MD), task]
     env = _clean_env()
+    env["RSI_PROVIDER"] = PI_PROVIDER  # the unified provider.ts registers the provider under this name
     env["RSI_MODEL"] = PI_MODEL  # the extension registers exactly this model id
     env["RSI_REASONING"] = REASONING  # extension flips model.reasoning on when a level is set
     shim = _agent_shim_dir()    # block the agent from gh + git push/merge/etc. (it ignores the contract)
@@ -1550,7 +1640,7 @@ def one_iteration() -> None:
         # like a normal iteration. A single operator file among the set keeps the whole set protected
         # (refuse + escalate, unchanged). The heuristic list is deliberately narrow (see
         # _AGENT_ARTIFACT_PATTERNS); a false positive destroys operator work.
-        action = _untracked_recovery_action(untracked)
+        action = _untracked_recovery_action(untracked, _repo_artifact_patterns(NAME))
         if action == "refuse":
             heartbeat(status="error", phase="preflight",
                       last_summary=f"Untracked non-ignored files on '{BASE_BRANCH}' would be deleted by "
@@ -2101,6 +2191,7 @@ def smoke() -> int:
             "--system-prompt", "Connectivity smoke test. Output exactly the single word READY.",
             "READY?"]
     env = _clean_env()
+    env["RSI_PROVIDER"] = PI_PROVIDER  # the unified provider.ts registers the provider under this name
     env["RSI_MODEL"] = PI_MODEL  # the extension registers exactly this model id
     try:
         p = subprocess.run(args, cwd=REPO, capture_output=True, text=True,

@@ -32,7 +32,7 @@ CONTROL = HERE.parent
 
 # visual_review.md contract — the system prompt for the vision agent
 VISUAL_REVIEW_MD = HERE / "visual_review.md"
-VISION_EXT = HERE / "vision-cloud.ts"
+VISION_EXT = HERE / "provider.ts"   # unified provider shim; RSI_PROVIDER=vision-cloud selects the vision config
 CAPTURE_JS = HERE / "capture.js"  # legacy helper path; the active capture function uses AgentBrowser
 
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
@@ -278,6 +278,24 @@ def run(repo_path: str, runtime_dir: Path, sandbox_config: dict,
             task = _build_vision_task(capture_result, iteration_summary, pages)
             log("visual review: running vision agent...")
             agent_text = _run_vision_agent(task, vision_model, sandbox_config, capture_result)
+            if not agent_text:
+                # The vision agent produced no output even after a retry (it timed out or is
+                # unavailable). Make that EXPLICIT — a review that FAILED to run must not masquerade
+                # as a clean pass (empty findings). The best-effort contract is unchanged: an ok:false
+                # review does NOT block the gate (run_improver only blocks on an ok:true review WITH a
+                # critical finding); it is surfaced in report.json + the log so the operator sees
+                # "review skipped: vision agent unavailable", not a silent green.
+                log("visual review: vision agent produced no output (timeout/unavailable) — "
+                    "review SKIPPED, not a clean pass")
+                report = {
+                    "ts": _now(), "ok": False,
+                    "error": "vision agent produced no output",
+                    "findings": [],
+                    "summary": "Visual review SKIPPED — vision agent unavailable (no output after retry).",
+                    "screenshots": screenshots, "capture": capture_result, "feedback": "",
+                }
+                _save_report(report, out_dir)
+                return report
             findings = _parse_findings(agent_text)
             summary = _parse_summary(agent_text) or agent_text[:200]
 
@@ -303,12 +321,16 @@ def run(repo_path: str, runtime_dir: Path, sandbox_config: dict,
 
 
 def _run_vision_agent(task: str, vision_model: str, sandbox_config: dict,
-                      capture_result: dict) -> str:
-    """Run the pi vision agent. Returns the agent's final text output."""
+                      capture_result: dict) -> str | None:
+    """Run the pi vision agent. Returns the agent's final text output, or None when it could not run
+    or produced no output even after a retry — so the caller can distinguish a review that FAILED to
+    run (review-skipped) from one that genuinely passed clean (empty findings). A timeout or empty
+    first attempt is retried ONCE with a longer timeout (a slow cold-start must not read as a clean
+    pass); if it is still empty, return None and let the caller surface ok:false."""
     import shutil
     pi = shutil.which("pi")
     if not pi:
-        return ""
+        return None
 
     args = [pi, "--print", "--mode", "json",
             "--provider", "vision-cloud", "--model", vision_model,
@@ -318,18 +340,24 @@ def _run_vision_agent(task: str, vision_model: str, sandbox_config: dict,
             task]
 
     env = dict(os.environ)
+    env["RSI_PROVIDER"] = "vision-cloud"  # the unified provider.ts registers the vision provider config
     env["RSI_VISION_MODEL"] = vision_model
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)
 
-    try:
-        p = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", env=env, timeout=120, creationflags=_NO_WINDOW)
-    except (subprocess.TimeoutExpired, OSError):
-        return ""
-
-    # Extract the last assistant text from pi --mode json output
-    return _final_text(p.stdout or "")
+    # Retry once (longer timeout) on a timeout/empty: a failed-to-run review (vision agent slow or
+    # unavailable) must be DISTINGUISHABLE from a clean pass — not silently swallowed as "zero
+    # findings". The caller converts a persistent empty into an explicit ok:false report.
+    for timeout in (120, 180):
+        try:
+            p = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", env=env, timeout=timeout, creationflags=_NO_WINDOW)
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+        text = _final_text(p.stdout or "")
+        if text:
+            return text
+    return None
 
 
 def _final_text(stdout: str) -> str:
