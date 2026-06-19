@@ -80,6 +80,7 @@ class Api:
                     "goal": control.project_goal(r),
                     "interval": control.project_interval(r),
                     "max_iterations": control.project_max_iterations(r),
+                    "phases": r.get("phases") or {},
                     "is_git": bool(r.get("is_git")),
                     "has_remote": bool(r.get("has_remote")),
                     "running": control.is_running(r),
@@ -140,10 +141,11 @@ class Api:
     # ---- config ---------------------------------------------------------
     def set_repo_config(self, name, provider=None, model=None, ship=None, gate=None,
                         pr_target_branch=None, interval=None, max_iterations=None,
-                        reasoning=None, goal=None):
+                        reasoning=None, goal=None, phases=None):
         return control.set_repo_config(name, provider=provider, model=model, ship=ship, gate=gate,
                                        pr_target_branch=pr_target_branch, interval=interval,
-                                       max_iterations=max_iterations, reasoning=reasoning, goal=goal)
+                                       max_iterations=max_iterations, reasoning=reasoning, goal=goal,
+                                       phases=phases)
 
     def set_key(self, provider, value):
         return control.set_key(provider, value)

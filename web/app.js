@@ -10,6 +10,7 @@ const THEMES = [["dark", "#e08a63"], ["paper", "#d97757"], ["sakura", "#e0568a"]
 const PROVIDER_LABEL = { "ollama-cloud": "Ollama Cloud", "openrouter": "OpenRouter" };
 const SHIP_MODES = [["local", "Local"], ["push", "Push"], ["pr", "PR"], ["auto-merge", "Auto-merge"]];
 const REASONING = ["", "off", "minimal", "low", "medium", "high", "xhigh"];
+const PHASES = ["plan", "implement", "review", "e2e", "beautify", "ideate", "recovery"];
 const NAV = [["home", "Home"], ["approvals", "Approvals"], ["history", "History"], ["console", "Console"], ["settings", "Settings"]];
 
 const state = { theme: "dark", auto_push: true, auto_ai_fix: false, repos: [], gh_ready: false, keys: {}, github: {},
@@ -578,13 +579,35 @@ async function renderWsTab(r) {
       <div class="cfg-field"><label>Gate command</label><input class="input" id="cG" value="${esc(r.gate || "")}" placeholder="pytest (default)" /></div>
       <div class="cfg-field"><label>Interval (s)</label><input class="input" id="cI" type="number" value="${esc(r.interval ?? 120)}" /></div>
       <div class="cfg-field"><label>Max iterations</label><input class="input" id="cX" type="number" value="${esc(r.max_iterations ?? 0)}" /></div>
+      <div class="cfg-field full"><label>Per-phase overrides — model / provider / reasoning per RSI phase (blank = inherit the repo defaults above; light phases beautify/e2e auto-use a cheap worker model)</label>
+        <div id="phaseGrid" style="display:flex;flex-direction:column;gap:4px;margin-top:4px">
+          ${PHASES.map(ph => { const pc = (r.phases && r.phases[ph]) || {}; return `
+          <div class="phase-row" data-phase="${ph}" style="display:flex;gap:6px;align-items:center">
+            <span style="min-width:78px;font-size:12px;opacity:.75">${ph}</span>
+            <select class="select phase-prov" style="max-width:130px"><option value="">inherit</option>${state.providers.map(p => `<option value="${p}"${p === (pc.provider || "") ? " selected" : ""}>${esc(PROVIDER_LABEL[p] || p)}</option>`).join("")}</select>
+            <input class="input phase-model" value="${esc(pc.model || "")}" placeholder="inherit" style="flex:1" />
+            <select class="select phase-reason" style="max-width:110px"><option value="">inherit</option>${REASONING.filter(x => x).map(rv => `<option value="${rv}"${rv === (pc.reasoning || "") ? " selected" : ""}>${rv}</option>`).join("")}</select>
+          </div>`; }).join("")}
+        </div>
+      </div>
       <div class="cfg-field full"><button class="btn accent" id="cSave">Save configuration</button></div>
     </div>`;
     $("#cSave", body).onclick = async () => {
+      const phases = {};
+      body.querySelectorAll(".phase-row").forEach((row) => {
+        const o = {};
+        const pv = row.querySelector(".phase-prov").value;
+        const pm = row.querySelector(".phase-model").value.trim();
+        const pr = row.querySelector(".phase-reason").value;
+        if (pv) o.provider = pv;
+        if (pm) o.model = pm;
+        if (pr) o.reasoning = pr;
+        if (Object.keys(o).length) phases[row.dataset.phase] = o;
+      });
       const x = await act("set_repo_config", r.name, $("#cP", body).value, $("#cM", body).value.trim(),
         $("#cS", body).value, $("#cG", body).value.trim(), $("#cB", body).value.trim() || "main",
         parseInt($("#cI", body).value) || 120, parseInt($("#cX", body).value) || 0, $("#cR", body).value,
-        $("#cGoal", body).value.trim());
+        $("#cGoal", body).value.trim(), phases);
       toast(x.ok ? `${r.name}: configuration saved` : `Failed: ${x.error}`, x.ok ? "ok" : "err"); refresh();
     };
     return;

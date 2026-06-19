@@ -252,7 +252,7 @@ def read_visual_review(repo):
 
 def set_repo_config(name, provider=None, model=None, ship=None, gate=None,
                     pr_target_branch=None, interval=None, max_iterations=None,
-                    reasoning=None, goal=None, sandbox=None):
+                    reasoning=None, goal=None, sandbox=None, phases=None):
     """Upsert the repos.json entry for `name`, setting any passed (non-None) keys.
     Creates the entry (carrying its discovered path) if it doesn't exist."""
     if not name:
@@ -289,6 +289,12 @@ def set_repo_config(name, provider=None, model=None, ship=None, gate=None,
         entry["goal"] = goal
     if sandbox is not None:
         entry["sandbox"] = sandbox
+    if phases is not None:
+        # full-replace the per-phase model/provider/reasoning map (the UI sends the complete desired
+        # state); drop empty per-phase entries so the row stays clean, and {} clears all overrides.
+        entry["phases"] = {k: v for k, v in phases.items() if isinstance(v, dict) and v}
+        if not entry["phases"]:
+            entry.pop("phases", None)
     try:
         # atomic write (tmp + os.replace): a crash or a concurrent reader/writer must never see a
         # half-written repos.json — a truncate-in-place that fails mid-write would drop EVERY repo's
