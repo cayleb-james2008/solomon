@@ -701,6 +701,23 @@ def _drop_branch(branch: str, phase: str, summary: str, status: str = "sleeping"
 
 
 # ---- pi -------------------------------------------------------------------
+def _prune_stale_rsi_branches() -> int:
+    """Branch hygiene (no dirty worktrees + at most ONE rsi/* branch at a time): delete every local
+    rsi/* iteration branch except the current one, and prune stale worktrees. Called in preflight
+    while on the CLEAN base, so it never discards in-flight work — leftover rsi/iter-* / rsi/beautify-*
+    / rsi/solomon-* from dead runs or local/push ships are exactly the residue that accumulates into
+    'dirty worktrees'; this condenses everything back to the base + the single branch about to be cut."""
+    git("worktree", "prune")
+    cur = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    out = (git("branch", "--list", "rsi/*").stdout or "")
+    pruned = 0
+    for line in out.splitlines():
+        b = line.replace("*", "").strip()
+        if b and b != cur and git("branch", "-D", b).returncode == 0:
+            pruned += 1
+    return pruned
+
+
 def _kill_tree(pid: int) -> None:
     """Force-kill a process and ALL its children (pi spawns a node child)."""
     if sys.platform == "win32":
@@ -1580,6 +1597,47 @@ def _auto_merge(pr: dict) -> dict:
     return pr
 
 
+# Auto-condense to main: poll CI up to this ceiling, then merge on green / revert on red. Bounded so
+# the iteration stays within the operator's ~1hr loop budget; if CI is still pending at the cap we
+# hand off to GitHub native auto-merge (merges when checks pass) rather than block the loop forever.
+CI_WAIT_CEILING_S = 1200
+CI_POLL_DELAY_S = 20
+
+
+def _wait_for_ci_then_merge(pr: dict) -> dict:
+    """Auto-condense to main BEFORE the iteration finishes: poll the PR's CI up to CI_WAIT_CEILING_S,
+    then MERGE on green (squash + delete-branch) or REVERT on red (close PR + delete branch) — the
+    pr-only-shipping-with-auto-revert invariant applied to CI. No CI configured == the runner gate +
+    judge already passed, so merge. If CI stays pending past the ceiling, hand off to GitHub native
+    auto-merge so the loop never exceeds its budget. STOP-aware (a mid-wait stop leaves the PR)."""
+    num = pr.get("number")
+    if not num:
+        return pr
+    heartbeat(phase="merge")
+    deadline = time.time() + CI_WAIT_CEILING_S
+    while True:
+        checks = _pr_checks(num)
+        if checks in ("success", None):
+            m = subprocess.run([gh_exe(), "pr", "merge", str(num), "--squash", "--delete-branch"],
+                               cwd=REPO, capture_output=True, text=True, env=_clean_env(), creationflags=_NO_WINDOW)
+            if m.returncode == 0:
+                return {**pr, "state": "merged"}
+            log(f"gh pr merge {num} failed: {(m.stderr or '').strip()[:200]} — PR left open")
+            return {**pr, "state": "open (merge failed)"}
+        if checks == "failure":
+            subprocess.run([gh_exe(), "pr", "close", str(num), "--delete-branch"],
+                           cwd=REPO, capture_output=True, text=True, env=_clean_env(), creationflags=_NO_WINDOW)
+            log(f"CI RED on PR {num} — closed PR + deleted branch (auto-revert)")
+            return {**pr, "state": "reverted (CI red)"}
+        if STOP.exists():
+            return {**pr, "state": "open (stopped before merge)"}
+        if time.time() >= deadline:
+            am = subprocess.run([gh_exe(), "pr", "merge", str(num), "--auto", "--squash", "--delete-branch"],
+                                cwd=REPO, capture_output=True, text=True, env=_clean_env(), creationflags=_NO_WINDOW)
+            return {**pr, "state": "auto-merge queued (awaiting CI)" if am.returncode == 0 else "open (awaiting CI)"}
+        time.sleep(CI_POLL_DELAY_S)
+
+
 # ---- iteration ------------------------------------------------------------
 def one_iteration() -> None:
     # The iteration counter is incremented ONLY when the iteration actually reaches the implement
@@ -1681,6 +1739,13 @@ def one_iteration() -> None:
         rs = git("reset", "--hard", f"origin/{BASE_BRANCH}")
         if rs.returncode != 0:
             log(f"reset to origin/{BASE_BRANCH} failed: {(rs.stderr or '').strip()[:160]} — using local {BASE_BRANCH}")
+    # Branch hygiene: condense any leftover rsi/* branches (dead-run / local-ship residue) so at most
+    # ONE rsi/* branch exists at a time — the one cut next. We're on the clean, origin-synced base
+    # here, so this never discards in-flight work; it's the deterministic cure for accumulating
+    # 'dirty worktrees'. (cleanup is the always-on, model-free hygiene phase of the loop.)
+    pruned = _prune_stale_rsi_branches()
+    if pruned:
+        log(f"branch hygiene: pruned {pruned} stale rsi/* branch(es) before this iteration")
     if git("checkout", "-B", branch).returncode != 0:
         heartbeat(status="error", phase="preflight", last_summary=f"Could not create branch {branch}")
         return
@@ -1950,6 +2015,14 @@ def one_iteration() -> None:
     title = "beautify repo" if BEAUTIFY else _pr_title("" if item_deviated else goal, summary)
     pr = _ship(branch, title, summary, tests)
     git("checkout", BASE_BRANCH)
+    # Branch hygiene: back on the base, delete the iteration branch so exactly ONE rsi/* branch ever
+    # exists. Skip only ship=local (there the local branch is the sole copy of the work); auto-merge
+    # already merged+deleted it on origin, pr-mode has it pushed, revert/noop deleted it via
+    # _abort_branch. A clean-tree tripwire guarantees a pristine base for the next preflight.
+    if SHIP != "local":
+        git("branch", "-D", branch)
+    if tree_dirty():
+        git("reset", "--hard")
     # Advance the backlog ONLY on a real LANDED ship of the NAMED item — a PR opened (pr-mode) /
     # merged or queued (auto-merge) / a verified push / a kept-local branch. Never on a push/auth
     # FAILURE or an auto-merge PR left un-merged on red CI (item lost without landing), and never
@@ -1977,7 +2050,7 @@ def _ship_succeeded(pr: dict) -> bool:
       - a deliberately kept-local branch (ship=local).
     NOT a push/auth failure (those didn't land and must be retried)."""
     state = (pr.get("state") or "").lower()
-    if "fail" in state:
+    if "fail" in state or "revert" in state:
         return False
     if pr.get("number"):
         # un-landed auto-merge states all read 'open (CI red ...)' / 'open (awaiting CI)' /
@@ -2054,8 +2127,7 @@ def _ship(branch: str, title: str, summary: str, tests: dict) -> dict:
             log("stop requested — not auto-merging; PR left open for review")
             pr = {**pr, "state": "open (stopped before merge)"}
         else:
-            heartbeat(phase="merge")
-            pr = _auto_merge(pr)
+            pr = _wait_for_ci_then_merge(pr)
         log(f"ship=auto-merge — {pr.get('state')}: {pr.get('url')}")
     return pr
 

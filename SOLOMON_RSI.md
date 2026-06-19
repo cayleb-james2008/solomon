@@ -472,5 +472,6 @@ Safety: never force-pushes/resets/discards local commits (`--ff-only` fails loud
 divergence); never pulls over a dirty tree (warns + rebuilds with the current tree); stops
 a running `Solomon.exe` before rebuilding so the file isn't locked; on a build failure,
 launches the previous exe if present so the operator isn't stranded. Build python is the
-maki venv (same as `build.ps1`); override with `SOLOMON_BUILD_PY`. `build.ps1` now builds
-both exes.
+maki venv (same as `build.ps1`); override with `SOLOMON_BUILD_PY`. `build.ps1` builds
+`Solomon.exe` (via `solomon.spec`); `SolomonUpdater.exe` is built separately via its own
+`updater.spec` (`<maki-venv-python> -m PyInstaller updater.spec`).
