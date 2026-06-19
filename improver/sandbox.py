@@ -16,7 +16,8 @@ import tempfile
 import time
 from pathlib import Path
 
-_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+from winproc import hidden_subprocess_kwargs
+
 _SECRET_WORDS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH")
 _SAFE_INHERITED_ENV = {
     "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "NUMBER_OF_PROCESSORS",
@@ -212,13 +213,12 @@ class Sandbox:
             extra[str(state_env)] = str(self.state_dir)
         env = _clean_sandbox_env(extra, self.state_dir)
         env["HOST"] = "127.0.0.1"
-        flags = _NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
         self._stdout = open(self.stdout_path, "w", encoding="utf-8")
         self._stderr = open(self.stderr_path, "w", encoding="utf-8")
         self.proc = subprocess.Popen(
             self._command(), shell=False, cwd=self.work_dir, env=env,
             stdout=self._stdout, stderr=self._stderr, stdin=subprocess.DEVNULL,
-            creationflags=flags, close_fds=True,
+            close_fds=True, **hidden_subprocess_kwargs(new_group=True),
         )
         self._job_handle = _create_kill_on_close_job()
         if self._job_handle and not _assign_to_job(self._job_handle, self.proc):
@@ -273,7 +273,7 @@ class Sandbox:
                 self._job_handle = None
             elif sys.platform == "win32":
                 subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
-                               capture_output=True, creationflags=_NO_WINDOW, timeout=10)
+                               capture_output=True, timeout=10, **hidden_subprocess_kwargs())
             else:
                 import signal
                 os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
