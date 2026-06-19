@@ -87,6 +87,10 @@ SOLOMON = False                      # supervisor fix-session — set from --sol
 PROVISION_MD = HERE / "provision.md" # one-shot contract-generation system prompt
 IDEATE_MD = HERE / "ideate.md"       # divergent ideation system prompt (anti-shallowness lane)
 SOLOMON_MD = HERE / "solomon.md"     # supervisor fix-session system prompt
+REVIEW_MD = HERE / "review.md"       # adversarial judge/review phase system prompt (pipeline.review)
+PLAN_MD = HERE / "plan.md"           # pre-implement planning phase system prompt (pipeline.plan)
+REVIEW_ENABLED = False               # run the adversarial review/judge phase (repos.json pipeline.review)
+PLAN_ENABLED = False                 # run the planning phase before implement (repos.json pipeline.plan)
 
 # Visual E2E review — boots the app in a sandbox after the gate passes, captures screenshots,
 # runs a vision agent, and produces one-time feedback for the next iteration.
@@ -144,7 +148,7 @@ def _refresh_config_from_registry() -> None:
     interval / max_iterations are launch-owned too. Best-effort: any read/parse error keeps the current
     config (writes to repos.json are atomic, so a torn read is transient)."""
     global PI_PROVIDER, PI_MODEL, PI_EXT, GATE_CMD, REASONING, GOAL
-    global VISUAL_REVIEW_ENABLED, SANDBOX_CONFIG, VISION_MODEL
+    global VISUAL_REVIEW_ENABLED, SANDBOX_CONFIG, VISION_MODEL, REVIEW_ENABLED, PLAN_ENABLED
     try:
         rows = json.loads((CONTROL / "repos.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:       # ValueError covers json.JSONDecodeError
@@ -163,6 +167,9 @@ def _refresh_config_from_registry() -> None:
     GATE_CMD = (row.get("gate") or "").strip()
     REASONING = row.get("reasoning") or "xhigh"   # max reasoning by default
     GOAL = (row.get("goal") or "").strip()
+    pipe = row.get("pipeline") if isinstance(row.get("pipeline"), dict) else {}
+    REVIEW_ENABLED = bool(pipe.get("review"))   # adversarial judge phase (default off = legacy)
+    PLAN_ENABLED = bool(pipe.get("plan"))       # pre-implement planning phase (default off = legacy)
     _hb["model"] = PI_MODEL
     # Visual E2E review config — refreshed each iteration so a dashboard edit takes effect
     # without a stop+restart, mirroring the other config keys above.
@@ -1688,6 +1695,71 @@ def _wait_for_ci_then_merge(pr: dict) -> dict:
 
 
 # ---- iteration ------------------------------------------------------------
+def _phase_run_pi(phase: str, task: str, system_md: "Path | None" = None, timeout: int = 600):
+    """Run a one-off pi call for an in-process pipeline phase (plan/review) on THAT phase's configured
+    provider/model/reasoning, then restore the loop's (implement) config. Reuses run_pi + the
+    per-phase resolver so e.g. the review phase can run on a different model than implement."""
+    global PHASE, PI_PROVIDER, PI_MODEL, PI_EXT, REASONING
+    saved = (PHASE, PI_PROVIDER, PI_MODEL, PI_EXT, REASONING)
+    try:
+        PHASE = phase
+        _apply_phase_config()
+        return run_pi(task, system_md=system_md, timeout=timeout)
+    finally:
+        PHASE, PI_PROVIDER, PI_MODEL, PI_EXT, REASONING = saved
+
+
+def _run_review_phase(branch: str, goal: str, summary: str) -> str:
+    """Adversarial REVIEW/JUDGE after the runner's objective gate passes + the change is committed.
+    An independent critic inspects the committed diff for reward-hacking, scope creep, regressions, or
+    a change that doesn't accomplish the goal. Returns 'approve'|'reject'|'skip'. On 'reject' the
+    branch is reverted (never shipped). Fail-OPEN: any error/timeout/unparseable verdict is 'skip'
+    (the objective gate already passed, so the loop must not wedge on a flaky reviewer). This is the
+    Judge of the 2026 Proposer/Solver/Judge loop — the safety gate for fully-automatic merge-to-main."""
+    stat = (git("diff", f"{BASE_BRANCH}..{branch}", "--stat").stdout or "")[:2000]
+    task = (
+        f"Adversarially review the committed change on this rsi/* branch — you are the JUDGE.\n\n"
+        f"Iteration goal:\n{goal or '(no explicit goal)'}\n\nImplementer's summary:\n{summary}\n\n"
+        f"Changed files (stat):\n{stat}\n\nInspect the full diff with `git diff {BASE_BRANCH}..HEAD` "
+        f"and read the changed files. Judge per review.md, then end with EXACTLY one line: "
+        f"'REVIEW: approve - <reason>' or 'REVIEW: reject - <reason>'."
+    )
+    try:
+        p = _phase_run_pi("review", task, system_md=REVIEW_MD, timeout=600)
+    except Exception as e:  # noqa: BLE001 — fail-open: a broken reviewer must not wedge the loop
+        log(f"review/judge: error ({str(e)[:120]}) — fail-open, not blocking")
+        return "skip"
+    text = final_text(p.stdout or "")
+    m = re.search(r"REVIEW:\s*(approve|reject)\b([^\n]*)", text, re.I)
+    if not m:
+        log("review/judge: no parseable verdict — fail-open, not blocking ship")
+        return "skip"
+    verdict = m.group(1).lower()
+    reason = m.group(2).lstrip(" -—:").strip()[:200]
+    if verdict == "reject":
+        log(f"review/judge: REJECT — {reason} — reverting (change not shipped)")
+        _drop_branch(branch, "reverted", f"Reverted — review/judge rejected: {reason}. {summary}")
+        return "reject"
+    log(f"review/judge: APPROVE — {reason}")
+    return "approve"
+
+
+def _run_plan_phase(goal: str) -> str:
+    """Pre-implement PLAN phase: a read-only planner drafts a short implementation plan for the chosen
+    backlog item, returned as advisory text injected into the implement task (the planner never writes
+    files — it sharpens the implementer's approach). Best-effort: '' on any error/timeout (planning
+    never blocks the iteration). Runs on the 'plan' phase's configured model."""
+    task = (f"Draft a SHORT implementation plan for this ONE backlog item — do NOT write or edit any "
+            f"files, just plan.\n\nItem:\n{goal}\n\nInspect the repo read-only as needed, then output a "
+            f"concise, ordered plan: the files to touch, the approach, and how to verify. Keep it tight.")
+    try:
+        p = _phase_run_pi("plan", task, system_md=PLAN_MD, timeout=400)
+    except Exception as e:  # noqa: BLE001 — planning is best-effort, never blocks
+        log(f"plan phase: error ({str(e)[:120]}) — skipping (no plan injected)")
+        return ""
+    return final_text(p.stdout or "").strip()[:4000]
+
+
 def one_iteration() -> None:
     # The iteration counter is incremented ONLY when the iteration actually reaches the implement
     # phase (after preflight + base-gate succeed). A preflight bail (dirty tree, out-of-band base,
@@ -1851,6 +1923,13 @@ def one_iteration() -> None:
         goal, tier = _top_backlog_item()
         task = build_task(goal, tier)
         system_md = None
+        # PLAN phase (pipeline.plan): a read-only planner drafts a short plan for the chosen item,
+        # injected as advisory context so the implementer starts from a sharper approach.
+        if PLAN_ENABLED and goal:
+            heartbeat(phase="plan")
+            plan = _run_plan_phase(goal)
+            if plan:
+                task += f"\n\n## Implementation plan (advisory — from the planning phase)\n{plan}"
     # preflight + base-gate succeeded — this is a REAL iteration; count it now (not at the top, so
     # preflight no-op wedges don't burn --max-iterations on zero-progress skips).
     _hb["iteration"] += 1
@@ -2000,6 +2079,15 @@ def one_iteration() -> None:
             log(f"DEVIATION: the item names file(s) the committed diff never touched — agent shipped "
                 f"unrelated work; not ticking '{goal[:60]}'")
             item_deviated = True
+
+    # Adversarial REVIEW / JUDGE phase (pipeline.review) — the SECOND gate, after the runner's
+    # objective gate + the commit, BEFORE shipping. An independent critic catches what a green test
+    # gate misses (reward-hacking, scope creep, regressions, goal-miss); on REJECT the branch is
+    # reverted and never shipped. Fail-open (the objective gate already passed). This is the Judge of
+    # the Proposer/Solver/Judge loop and the safety gate for fully-automatic merge-to-main.
+    if REVIEW_ENABLED and not BEAUTIFY and not SOLOMON:
+        if _run_review_phase(branch, goal, summary) == "reject":
+            return   # branch already reverted inside _run_review_phase
 
     # Visual E2E review (ADR: visual-sandbox-reviewer) — AFTER the gate passes and the change is
     # committed, BEFORE shipping. Boots the app in an ephemeral sandbox, captures screenshots,

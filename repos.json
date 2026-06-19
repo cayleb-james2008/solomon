@@ -8,7 +8,8 @@
     "ship": "auto-merge",
     "pr_target_branch": "main",
     "gate": ".venv\\Scripts\\python -m pytest",
-    "reasoning": "xhigh"
+    "reasoning": "xhigh",
+    "pipeline": { "plan": true, "review": true }
   },
   {
     "name": "sover",
@@ -22,20 +23,22 @@
     "pr_target_branch": "main",
     "interval": 120,
     "max_iterations": 0,
-    "reasoning": "xhigh"
+    "reasoning": "xhigh",
+    "pipeline": { "plan": true, "review": true }
   },
   {
     "name": "asmodeus",
     "branch_prefix": "rsi/",
     "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\asmodeus",
     "gate": ".venv\\Scripts\\python -m pytest",
-    "ship": "local",
+    "ship": "auto-merge",
     "pr_target_branch": "master",
     "provider": "ollama-cloud",
     "model": "glm-5.2",
     "interval": 120,
     "max_iterations": 0,
     "reasoning": "xhigh",
-    "goal": ""
+    "goal": "",
+    "pipeline": { "plan": true, "review": true }
   }
 ]
