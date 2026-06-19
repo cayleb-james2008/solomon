@@ -58,6 +58,38 @@ def _save_state(state: dict) -> None:
 class Api:
     def __init__(self):
         self._state = _load_state()
+        self._window = None          # set in main(); used by apply_update to close after spawn
+        self._update = None          # last launch-time update_status() result (cached for the UI)
+
+    # ---- in-app updater (source-rebuild) --------------------------------
+    def current_sha(self):
+        """Short git sha of Solomon's own checkout, shown as the version identity."""
+        return control.current_sha()
+
+    def update_status(self):
+        """Live check: is this Solomon checkout behind origin? Caches the result for the UI."""
+        self._update = control.update_status()
+        return self._update
+
+    def cached_update_status(self):
+        """The launch-time check result (or None if it hasn't run yet) — no network call."""
+        return self._update
+
+    def _bg_update_check(self):
+        """Launch-time check, run in a background thread so the window opens instantly."""
+        try:
+            self._update = control.update_status()
+        except Exception:  # noqa: BLE001 — a check failure must never crash startup
+            self._update = {"ok": False, "available": False}
+
+    def apply_update(self):
+        """Spawn the source-rebuild updater, then close the window so it can rebuild + relaunch."""
+        res = control.apply_update()
+        if res.get("started") and self._window is not None:
+            # Give the bridge call time to return to the UI before the window tears down.
+            import threading
+            threading.Timer(0.6, self._window.destroy).start()
+        return res
 
     # ---- combined dashboard state ---------------------------------------
     def get_state(self):
@@ -320,14 +352,18 @@ def main():
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Solomon.Dashboard")
         except Exception:  # noqa: BLE001 — best-effort cosmetic
             pass
+    import threading
+
     import webview  # lazy: GUI-only dependency, not needed by the headless control surface
     api = Api()
-    webview.create_window(
+    api._window = webview.create_window(
         "Solomon",
         url=resource_path(os.path.join("web", "index.html")),
         js_api=api, width=1000, height=760, min_size=(820, 600),
         background_color="#191917",
     )
+    # Launch-time update check, in a background thread so the window opens without waiting on git fetch.
+    threading.Thread(target=api._bg_update_check, daemon=True).start()
     webview.start(gui="edgechromium")
 
 

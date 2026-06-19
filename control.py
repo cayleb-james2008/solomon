@@ -377,6 +377,123 @@ def _which_git():
     return shutil.which("git")
 
 
+# --------------------------------------------------------------------------- #
+# in-app updater (source-rebuild model — see updater.py / SolomonUpdater.exe)
+# --------------------------------------------------------------------------- #
+def _solomon_repo():
+    """Locate Solomon's own git checkout (the source-rebuild target). Resolution mirrors
+    updater._find_solomon_repo: SOLOMON_HOME, then a walk UP from HERE/sys.executable looking
+    for solomon.spec + control.py. Returns a path str, or None if not found."""
+    def _is_repo(d):
+        return os.path.isfile(os.path.join(d, "solomon.spec")) \
+            and os.path.isfile(os.path.join(d, "control.py"))
+
+    env_home = os.environ.get("SOLOMON_HOME")
+    if env_home and _is_repo(env_home):
+        return env_home
+    starts = [HERE]
+    if getattr(sys, "frozen", False):
+        starts.append(os.path.dirname(os.path.abspath(sys.executable)))
+    for start in starts:
+        d = os.path.abspath(start)
+        for _ in range(8):
+            if _is_repo(d):
+                return d
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+    return None
+
+
+def current_sha():
+    """Short commit sha of Solomon's own checkout (e.g. 'a1b2c3d'), or None when unavailable.
+    Used for the version/identity shown in the UI."""
+    repo = _solomon_repo()
+    git = _which_git()
+    if not repo or not git:
+        return None
+    try:
+        r = _run([git, "-C", repo, "rev-parse", "--short", "HEAD"])
+    except OSError:
+        return None
+    return (r.stdout or "").strip() or None if r.returncode == 0 else None
+
+
+def update_status():
+    """Check whether Solomon's own checkout is behind its remote default branch.
+
+    Runs `git fetch` then counts origin/<branch>..HEAD (behind) and detects a dirty tree
+    (uncommitted tracked changes block an ff pull). An update is 'available' only when behind>0
+    AND not dirty (a dirty tree must be committed/stashed first — surfaced via reason).
+
+    Returns a dict: {ok, available, behind, dirty, currentSha, branch, reason?, error?}.
+    Pure-read + network fetch only; never modifies the tree. Safe (ok:False) on any error."""
+    repo = _solomon_repo()
+    git = _which_git()
+    if not repo:
+        return {"ok": False, "error": "Solomon source repo not found (needs solomon.spec + control.py)",
+                "available": False, "behind": 0, "dirty": False, "currentSha": None}
+    if not git:
+        return {"ok": False, "error": "git not found on PATH",
+                "available": False, "behind": 0, "dirty": False, "currentSha": None}
+
+    def g(*args):
+        return _run([git, "-C", repo, *args])
+
+    try:
+        branch = (g("rev-parse", "--abbrev-ref", "HEAD").stdout or "").strip() or "main"
+        sha = (g("rev-parse", "--short", "HEAD").stdout or "").strip() or None
+        if g("remote", "get-url", "origin").returncode != 0:
+            return {"ok": True, "available": False, "behind": 0, "dirty": False,
+                    "currentSha": sha, "branch": branch, "reason": "no 'origin' remote"}
+        g("fetch", "origin", "--quiet")
+        dirty = bool((g("status", "--porcelain", "--untracked-files=no").stdout or "").strip())
+        cnt = g("rev-list", "--count", f"HEAD..origin/{branch}")
+        behind = int((cnt.stdout or "0").strip() or "0") if cnt.returncode == 0 else 0
+    except (OSError, ValueError) as e:
+        return {"ok": False, "error": str(e), "available": False, "behind": 0,
+                "dirty": False, "currentSha": None}
+
+    available = behind > 0 and not dirty
+    out = {"ok": True, "available": available, "behind": behind, "dirty": dirty,
+           "currentSha": sha, "branch": branch}
+    if behind > 0 and dirty:
+        out["reason"] = "update available but working tree is dirty — commit or stash first"
+    return out
+
+
+def apply_update():
+    """Spawn the source-rebuild updater detached, then signal the app to exit so the updater can
+    rebuild + relaunch (it kills any running Solomon.exe itself). Prefers the prebuilt
+    SolomonUpdater.exe; falls back to running updater.py with the maki build venv python.
+
+    Returns {ok, started, mode?, error?}. Does NOT exit the process — the caller (app.py) decides
+    when to close the window after this returns started:True."""
+    repo = _solomon_repo()
+    if not repo:
+        return {"ok": False, "started": False, "error": "Solomon source repo not found"}
+    env = dict(os.environ)
+    env["SOLOMON_HOME"] = repo  # so the spawned updater resolves the same checkout
+    exe = os.path.join(repo, "dist", "updater", "SolomonUpdater", "SolomonUpdater.exe")
+    try:
+        if os.path.isfile(exe):
+            subprocess.Popen([exe], cwd=repo, close_fds=True, env=env,
+                             **hidden_subprocess_kwargs(detached=True, new_group=True))
+            return {"ok": True, "started": True, "mode": "exe"}
+        # Fallback: run updater.py with the build venv python (it has pyinstaller + pywebview).
+        from updater import _BUILD_PY_DEFAULT  # local import: avoids a hard dep at module load
+        py = env.get("SOLOMON_BUILD_PY") or _BUILD_PY_DEFAULT
+        if not os.path.isfile(py):
+            return {"ok": False, "started": False,
+                    "error": f"updater exe missing and build python not found: {py}"}
+        subprocess.Popen([py, os.path.join(repo, "updater.py")], cwd=repo, close_fds=True, env=env,
+                         **hidden_subprocess_kwargs(detached=True, new_group=True))
+        return {"ok": True, "started": True, "mode": "source"}
+    except OSError as e:
+        return {"ok": False, "started": False, "error": str(e)}
+
+
 def has_frontend(repo):
     """Return whether a repository exposes a user-facing web surface.
 
