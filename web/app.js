@@ -14,7 +14,7 @@ const NAV = [["home", "Home"], ["approvals", "Approvals"], ["history", "History"
 
 const state = { theme: "dark", auto_push: true, auto_ai_fix: false, repos: [], gh_ready: false, keys: {}, github: {},
   providers: ["ollama-cloud", "openrouter"], view: "home", openRepo: null, wsTab: "activity",
-  selPR: null, diffCache: {}, consoleRepo: null, histRepo: null };
+  selPR: null, diffCache: {}, consoleRepo: null, histRepo: null, appTestTimer: null };
 
 /* ---------- icons (24x24 stroke) ---------- */
 const P = {
@@ -136,13 +136,18 @@ async function doSupervise(name, allowPi) {
 }
 
 /* ================= VIEWS ================= */
-function setView(v) { state.view = v; state.selPR = null; render(); }
+function setView(v) {
+  state.view = v; state.selPR = null;
+  if (v === "home") closeGlobalWorkspace();
+  render();
+}
 
 function render() {
   syncTopbar(); syncRail();
-  $("#shell").classList.toggle("no-dock", state.view !== "home");
-  renderView();
+  $("#shell").classList.remove("no-dock");
+  renderHome($("#view"));
   renderDock();
+  if (state.view !== "home") renderGlobalWorkspace();
 }
 
 function renderView() {
@@ -152,6 +157,31 @@ function renderView() {
   if (state.view === "history") return renderHistory(v);
   if (state.view === "console") return renderConsole(v);
   if (state.view === "settings") return renderSettings(v);
+}
+
+function closeGlobalWorkspace() {
+  const scrim = $("#globalWsScrim"); if (scrim) scrim.remove();
+  if (state.view !== "home") state.view = "home";
+  syncRail();
+}
+function renderGlobalWorkspace() {
+  if (state.view === "home") return closeGlobalWorkspace();
+  let scrim = $("#globalWsScrim");
+  if (!scrim) {
+    scrim = el("div", "ws-scrim global-workspace"); scrim.id = "globalWsScrim";
+    document.body.appendChild(scrim);
+    scrim.onclick = e => { if (e.target === scrim) closeGlobalWorkspace(); };
+  }
+  const title = NAV.find(([key]) => key === state.view)?.[1] || "Workspace";
+  scrim.innerHTML = `<section class="ws" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+    <div class="ws-head"><div class="ws-title">&#8734; ${esc(title)}</div><button class="btn sm ghost" id="globalWsClose" aria-label="Close">${icon("x", 15)}</button></div>
+    <div class="ws-body" id="globalWsBody"></div></section>`;
+  $("#globalWsClose", scrim).onclick = closeGlobalWorkspace;
+  const body = $("#globalWsBody", scrim);
+  if (state.view === "approvals") renderApprovals(body);
+  else if (state.view === "history") renderHistory(body);
+  else if (state.view === "console") renderConsole(body);
+  else if (state.view === "settings") renderSettings(body);
 }
 
 function needsOnboarding() {
@@ -388,8 +418,9 @@ function renderSettings(v) {
       <div class="set-row"><label>Ollama Cloud ${k["ollama-cloud"] ? "&#10003;" : "&mdash;"}</label><input class="input" id="kOllama" type="password" placeholder="OLLAMA_API_KEY" /><button class="btn sm accent" data-prov="ollama-cloud">Save</button></div>
       <div class="set-row"><label>OpenRouter ${k["openrouter"] ? "&#10003;" : "&mdash;"}</label><input class="input" id="kOpen" type="password" placeholder="OPENROUTER_API_KEY" /><button class="btn sm accent" data-prov="openrouter">Save</button></div>
     </div>
-    <div class="set-sec"><h4>GitHub</h4><p>${gh.login ? `Connected as <b>${esc(gh.login)}</b>.` : `Run <code>gh auth login</code> to connect.`}</p>
-      <div class="set-row"><label>Add project</label><input class="input" id="addRepo" type="text" placeholder="owner/repo or GitHub URL" /><button class="btn sm accent" id="addRepoBtn">Add</button></div>
+    <div class="set-sec"><h4>Projects &amp; GitHub</h4><p>${gh.login ? `Connected as <b>${esc(gh.login)}</b>.` : `Connect GitHub once, or add a local folder directly.`}</p>
+      ${gh.login ? "" : `<div class="set-row"><label>GitHub</label><button class="btn sm" id="ghLoginBtn">Connect GitHub</button></div>`}
+      <div class="set-row"><label>Connect project</label><input class="input" id="addRepo" type="text" placeholder="local path, owner/repo, or GitHub URL" /><button class="btn sm accent" id="addRepoBtn">Connect</button></div>
     </div>
     <div class="set-sec"><h4>Global</h4><p>Auto-push gate is in the top bar. Maintenance below.</p>
       <div class="set-row"><label>AI fixes</label>
@@ -405,8 +436,12 @@ function renderSettings(v) {
   });
   $("#addRepoBtn", v).onclick = async () => {
     const spec = $("#addRepo", v).value.trim(); if (!spec) return;
-    const x = await act("add_project", spec);
+    const x = await act("connect_project", spec, "", "pr", null);
     toast(x.ok ? `Added ${x.name}${x.enriching ? " — enriching contract…" : ""}` : `Failed: ${x.error}`, x.ok ? "ok" : "err"); refresh();
+  };
+  const ghLogin = $("#ghLoginBtn", v); if (ghLogin) ghLogin.onclick = async () => {
+    const x = await act("github_login_start");
+    toast(x.ok ? (x.already ? `Connected as ${x.login || "GitHub user"}` : "GitHub login opened") : `Failed: ${x.error}`, x.ok ? "ok" : "err");
   };
   const aft = $("#aiFixToggle", v);
   if (aft) aft.onclick = async () => {
@@ -424,14 +459,14 @@ function renderSettings(v) {
 
 /* ================= WORKSPACE ================= */
 function openWorkspace(name) { state.openRepo = name; state.wsTab = "activity"; renderWorkspace(); }
-function closeWorkspace() { state.openRepo = null; const s = $("#wsScrim"); if (s) s.remove(); }
+function closeWorkspace() { state.openRepo = null; if (state.appTestTimer) clearTimeout(state.appTestTimer); state.appTestTimer = null; const s = $("#wsScrim"); if (s) s.remove(); }
 function renderWorkspace() {
   const r = state.repos.find(x => x.name === state.openRepo); if (!r) return closeWorkspace();
   let scrim = $("#wsScrim");
   if (!scrim) { scrim = el("div", "ws-scrim"); scrim.id = "wsScrim"; document.body.appendChild(scrim);
     scrim.onclick = (e) => { if (e.target === scrim) closeWorkspace(); }; }
   const hb = r.heartbeat || {}; const si = statusInfo(r); const ds = diagState(r); const esc1 = r.escalation;
-  const TABS = [["activity", "Activity"], ["diff", "Diff"], ["backlog", "Backlog"], ["contract", "Contract"], ["config", "Config"], ["supervisor", "Supervisor"]];
+  const TABS = [["activity", "Activity"], ["app-test", "App Test"], ["diff", "Diff"], ["backlog", "Backlog"], ["contract", "Contract"], ["config", "Config"], ["supervisor", "Supervisor"]];
   scrim.innerHTML = `<div class="ws">
     <div class="ws-head"><div class="ws-title">&#8734; ${esc(r.name)} <span class="pill ${si.cls}">${esc(si.label)}</span>${ds.flagged ? ` <span class="pill ${ds.cls}">${esc(ds.label)}</span>` : ""}</div>
       <button class="btn sm ghost" id="wsClose">${icon("x", 15)}</button></div>
@@ -477,6 +512,17 @@ function renderWorkspace() {
 async function renderWsTab(r) {
   scrimActiveTabs(); const body = $("#wsBody"); if (!body) return;
   const hb = r.heartbeat || {};
+  if (state.wsTab === "app-test") {
+    body.innerHTML = `<div class="app-test-grid">
+      <div class="app-test-viewport"><div class="empty" id="appTestEmpty">Start a monitored frontend test.</div><img id="appTestFrame" alt="Live app test" hidden /><span class="app-test-cursor" id="appTestCursor" hidden></span></div>
+      <aside class="app-test-side"><div class="app-test-meta" id="appTestMeta">No active session.</div>
+        <div><button class="btn sm accent" id="appTestStart">Start test</button> <button class="btn sm danger" id="appTestStop">Stop</button> <button class="btn sm" id="appTestReport">Report</button></div>
+        <div class="app-test-events" id="appTestEvents">Waiting for observations.</div></aside></div>`;
+    $("#appTestStart", body).onclick = async () => { const x = await act("start_app_test", r.name); toast(x.ok ? "App test starting" : x.error, x.ok ? "ok" : "err"); updateAppTest(r, body, 0); };
+    $("#appTestStop", body).onclick = async () => { const x = await act("stop_app_test", r.name); toast(x.ok ? "App test stopped" : x.error, x.ok ? "ok" : "err"); };
+    $("#appTestReport", body).onclick = async () => { const x = await act("read_app_test_report", r.name); $("#appTestEvents", body).textContent = JSON.stringify(x, null, 2); };
+    updateAppTest(r, body, 0); return;
+  }
   if (state.wsTab === "activity") {
     body.innerHTML = `<div class="console" id="wsLog" style="height:auto;min-height:300px">loading…</div>`;
     const res = await call("read_log", r.name); const log = (res && res.log) || (hb.log_tail || []).join("\n");
@@ -554,6 +600,24 @@ async function renderWsTab(r) {
     return;
   }
 }
+async function updateAppTest(r, body, afterSeq) {
+  if (state.wsTab !== "app-test" || !state.openRepo || !body.isConnected) return;
+  const snapshot = await act("app_test_state", r.name, afterSeq || 0);
+  let seq = afterSeq || 0;
+  if (snapshot && snapshot.ok && !snapshot.unchanged) {
+    seq = snapshot.seq || seq;
+    const meta = $("#appTestMeta", body); if (meta) meta.innerHTML = `<b>${esc(snapshot.status || "ready")}</b><br>${esc(snapshot.url || "")}<br><small>session ${esc(snapshot.sessionId || "-")} &middot; seq ${esc(seq)} &middot; phase ${esc(snapshot.phase || "-")}</small>`;
+    const events = $("#appTestEvents", body); if (events) events.textContent = JSON.stringify({ action: snapshot.currentAction || {}, elements: snapshot.elements || [], error: snapshot.error || null }, null, 2);
+    const frame = await act("app_test_frame", r.name, Math.max(0, seq - 1));
+    if (frame && frame.ok && frame.data) { const img = $("#appTestFrame", body); img.src = `data:${frame.mime || "image/jpeg"};base64,${frame.data}`; img.hidden = false; $("#appTestEmpty", body).hidden = true; }
+    const cursor = snapshot.cursor || {}; const dot = $("#appTestCursor", body);
+    if (dot && cursor.x != null && cursor.y != null) { dot.hidden = false; dot.style.left = `${cursor.x}%`; dot.style.top = `${cursor.y}%`; }
+  } else if (snapshot && !snapshot.ok) {
+    const events = $("#appTestEvents", body); if (events) events.textContent = snapshot.error || "No active app test.";
+  }
+  if (state.appTestTimer) clearTimeout(state.appTestTimer);
+  state.appTestTimer = setTimeout(() => updateAppTest(r, body, seq), 750);
+}
 function scrimActiveTabs() { const s = $("#wsScrim"); if (!s) return; s.querySelectorAll(".ws-tab").forEach(t => t.classList.toggle("active", t.dataset.tab === state.wsTab)); }
 
 /* ---------- confirm + palette ---------- */
@@ -607,7 +671,8 @@ async function refresh() {
     if (busy()) return;                       // don't clobber open editors / palette
     if (state.openRepo && state.wsTab !== "activity") { return; }  // keep workspace editors stable
     if (state.openRepo) { renderWorkspace(); return; }
-    renderView(); renderDock();
+    renderHome($("#view")); renderDock();
+    if (state.view !== "home") renderGlobalWorkspace();
   } catch (e) { /* backend not ready */ }
 }
 let _poll = false;
@@ -678,6 +743,13 @@ const mock = (() => {
     beautify: () => ({ ok: true }),
     merge: () => ({ ok: true }), close: () => ({ ok: true }),
     set_repo_config: () => ({ ok: true }), set_key: () => ({ ok: true }), add_project: (s) => ({ ok: true, name: s.split("/").pop(), enriching: true }),
+    connect_project: (s) => ({ ok: true, name: s.split(/[\\/]/).pop(), enriching: true, visual_gate: true }),
+    github_login_start: () => ({ ok: true, already: true, login: "cayleb" }),
+    start_app_test: () => ({ ok: true, sessionId: "mock-session", status: "starting" }),
+    stop_app_test: () => ({ ok: true }),
+    app_test_state: () => ({ ok: true, schemaVersion: 1, sessionId: "mock-session", seq: 2, status: "ready", phase: "active", url: "http://127.0.0.1:4000/", currentAction: { kind: "observe" }, elements: [{ ref: "@e1", role: "button", name: "Run" }] }),
+    app_test_frame: () => ({ ok: false, error: "mock frame unavailable" }),
+    read_app_test_report: () => ({ ok: true, findings: [], status: "ready" }),
     publish: () => ({ ok: true }),
     pr_diff: () => ({ ok: true, diff: "diff --git a/auth.py b/auth.py\n@@ -10,6 +10,9 @@ def rotate():\n-    return token\n+    new = mint(token)\n+    revoke(token)\n+    return new", truncated: false }),
     read_log: (n) => ({ ok: true, log: ((find(n) || {}).heartbeat || {}).log_tail?.join("\n") || "12:00:01Z improver started\n12:00:02Z idle" }),

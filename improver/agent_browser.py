@@ -1,44 +1,22 @@
-"""Agent-browser bridge — a long-lived, agent-driven browser session whose live state
-(screenshot + cursor position + URL) is written to runtime/<name>/browser_state.json
-so the in-app Browser panel (Feature 1) can render it for the operator.
+"""Persistent, policy-bounded agent-browser bridge for monitored frontend tests.
 
-Design:
-  - A single Chromium instance (Playwright, headed=false so it never steals the operator's
-    cursor) is launched per repo on demand and kept alive for the duration of an agent
-    browsing session. The agent never touches the operator's real Chrome profile.
-  - The agent drives the browser through a small set of actions (navigate, click, type,
-    scroll, screenshot). After EACH action the bridge captures a screenshot + the cursor's
-    current position (as a % of the viewport) and atomically writes browser_state.json.
-  - The dashboard's `control.browser_state()` reads that file and the UI renders the
-    screenshot + an animated cursor at the reported position.
-  - The bridge is agent-control only: the operator observes via the panel, they never
-    drive the browser directly. This matches the "agent control only" requirement.
-  - An image-native model is required for browser control: the agent is given the
-    screenshot and must output the next action (click at x/y, type text, scroll, etc.),
-    which this bridge executes. The cursor position is the last action's target.
-
-The bridge is best-effort and never raises into the RSI loop — a failure writes
-{ok:false} to browser_state.json and the panel shows the empty state. The RSI loop
-must not break if the browser infra is down.
-
-Usage (driven by run_improver.py / a browsing pi task):
-    with AgentBrowser(repo_path, runtime_dir, sandbox_config) as ab:
-        ab.navigate("http://127.0.0.1:39201/dashboard")
-        ab.write_state(phase="active", status="agent driving")  # panel updates live
-        # the pi agent's action loop calls ab.click(x_pct, y_pct), ab.type(text), etc.
-    # on exit, the browser closes and browser_state.json is cleared
+The product owns an isolated named agent-browser session; the operator only observes
+its structured state and latest JPEG through Solomon.  No raw JavaScript, file transfer,
+clipboard, or personal Chrome profile is exposed by this adapter.
 """
 from __future__ import annotations
 
-import base64
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
@@ -47,162 +25,263 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _clean_env() -> dict:
+    env = dict(os.environ)
+    for key in tuple(env):
+        upper = key.upper()
+        if key in ("PYTHONPATH", "PYTHONHOME", "GITHUB_TOKEN", "GH_TOKEN") or any(
+            token in upper for token in ("PASSWORD", "SECRET", "CREDENTIAL")
+        ):
+            env.pop(key, None)
+    env["AGENT_BROWSER_HEADED"] = "false"
+    env["AGENT_BROWSER_SCREENSHOT_FORMAT"] = "jpeg"
+    env["AGENT_BROWSER_SCREENSHOT_QUALITY"] = "70"
+    return env
+
+
 class AgentBrowser:
-    """A long-lived, agent-driven Chromium session whose live state is surfaced to the
-    in-app Browser panel via browser_state.json.
+    """One persistent agent-browser session with monotonic observations."""
 
-    The browser is launched headless so it never steals the operator's cursor/focus —
-    the operator sees the agent's browser ONLY through the in-app panel's screenshot
-    stream + the rendered visible cursor. This is the "agent control only, visible to
-    the user through a panel" requirement, satisfied mechanically.
-    """
-
-    def __init__(self, repo_path: str, runtime_dir: Path, viewport=(1280, 800)):
-        self.repo_path = repo_path
+    def __init__(self, repo_path: str, runtime_dir: Path, viewport=(1280, 800),
+                 allowed_origins: list[str] | None = None, session_id: str | None = None):
+        self.repo_path = os.path.abspath(repo_path)
         self.runtime_dir = Path(runtime_dir)
         self.state_file = self.runtime_dir / "browser_state.json"
-        self.viewport = viewport
-        self._proc = None          # the node driver subprocess (see _driver_js)
-        self._page_w = viewport[0]
-        self._page_h = viewport[1]
+        self.frame_file = self.runtime_dir / "browser_frame.jpg"
+        self.profile_dir = self.runtime_dir / "browser-profile"
+        self.viewport = tuple(viewport)
+        self.session_id = session_id or f"solomon-{uuid.uuid4().hex[:12]}"
+        self.allowed_origins = {self._origin(value) for value in (allowed_origins or []) if value}
+        self._seq = 0
+        self._last_url = ""
+        self._last_title = ""
+        self._last_refs: list[dict] = []
+        self._closed = False
 
-    # ---- lifecycle ----
     def __enter__(self):
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
-        self.write_state(ok=True, url="", screenshot_b64="", cursor=None,
-                        status="starting", phase="active")
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        self.write_state(ok=True, status="starting", phase="starting")
         return self
 
     def __exit__(self, *exc):
         self.close()
         return False
 
-    def close(self):
-        """Terminate the browser driver and clear the panel state."""
-        if self._proc and self._proc.poll() is None:
-            try:
-                self._proc.terminate()
-                try:
-                    self._proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self._proc.kill()
-            except OSError:
-                pass
-        self._proc = None
-        # clear the state file so the panel returns to the empty state
+    @staticmethod
+    def _origin(url: str) -> str:
+        parsed = urlsplit(str(url))
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return ""
+        port = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme}://{parsed.hostname.lower()}{port}"
+
+    def _url_allowed(self, url: str) -> bool:
+        origin = self._origin(url)
+        return bool(origin and (not self.allowed_origins or origin in self.allowed_origins))
+
+    def _base_command(self) -> tuple[str | None, list[str]]:
+        binary = os.environ.get("SOLOMON_AGENT_BROWSER") or shutil.which("agent-browser")
+        if getattr(sys, "frozen", False):
+            bundle = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+            packaged = bundle / "agent-browser" / "agent-browser-win32-x64.exe"
+            if packaged.is_file():
+                binary = str(packaged)
+        if binary and sys.platform == "win32":
+            native = Path(binary).parent / "node_modules" / "agent-browser" / "bin" / "agent-browser-win32-x64.exe"
+            if native.is_file():
+                binary = str(native)
+        command = [
+            binary or "agent-browser", "--session", self.session_id,
+            "--profile", str(self.profile_dir), "--json",
+            "--screenshot-format", "jpeg", "--screenshot-quality", "70",
+        ]
+        if self.allowed_origins:
+            domains = sorted({urlsplit(origin).hostname or "" for origin in self.allowed_origins})
+            command += ["--allowed-domains", ",".join(d for d in domains if d)]
+        return binary, command
+
+    def _run_cli(self, args: list[str], timeout: int = 30) -> dict:
+        binary, command = self._base_command()
+        if not binary:
+            return {"ok": False, "error": "agent-browser 0.27.0 is not installed"}
         try:
-            if self.state_file.exists():
-                self.state_file.unlink()
-        except OSError:
-            pass
+            # agent-browser may spawn a persistent daemon. Regular temp files avoid the
+            # daemon retaining a PIPE handle and making subprocess.communicate wait forever.
+            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdout_file, \
+                    tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr_file:
+                result = subprocess.run(
+                    command + args, stdout=stdout_file, stderr=stderr_file, text=True,
+                    stdin=subprocess.DEVNULL, timeout=timeout, cwd=self.repo_path,
+                    env=_clean_env(), creationflags=_NO_WINDOW, close_fds=True,
+                )
+                stdout_file.seek(0); stderr_file.seek(0)
+                stdout = getattr(result, "stdout", None) or stdout_file.read()
+                stderr = getattr(result, "stderr", None) or stderr_file.read()
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"ok": False, "error": str(exc)[:300]}
+        payload = None
+        for line in reversed((stdout or "").splitlines()):
+            try:
+                payload = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
+        if result.returncode != 0 or not isinstance(payload, dict) or not payload.get("success"):
+            error = (payload or {}).get("error") if isinstance(payload, dict) else None
+            return {"ok": False, "error": str(error or stderr or stdout or
+                                                "agent-browser command failed")[:300]}
+        data = payload.get("data")
+        return {"ok": True, "data": data if isinstance(data, dict) else {"value": data}}
 
-    # ---- public actions (called by the agent's action loop) ----
+    def _fail(self, error: str, action: dict | None = None) -> dict:
+        self._seq += 1
+        state = self.write_state(ok=False, status="error", phase="error", error=error,
+                                 current_action=action)
+        return state
+
     def navigate(self, url: str) -> dict:
-        """Navigate the browser to a URL, capture a screenshot, and write the live state.
-        Returns {ok, url} or {ok:false, error}. The screenshot + cursor are written to
-        browser_state.json for the panel to render."""
-        # The actual browser driving is delegated to a node/Playwright driver (see
-        # _run_driver). This keeps the heavy Playwright dep in node-land and lets the
-        # bridge run under any Python.
-        return self._run_driver("navigate", url=url)
+        if not self._url_allowed(url):
+            return self._fail("navigation is outside the allowed sandbox origins",
+                              {"kind": "navigate", "url": str(url)})
+        result = self._run_cli(["open", str(url)])
+        if not result.get("ok"):
+            return self._fail(result.get("error", "navigation failed"), {"kind": "navigate"})
+        return self.observe({"kind": "navigate", "url": str(url)})
 
+    def observe(self, action: dict | None = None) -> dict:
+        snapshot = self._run_cli(["snapshot", "-i", "-c"])
+        if not snapshot.get("ok"):
+            return self._fail(snapshot.get("error", "snapshot failed"), action or {"kind": "observe"})
+        data = snapshot.get("data") or {}
+        refs = data.get("refs") if isinstance(data, dict) else {}
+        elements = []
+        if isinstance(refs, dict):
+            for ref, value in refs.items():
+                item = {"ref": ref if str(ref).startswith("@") else f"@{ref}"}
+                if isinstance(value, dict):
+                    item.update({k: value.get(k) for k in ("role", "name") if value.get(k) is not None})
+                else:
+                    item["name"] = str(value)
+                elements.append(item)
+        url_result = self._run_cli(["get", "url"])
+        if url_result.get("ok"):
+            self._last_url = str((url_result.get("data") or {}).get("url") or self._last_url)
+        self._last_title = str(data.get("title") or self._last_title) if isinstance(data, dict) else self._last_title
+        shot = self._run_cli(["screenshot", str(self.frame_file)])
+        console_result = self._run_cli(["errors"])
+        network_result = self._run_cli(["network", "requests"])
+        console_errors = (console_result.get("data") or {}).get("errors") or [] \
+            if console_result.get("ok") else []
+        requests = (network_result.get("data") or {}).get("requests") or [] \
+            if network_result.get("ok") else []
+        network_errors = [request for request in requests if isinstance(request, dict) and
+                          (request.get("failure") or int(request.get("status") or 0) >= 400)]
+        cursor = {}
+        if action and action.get("x") is not None and action.get("y") is not None:
+            cursor = {"x": round(100 * float(action["x"]) / self.viewport[0], 2),
+                      "y": round(100 * float(action["y"]) / self.viewport[1], 2),
+                      "click": action.get("kind") == "click"}
+        self._seq += 1
+        self._last_refs = elements
+        return self.write_state(
+            ok=True, url=self._last_url, status="ready", phase="active",
+            current_action=action or {"kind": "observe"}, elements=elements,
+            frame_ok=bool(shot.get("ok")), cursor=cursor,
+            console_errors=console_errors, network_errors=network_errors,
+        )
+
+    def act(self, action: dict) -> dict:
+        if not isinstance(action, dict):
+            return self._fail("action must be an object")
+        kind = str(action.get("kind") or "")
+        observation_seq = action.get("observation_seq")
+        if observation_seq is not None and int(observation_seq) != self._seq:
+            return self._fail(f"stale element reference: expected observation {self._seq}", action)
+        if kind == "navigate":
+            return self.navigate(str(action.get("url") or ""))
+        if kind == "observe":
+            return self.observe(action)
+        if kind == "click":
+            ref = action.get("ref")
+            if ref:
+                result = self._run_cli(["click", str(ref)])
+            elif action.get("x") is not None and action.get("y") is not None:
+                result = self._run_cli(["mouse", "move", str(int(action["x"])), str(int(action["y"]))])
+                if result.get("ok"):
+                    result = self._run_cli(["mouse", "down"])
+                if result.get("ok"):
+                    result = self._run_cli(["mouse", "up"])
+            else:
+                return self._fail("click requires a ref or x/y coordinates", action)
+        elif kind == "type":
+            ref, text = action.get("ref"), str(action.get("text") or "")
+            result = self._run_cli(["fill", str(ref), text]) if ref else self._run_cli(["keyboard", "type", text])
+        elif kind == "key":
+            result = self._run_cli(["press", str(action.get("key") or "")])
+        elif kind == "select":
+            result = self._run_cli(["select", str(action.get("ref") or ""), str(action.get("value") or "")])
+        elif kind == "scroll":
+            direction = str(action.get("direction") or "down")
+            result = self._run_cli(["scroll", direction, str(int(action.get("pixels") or 300))])
+        elif kind == "wait":
+            result = self._run_cli(["wait", str(int(action.get("ms") or 500))])
+        else:
+            return self._fail(f"unsupported browser action: {kind or '(missing)'}", action)
+        if not result.get("ok"):
+            return self._fail(result.get("error", "browser action failed"), action)
+        return self.observe(action)
+
+    # Compatibility helpers for existing callers.
     def click(self, x_pct: float, y_pct: float) -> dict:
-        """Click at the given viewport percentages (0-100). The cursor position is
-        recorded so the panel renders the visible cursor at the click point."""
-        return self._run_driver("click", x_pct=float(x_pct), y_pct=float(y_pct))
+        return self.act({"kind": "click", "x": self.viewport[0] * float(x_pct) / 100,
+                         "y": self.viewport[1] * float(y_pct) / 100})
 
     def type_text(self, text: str) -> dict:
-        """Type text into the currently-focused element."""
-        return self._run_driver("type", text=text)
+        return self.act({"kind": "type", "text": text})
 
     def scroll(self, dx: int = 0, dy: int = 300) -> dict:
-        """Scroll the page by (dx, dy) pixels."""
-        return self._run_driver("scroll", dx=int(dx), dy=int(dy))
+        return self.act({"kind": "scroll", "direction": "down" if dy >= 0 else "up",
+                         "pixels": abs(int(dy))})
 
     def screenshot(self) -> dict:
-        """Capture a screenshot without taking an action."""
-        return self._run_driver("screenshot")
+        return self.observe({"kind": "observe"})
 
-    # ---- state writer (read by control.browser_state + the panel) ----
     def write_state(self, ok=True, url="", screenshot_b64="", cursor=None,
-                    status="live", phase="active", error=None):
-        """Atomically write the live browser state to browser_state.json.
-
-        `cursor` is {x, y, click} where x/y are viewport percentages (0-100) and click
-        is True for a brief moment after a click (the panel animates a click ring).
-        The file is written atomically (tmp + os.replace) so the panel never reads a
-        half-written snapshot."""
-        snap = {"ok": ok, "url": url, "screenshot_b64": screenshot_b64,
-                "cursor": cursor or {}, "status": status, "phase": phase, "ts": _now()}
+                    status="live", phase="active", error=None, current_action=None,
+                    elements=None, frame_ok=False, console_errors=None, network_errors=None):
+        state = {
+            "schemaVersion": 1, "sessionId": self.session_id, "seq": self._seq,
+            "ok": bool(ok), "url": url or self._last_url, "title": self._last_title,
+            "viewport": {"width": self.viewport[0], "height": self.viewport[1]},
+            "elements": elements if elements is not None else self._last_refs,
+            "cursor": cursor or {}, "currentAction": current_action or {},
+            "consoleErrors": console_errors or [], "networkErrors": network_errors or [],
+            "status": status, "phase": phase, "ts": _now(),
+            "frame": {"seq": self._seq, "mime": "image/jpeg", "available": bool(frame_ok)},
+        }
+        if screenshot_b64:  # compatibility with older tests/state readers
+            state["screenshot_b64"] = screenshot_b64
         if error:
-            snap["error"] = str(error)[:300]
+            state["error"] = str(error)[:300]
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            tmp = str(self.state_file) + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(snap, f)
+            tmp = self.state_file.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(state), encoding="utf-8")
             os.replace(tmp, self.state_file)
         except OSError:
             pass
-        return snap
+        return state
 
-    # ---- driver: delegates the real browser work to a node/Playwright script ----
-    def _run_driver(self, action: str, **kwargs) -> dict:
-        """Run the node driver for a single action. The driver script owns the
-        Chromium instance + page, performs the action, captures a screenshot, and
-        prints a JSON line the bridge parses. If the driver isn't available, the
-        bridge writes a best-effort {ok:false} state and returns it (never raises)."""
-        node = shutil.which("node")
-        if not node:
-            self.write_state(ok=False, status="node not found", phase="idle")
-            return {"ok": False, "error": "node not found"}
-        driver = Path(__file__).parent / "agent_browser_driver.js"
-        if not driver.exists():
-            self.write_state(ok=False, status="driver missing", phase="idle")
-            return {"ok": False, "error": "agent_browser_driver.js not found"}
-        payload = json.dumps({"action": action, "viewport": list(self.viewport), **kwargs})
-        try:
-            p = subprocess.run(
-                [node, str(driver), str(self.repo_path), payload],
-                capture_output=True, text=True, timeout=30,
-                env=_clean_env(), creationflags=_NO_WINDOW,
-            )
-        except (subprocess.TimeoutExpired, OSError) as e:
-            self.write_state(ok=False, status="driver timeout", phase="idle",
-                             error=str(e)[:200])
-            return {"ok": False, "error": str(e)[:200]}
-        if p.returncode != 0:
-            self.write_state(ok=False, status="driver failed", phase="idle",
-                             error=(p.stderr or p.stdout or "")[:200])
-            return {"ok": False, "error": (p.stderr or p.stdout or "driver failed")[:200]}
-        # parse the last JSON line from stdout
-        for line in reversed((p.stdout or "").splitlines()):
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    res = json.loads(line)
-                except json.JSONDecodeError:
-                    break
-                # the driver returns {ok, url, screenshot_b64, cursor, x, y}; write the panel state
-                self.write_state(
-                    ok=bool(res.get("ok")),
-                    url=res.get("url", ""),
-                    screenshot_b64=res.get("screenshot_b64", ""),
-                    cursor={"x": res.get("x", 0), "y": res.get("y", 0),
-                            "click": action == "click"},
-                    status=res.get("status", "live"),
-                    phase="active",
-                    error=res.get("error"),
-                )
-                return res
-        self.write_state(ok=False, status="no driver output", phase="idle")
-        return {"ok": False, "error": "no driver output"}
-
-
-def _clean_env() -> dict:
-    """Env for the node driver — strip secrets + python path pollution (same rules as
-    the visual review capture)."""
-    env = dict(os.environ)
-    for k in ("PYTHONPATH", "PYTHONHOME", "GITHUB_TOKEN", "GH_TOKEN"):
-        env.pop(k, None)
-    return env
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        if shutil.which("agent-browser"):
+            self._run_cli(["close"], timeout=10)
+        for path in (self.state_file, self.frame_file):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        shutil.rmtree(self.profile_dir, ignore_errors=True)

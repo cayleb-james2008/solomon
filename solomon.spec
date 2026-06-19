@@ -3,15 +3,23 @@
 (repos.json, improver/, runtime/, .env) is NOT bundled — it lives in the real Solomon folder and is
 resolved at runtime by control._base_dir(). Mirrors maki.spec's webview collect_all + clr pattern."""
 from PyInstaller.utils.hooks import collect_all
+import os
 
 # Only the web UI is bundled. The operator data (repos.json, improver/, runtime/, .env)
 # lives in the real Solomon folder and is resolved at runtime by control._base_dir().
 datas = [("web", "web")]
 binaries = []
+agent_browser = os.path.expandvars(
+    r"%APPDATA%\npm\node_modules\agent-browser\bin\agent-browser-win32-x64.exe")
+if os.path.isfile(agent_browser):
+    binaries.append((agent_browser, "agent-browser"))
 hiddenimports = [
     "control",
     "solomon",  # improver/solomon.py — the supervisor module, imported in-process by app.py
     "clr",  # pythonnet, used by pywebview edgechromium backend
+    "improver.agent_browser",
+    "improver.sandbox",
+    "improver.app_test_runtime",
 ]
 
 # Collect webview (native libs / data / dynamic submodules).

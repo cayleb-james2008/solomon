@@ -7,7 +7,7 @@ Solomon dashboard's Visual Review tab.
 
 The flow:
   1. Boot the app in an ephemeral sandbox (sandbox.py)
-  2. Drive Playwright (capture.js) over the configured pages
+  2. Drive the persistent agent-browser adapter over the configured pages
   3. Save screenshots to runtime/<name>/visual_review/
   4. Build a pi task with the screenshots (base64) + a11y trees + console/network errors
   5. Run the vision agent (visual_review.md contract) → parse findings
@@ -24,6 +24,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from improver.agent_browser import AgentBrowser
+
 # Import sibling modules — visual_review.py lives in improver/, same as run_improver.py
 HERE = Path(__file__).resolve().parent
 CONTROL = HERE.parent
@@ -31,7 +33,7 @@ CONTROL = HERE.parent
 # visual_review.md contract — the system prompt for the vision agent
 VISUAL_REVIEW_MD = HERE / "visual_review.md"
 VISION_EXT = HERE / "vision-cloud.ts"
-CAPTURE_JS = HERE / "capture.js"
+CAPTURE_JS = HERE / "capture.js"  # legacy helper path; the active capture function uses AgentBrowser
 
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
@@ -44,7 +46,7 @@ def _ts_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
 
 
-def _run_capture(base_url: str, pages: list, timeout: int = 60) -> dict | None:
+def _legacy_playwright_capture(base_url: str, pages: list, timeout: int = 60) -> dict | None:
     """Run capture.js via node, parse its JSON stdout output. Returns the capture result
     or None on failure (never raises — visual review is best-effort)."""
     import shutil
@@ -79,6 +81,39 @@ def _clean_env_for_capture() -> dict:
     for k in ("PYTHONPATH", "PYTHONHOME", "GITHUB_TOKEN", "GH_TOKEN"):
         env.pop(k, None)
     return env
+
+
+def _run_capture(base_url: str, pages: list, runtime_dir: Path,
+                 repo_path: str | None = None) -> dict | None:
+    """Capture pages through the persistent, policy-bounded agent-browser adapter."""
+    captured = []
+    try:
+        with AgentBrowser(repo_path or str(CONTROL), Path(runtime_dir),
+                          allowed_origins=[base_url]) as browser:
+            for page in pages or ["/"]:
+                path = str(page or "/")
+                url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+                state = browser.navigate(url)
+                item = {"path": path, "console_errors": state.get("consoleErrors") or [],
+                        "network_errors": state.get("networkErrors") or []}
+                if not state.get("ok"):
+                    item["nav_error"] = state.get("error") or "navigation failed"
+                    captured.append(item)
+                    continue
+                try:
+                    item["screenshot_b64"] = base64.b64encode(
+                        browser.frame_file.read_bytes()).decode("ascii")
+                except OSError:
+                    item["screenshot_b64"] = ""
+                item["a11y_yaml"] = "\n".join(
+                    f"- {element.get('role', 'element')}: {element.get('name', '')} "
+                    f"[{element.get('ref', '')}]"
+                    for element in state.get("elements") or [] if isinstance(element, dict)
+                )
+                captured.append(item)
+        return {"ok": True, "pages": captured}
+    except Exception:  # noqa: BLE001 - caller converts unavailable capture into a gate result
+        return None
 
 
 def _save_screenshots(capture_result: dict, out_dir: Path) -> list:
@@ -208,9 +243,10 @@ def run(repo_path: str, runtime_dir: Path, sandbox_config: dict,
 
             # 2. Capture
             log("visual review: capturing pages...")
-            capture_result = _run_capture(sb.base_url, pages)
+            capture_result = _run_capture(sb.base_url, pages,
+                                          runtime_dir / "app_test_capture", repo_path)
             if not capture_result:
-                return {"ok": False, "error": "capture failed (node/playwright unavailable?)"}
+                return {"ok": False, "error": "capture failed (agent-browser unavailable)"}
 
             # 3. Save screenshots
             screenshots = _save_screenshots(capture_result, out_dir)

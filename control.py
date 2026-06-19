@@ -19,6 +19,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 def _base_dir():
     """The operator data dir (repos.json, improver/, runtime/, .env). When frozen, the PyInstaller
@@ -371,6 +372,45 @@ def _which_git():
     return shutil.which("git")
 
 
+def has_frontend(repo):
+    """Return whether a repository exposes a user-facing web surface.
+
+    Detection is deliberately cheap and root-scoped: it is used while loading the
+    dashboard, so it must not recursively walk node_modules or large worktrees.
+    """
+    path = _repo_path(repo)
+    if not path or not os.path.isdir(path):
+        return False
+    markers = (
+        "index.html", "web/index.html", "public/index.html", "src/index.html",
+        "templates", "web", "frontend", "client",
+    )
+    for marker in markers:
+        candidate = os.path.join(path, *marker.split("/"))
+        if os.path.isfile(candidate) or (marker in {"templates", "frontend", "client"}
+                                         and os.path.isdir(candidate)):
+            return True
+    package_path = os.path.join(path, "package.json")
+    try:
+        with open(package_path, "r", encoding="utf-8") as f:
+            package = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        package = {}
+    deps = {}
+    for key in ("dependencies", "devDependencies"):
+        value = package.get(key)
+        if isinstance(value, dict):
+            deps.update(value)
+    frameworks = {
+        "react", "react-dom", "vue", "@vue/cli-service", "svelte", "@sveltejs/kit",
+        "next", "nuxt", "vite", "astro", "angular", "@angular/core",
+    }
+    if frameworks.intersection(deps):
+        return True
+    scripts = package.get("scripts") if isinstance(package, dict) else None
+    return bool(isinstance(scripts, dict) and any(k in scripts for k in ("dev", "start", "preview")))
+
+
 # --------------------------------------------------------------------------- #
 # keys config (.env) — global per-provider API keys
 # --------------------------------------------------------------------------- #
@@ -443,6 +483,27 @@ def github_status():
     return {"ready": ready, "login": login}
 
 
+def github_login_start():
+    """Start GitHub CLI's browser-based login without blocking the dashboard."""
+    gh = _which_gh()
+    if not gh:
+        return {"ok": False, "error": "gh not found"}
+    if gh_ready():
+        status = github_status()
+        return {"ok": True, "already": True, "login": status.get("login")}
+    try:
+        kw = {"cwd": HERE, "env": _clean_subenv()}
+        if sys.platform == "win32":
+            kw["creationflags"] = _NO_WINDOW
+        subprocess.Popen(
+            [gh, "auth", "login", "--hostname", "github.com", "--git-protocol", "https", "--web"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, **kw,
+        )
+        return {"ok": True, "started": True}
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+
+
 def _parse_repo_spec(spec):
     """Return the bare repo name from a GitHub spec, or None if it's not one.
     Accepts https://github.com/owner/repo[.git] or owner/repo."""
@@ -483,6 +544,77 @@ def add_project(spec):
     if r.returncode == 0:
         return {"ok": True, "name": name}
     return {"ok": False, "error": (r.stderr or r.stdout or "clone failed").strip()}
+
+
+def _write_repo_entries(entries):
+    """Atomically persist a complete repos.json list."""
+    try:
+        os.makedirs(os.path.dirname(REPOS_JSON) or ".", exist_ok=True)
+        tmp = REPOS_JSON + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(entries, f, indent=2)
+        os.replace(tmp, REPOS_JSON)
+        return {"ok": True}
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+
+
+def connect_project(spec, goal=None, ship="pr", visual_gate=None):
+    """Register a local directory or clone/register a GitHub repository in one call."""
+    raw = os.path.expandvars(os.path.expanduser((spec or "").strip()))
+    if os.path.isdir(raw):
+        path = os.path.abspath(raw)
+        name = os.path.basename(os.path.normpath(path))
+    else:
+        cloned = add_project(raw)
+        if not cloned.get("ok"):
+            return cloned
+        name = cloned["name"]
+        path = os.path.abspath(os.path.join(PROJECTS_DIR, name))
+    if not name or not os.path.isdir(path):
+        return {"ok": False, "error": "project path not found"}
+
+    git_dir = os.path.join(path, ".git")
+    entry = {
+        "name": name,
+        "path": path,
+        "branch_prefix": "rsi/",
+        "is_git": os.path.exists(git_dir),
+        "has_remote": _has_origin(path) if os.path.exists(git_dir) else False,
+        "ship": ship or "pr",
+    }
+    if goal is not None:
+        entry["goal"] = str(goal).strip()
+    resolved_visual_gate = bool(has_frontend(entry)) if visual_gate is None else bool(visual_gate)
+    entry["visual_gate"] = resolved_visual_gate
+
+    entries = _read_repos_json(REPOS_JSON)
+    existing = next((r for r in entries if isinstance(r, dict) and r.get("name") == name), None)
+    if existing is None:
+        entries.append(entry)
+    else:
+        existing.update(entry)
+        entry = existing
+    written = _write_repo_entries(entries)
+    if not written.get("ok"):
+        return written
+
+    contracts = ensure_contracts(entry)
+    enriching = False
+    try:
+        enriching = bool(enrich_contract(entry, background=True).get("ok"))
+    except Exception:  # noqa: BLE001 - registration remains useful if enrichment cannot start
+        enriching = False
+    return {
+        "ok": True,
+        "name": name,
+        "path": path,
+        "visual_gate": resolved_visual_gate,
+        "contracts": contracts,
+        "enriching": enriching,
+        "provider_ready": bool(keys_status().get(project_provider(entry))),
+        "sandbox_configured": bool(project_sandbox(entry)),
+    }
 
 
 def publish_to_github(name, private=True):
@@ -1346,6 +1478,111 @@ def cleanup_worktrees(repo):
         except OSError:
             pass
     return {"ok": True, "pruned": pruned, "removed": removed}
+
+
+def list_worktrees(repo):
+    """Return parsed `git worktree list --porcelain` entries for visualization."""
+    git = _which_git()
+    path = _repo_path(repo)
+    if not git or not path:
+        return []
+    try:
+        result = _run([git, "-C", path, "worktree", "list", "--porcelain"])
+    except OSError:
+        return []
+    if result.returncode != 0:
+        return []
+    rows, current = [], None
+    for line in (result.stdout or "").splitlines() + [""]:
+        if not line:
+            if current:
+                rows.append(current)
+                current = None
+            continue
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            current = {"path": value, "branch": None, "head": None, "bare": False,
+                       "detached": False, "locked": False, "prunable": False}
+        elif current is not None:
+            if key == "branch":
+                current["branch"] = value.removeprefix("refs/heads/")
+            elif key == "HEAD":
+                current["head"] = value
+            elif key in ("bare", "detached", "locked", "prunable"):
+                current[key] = True
+    return rows
+
+
+def browser_state(repo):
+    """Read the latest monitored browser observation without raising into the UI."""
+    rt = _runtime_dir(repo)
+    if not rt:
+        return {"ok": False, "error": "repo has no runtime"}
+    path = os.path.join(rt, "browser_state.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        return state if isinstance(state, dict) else {"ok": False, "error": "invalid browser state"}
+    except (OSError, json.JSONDecodeError) as e:
+        return {"ok": False, "error": str(e)}
+
+
+def start_app_test(repo):
+    if not repo:
+        return {"ok": False, "error": "unknown repo"}
+    rt = _runtime_dir(repo)
+    if not rt:
+        return {"ok": False, "error": "repo has no runtime"}
+    from improver.app_test_runtime import MANAGER
+    return MANAGER.start(repo, Path(rt))
+
+
+def stop_app_test(repo):
+    if not repo:
+        return {"ok": False, "error": "unknown repo"}
+    from improver.app_test_runtime import MANAGER
+    return MANAGER.stop(_repo_name(repo))
+
+
+def app_test_state(repo, after_seq=0):
+    state = browser_state(repo)
+    try:
+        seq = int(state.get("seq") or 0)
+        after = int(after_seq or 0)
+    except (TypeError, ValueError):
+        seq, after = 0, 0
+    if state.get("ok") and seq > 0 and seq <= after:
+        return {"ok": True, "unchanged": True, "seq": seq}
+    return state
+
+
+def app_test_frame(repo, after_seq=0):
+    import base64
+    state = browser_state(repo)
+    try:
+        seq = int(state.get("seq") or 0)
+    except (TypeError, ValueError):
+        seq = 0
+    if seq <= int(after_seq or 0):
+        return {"ok": True, "unchanged": True, "seq": seq}
+    rt = _runtime_dir(repo)
+    frame = os.path.join(rt, "browser_frame.jpg") if rt else ""
+    try:
+        data = base64.b64encode(Path(frame).read_bytes()).decode("ascii")
+        return {"ok": True, "seq": seq, "mime": "image/jpeg", "data": data}
+    except OSError as e:
+        return {"ok": False, "seq": seq, "error": str(e)}
+
+
+def read_app_test_report(repo):
+    rt = _runtime_dir(repo)
+    path = os.path.join(rt, "app_test_report.json") if rt else ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            report = json.load(f)
+        return report if isinstance(report, dict) else {"ok": False, "error": "invalid report"}
+    except (OSError, json.JSONDecodeError) as e:
+        return {"ok": False, "error": str(e)}
 
 
 # --------------------------------------------------------------------------- #

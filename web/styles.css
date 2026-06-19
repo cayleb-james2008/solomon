@@ -241,12 +241,22 @@ a:hover{text-decoration:underline}
 .set-row label{font-size:12.5px; color:var(--ink-2); width:130px; flex:none}
 
 /* ---------- workspace drawer ---------- */
-.ws-scrim{position:fixed; inset:0; background:var(--scrim); z-index:50; display:flex; justify-content:flex-end;
-  animation:fade .16s var(--ease)}
+.ws-scrim{position:fixed; inset:0; background:var(--scrim); z-index:50; display:flex; justify-content:center;
+  align-items:center; padding:4vh 4vw; animation:fade .16s var(--ease); backdrop-filter:blur(8px)}
 @keyframes fade{from{opacity:0}to{opacity:1}}
-.ws{background:var(--bg); width:min(720px,94vw); height:100%; display:flex; flex-direction:column;
-  border-left:1px solid var(--line-2); box-shadow:var(--shadow-lg); animation:slide .2s var(--ease)}
-@keyframes slide{from{transform:translateX(24px)}to{transform:none}}
+.ws{background:var(--bg); width:92vw; max-width:1480px; height:88vh; display:flex; flex-direction:column;
+  border:1px solid var(--line-2); border-radius:24px; overflow:hidden; box-shadow:var(--shadow-lg);
+  animation:workspace-in .2s var(--ease)}
+@keyframes workspace-in{from{transform:translateY(14px) scale(.985);opacity:.65}to{transform:none;opacity:1}}
+.global-workspace .ws-body{padding:24px 28px 36px}
+.app-test-grid{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:16px;min-height:480px}
+.app-test-viewport{position:relative;background:#0b0b0b;border:1px solid var(--line);border-radius:14px;overflow:hidden;min-height:440px;display:grid;place-items:center}
+.app-test-viewport img{width:100%;height:100%;object-fit:contain;display:block}
+.app-test-cursor{position:absolute;width:16px;height:16px;border:2px solid var(--clay);border-radius:50%;transform:translate(-50%,-50%);pointer-events:none;box-shadow:0 0 0 5px color-mix(in srgb,var(--clay) 22%,transparent)}
+.app-test-side{display:flex;flex-direction:column;gap:12px;min-width:0}
+.app-test-meta,.app-test-events{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px}
+.app-test-events{font-family:var(--mono);font-size:11px;line-height:1.55;overflow:auto;max-height:410px}
+@media(max-width:760px){.ws-scrim{padding:0}.ws{width:100vw;height:100vh;max-width:none;border-radius:0;border:none}.app-test-grid{grid-template-columns:1fr}.app-test-side{min-height:220px}}
 .ws-head{display:flex; align-items:center; justify-content:space-between; gap:12px; padding:16px 20px; border-bottom:1px solid var(--line)}
 .ws-title{font-family:var(--serif); font-size:20px; display:flex; align-items:center; gap:10px}
 .ws-goal-wrap{padding:16px 20px; border-bottom:1px solid var(--line); background:var(--bg-warm)}

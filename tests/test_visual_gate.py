@@ -82,20 +82,22 @@ def test_visual_gate_decision_allows_no_findings():
     assert m._visual_gate_reason({"ok": True, "findings": []}) is None
 
 
-def test_visual_gate_decision_allows_failed_review():
+def test_visual_gate_decision_blocks_failed_review():
     """A visual-review that itself FAILED to run (ok=False) does NOT block the ship — it's
     best-effort (the RSI loop must not break if the visual infra is down). The advisory path still
     applies (no feedback); the hard gate only fires on a SUCCESSFUL review WITH critical findings."""
     m = _load_runner()
     res = {"ok": False, "error": "sandbox failed to boot"}
-    assert m._visual_gate_reason(res) is None
+    reason = m._visual_gate_reason(res)
+    assert reason is not None
+    assert "unavailable" in reason.lower()
 
 
 def test_visual_gate_decision_handles_missing_findings_key():
     m = _load_runner()
     assert m._visual_gate_reason({"ok": True}) is None
-    assert m._visual_gate_reason({}) is None
-    assert m._visual_gate_reason(None) is None
+    assert "unavailable" in m._visual_gate_reason({}).lower()
+    assert "unavailable" in m._visual_gate_reason(None).lower()
 
 
 # ---- Feature 1a: mandatory visual testing for frontend repos -------------
