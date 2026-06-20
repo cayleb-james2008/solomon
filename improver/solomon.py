@@ -86,6 +86,14 @@ def diagnose(repo):
         cat, ev, rec, safe = ("base_out_of_band", summary[:200],
                               ["base has un-pushed / out-of-band commits — push or revert them "
                                "(the loop changes a repo only via gated PRs)"], False)
+    elif status == "error" and phase == "preflight" and "would be deleted by the preflight clean" in summary.lower():
+        # The untracked-file refusal (hygiene-3): preflight refused `git clean -fd` because untracked
+        # non-ignored files on the base would be destroyed (possible operator work). The runner's
+        # auto-stash already failed or didn't fire (else there'd be no wedge), so this is operator-
+        # gated — it must NOT be reported healthy. Escalate with steps; never auto-delete the files.
+        cat, ev, rec, safe = ("untracked_refusal", summary[:200],
+                              ["untracked files on the base block the preflight clean — review them, "
+                               "then commit or remove them (the loop won't delete possible operator work)"], False)
     elif has_lock and not running:
         cat, ev, rec, safe = "stale_lock", "lock file present but no live improver PID", ["clear the stale lock"], True
     elif has_stop and not running:
@@ -108,6 +116,23 @@ def diagnose(repo):
         cat, ev, rec, safe = ("ci_red_streak",
                               "last 3 auto-merge PRs did not land (CI-red / unmerged) — CI keeps failing",
                               ["review the failing CI on the open rsi/* PRs and fix the cause"], False)
+    elif len(hist) >= 5 and all(r.get("status") == "noop" for r in hist[-5:]):
+        # The agent made NO change 5 iterations running: the backlog is exhausted or every remaining
+        # item is too hard for the current model (the asmodeus 'deferred after repeated tries' state).
+        # gate_red_streak only matches reverted/error, so a pure-noop churn was invisible — the loop
+        # burned iterations forever with no alert (self-heal-4). Surface it so the menu gets refilled.
+        cat, ev, rec, safe = ("noop_streak",
+                              "5 iterations in a row made no change — the backlog looks exhausted or "
+                              "too hard for the current model",
+                              ["refill the backlog (run Ideate) or simplify/replace the deferred items, "
+                               "or raise the repo's model"], False)
+    elif status == "error":
+        # Catch-all (lifecycle-3): an error we couldn't classify above — e.g. a base branch that does
+        # not exist (no phase set) or a github/exec failure — must NOT fall through to 'ok'. That
+        # reported a wedged repo as healthy and let the watchdog blind-restart it with no operator
+        # alert. Surface it as a non-auto 'unknown_error' so recover() escalates (writes escalation.json).
+        cat, ev, rec, safe = ("unknown_error", (summary[:200] or "unclassified loop error"),
+                              ["review the loop's last error (dashboard / runtime log) and address the cause"], False)
 
     # anti-thrash: same auto category fixed >= 3 times recently -> escalate instead of looping forever
     if safe and cat != "ok":
@@ -141,6 +166,14 @@ def _suggested_steps(repo, cat):
         return [cd, "gh pr list --state open            # the CI-red rsi/* PRs that won't merge",
                 "gh pr checks <number>                  # which check failed",
                 "# fix the failing-CI cause (or close the bad PRs); tick 'Allow AI fix' for a fix-session"]
+    if cat == "untracked_refusal":
+        return [cd, "git status --porcelain                          # the untracked files blocking preflight",
+                "git stash push --include-untracked -m solomon       # if they're disposable, OR",
+                'git add -A && git commit -m "operator work"         # if they are real work to keep']
+    if cat == "noop_streak":
+        return ["Open Solomon → this repo → Ideate to refill the backlog with fresh items,",
+                "or edit improver/<name>/backlog.md to add/simplify items,",
+                "or raise the repo's model in Config (the current one keeps failing to implement)"]
     return [cd, "git status"]
 
 
@@ -243,6 +276,17 @@ def recover(repo, allow_pi=False, allow_restart=True, auto_push=True):
         if control.is_running(repo):
             return _finish(repo, d, [], escalate=True,
                            msg="loop is live — stop it before Solomon resets the un-reverted base")
+        # anti-thrash (self-heal-6): a deterministic revert-failure can recur after each successful
+        # reset (an un-deletable path, a tree that re-wedges identically). The revert_failed rung is
+        # NOT covered by the auto-safe anti-thrash below (safe=False), so without this it would
+        # reset+restart forever. After N recent auto-resets of this category, escalate instead.
+        prior_resets = sum(1 for s in control.read_supervisor_log(repo, limit=6)
+                           if s.get("category") == "revert_failed"
+                           and "reset_to_base" in (s.get("actions") or []))
+        if prior_resets >= 3:
+            return _finish(repo, d, [], escalate=True,
+                           msg="revert-failure recurs after repeated auto-resets — escalating "
+                               "(a deterministic cause keeps re-wedging the base)")
         ok, token = control.acquire_supervisor_lock(repo)
         if not ok:
             return _finish(repo, d, [], escalate=True,
