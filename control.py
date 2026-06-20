@@ -360,6 +360,12 @@ def _clean_subenv():
     env = dict(os.environ)
     for k in ("GITHUB_TOKEN", "GH_TOKEN", "PYTHONPATH", "PYTHONHOME"):
         env.pop(k, None)
+    # Run spawned children in UTF-8 mode so the runner's stdout AND every subprocess.run(text=True) it
+    # makes (git diffs, the test gate's output, gh) decode/encode as UTF-8 instead of the Windows
+    # cp1252 locale — a non-cp1252 char (≥, em-dash, emoji) in agent output otherwise raises
+    # Unicode{Encode,Decode}Error and CRASHES the iteration (observed: asmodeus died mid-iteration).
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     return env
 
 
