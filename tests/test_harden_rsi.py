@@ -87,3 +87,50 @@ def test_correlated_expansion_never_narrows_default_gate(tmp_path, monkeypatch):
     assert out == ""                              # full suite, not "pytest test_config.py"
     # a custom gate is likewise run verbatim (operator-owned), so baseline==after for it too
     assert m._expand_gate_with_correlated("mygate --x", ["scripts/config.py"]) == "mygate --x"
+
+
+# --------------------------------------------------------------------------- #
+# HARDEN-D (gate-2) — count-less custom gates still catch test deletion
+# --------------------------------------------------------------------------- #
+def test_removed_test_def_caught_when_counts_inactive():
+    m = _load_runner()
+    diff = "-def test_old_behaviour():\n-    assert thing()\n+CONST = 1\n"
+    # gate emitted no parseable counts -> numeric rails inert -> the diff-based deletion rail fires
+    reason = m._anti_gaming_reason({"passed": 0, "collected": 0},
+                                   {"passed": 0, "collected": 0, "green": True}, diff)
+    assert reason is not None and "removed" in reason and "test definition" in reason
+
+
+def test_removed_test_def_not_double_flagged_when_counts_active():
+    m = _load_runner()
+    diff = "-def test_old_behaviour():\n-    assert thing()\n+CONST = 1\n"
+    # with parseable, steady counts the numeric rails own deletion detection; the diff rail stays off
+    reason = m._anti_gaming_reason({"passed": 5, "collected": 5},
+                                   {"passed": 5, "collected": 5, "green": True}, diff)
+    assert reason is None
+
+
+def test_removed_test_defs_helper():
+    m = _load_runner()
+    assert m._removed_test_defs("-def test_x():\n-class TestY:\n-    pass") != []
+    assert m._removed_test_defs("---  a/x.py\n-x = 1\n+def test_x():") == []   # header + add excluded
+
+
+# --------------------------------------------------------------------------- #
+# HARDEN-E (gate-3) — an "add tests" item that added no test is not ticked
+# --------------------------------------------------------------------------- #
+def test_item_demands_tests_detection():
+    m = _load_runner()
+    assert m._item_demands_tests("Add unit tests for `asmodeus.cli` covering version/kill (0% coverage)")
+    assert m._item_demands_tests("Increase coverage of env.load_env to 80%")
+    assert not m._item_demands_tests("Refactor the scheduler to use asyncio")
+    assert not m._item_demands_tests("Fix the flaky retry in the fetcher")
+
+
+def test_added_test_defs_detection():
+    m = _load_runner()
+    assert m._added_test_defs("+def test_foo():\n+    assert 1") != []
+    assert m._added_test_defs("+async def test_bar():\n+    pass") != []
+    assert m._added_test_defs("+class TestBaz:\n+    pass") != []
+    assert m._added_test_defs("+def helper():\n+    return 1") == []     # not a test def
+    assert m._added_test_defs("+++ b/tests/test_x.py\n+x=1") == []       # header excluded
