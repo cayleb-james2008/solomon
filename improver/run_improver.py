@@ -597,7 +597,11 @@ def _record_history(status: str, branch: str | None, summary: str, *, extra: dic
 
 # ---- git ------------------------------------------------------------------
 def git(*args: str) -> subprocess.CompletedProcess:
+    # encoding/errors: git output (diffs, commit messages, non-ASCII paths) can contain UTF-8; without
+    # these, text=True decodes as the Windows locale (cp1252) and a UnicodeDecodeError crashes the whole
+    # iteration. errors="replace" keeps the loop alive. (Belt-and-suspenders with PYTHONUTF8 in the env.)
     return subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace",
                           env=_clean_env(), **hidden_subprocess_kwargs())
 
 
@@ -3228,6 +3232,15 @@ def main(argv=None) -> int:
     ap.add_argument("--solomon", action="store_true",
                     help="supervisor fix-session: diagnose + fix a persistent gate failure (one iteration)")
     a = ap.parse_args(argv)
+    # Windows: the detached runner's stdout/stderr default to cp1252, so print()/log() of agent output
+    # containing non-cp1252 chars (≥, ≤, em-dashes, emoji) raises UnicodeEncodeError and CRASHES the
+    # loop mid-iteration (observed: asmodeus died after a '≥' encode error). Force UTF-8 + replace
+    # so logging can never kill the loop. (File logs already open utf-8; this fixes the print() path.)
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     configure(a.repo, a.name or Path(a.repo).name, a.provider, a.model)
     global SHIP, GATE_CMD, REASONING, GOAL, BEAUTIFY, SOLOMON, INTERVAL, PHASE
     SHIP = a.ship
@@ -3299,10 +3312,12 @@ def main(argv=None) -> int:
     _hb["started_at"] = _now()
     heartbeat(status="idle", phase=None)
     log(f"Solomon RSI improver started for {NAME}")
-    try:
+    clean_exit = False     # True only on a DELIBERATE exit (stop/once/max-iter/interrupt); an unhandled-
+    try:                   # exception crash leaves it False so the finally records an error, not 'stopped'.
         while True:
             if STOP.exists():
                 log("stop flag set — exiting")
+                clean_exit = True
                 break
             _refresh_config_from_registry()   # pick up dashboard edits to model/gate/reasoning/goal mid-loop
             one_iteration()
@@ -3319,9 +3334,11 @@ def main(argv=None) -> int:
             if _hb.get("status") != "error":
                 reflect()
             if a.once:
+                clean_exit = True
                 break
             if a.max_iterations and _hb["iteration"] >= a.max_iterations:
                 log(f"reached max iterations ({a.max_iterations}) — exiting")
+                clean_exit = True
                 break
             for _ in range(max(1, a.interval)):  # interruptible cooldown
                 if STOP.exists():
@@ -3329,11 +3346,23 @@ def main(argv=None) -> int:
                 time.sleep(1)
     except KeyboardInterrupt:
         log("interrupted")
+        clean_exit = True
     finally:
-        # Preserve the error/reverted heartbeat on a halt so the supervisor still diagnoses
-        # revert_failed (and the watchdog leaves it alone); a normal exit reports 'stopped'.
-        if not _HALTED:
+        # A HALT keeps its error/reverted heartbeat so the supervisor still diagnoses revert_failed (the
+        # watchdog leaves it alone). A DELIBERATE exit (stop/once/max-iter/interrupt) reports 'stopped'.
+        # An unhandled-exception CRASH (clean_exit stays False) must NOT report 'stopped' — that would
+        # make monitor.should_restart() mistake the crash for an operator stop and leave the loop DEAD;
+        # record status=error so the watchdog RESTARTS it (self-heal). (The exception still propagates.)
+        if _HALTED:
+            pass
+        elif clean_exit:
             heartbeat(status="stopped", phase=None)
+        else:
+            try:
+                heartbeat(status="error", phase="crashed",
+                          last_summary="loop crashed (unhandled exception) — will be restarted")
+            except Exception:  # noqa: BLE001 — the finally must not mask the original crash
+                pass
         release_lock()
         try:
             STOP.unlink()

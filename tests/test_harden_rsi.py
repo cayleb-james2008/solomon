@@ -210,3 +210,22 @@ def test_git_add_all_skips_ignored_without_error(tmp_path, monkeypatch):
     assert "normal.py" in staged                              # the real change is staged
     assert "priv/brand.json" not in staged                   # private path kept out of the commit
     assert "ignored_dir" not in staged                       # ignored files skipped silently
+
+
+# --------------------------------------------------------------------------- #
+# HARDEN-I — a crashed loop is restarted (not mistaken for a clean stop)
+# --------------------------------------------------------------------------- #
+def test_watchdog_restarts_a_crashed_loop():
+    """Bug B: an unhandled-exception crash now records status=error/phase='crashed' (not 'stopped'),
+    so monitor.should_restart RESTARTS it instead of mistaking the crash for a deliberate operator
+    stop and leaving the loop dead. A real clean stop and the revert HALT are still left alone."""
+    spec = importlib.util.spec_from_file_location("monitor", os.path.join(ROOT, "monitor.py"))
+    mon = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mon)
+    crashed = {"status": "error", "phase": "crashed"}
+    assert mon.should_restart(running=False, hb=crashed, paused=False, stop_pending=False) is True
+    assert mon.should_restart(running=False, hb={"status": "stopped"}, paused=False, stop_pending=False) is False
+    halt = {"status": "error", "phase": "reverted"}
+    assert mon.should_restart(running=False, hb=halt, paused=False, stop_pending=False) is False
+    # a crashed loop the operator paused stays paused (no surprise restart)
+    assert mon.should_restart(running=False, hb=crashed, paused=True, stop_pending=False) is False
