@@ -378,6 +378,46 @@ def _which_git():
 
 
 # --------------------------------------------------------------------------- #
+# watchdog self-rearm — the SolomonWatchdog scheduled task is the entire keep-alive
+# layer; if it is deleted/disabled, crashed loops stay dead and repos go silent with
+# no signal. Nothing previously noticed or re-created it. _ensure_watchdog_task makes
+# opening the dashboard (app.main) idempotently re-arm a MISSING task.
+# --------------------------------------------------------------------------- #
+def _watchdog_python():
+    """A WINDOWLESS python (pythonw.exe) that can import control/monitor for the scheduled sweep.
+    Prefer the maki .venv (the established watchdog interpreter — scripts/watchdog.cmd uses it), else a
+    pythonw beside the current interpreter when unfrozen. None when none is usable (caller no-ops)."""
+    cand = os.path.join(PROJECTS_DIR, "maki", ".venv", "Scripts", "pythonw.exe")
+    if os.path.isfile(cand):
+        return cand
+    if not getattr(sys, "frozen", False):
+        pw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        return pw if os.path.isfile(pw) else sys.executable
+    return None
+
+
+def _ensure_watchdog_task():
+    """Idempotently ensure the SolomonWatchdog scheduled task exists (windowless `pythonw monitor.py`,
+    every 2 min). Query first; CREATE only if MISSING — never clobber an existing task or its operator-
+    chosen schedule. Best-effort: any failure (no schtasks, locked-down host, elevation prompt) is
+    swallowed so it never blocks startup. Windows-only. Returns a short status string for logging."""
+    if sys.platform != "win32":
+        return "skipped (not win32)"
+    try:
+        if _run(["schtasks", "/Query", "/TN", "SolomonWatchdog"]).returncode == 0:
+            return "present"
+        py = _watchdog_python()
+        monitor = os.path.join(HERE, "monitor.py")
+        if not py or not os.path.isfile(monitor):
+            return "missing (no python/monitor to arm)"
+        c = _run(["schtasks", "/Create", "/TN", "SolomonWatchdog", "/TR", f'"{py}" "{monitor}"',
+                  "/SC", "MINUTE", "/MO", "2", "/F"])
+        return "armed" if c.returncode == 0 else f"arm-failed: {(c.stderr or c.stdout or '').strip()[:120]}"
+    except OSError as e:
+        return f"arm-error: {e}"
+
+
+# --------------------------------------------------------------------------- #
 # in-app updater (source-rebuild model — see updater.py / SolomonUpdater.exe)
 # --------------------------------------------------------------------------- #
 def _solomon_repo():

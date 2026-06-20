@@ -360,6 +360,14 @@ def main():
             pass
     import threading
 
+    # Re-arm the keep-alive watchdog if its scheduled task was deleted/disabled (idempotent, best-
+    # effort, never blocks startup) — so opening the dashboard restores crash-recovery for the loops.
+    try:
+        import control
+        control._ensure_watchdog_task()
+    except Exception:  # noqa: BLE001 — best-effort; a watchdog-arm failure must never block the GUI
+        pass
+
     import webview  # lazy: GUI-only dependency, not needed by the headless control surface
     api = Api()
     api._window = webview.create_window(
