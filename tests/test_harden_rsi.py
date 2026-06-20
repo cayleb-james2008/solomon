@@ -123,8 +123,18 @@ def test_item_demands_tests_detection():
     m = _load_runner()
     assert m._item_demands_tests("Add unit tests for `asmodeus.cli` covering version/kill (0% coverage)")
     assert m._item_demands_tests("Increase coverage of env.load_env to 80%")
+    # broader real-world phrasings (verification finding): raise-coverage + restore/backfill/port tests
+    assert m._item_demands_tests("Improve test coverage for the parser")
+    assert m._item_demands_tests("Bump coverage of asmodeus.cli to 80%")
+    assert m._item_demands_tests("Raise coverage to 80%")
+    assert m._item_demands_tests("Backfill tests for env.load_env")
+    assert m._item_demands_tests("Restore the deleted unit tests")
+    assert m._item_demands_tests("Port tests from the legacy suite")
+    # negatives — non-test work, and crucially test-INFRA work that legitimately adds no test
     assert not m._item_demands_tests("Refactor the scheduler to use asyncio")
     assert not m._item_demands_tests("Fix the flaky retry in the fetcher")
+    assert not m._item_demands_tests("Improve the test runner's parallelism")
+    assert not m._item_demands_tests("Speed up the test harness startup")
 
 
 def test_added_test_defs_detection():
