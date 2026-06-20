@@ -2537,10 +2537,25 @@ def one_iteration() -> None:
             _mark_backlog_done(goal)
             _clear_failure_state(goal)    # a real landed ship resets the item's escalation tally
     heartbeat(status="sleeping", phase="sleep", last_pr=pr, last_summary=summary)
-    # 'shipped' only when the change actually landed (or is in-flight to merge); an auto-merge PR
-    # left un-merged on red/awaiting CI, or a failed push, records 'blocked' so it is not counted as
-    # a success and a streak of them is diagnosable (ci_red_streak) instead of silently 'shipped'.
-    _record_history("shipped" if landed else "blocked", branch, summary)
+    # History status: 'shipped' only when the change truly LANDED; otherwise 'blocked' so it is not
+    # counted as success and a streak is diagnosable (ci_red_streak). In auto-merge mode "landed" means
+    # a CONFIRMED MERGE — a native-auto-merge handoff ('auto-merge queued (awaiting CI)') has NOT yet
+    # merged onto the integration branch, so it records 'blocked'; if it never lands, the streak surfaces
+    # it instead of a dangling PR looking like silent success (hygiene-4). The backlog item is still
+    # ticked above (on _ship_succeeded) so the queued PR isn't re-shipped as a duplicate next iteration.
+    _record_history(_ship_outcome(pr, SHIP), branch, summary)
+
+
+def _ship_outcome(pr: dict, ship_mode: str) -> str:
+    """The history status for a completed ship. 'shipped' = it landed (in pr-mode, the PR is open for
+    the human to merge); 'blocked' = it did NOT land and must not look like success. In auto-merge
+    mode "landed" means a CONFIRMED MERGE — an auto-merge PR left queued/open (awaiting or red CI) is
+    'blocked' so a streak that never merges is diagnosable via ci_red_streak (hygiene-4). pr/push/local
+    keep the _ship_succeeded notion (an opened PR / verified push / kept-local branch is success)."""
+    state = (pr.get("state") or "").lower()
+    if ship_mode == "auto-merge":
+        return "shipped" if ("merged" in state and "not merged" not in state) else "blocked"
+    return "shipped" if _ship_succeeded(pr) else "blocked"
 
 
 def _ship_succeeded(pr: dict) -> bool:

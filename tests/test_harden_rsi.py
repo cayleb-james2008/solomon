@@ -149,3 +149,17 @@ def test_redact_scrubs_alpha_credential_values(monkeypatch):
     # but a BARE lowercase 'token:'/'secret:' prose word with an alpha value stays untouched
     assert m._redact("token: validation logic") == "token: validation logic"
     assert m._redact("secret: be consistent daily") == "secret: be consistent daily"
+
+
+# --------------------------------------------------------------------------- #
+# HARDEN-G (hygiene-4) — auto-merge records 'shipped' only on a confirmed merge
+# --------------------------------------------------------------------------- #
+def test_ship_outcome_auto_merge_only_shipped_on_confirmed_merge():
+    m = _load_runner()
+    assert m._ship_outcome({"number": 1, "state": "merged"}, "auto-merge") == "shipped"
+    # a native-auto-merge HANDOFF has NOT landed -> 'blocked' so a never-merging streak is diagnosable
+    assert m._ship_outcome({"number": 1, "state": "auto-merge queued (awaiting CI)"}, "auto-merge") == "blocked"
+    assert m._ship_outcome({"number": 1, "state": "open (CI red — not merged)"}, "auto-merge") == "blocked"
+    assert m._ship_outcome({"number": None, "state": "reverted (CI red)"}, "auto-merge") == "blocked"
+    # pr-mode: an opened PR IS a successful ship (the human merges it later)
+    assert m._ship_outcome({"number": 7, "state": "open"}, "pr") == "shipped"
