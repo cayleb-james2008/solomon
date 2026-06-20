@@ -474,6 +474,13 @@ def _redact(text: str) -> str:
         _v = os.environ.get(_k)
         if _v and len(_v) >= 8:
             out = out.replace(_v, "[REDACTED]")
+    # Brand/account identity pass: the agent's free-text (commit/PR body/log) describing what it read
+    # while working on a PUBLIC repo can name the operator's private brand/account (e.g. the GGG
+    # handles). Scrub each operator-supplied deny-term (repos.json `deny_terms`) case-insensitively so
+    # it never reaches a pushed PR/commit/log. No-op when no deny_terms are configured.
+    for _term in _repo_deny_terms(NAME):
+        if _term:
+            out = re.sub(re.escape(_term), "[REDACTED]", out, flags=re.IGNORECASE)
     return out
 
 
@@ -1233,6 +1240,74 @@ def _eval_cmd(name: str) -> str:
     return (row.get("EVAL_CMD") or "").strip()
 
 
+# --------------------------------------------------------------------------- #
+# leak prevention — gate what may reach a PUBLIC repo's pushed commits
+# --------------------------------------------------------------------------- #
+def _repo_row(name: str) -> dict:
+    """THIS repo's repos.json row (read fresh so a dashboard edit takes effect mid-loop), or {}."""
+    try:
+        rows = json.loads((CONTROL / "repos.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(rows, list):
+        return {}
+    row = next((r for r in rows if isinstance(r, dict) and r.get("name") == name), None)
+    return row if isinstance(row, dict) else {}
+
+
+def _repo_is_public(name: str) -> bool:
+    """Whether the repo is PUBLIC (repos.json `public: true`). Public repos get the leak guards below;
+    private repos are byte-identical to before (every guard is a no-op)."""
+    return bool(_repo_row(name).get("public"))
+
+
+def _repo_private_paths(name: str) -> list:
+    """Repo-relative paths that must NEVER be staged into a PUBLIC repo's commit even if the agent
+    un-ignored them (repos.json `private_paths`, e.g. 'profiles/ggg/'). POSIX, trailing slash trimmed."""
+    raw = _repo_row(name).get("private_paths")
+    if not isinstance(raw, list):
+        return []
+    return [str(p).strip().replace("\\", "/").rstrip("/") for p in raw if str(p).strip()]
+
+
+def _repo_deny_terms(name: str) -> list:
+    """Operator brand/account identity strings to scrub from agent text AND block from a public diff
+    (repos.json `deny_terms`, e.g. 'gains.god.growth'). [] when absent (no-op)."""
+    raw = _repo_row(name).get("deny_terms")
+    if not isinstance(raw, list):
+        return []
+    return [str(t) for t in raw if str(t).strip()]
+
+
+def _git_add_all():
+    """`git add -A`, but for a PUBLIC repo exclude its `private_paths` via an exclude pathspec — so an
+    agent that un-ignored a private path (edited .gitignore) STILL cannot stage it into a pushed commit.
+    Non-destructive: excluded files simply stay unstaged and on disk. Private repos: plain `git add -A`."""
+    paths = _repo_private_paths(NAME) if _repo_is_public(NAME) else []
+    if paths:
+        return git("add", "-A", "--", ".", *[f":(exclude){p}" for p in paths])
+    return git("add", "-A")
+
+
+def _leak_in_diff(diff: str) -> str:
+    """For a PUBLIC repo: a short reason if the committed diff's ADDED lines contain an operator
+    deny-term or a secret-shaped token, else ''. Scans only added ('+') lines (the new content being
+    pushed) so deleting a deny-term never trips it. Pure (over NAME's config) so it is unit-testable."""
+    if not diff:
+        return ""
+    added = "\n".join(l for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++"))
+    if not added:
+        return ""
+    low = added.lower()
+    for term in _repo_deny_terms(NAME):
+        if term and term.lower() in low:
+            return f"deny-term '{term}' present in the diff"
+    for pat in _SECRET_TOKEN_PATTERNS:
+        if pat.search(added):
+            return "a secret-shaped token is present in the diff"
+    return ""
+
+
 def _eval_gate_reason(base_score, after_score):
     """Why a gate-green change should still be reverted because the eval score dropped, or None.
     Pure (no IO) so the rule is unit-tested directly. None baseline or None after -> None (a new or
@@ -1788,6 +1863,13 @@ def _open_pr(branch: str, title: str, summary: str, tests: dict | None) -> dict:
                 log(f"adopted existing PR #{num} for {branch} (gh pr create: already exists)")
                 return {"number": num, "url": url, "branch": branch, "state": "open"}
         log(f"gh pr create failed: {stderr[:200]}")
+        # Un-strand the branch we just pushed: no PR landed, the item is not ticked, and it retries on
+        # a FRESH branch next iteration — so leaving this one on origin only accumulates orphaned rsi/*
+        # branches on the (possibly public) remote with no later cleanup path. Best-effort delete of
+        # exactly this run's branch (never a blanket remote prune that could hit a human-opened PR).
+        d = git("push", "origin", "--delete", branch)
+        if d.returncode == 0:
+            log(f"leak/hygiene: deleted orphaned remote branch {branch} after failed pr-create")
         return {"number": None, "url": None, "branch": branch, "state": "push-only"}
     url = (p.stdout or "").strip().splitlines()[-1] if p.stdout.strip() else None
     num = None
@@ -1797,6 +1879,23 @@ def _open_pr(branch: str, title: str, summary: str, tests: dict | None) -> dict:
         except ValueError:
             pass
     return {"number": num, "url": url, "branch": branch, "state": "open"}
+
+
+def _try_squash_merge(num) -> "subprocess.CompletedProcess":
+    """`gh pr merge --squash --delete-branch` with a few bounded retries for a TRANSIENT gh/network
+    blip on already-green CI (which would otherwise leave PR #1 open and make the next iteration open a
+    duplicate PR for the same item on a public repo). Retrying a squash-merge on green CI cannot land
+    bad work; the bound stops it looping on a genuinely unmergeable (conflict) PR. Returns the last
+    CompletedProcess (returncode 0 == merged)."""
+    m = None
+    for attempt in range(3):
+        m = subprocess.run([gh_exe(), "pr", "merge", str(num), "--squash", "--delete-branch"],
+                           cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
+        if m.returncode == 0:
+            return m
+        if attempt < 2:
+            time.sleep(5)
+    return m
 
 
 def _auto_merge(pr: dict) -> dict:
@@ -1818,8 +1917,7 @@ def _auto_merge(pr: dict) -> dict:
             return {**pr, "state": "auto-merge queued (awaiting CI)"}
         log(f"auto-merge: CI pending and native --auto unavailable on PR {num} — leaving open until CI resolves")
         return {**pr, "state": "open (awaiting CI)"}
-    m = subprocess.run([gh_exe(), "pr", "merge", str(num), "--squash", "--delete-branch"],
-                       cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
+    m = _try_squash_merge(num)
     if m.returncode == 0:
         return {**pr, "state": "merged"}
     log(f"gh pr merge {num} failed: {(m.stderr or '').strip()[:200]} — PR left open")
@@ -1847,11 +1945,10 @@ def _wait_for_ci_then_merge(pr: dict) -> dict:
     while True:
         checks = _pr_checks(num)
         if checks in ("success", None):
-            m = subprocess.run([gh_exe(), "pr", "merge", str(num), "--squash", "--delete-branch"],
-                               cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
+            m = _try_squash_merge(num)
             if m.returncode == 0:
                 return {**pr, "state": "merged"}
-            log(f"gh pr merge {num} failed: {(m.stderr or '').strip()[:200]} — PR left open")
+            log(f"gh pr merge {num} failed after retries: {(m.stderr or '').strip()[:200]} — PR left open")
             return {**pr, "state": "open (merge failed)"}
         if checks == "failure":
             subprocess.run([gh_exe(), "pr", "close", str(num), "--delete-branch"],
@@ -2186,7 +2283,7 @@ def one_iteration() -> None:
         # so the diff includes NEW UNTRACKED test files — `git diff <commit>` omits untracked files, so a
         # skip/xfail added inside a brand-new test file (the common case: Pi writes new tests) would
         # otherwise be invisible — then diff the staged tree against base.
-        git("add", "-A")
+        _git_add_all()
         gamed = _anti_gaming_reason(base_tests, tests, git("diff", "--cached", BASE_BRANCH).stdout or "")
         if gamed:
             log(f"anti-gaming: {gamed} — reverting")
@@ -2234,7 +2331,7 @@ def one_iteration() -> None:
 
     # commit anything Pi left uncommitted (it shouldn't commit, but be robust)
     heartbeat(phase="commit")
-    add = git("add", "-A")
+    add = _git_add_all()
     if add.returncode != 0:
         # `git add` can fail outright — e.g. an untracked Windows reserved-name file (`nul`, `con`, …)
         # that core.protectNTFS refuses — and then NOTHING stages: the iteration silently looks like a
@@ -2276,6 +2373,20 @@ def one_iteration() -> None:
             log(f"DEVIATION: the item names file(s) the committed diff never touched — agent shipped "
                 f"unrelated work; not ticking '{goal[:60]}'")
             item_deviated = True
+
+    # LEAK GUARD (PUBLIC repos only) — the change is committed but NOT yet pushed. Scan the committed
+    # diff's ADDED lines for operator deny-terms (brand/account identity) or secret-shaped tokens; a
+    # hit REVERTS the branch (exactly like a gate-red), so private operator data or a secret can never
+    # reach a PUBLIC remote — even if a too-capable agent wrote it into a tracked source file/test.
+    # No-op for private repos and for public repos with no deny_terms (still catches secret shapes).
+    if _repo_is_public(NAME):
+        leak = _leak_in_diff(git("diff", f"{BASE_BRANCH}..{branch}").stdout or "")
+        if leak:
+            log(f"LEAK GUARD: {leak} — reverting (won't push private/secret data to a public repo)")
+            _drop_branch(branch, "reverted",
+                         f"Reverted — leak guard: {leak}. The committed change would push private "
+                         f"operator data or a secret to the PUBLIC repo; fix the change to exclude it.")
+            return
 
     # Adversarial REVIEW / JUDGE phase (pipeline.review) — the SECOND gate, after the runner's
     # objective gate + the commit, BEFORE shipping. An independent critic catches what a green test
