@@ -1547,16 +1547,25 @@ def _removed_test_defs(diff_text: str) -> list:
             if ln.startswith("-") and not ln.startswith("---") and _TEST_DEF_RE.match(ln[1:])]
 
 
+# Two precise branches so "raise X coverage" is caught while "improve the test RUNNER" is NOT (the
+# latter is real non-test-adding work — a false 'deviation' would wrongly defer it):
+#   - an ADD/RESTORE/PORT-style verb near the word "test(s)"   (adds test code), OR
+#   - any RAISE-style verb near the word "coverage"            (raising coverage == adding tests).
 _DEMANDS_TESTS_RE = re.compile(
-    r"\b(?:add|adds|adding|write|writes|writing|create|creates|creating|cover|covers|covering|"
-    r"increase|increases|increasing|extend|extends|extending)\b[^.\n]{0,80}\b(?:tests?|coverage)\b",
+    r"\b(?:add|adds|adding|write|writes|writing|create|creates|creating|backfill|backfills|"
+    r"restore|restores|port|ports|porting)\b[^.\n]{0,80}\btests?\b"
+    r"|\b(?:add|adds|adding|increase|increases|increasing|improve|improves|improving|raise|raises|"
+    r"raising|bump|bumps|cover|covers|covering|extend|extends|extending|expand|expands)\b"
+    r"[^.\n]{0,80}\bcoverage\b",
     re.I)
 
 
 def _item_demands_tests(goal: str) -> bool:
-    """True when the backlog item explicitly asks to ADD/extend tests or coverage (e.g. 'Add unit tests
-    for X', 'increase coverage'). Used to refuse ticking such an item when the committed diff added no
-    test definition at all — the dominant 'narrated-but-not-done' shape on test-writing backlogs."""
+    """True when the backlog item explicitly asks to ADD/restore tests or RAISE coverage (e.g. 'Add unit
+    tests for X', 'improve coverage', 'backfill tests', 'port tests'). Used to refuse ticking such an
+    item when the committed diff added no test definition at all — the dominant 'narrated-but-not-done'
+    shape on test-writing backlogs. Deliberately does NOT fire on test-infra work like 'improve the test
+    runner' (no 'coverage', and 'improve' is not an add-tests verb), which legitimately adds no test."""
     return bool(_DEMANDS_TESTS_RE.search(goal or ""))
 
 
@@ -2250,6 +2259,13 @@ def one_iteration() -> None:
                 "presentation only — do NOT change any source code or behavior. Then stop.")
         system_md = BEAUTIFY_MD
     else:
+        # A fresh real iteration is underway (preflight + base gate passed). Clear any stale error
+        # status a PRIOR non-HALT preflight bail left in the heartbeat, so the status-freeze guard
+        # doesn't suppress the ideate/plan phase labels and a watchdog sweep during planning doesn't
+        # briefly re-diagnose the (now-resolved) wedge. The implement heartbeat below would reset it
+        # anyway; doing it here keeps the pre-implement phases honest.
+        if _hb.get("status") == "error":
+            heartbeat(status="iterating", phase="preflight")
         # IDEATE phase (pipeline.ideate): a divergent pass BEFORE plan that novelty-filters and
         # prepends fresh, ambitious items to the backlog — so the greedy loop selects from a
         # continually-refreshed menu instead of grinding the same stale top item. No-op when disabled.
