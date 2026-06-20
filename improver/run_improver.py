@@ -70,6 +70,7 @@ STOP = RUNTIME / "stop"
 LOG = RUNTIME / "improver.log"
 AGENT_MD = HERE / NAME / "AGENT.md"
 BACKLOG = HERE / NAME / "backlog.md"
+LESSONS = HERE / NAME / "LESSONS.md"   # per-repo durable lessons store (the REFLECT phase appends here)
 VENV_PY = REPO / ".venv" / "Scripts" / ("python.exe" if os.name == "nt" else "python")
 
 PI_PROVIDER = "maki-cloud"
@@ -93,11 +94,14 @@ GITHUB_TOOLS_EXT = HERE / "github-tools.ts"  # gh-backed GitHub verification too
 SOLOMON = False                      # supervisor fix-session — set from --solomon (runs the gate + ships a PR)
 PROVISION_MD = HERE / "provision.md" # one-shot contract-generation system prompt
 IDEATE_MD = HERE / "ideate.md"       # divergent ideation system prompt (anti-shallowness lane)
+REFLECT_MD = HERE / "reflect.md"     # post-iteration retrospective system prompt (pipeline.reflect)
 SOLOMON_MD = HERE / "solomon.md"     # supervisor fix-session system prompt
 REVIEW_MD = HERE / "review.md"       # adversarial judge/review phase system prompt (pipeline.review)
 PLAN_MD = HERE / "plan.md"           # pre-implement planning phase system prompt (pipeline.plan)
 REVIEW_ENABLED = False               # run the adversarial review/judge phase (repos.json pipeline.review)
 PLAN_ENABLED = False                 # run the planning phase before implement (repos.json pipeline.plan)
+IDEATE_ENABLED = False               # run divergent ideation BEFORE plan each iteration (pipeline.ideate)
+REFLECT_ENABLED = False              # run the retrospective AFTER each iteration (pipeline.reflect)
 
 # Visual E2E review — boots the app in a sandbox after the gate passes, captures screenshots,
 # runs a vision agent, and produces one-time feedback for the next iteration.
@@ -105,6 +109,10 @@ VISUAL_REVIEW_ENABLED = False         # set True when the repo's sandbox config 
 SANDBOX_CONFIG = None                 # per-repo sandbox config (from repos.json)
 VISION_MODEL = ""                     # vision-capable model id for the visual reviewer
 LAST_VISUAL_FEEDBACK = ""             # one-time feedback from the previous iteration's review
+LAST_GATE_FEEDBACK = ""               # one-time CORRECTIVE feedback from the previous iteration's FAILURE
+                                      # (gamed-revert / failed gate / no-op / deviation) — injected into the
+                                      # next task so the agent fixes the specific cause instead of blindly
+                                      # repeating the attempt (escalation-ladder rung 0).
 
 # Per-phase model/provider/reasoning ("model/reasoning/provider selection for each part of the RSI
 # loop"). PHASE is derived from the launch flags (implement|ideate|beautify|recovery|provision).
@@ -119,14 +127,29 @@ _PHASE_DEFAULTS = {
 }
 _CHEAP_MODEL = {"ollama-cloud": "minimax-m3", "openrouter": "qwen/qwen3-coder"}
 
+# --- Escalation ladder (operator-approved) ------------------------------------------------------------
+# Instead of silently deferring an item the agent keeps failing on, the loop ESCALATES before it dead-ends:
+#   rung 0  feed the SPECIFIC failure reason back into the next task (LAST_GATE_FEEDBACK),
+#   rung 1  fall back to a stronger/different model (_FALLBACK_MODEL) for the next attempt,
+#   rung 2  decompose the goal into smaller sub-items (decompose.md) — else defer (prior behavior).
+# This turns the three observed dead-ends (gamed-then-reverted forever; "made no changes"; "deferred after
+# repeated tries") into adaptive progress. _FALLBACK_MODEL/_CHEAP_MODEL are keyed by provider NAME.
+_FALLBACK_MODEL = {"ollama-cloud": "kimi-k2.7", "openrouter": "z-ai/glm-4.6"}
+_ESCALATE_TO_FALLBACK = 2             # cumulative failures on an item before switching to the fallback model
+DECOMPOSE_ENABLED = False             # rung-2 goal decomposition (decompose.md). Opt-in per repo until
+                                      # validated live; when off, the final rung defers (prior behavior).
+PROVIDER_NAME = "ollama-cloud"        # the active repo's provider NAME (keys _FALLBACK_MODEL/_CHEAP_MODEL)
+_fail_counts: dict = {}               # per-goal cumulative failure tally across noop/deviation/revert
+_escalated_goals: set = set()         # goals at/after the fallback rung — next attempt uses _FALLBACK_MODEL
+
 
 def configure(repo: str, name: str, provider: str = "ollama-cloud",
               model: str | None = None) -> None:
     """Point the runner at a target repo with a chosen provider/model. Runtime
     (heartbeat/lock/stop/log) and the per-repo contract live under Solomon —
     never inside the target repo, which stays RSI-free."""
-    global REPO, NAME, RUNTIME, HEARTBEAT, LOCK, STOP, LOG, AGENT_MD, BACKLOG, VENV_PY
-    global PI_PROVIDER, PI_MODEL, PI_EXT
+    global REPO, NAME, RUNTIME, HEARTBEAT, LOCK, STOP, LOG, AGENT_MD, BACKLOG, LESSONS, VENV_PY
+    global PI_PROVIDER, PI_MODEL, PI_EXT, PROVIDER_NAME
     REPO = Path(repo).resolve()
     NAME = name
     RUNTIME = CONTROL / "runtime" / name
@@ -136,8 +159,10 @@ def configure(repo: str, name: str, provider: str = "ollama-cloud",
     LOG = RUNTIME / "improver.log"
     AGENT_MD = HERE / name / "AGENT.md"
     BACKLOG = HERE / name / "backlog.md"
+    LESSONS = HERE / name / "LESSONS.md"
     VENV_PY = REPO / ".venv" / "Scripts" / ("python.exe" if os.name == "nt" else "python")
     prov = PROVIDERS.get(provider) or PROVIDERS["ollama-cloud"]
+    PROVIDER_NAME = provider if provider in PROVIDERS else "ollama-cloud"
     PI_PROVIDER = prov["pi_provider"]
     PI_MODEL = model or prov["default_model"]
     PI_EXT = HERE / prov["ext"]
@@ -156,6 +181,7 @@ def _refresh_config_from_registry() -> None:
     config (writes to repos.json are atomic, so a torn read is transient)."""
     global PI_PROVIDER, PI_MODEL, PI_EXT, GATE_CMD, REASONING, GOAL
     global VISUAL_REVIEW_ENABLED, SANDBOX_CONFIG, VISION_MODEL, REVIEW_ENABLED, PLAN_ENABLED
+    global IDEATE_ENABLED, REFLECT_ENABLED
     try:
         rows = json.loads((CONTROL / "repos.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:       # ValueError covers json.JSONDecodeError
@@ -177,6 +203,8 @@ def _refresh_config_from_registry() -> None:
     pipe = row.get("pipeline") if isinstance(row.get("pipeline"), dict) else {}
     REVIEW_ENABLED = bool(pipe.get("review"))   # adversarial judge phase (default off = legacy)
     PLAN_ENABLED = bool(pipe.get("plan"))       # pre-implement planning phase (default off = legacy)
+    IDEATE_ENABLED = bool(pipe.get("ideate"))   # divergent ideation BEFORE plan (default off = legacy)
+    REFLECT_ENABLED = bool(pipe.get("reflect")) # post-iteration retrospective (default off = legacy)
     _hb["model"] = PI_MODEL
     # Visual E2E review config — refreshed each iteration so a dashboard edit takes effect
     # without a stop+restart, mirroring the other config keys above.
@@ -230,7 +258,11 @@ def _apply_phase_config(row=None) -> None:
 def build_task(goal: str, tier: str = "chore") -> str:
     """Per-iteration instruction for the Pi coder. The full operating contract is injected
     separately via --append-system-prompt (AGENT_MD); here we name the chosen item, its ambition
-    TIER (sizing the change to the opportunity), and the operator's north-star GOAL."""
+    TIER (sizing the change to the opportunity), and the operator's north-star GOAL.
+
+    Also CONSUMES any one-time escalation feedback (LAST_GATE_FEEDBACK) from the previous failed
+    attempt and clears it, so the corrective note is injected exactly once."""
+    global LAST_GATE_FEEDBACK
     north_star = (
         f'NORTH-STAR GOAL (weigh above all): {GOAL}\nChoose the change with the most leverage toward '
         f'that goal; if it needs a capability the project lacks, BUILD that capability as this one '
@@ -254,6 +286,14 @@ def build_task(goal: str, tier: str = "chore") -> str:
             "within the current backlog item's scope. Otherwise, note it for a future item. The visual "
             "feedback is ONE-TIME — it does not repeat unless a new E2E sandbox review runs.\n"
         )
+    if LAST_GATE_FEEDBACK:
+        feedback_block += (
+            f"\n\nTHE PREVIOUS ATTEMPT ON THIS ITEM FAILED — {LAST_GATE_FEEDBACK}\n"
+            "Do NOT repeat that approach; fix the underlying cause. NEVER make the gate pass by skipping, "
+            "xfail-ing, deleting, or weakening tests — implement the real change so the existing tests "
+            "stay green. This corrective note is ONE-TIME.\n"
+        )
+        LAST_GATE_FEEDBACK = ""   # consumed — inject exactly once
     return (
         f'{north_star}Implement exactly ONE improvement in this repository: "{goal}". {sizing} Then run '
         "the test suite (`.venv/Scripts/python -m pytest`) yourself to confirm it is green. Do NOT run "
@@ -1456,38 +1496,115 @@ def _mark_backlog_done(goal: str) -> None:
             return
 
 
-_noop_counts: dict = {}   # per-goal consecutive-noop tally, for this loop process's lifetime
+DECOMPOSE_MD = HERE / "decompose.md"   # rung-2 prompt: split a stuck item into smaller sub-items
+
+
+def _decompose_item(goal: str, reason: str = "") -> bool:
+    """Rung 2 of the escalation ladder: ask pi (decompose.md) to split a repeatedly-failing backlog item
+    into 2-4 smaller, independently-shippable sub-items, then REPLACE the original item with them — so the
+    loop makes incremental progress instead of dead-ending on a too-big goal. Returns True if it rewrote
+    the backlog. Opt-in (DECOMPOSE_ENABLED) until validated live; ANY error/timeout -> False (the caller
+    falls back to defer)."""
+    if not goal or not DECOMPOSE_MD.exists():
+        return False
+    task = (f'The backlog item "{goal}" could not be implemented in one iteration'
+            + (f' (last failure: {reason})' if reason else '')
+            + '. Per decompose.md, split it into 2-4 SMALLER, independently-shippable sub-items that '
+              'together accomplish it. Output ONLY the sub-item lines, one per line, each starting "- ".')
+    try:
+        p = run_pi(task, system_md=DECOMPOSE_MD, timeout=600)
+    except Exception as exc:   # timeout/launch failure — defer instead
+        log(f"decompose failed ({exc}); deferring instead")
+        return False
+    raw = final_text(p.stdout) or ""
+    subs = [s.strip()[2:].strip() for s in raw.splitlines()
+            if s.strip().startswith("- ") and len(s.strip()) > 4]
+    subs = [s for s in subs if s][:4]
+    if len(subs) < 2:
+        return False
+    try:
+        lines = BACKLOG.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith("- [ ]") and _strip_tier(s[5:].strip())[0] == goal.strip():
+            lines[i:i + 1] = [f"- [ ] {sub}" for sub in subs]
+            try:
+                BACKLOG.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                return True
+            except OSError:
+                return False
+    return False
+
+
+def _register_failure(goal: str, kind: str, reason: str, limit: int = 3) -> None:
+    """The escalation ladder for a failed iteration (kind: noop | deviation | revert). Replaces the old
+    silent per-kind defer so a stuck item ADAPTS instead of looping or dead-ending:
+      rung 0 — record a SPECIFIC corrective note (LAST_GATE_FEEDBACK) for the next attempt;
+      rung 1 — at _ESCALATE_TO_FALLBACK cumulative failures, switch to the fallback model next attempt;
+      final — at `limit` failures, decompose the item (if enabled) else defer it.
+    Counts are cumulative ACROSS kinds (a no-op then a gamed-revert on the same item both count), so a
+    truly stuck item escalates regardless of HOW it keeps failing. (Operator-approved Escalation ladder.)"""
+    global LAST_GATE_FEEDBACK
+    if not goal or BEAUTIFY or SOLOMON or goal.lower() == "model-chosen improvement":
+        return
+    if reason:
+        LAST_GATE_FEEDBACK = reason[:600]
+    n = _fail_counts.get(goal, 0) + 1
+    _fail_counts[goal] = n
+    if n >= _ESCALATE_TO_FALLBACK:
+        _escalated_goals.add(goal)
+        log(f"escalation: '{goal[:50]}' failed {n}x ({kind}) — next attempt uses the fallback model")
+    if n >= limit:
+        if DECOMPOSE_ENABLED and _decompose_item(goal, reason):
+            log(f"escalation: '{goal[:50]}' failed {n}x — decomposed into sub-items")
+        elif _defer_backlog_item(goal):
+            log(f"escalation: '{goal[:50]}' failed {limit}x ({kind}) — deferred to bottom of backlog")
+        _fail_counts[goal] = 0
+        _escalated_goals.discard(goal)
+
+
+def _clear_failure_state(goal: str) -> None:
+    """A successful ship resets the item's escalation state (so a future re-add starts clean)."""
+    _fail_counts.pop(goal, None)
+    _escalated_goals.discard(goal)
+
+
+def _apply_fallback_model(goal: str) -> None:
+    """Escalation rung 1: if `goal` has hit the fallback rung, override PI_MODEL with the provider's
+    fallback model for THIS attempt, so one weak model can't dead-end an implementable item."""
+    global PI_MODEL
+    if goal in _escalated_goals:
+        fb = _FALLBACK_MODEL.get(PROVIDER_NAME)
+        if fb and fb != PI_MODEL:
+            log(f"escalation: retrying '{goal[:50]}' with fallback model {fb} (was {PI_MODEL})")
+            PI_MODEL = fb
+            _hb["model"] = fb
 
 
 def _note_noop(goal: str, limit: int = 3) -> None:
-    """Track consecutive no-change iterations on a backlog goal. After `limit` of them — the agent
-    can't implement this item right now — defer it to the bottom of the backlog so the loop ADVANCES
-    instead of spinning forever on a too-hard item (the supervisor's gate_red_streak only catches
-    reverts/errors, not noops)."""
-    if not goal or BEAUTIFY or SOLOMON or goal.lower() == "model-chosen improvement":
-        return
-    _noop_counts[goal] = _noop_counts.get(goal, 0) + 1
-    if _noop_counts[goal] >= limit:
-        if _defer_backlog_item(goal):
-            log(f"item noop'd {limit}x — deferred to bottom of backlog: {goal[:60]}")
-        _noop_counts[goal] = 0
-
-
-_deviation_counts: dict = {}   # per-goal consecutive-deviation tally, for this loop process's lifetime
+    """No-change iteration — escalate (feedback -> fallback model -> decompose/defer) instead of looping
+    forever on a too-hard item (the supervisor's gate_red_streak only catches reverts/errors, not noops)."""
+    _register_failure(goal, "noop",
+                      "the previous attempt produced NO changes to a clean tree — pick a different, "
+                      "concrete approach and actually edit files to implement THIS item", limit)
 
 
 def _note_deviation(goal: str, limit: int = 3) -> None:
-    """Track consecutive iterations where the agent DEVIATED from a backlog goal (shipped a real
-    change, but to something OTHER than the named item). Deviations don't tick the item and aren't
-    noops, so without this the loop re-selects the same item forever and keeps shipping unrelated PRs
-    under its name. After `limit` deviations, defer the item so the loop ADVANCES."""
-    if not goal or BEAUTIFY or SOLOMON or goal.lower() == "model-chosen improvement":
-        return
-    _deviation_counts[goal] = _deviation_counts.get(goal, 0) + 1
-    if _deviation_counts[goal] >= limit:
-        if _defer_backlog_item(goal):
-            log(f"item deviated {limit}x — deferred to bottom of backlog: {goal[:60]}")
-        _deviation_counts[goal] = 0
+    """The agent shipped a real change to something OTHER than the named item. Escalate so the loop
+    advances instead of re-selecting the same item and shipping unrelated PRs under its name."""
+    _register_failure(goal, "deviation",
+                      "the previous attempt changed something OTHER than this item — implement THIS "
+                      "specific backlog item, not an unrelated change", limit)
+
+
+def _note_revert(goal: str, reason: str, limit: int = 3) -> None:
+    """A green-but-REVERTED iteration (gamed gate / failed gate / eval drop / review reject). Previously
+    this incremented NO counter, so a model could be reverted on the same item indefinitely with zero
+    adaptation (the headline RSI-fidelity gap). Now it escalates exactly like noop/deviation, feeding the
+    specific revert reason back to the next attempt."""
+    _register_failure(goal, "revert", reason, limit)
 
 
 def _defer_backlog_item(goal: str) -> bool:
@@ -1925,7 +2042,12 @@ def one_iteration() -> None:
                 "presentation only — do NOT change any source code or behavior. Then stop.")
         system_md = BEAUTIFY_MD
     else:
+        # IDEATE phase (pipeline.ideate): a divergent pass BEFORE plan that novelty-filters and
+        # prepends fresh, ambitious items to the backlog — so the greedy loop selects from a
+        # continually-refreshed menu instead of grinding the same stale top item. No-op when disabled.
+        ideate_phase()
         goal, tier = _top_backlog_item()
+        _apply_fallback_model(goal)   # escalation rung 1: a repeatedly-stuck item retries on the fallback model
         task = build_task(goal, tier)
         system_md = None
         # PLAN phase (pipeline.plan): a read-only planner drafts a short plan for the chosen item,
@@ -1988,6 +2110,8 @@ def one_iteration() -> None:
         log(f"gate: {'GREEN' if green else 'RED'} {tests}")
         if not green:
             log(f"gate tail: {_redact(tail[-400:])}")   # SEC-5: failing test output can carry secrets
+            _note_revert(goal, f"the change FAILED the test gate ({tests['failed']} test(s) failed) — "
+                               "fix the failing tests by correcting the implementation")
             _drop_branch(branch, "reverted",
                          f"Reverted — tests failed ({tests['failed']} failed). {summary}")
             return
@@ -2000,6 +2124,8 @@ def one_iteration() -> None:
         gamed = _anti_gaming_reason(base_tests, tests, git("diff", "--cached", BASE_BRANCH).stdout or "")
         if gamed:
             log(f"anti-gaming: {gamed} — reverting")
+            _note_revert(goal, f"the gate was GAMED ({gamed}) and reverted — make the REAL tests pass; "
+                               "do not skip, xfail, delete, or weaken any test")
             _drop_branch(branch, "reverted", f"Reverted — anti-gaming: {gamed}. {summary}")
             return
 
@@ -2175,6 +2301,7 @@ def one_iteration() -> None:
             _note_deviation(goal)         # defer the item if the agent keeps shipping something ELSE
         else:
             _mark_backlog_done(goal)
+            _clear_failure_state(goal)    # a real landed ship resets the item's escalation tally
     heartbeat(status="sleeping", phase="sleep", last_pr=pr, last_summary=summary)
     # 'shipped' only when the change actually landed (or is in-flight to merge); an auto-merge PR
     # left un-merged on red/awaiting CI, or a failed push, records 'blocked' so it is not counted as
@@ -2484,6 +2611,87 @@ def provision() -> int:
     return 0
 
 
+# ---- novelty / dedup (dependency-free token-Jaccard similarity) ------------
+# Shared by ideate() (drop candidate ideas that re-propose what's already on the menu or was just
+# tried) and reflect() (don't append a near-duplicate of an existing lesson). Deliberately simple —
+# Video 1's 'stuck in a local minimum' is escaped with cheap token overlap, no embeddings/deps.
+_STOPWORDS = frozenset(
+    "a an the and or but for to of in on at by with from into as is are be it this that these those "
+    "add adds added use uses using make makes made into via per its it's not no than then so we i".split())
+
+
+def _tokenize(text: str) -> set:
+    """Lowercase word tokens with stopwords + short noise dropped — the unit of similarity."""
+    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return {w for w in words if len(w) > 2 and w not in _STOPWORDS}
+
+
+def _jaccard(a: set, b: set) -> float:
+    """|a∩b| / |a∪b| — 1.0 identical, 0.0 disjoint (or both empty: nothing to compare -> 0.0)."""
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
+def _is_novel(idea: str, corpus, threshold: float = 0.6) -> bool:
+    """True if `idea` is NOT a near-duplicate of any string in `corpus`. An empty corpus is always
+    novel. Used to filter candidate ideas and to dedupe lessons.
+
+    Two cheap signals (no deps): symmetric Jaccard catches reworded near-equals; the containment
+    coefficient (|a∩b| / min(|a|,|b|)) catches the asymmetric case where a short idea is SUBSUMED by a
+    longer corpus item — e.g. a one-line backlog idea fully restated inside a longer lesson that also
+    carries the outcome + root cause. Either signal at/over threshold -> not novel."""
+    toks = _tokenize(idea)
+    if not toks:
+        return True
+    for other in corpus or ():
+        ot = _tokenize(other)
+        if not ot:
+            continue
+        inter = len(toks & ot)
+        if not inter:
+            continue
+        if inter / len(toks | ot) >= threshold:                 # Jaccard (symmetric near-equal)
+            return False
+        if inter / min(len(toks), len(ot)) >= threshold + 0.15:  # containment (subsumed by a longer item)
+            return False
+    return True
+
+
+def _read_lessons() -> str:
+    """The accumulated lessons text (LESSONS.md) — best-effort, '' when absent. Fed into ideate's
+    novelty corpus so the divergent lane stops re-proposing moves a past iteration already learned
+    were dead ends."""
+    try:
+        return LESSONS.read_text(encoding="utf-8") if LESSONS.exists() else ""
+    except OSError:
+        return ""
+
+
+def _recent_history_summaries(limit: int = 30) -> list:
+    """The last `limit` history.jsonl iteration summaries (newest-biased) — the corpus of what was
+    recently tried, so ideate doesn't re-propose a direction already attempted/shipped."""
+    out = []
+    try:
+        lines = (RUNTIME / "history.jsonl").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return out
+    for line in lines[-limit:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        s = (rec.get("summary") or "").strip()
+        if s:
+            out.append(s)
+    return out
+
+
 # ---- ideate (divergent backlog generation — the anti-shallowness lane) -----
 def _parse_ideas(text: str):
     """Parse the ideate lane's `[tier] | leverage | idea` lines into (leverage, tier, idea) tuples,
@@ -2560,11 +2768,32 @@ def ideate() -> int:
         log(f"ideate: no parseable ideas. Raw agent output (first 800 chars):\n{raw[:800]}")
         print(json.dumps({"ok": False, "error": "ideate emitted no parseable ideas"}))
         return 5
-    new_lines = [f"- [ ] [{tier}] {idea}" for _lev, tier, idea in ideas]
     try:
         existing = BACKLOG.read_text(encoding="utf-8") if BACKLOG.exists() else "# backlog\n"
     except OSError:
         existing = "# backlog\n"
+    # NOVELTY SCORING (Video 1: 'stuck in a local minimum, never looked up new ideas'): drop candidate
+    # ideas that near-duplicate (a) what's already on the backlog, (b) what was recently tried
+    # (history.jsonl summaries), or (c) what an earlier iteration learned was a dead end (LESSONS.md).
+    # Cheap token-Jaccard, no deps — keeps the divergent lane yielding genuinely FRESH directions.
+    corpus = ([ln.strip() for ln in existing.splitlines() if ln.strip().startswith("- ")]
+              + _recent_history_summaries()
+              + [ln.strip() for ln in _read_lessons().splitlines() if ln.strip().startswith("- ")])
+    fresh, dropped = [], 0
+    for lev, tier, idea in ideas:
+        if _is_novel(idea, corpus):
+            fresh.append((lev, tier, idea))
+            corpus.append(idea)          # so two near-identical candidates in one batch also dedupe
+        else:
+            dropped += 1
+    if dropped:
+        log(f"ideate: dropped {dropped} near-duplicate idea(s) (novelty filter); {len(fresh)} fresh")
+    ideas = fresh
+    if not ideas:
+        log("ideate: every candidate was a near-duplicate of the backlog/history/lessons — nothing fresh")
+        print(json.dumps({"ok": False, "error": "ideate emitted only near-duplicate ideas"}))
+        return 5
+    new_lines = [f"- [ ] [{tier}] {idea}" for _lev, tier, idea in ideas]
     # prepend ambitious items above the existing menu, after a header line if present
     lines = existing.splitlines()
     head = 1 if lines and lines[0].lstrip().startswith("#") else 0
@@ -2578,6 +2807,97 @@ def ideate() -> int:
     print(json.dumps({"ok": True, "added": len(new_lines),
                       "top": new_lines[0][:90] if new_lines else ""}))
     return 0
+
+
+def ideate_phase() -> None:
+    """Pipeline-phase wrapper for ideate() (pipeline.ideate), run BEFORE plan at the top of an
+    iteration when the backlog is thin or to keep the menu fresh — the in-loop counterpart of the
+    one-shot --ideate lane. Reuses ideate() exactly (novelty-filtered, prepended), so the loop's
+    divergent phase stays identical to the operator lane. Best-effort: a no-op when disabled, and
+    never wedges the implement phase on an ideation failure (the greedy loop still has the backlog)."""
+    if not IDEATE_ENABLED:
+        return
+    try:
+        heartbeat(phase="ideate")
+        rc = ideate()
+        log(f"ideate phase: {'ok' if rc == 0 else 'no fresh ideas'} (rc={rc})")
+    except Exception as e:  # noqa: BLE001 — ideation is best-effort; the implement loop must not break
+        log(f"ideate phase: error ({str(e)[:160]}) — continuing to plan/implement")
+
+
+def _reflect_task(rec: dict) -> str:
+    """The REFLECT phase's pi task: distill ONE durable, concrete lesson from the just-finished
+    iteration record (status + summary + tests). Names the existing lessons so the agent doesn't
+    restate one (Python still dedupes as a backstop)."""
+    status = rec.get("status") or "?"
+    summary = (rec.get("summary") or "")[:1200]
+    tests = rec.get("tests") or {}
+    existing = _read_lessons().strip()
+    existing_block = (f"\n\nLessons already recorded (do NOT restate any of these — only add a NEW, "
+                      f"non-duplicate lesson):\n{existing[-2000:]}" if existing else "")
+    return (
+        f"The RSI loop just finished one iteration on this repository.\n"
+        f"Outcome: {status}\nTest counts: {json.dumps(tests)}\n"
+        f"What the implementer reported:\n{summary}\n"
+        f"Read the relevant code/diff/history as needed, then distill ONE durable, CONCRETE lesson per "
+        f"reflect.md — what was attempted, the outcome, the ROOT CAUSE if it failed, and what to try "
+        f"or avoid next time. End with EXACTLY one line beginning 'LESSON: '." + existing_block)
+
+
+def reflect() -> None:
+    """REFLECT phase (pipeline.reflect): after EACH iteration — shipped OR failed/deferred — distill a
+    durable, concrete lesson and APPEND it (timestamped, deduplicated) to the target repo's LESSONS.md.
+    Every terminal path of one_iteration() records the outcome to history.jsonl, so the LAST history
+    record is the authoritative outcome to reflect on. Best-effort: a no-op when disabled or when there
+    is no history yet; never wedges the loop (a reflection failure must not break the run)."""
+    if not REFLECT_ENABLED:
+        return
+    try:
+        lines = (RUNTIME / "history.jsonl").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    rec = None
+    for line in reversed(lines):                  # the last non-empty, parseable record
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            break
+        except json.JSONDecodeError:
+            continue
+    if rec is None:
+        return                                    # nothing to reflect on yet
+    try:
+        heartbeat(phase="reflect")
+        p = _phase_run_pi("reflect", _reflect_task(rec), system_md=REFLECT_MD, timeout=400)
+    except Exception as e:  # noqa: BLE001 — reflection is best-effort; the loop must not break on it
+        log(f"reflect phase: error ({str(e)[:160]}) — no lesson recorded")
+        return
+    text = final_text(p.stdout or "")
+    m = re.search(r"LESSON:\s*(.+)", text, re.I)
+    lesson = (m.group(1) if m else text).strip().splitlines()[0].strip() if (m or text.strip()) else ""
+    lesson = _redact(lesson)[:600].strip()
+    if not lesson:
+        log("reflect phase: agent produced no parseable lesson — nothing appended")
+        return
+    # DEDUP: skip a near-duplicate of an existing lesson (token-Jaccard) so the store stays concise.
+    existing = _read_lessons()
+    prior = [ln.strip() for ln in existing.splitlines() if ln.strip().startswith("- ")]
+    if not _is_novel(lesson, prior):
+        log("reflect phase: lesson near-duplicates an existing one — not appended (deduped)")
+        return
+    entry = f"- {_now()} — {lesson}"
+    try:
+        LESSONS.parent.mkdir(parents=True, exist_ok=True)
+        if not existing:
+            LESSONS.write_text("# Lessons\n\n" + entry + "\n", encoding="utf-8")
+        else:
+            with open(LESSONS, "a", encoding="utf-8") as f:
+                f.write(("" if existing.endswith("\n") else "\n") + entry + "\n")
+        log(f"reflect phase: appended lesson — {lesson[:90]}")
+    except OSError as e:
+        log(f"reflect phase: could not write lesson ({e})")
 
 
 def _solomon_task() -> str:
@@ -2714,6 +3034,10 @@ def main(argv=None) -> int:
                 break
             _refresh_config_from_registry()   # pick up dashboard edits to model/gate/reasoning/goal mid-loop
             one_iteration()
+            # REFLECT phase (pipeline.reflect): AFTER the iteration + its cleanup — shipped OR
+            # failed/deferred — distill one durable, deduplicated lesson from the recorded outcome and
+            # append it to the repo's LESSONS.md (ideate's novelty filter then steers away from dead ends).
+            reflect()
             if _HALTED:
                 log("halted after an unrecoverable revert failure — operator action required "
                     "(the repo is left at status=error/reverted for the supervisor to escalate)")
