@@ -112,3 +112,155 @@ def test_wait_for_ci_queues_auto_when_pending_past_cap(monkeypatch):
     out = m._wait_for_ci_then_merge({"number": 7, "state": "open"})
     assert "auto-merge queued" in out["state"]
     assert any("--auto" in c for c in calls)
+
+
+# --------------------------------------------------------------------------- #
+# control.branch_hygiene + control.clean_branch — the dashboard "Clean branch" tool
+# (auto-detect a dirty managed repo left off its base branch / with stray rsi/* branches,
+#  then clean it back to base). Real git temp repos, no network/gh/pi.
+# --------------------------------------------------------------------------- #
+import shutil  # noqa: E402
+
+import pytest  # noqa: E402
+
+requires_git = pytest.mark.skipif(not shutil.which("git"), reason="git not available")
+
+
+def _control_repo(tmp_path, monkeypatch, work, name="w"):
+    """Wire control's HERE at tmp_path (so runtime/<name> is isolated) and return the repo dict."""
+    import control
+    monkeypatch.setattr(control, "HERE", str(tmp_path))
+    rt = tmp_path / "runtime" / name
+    rt.mkdir(parents=True, exist_ok=True)
+    return {"name": name, "path": str(work), "branch_prefix": "rsi/", "pr_target_branch": "main"}
+
+
+@requires_git
+def test_hygiene_clean_repo_on_base_not_dirty(tmp_path, monkeypatch):
+    """(a) clean repo on base, no rsi/* branches → dirty False."""
+    import control
+    work = _mk_repo(tmp_path)
+    repo = _control_repo(tmp_path, monkeypatch, work)
+    monkeypatch.setattr(control, "is_running", lambda r: False)
+    h = control.branch_hygiene(repo)
+    assert h["dirty"] is False
+    assert h["off_base"] is False
+    assert h["stray"] == []
+    assert h["current"] == "main"
+    assert h["base"] == "main"
+
+
+@requires_git
+def test_hygiene_on_rsi_branch_is_dirty(tmp_path, monkeypatch):
+    """(b) checked out on an rsi/* branch, no runner → dirty True & off_base True."""
+    import control
+    work = _mk_repo(tmp_path)
+    _git(work, "checkout", "-b", "rsi/iter-cur")
+    repo = _control_repo(tmp_path, monkeypatch, work)
+    monkeypatch.setattr(control, "is_running", lambda r: False)
+    h = control.branch_hygiene(repo)
+    assert h["dirty"] is True
+    assert h["off_base"] is True
+    assert h["current"] == "rsi/iter-cur"
+    assert "rsi/iter-cur" in h["reason"]
+
+
+@requires_git
+def test_hygiene_stray_rsi_branch_is_dirty(tmp_path, monkeypatch):
+    """(c) on base with a stray rsi/* branch → dirty True & stray non-empty."""
+    import control
+    work = _mk_repo(tmp_path)
+    _git(work, "branch", "rsi/iter-stray")     # create but stay on main
+    repo = _control_repo(tmp_path, monkeypatch, work)
+    monkeypatch.setattr(control, "is_running", lambda r: False)
+    h = control.branch_hygiene(repo)
+    assert h["dirty"] is True
+    assert h["off_base"] is False              # we're on base, just have a stray branch
+    assert "rsi/iter-stray" in h["stray"]
+    assert "stray" in h["reason"]
+
+
+@requires_git
+def test_clean_branch_returns_to_base_and_removes_rsi(tmp_path, monkeypatch):
+    """(d) clean_branch on a dirty repo returns to base + removes the rsi branch(es) + ok True;
+    a follow-up branch_hygiene → dirty False."""
+    import control
+    work = _mk_repo(tmp_path)
+    _git(work, "checkout", "-b", "rsi/iter-cur")     # off base, on an rsi branch
+    _git(work, "branch", "rsi/iter-stray")           # plus a stray rsi branch
+    repo = _control_repo(tmp_path, monkeypatch, work)
+    monkeypatch.setattr(control, "is_running", lambda r: False)
+
+    res = control.clean_branch(repo)
+    assert res["ok"] is True
+    assert res["from"] == "rsi/iter-cur"
+    assert res["checked_out"] == "main"
+    # both rsi/* branches removed (the one we left + the stray); back on main first so both are deletable
+    assert sorted(res["removed"]) == ["rsi/iter-cur", "rsi/iter-stray"]
+    assert _git(work, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "main"
+    assert _git(work, "branch", "--list", "rsi/*").stdout.strip() == ""
+
+    h = control.branch_hygiene(repo)
+    assert h["dirty"] is False
+
+
+@requires_git
+def test_clean_branch_preserves_base_wip_when_only_stray(tmp_path, monkeypatch):
+    """Cleaning a STRAY rsi/* branch while ALREADY on base must NOT discard unrelated uncommitted
+    work on base (regression: the unconditional `checkout --force` was a data-loss footgun, found by
+    dogfooding the cleaner). switched must be False and the base WIP must survive."""
+    import control
+    work = _mk_repo(tmp_path)                       # on main
+    _git(work, "branch", "rsi/iter-stray")          # stray rsi branch; repo stays on main
+    (work / "f.txt").write_text("LOCAL EDIT")       # uncommitted TRACKED change on base
+    repo = _control_repo(tmp_path, monkeypatch, work)
+    monkeypatch.setattr(control, "is_running", lambda r: False)
+
+    res = control.clean_branch(repo)
+    assert res["ok"] is True
+    assert res["switched"] is False                 # never force-checked-out base
+    assert res["removed"] == ["rsi/iter-stray"]     # stray pruned
+    assert (work / "f.txt").read_text() == "LOCAL EDIT"   # base WIP preserved
+    assert _git(work, "branch", "--list", "rsi/*").stdout.strip() == ""
+
+
+@requires_git
+def test_clean_branch_refuses_when_running(tmp_path, monkeypatch):
+    """clean_branch refuses while a loop is live — it must not yank git out from under a runner."""
+    import control
+    work = _mk_repo(tmp_path)
+    _git(work, "checkout", "-b", "rsi/iter-cur")
+    repo = _control_repo(tmp_path, monkeypatch, work)
+    monkeypatch.setattr(control, "is_running", lambda r: True)
+    res = control.clean_branch(repo)
+    assert res["ok"] is False
+    assert "running" in res["error"]
+    # still on the rsi branch — nothing was changed
+    assert _git(work, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "rsi/iter-cur"
+
+
+@requires_git
+def test_hygiene_running_loop_on_rsi_branch_not_dirty(tmp_path, monkeypatch):
+    """(e) a runner running on an rsi branch is NORMAL mid-iteration → dirty False
+    (monkeypatch control.is_running True)."""
+    import control
+    work = _mk_repo(tmp_path)
+    _git(work, "checkout", "-b", "rsi/iter-cur")
+    repo = _control_repo(tmp_path, monkeypatch, work)
+    monkeypatch.setattr(control, "is_running", lambda r: True)
+    h = control.branch_hygiene(repo)
+    assert h["dirty"] is False
+    assert h["off_base"] is True               # it IS off base, but a live loop makes that normal
+    assert h["running"] is True
+
+
+def test_hygiene_non_git_repo_returns_clean_shape(tmp_path, monkeypatch):
+    """Never raises: a non-git / pathless repo returns the not-dirty shape."""
+    import control
+    monkeypatch.setattr(control, "HERE", str(tmp_path))
+    assert control.branch_hygiene({"name": "nope", "path": ""})["dirty"] is False
+    # a path that exists but isn't a git repo
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    h = control.branch_hygiene({"name": "plain", "path": str(plain)})
+    assert h["dirty"] is False

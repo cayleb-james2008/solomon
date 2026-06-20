@@ -120,6 +120,7 @@ class Api:
                     "prs": control.list_prs(r) if gh_ready else [],
                     "local_branches": control.local_rsi_branches(r),
                     "worktrees": control.list_worktrees(r),
+                    "hygiene": control.branch_hygiene(r),
                     "frontend": control.has_frontend(r),
                     "browser": control.browser_state(r),
                     "contracts": control.contracts_present(r),
@@ -133,6 +134,7 @@ class Api:
                             "reasoning": "", "goal": "", "interval": 120, "max_iterations": 0,
                             "is_git": bool(r.get("is_git")), "has_remote": bool(r.get("has_remote")),
                             "running": False, "heartbeat": None, "prs": [], "local_branches": [],
+                            "hygiene": {"dirty": False},
                             "contracts": {"agent": False, "backlog": False},
                             "diagnosis": {"category": "ok", "healthy": True}, "escalation": None,
                             "error": str(e)})
@@ -232,6 +234,10 @@ class Api:
     def cleanup_worktrees(self, name):
         r = self._repo(name)
         return control.cleanup_worktrees(r) if r else {"ok": False, "error": "unknown repo"}
+
+    def clean_branch(self, name):
+        r = self._repo(name)
+        return control.clean_branch(r) if r else {"ok": False, "error": "unknown repo"}
 
     def list_worktrees(self, name):
         r = self._repo(name)
