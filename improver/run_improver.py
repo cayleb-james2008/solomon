@@ -450,11 +450,15 @@ _SECRET_KEYVAL_PATTERN = re.compile(
 
 
 def _redact_keyval(m) -> str:
-    """Redact the value of a NAME<sep>value match ONLY when it's a real credential assignment — the
-    value looks token-like (contains a digit) OR the NAME is an UPPERCASE env-var-style identifier.
-    Otherwise it's prose (e.g. 'token: validation logic') — return it untouched."""
+    """Redact the value of a NAME<sep>value match when it is a credential assignment. The pattern's
+    NAME already ends in a credential keyword; a PREFIXED or otherwise non-bare credential name
+    (password, api_key, github_token, client_secret, DB_PASSWORD, ...) is almost never prose, so its
+    value is redacted REGARDLESS of shape — an all-alpha password/token leaks otherwise (onboarding-4).
+    Only a BARE lowercase 'token'/'secret' is prose-prone ('token: validation logic'); for those keep
+    the heuristic (redact only when the value is token-shaped: has a digit, or the NAME is UPPER_SNAKE)."""
     name, sep, value = m.group(1), m.group(2), m.group(3)
-    looks_secret = any(c.isdigit() for c in value) or (name.isupper() and "_" in name)
+    ambiguous_bare = name.lower() in ("token", "secret")
+    looks_secret = (not ambiguous_bare) or any(c.isdigit() for c in value) or (name.isupper() and "_" in name)
     return f"{name}{sep}[REDACTED]" if looks_secret else m.group(0)
 
 
