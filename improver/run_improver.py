@@ -1522,6 +1522,40 @@ def _new_skip_markers(diff_text: str) -> list:
             if ln.startswith("+") and not ln.startswith("+++") and _SKIP_MARKER_RE.search(ln)]
 
 
+# A test DEFINITION line (def test_* / async def test_* / class Test*), matched against diff content
+# with the leading +/- stripped. Used by both the count-less-gate deletion rail (gate-2) and the
+# 'add tests but added none' deviation backstop (gate-3).
+_TEST_DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+test\w*\s*\(|^\s*class\s+Test\w*\b")
+
+
+def _added_test_defs(diff_text: str) -> list:
+    """Added (+) diff lines that DEFINE a test. Confirms an 'add tests' item actually added tests
+    before its backlog item is ticked (gate-3)."""
+    return [ln for ln in (diff_text or "").splitlines()
+            if ln.startswith("+") and not ln.startswith("+++") and _TEST_DEF_RE.match(ln[1:])]
+
+
+def _removed_test_defs(diff_text: str) -> list:
+    """Removed (-) diff lines that DELETE a test definition. A count-independent anti-gaming rail for
+    custom gates that emit no parseable counts — the numeric pass/collected rails are inert there, so a
+    test deletion would otherwise ship unseen (gate-2). The '--- ' file-header line is excluded."""
+    return [ln for ln in (diff_text or "").splitlines()
+            if ln.startswith("-") and not ln.startswith("---") and _TEST_DEF_RE.match(ln[1:])]
+
+
+_DEMANDS_TESTS_RE = re.compile(
+    r"\b(?:add|adds|adding|write|writes|writing|create|creates|creating|cover|covers|covering|"
+    r"increase|increases|increasing|extend|extends|extending)\b[^.\n]{0,80}\b(?:tests?|coverage)\b",
+    re.I)
+
+
+def _item_demands_tests(goal: str) -> bool:
+    """True when the backlog item explicitly asks to ADD/extend tests or coverage (e.g. 'Add unit tests
+    for X', 'increase coverage'). Used to refuse ticking such an item when the committed diff added no
+    test definition at all — the dominant 'narrated-but-not-done' shape on test-writing backlogs."""
+    return bool(_DEMANDS_TESTS_RE.search(goal or ""))
+
+
 def _anti_gaming_reason(base_tests, tests, diff_text: str):
     """Why a GREEN gate should still be reverted as gamed, or None. Pure (no git/IO) so the rule is
     unit-tested directly: a dropped pass count (tests removed/weakened/skipped) or newly-introduced
@@ -1569,6 +1603,13 @@ def _anti_gaming_reason(base_tests, tests, diff_text: str):
             return (f"skipped count increased significantly {base_skipped}→{current_skipped} "
                     f"(tests being skipped instead of fixed)")
 
+    # Count-less custom gate (gate-2): when the gate emits no parseable counts the numeric rails above
+    # are inert, so a deleted test would ship unseen. Fall back to a diff-based deletion check.
+    if not (base_tests and any(base_tests.get(k) for k in ("passed", "collected"))):
+        removed = _removed_test_defs(diff_text)
+        if removed:
+            return (f"removed {len(removed)} test definition(s) on a gate with no parseable counts "
+                    "(numeric anti-gaming rail inactive)")
     skips = _new_skip_markers(diff_text)
     if skips:
         return f"introduced {len(skips)} skip/xfail marker(s)"
@@ -2376,6 +2417,14 @@ def one_iteration() -> None:
         if _deviated_from_named_files(goal, git("diff", "--name-only", "--no-renames", f"{BASE_BRANCH}..{branch}").stdout):
             log(f"DEVIATION: the item names file(s) the committed diff never touched — agent shipped "
                 f"unrelated work; not ticking '{goal[:60]}'")
+            item_deviated = True
+        # gate-3: a "add tests / coverage" item that landed with NO new test definition was not
+        # actually implemented (the narrated-but-not-done shape on test-writing backlogs). Don't trust
+        # ITEM-STATUS: done — mark it deviated so it defers instead of being consumed as done.
+        elif _item_demands_tests(goal) and not _added_test_defs(
+                git("diff", f"{BASE_BRANCH}..{branch}").stdout or ""):
+            log(f"DEVIATION: item asks to add tests but the committed diff added no test definition — "
+                f"not ticking '{goal[:60]}'")
             item_deviated = True
 
     # LEAK GUARD (PUBLIC repos only) — the change is committed but NOT yet pushed. Scan the committed
