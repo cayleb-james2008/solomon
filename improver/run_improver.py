@@ -1070,30 +1070,22 @@ def _find_correlated_tests(changed_files: list[str]) -> list[str]:
 
 
 def _expand_gate_with_correlated(gate_cmd: str, changed_files: list[str]) -> str:
-    """Expand the gate command to include correlated tests alongside the default gate.
+    """The after-change gate MUST run the SAME scope as the clean-base baseline (run_gate() with no
+    args) so the runner's anti-gaming pass/collected comparison is like-for-like. The default gate
+    already runs the FULL suite (`python -m pytest -o addopts=` collects from the rootdir), which
+    inherently includes every test correlated with the change — so there is nothing to "expand".
 
-    If the gate is the default pytest (no custom GATE_CMD), append the correlated
-    test files to ensure they're included. If a custom gate is set, return it
-    unchanged (the operator controls custom gates).
-
-    Returns the potentially expanded gate command."""
-    if not changed_files:
-        return gate_cmd
-
-    correlated = _find_correlated_tests(changed_files)
-    if not correlated:
-        return gate_cmd
-
-    # Only expand the default pytest gate, not custom gates
-    if gate_cmd:
-        return gate_cmd
-
-    # Build an expanded pytest command that includes the correlated tests
-    # The default gate is: python -m pytest -o addopts=
-    # We add the correlated test files to ensure they're collected
-    py = str(VENV_PY) if VENV_PY.exists() else sys.executable
-    test_args = " ".join(f'"{t}"' for t in correlated)
-    return f'{py} -m pytest -o addopts= {test_args}'
+    Listing the correlated files here (the previous behavior) would NARROW the after-gate to a subset
+    of the suite while the baseline measured the FULL suite. That broke the gate two ways:
+      (a) a regression in any NON-correlated test file shipped unseen (a green subset over a red full
+          suite), and
+      (b) `_anti_gaming_reason` compared the full-suite baseline count against the subset count, so
+          "pass/collected count fell" fired on EVERY iteration that touched a .py with any correlated
+          test — the change could never ship, escalated, and deferred forever.
+    A custom GATE_CMD is the operator's own command and is run unchanged. So the only correct
+    "expansion" of a full-suite gate is a no-op; correlated discovery is surfaced as a diagnostic in
+    one_iteration (via _find_correlated_tests), not used to scope the gate."""
+    return gate_cmd
 
 
 def _get_changed_files_for_correlation(base_sha: str) -> list[str]:
@@ -2272,10 +2264,14 @@ def one_iteration() -> None:
         tests = None
     else:
         heartbeat(phase="test", last_summary=summary)
-        # Get changed files for correlated test discovery
+        # Diagnostic only: surface which test files correlate with the change. They already run as
+        # part of the full-suite gate — the gate is NOT narrowed to them (see
+        # _expand_gate_with_correlated), so the after-gate scope matches the baseline scope.
         changed_files = _get_changed_files_for_correlation(base)
         if changed_files:
-            log(f"found {len(changed_files)} changed files for correlated test discovery")
+            correlated = _find_correlated_tests(changed_files)
+            if correlated:
+                log(f"{len(correlated)} correlated test file(s) cover this change (run within the full gate)")
         green, tests, tail = run_gate(changed_files)
         heartbeat(tests=tests)
         log(f"gate: {'GREEN' if green else 'RED'} {tests}")
