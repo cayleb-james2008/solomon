@@ -1157,22 +1157,26 @@ def stop(repo):
     # cleaning branches (so we don't delete a branch a still-live runner is standing on). Best-effort:
     # if the loop is slow to exit, cleanup_worktrees' own guard (never delete the current branch) keeps
     # it safe, and a later stop/Supervise sweep will catch stragglers.
+    stopped = False
     try:
         for _ in range(5):
             if not is_running(repo):
+                stopped = True
                 break
             time.sleep(1)
     except Exception:
-        pass
-    try:
-        cw = cleanup_worktrees(repo)
-        # cleanup is best-effort: a failure (e.g. git not found) does NOT block the stop — the sentinel
-        # was already written and the loop will exit. The guard inside cleanup_worktrees (never delete
-        # the current branch) keeps it safe even if the loop is slow to exit.
-        if not cw.get("ok"):
-            pass   # intentionally swallowed; the stop itself succeeded
-    except Exception:
-        pass
+        stopped = False
+    # Only prune rsi/* branches once the loop has CONFIRMED stopped. A live runner oscillates HEAD
+    # within a single iteration (checkout base -> rsi -> base), so a lock-free `git branch -D` here
+    # could race it and delete the iteration branch out from under it (lifecycle-4) — the current-branch
+    # guard inside cleanup_worktrees is TOCTOU against that. If the loop didn't exit in the grace
+    # window, skip cleanup: the Supervise sweep's RUNG-0 recovery prunes stragglers while HOLDING the
+    # single-flight lock, which is race-safe.
+    if stopped:
+        try:
+            cleanup_worktrees(repo)   # best-effort; the stop itself already succeeded
+        except Exception:
+            pass
     return {"ok": True}
 
 
