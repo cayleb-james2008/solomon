@@ -9,7 +9,7 @@
     "pr_target_branch": "main",
     "gate": ".venv\\Scripts\\python -m pytest",
     "reasoning": "xhigh",
-    "pipeline": { "plan": true, "review": true }
+    "pipeline": { "plan": true, "review": true, "ideate": true, "reflect": true }
   },
   {
     "name": "sover",
@@ -24,7 +24,7 @@
     "interval": 120,
     "max_iterations": 0,
     "reasoning": "xhigh",
-    "pipeline": { "plan": true, "review": true }
+    "pipeline": { "plan": true, "review": true, "ideate": true, "reflect": true }
   },
   {
     "name": "asmodeus",
@@ -39,6 +39,6 @@
     "max_iterations": 0,
     "reasoning": "xhigh",
     "goal": "",
-    "pipeline": { "plan": true, "review": true }
+    "pipeline": { "plan": true, "review": true, "ideate": true, "reflect": true }
   }
 ]

@@ -312,7 +312,7 @@ def test_note_deviation_defers_item_after_limit(tmp_path, monkeypatch):
     bl = tmp_path / "backlog.md"
     bl.write_text("# x backlog\n\n- [ ] target item\n- [ ] next item\n", encoding="utf-8")
     monkeypatch.setattr(m, "BACKLOG", bl)
-    m._deviation_counts.clear()
+    m._fail_counts.clear(); m._escalated_goals.clear()
     for _ in range(2):
         m._note_deviation("target item", limit=3)
     assert m._top_backlog_item()[0] == "target item"        # not deferred yet (< limit)
@@ -339,7 +339,7 @@ def test_note_noop_defers_stuck_item_after_three_tries(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "log", lambda *a, **k: None)
     m.BEAUTIFY = False
     m.SOLOMON = False
-    m._noop_counts.clear()
+    m._fail_counts.clear(); m._escalated_goals.clear()
     assert m._top_backlog_item()[0] == "hard item"
     m._note_noop("hard item")
     m._note_noop("hard item")
