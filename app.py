@@ -194,8 +194,9 @@ class Api:
                 r = {**r, "enriching": True}
         return r
 
-    def connect_project(self, spec, goal=None, ship="pr", visual_gate=None):
-        return control.connect_project(spec, goal=goal, ship=ship, visual_gate=visual_gate)
+    def connect_project(self, spec, goal=None, ship="pr", visual_gate=None, provider=None):
+        return control.connect_project(spec, goal=goal, ship=ship, visual_gate=visual_gate,
+                                       provider=provider)
 
     def github_login_start(self):
         return control.github_login_start()

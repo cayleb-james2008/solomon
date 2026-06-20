@@ -330,3 +330,20 @@ def test_stop_still_works_when_cleanup_fails(tmp_path, monkeypatch):
     res = control.stop(repo)
     assert res["ok"]                        # the stop sentinel still wrote; cleanup failure is logged
     assert (rt / "stop").exists()
+
+
+def test_stop_skips_cleanup_when_loop_still_running(tmp_path, monkeypatch):
+    """lifecycle-4: if the loop hasn't exited within the grace window, stop() must NOT run
+    cleanup_worktrees — a lock-free `git branch -D` would race the live iteration (which oscillates
+    HEAD base->rsi->base). Stragglers are pruned later by the Supervise sweep while it holds the lock."""
+    import control
+    repo = {"name": "w", "path": str(tmp_path), "branch_prefix": "rsi/", "pr_target_branch": "main"}
+    monkeypatch.setattr(control, "HERE", str(tmp_path))
+    rt = tmp_path / "runtime" / "w"; rt.mkdir(parents=True)
+    monkeypatch.setattr(control, "is_running", lambda repo: True)   # never confirms stopped
+    monkeypatch.setattr(control.time, "sleep", lambda s: None)      # don't actually wait the 5s grace
+    calls = []
+    monkeypatch.setattr(control, "cleanup_worktrees", lambda repo: calls.append(repo) or {"ok": True})
+    res = control.stop(repo)
+    assert res["ok"] and (rt / "stop").exists()
+    assert calls == []                                             # cleanup skipped while loop is live

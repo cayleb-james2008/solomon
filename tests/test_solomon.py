@@ -158,6 +158,66 @@ def test_anti_thrash_flips_to_escalate(tmp_path, monkeypatch):
     assert d["category"] == "stale_lock" and not d["auto_safe"]   # repeated auto-fix -> escalate
 
 
+# ---- hardening: previously-unclassified wedges now surface (2026-06-20 audit) ----
+def test_diagnose_untracked_refusal(tmp_path, monkeypatch):
+    # hygiene-3: preflight refused to clean untracked operator files. Must escalate, not report healthy.
+    rt = _rt(tmp_path, monkeypatch)
+    _hb(rt, status="error", phase="preflight",
+        last_summary="Untracked non-ignored files on 'main' would be deleted by the preflight clean "
+                      "— the loop won't destroy possible operator work.")
+    d = solomon.diagnose(_repo(tmp_path))
+    assert d["category"] == "untracked_refusal" and not d["auto_safe"]
+
+
+def test_diagnose_unknown_error_catchall(tmp_path, monkeypatch):
+    # lifecycle-3: a status=error with no matching branch (missing base branch, no phase) used to fall
+    # through to 'ok' (healthy lie + blind restart). It must now classify as a non-auto unknown_error.
+    rt = _rt(tmp_path, monkeypatch)
+    _hb(rt, status="error",
+        last_summary="Base branch 'main' does not exist locally or on origin — set this repo's "
+                      "PR-target branch to a real branch in Config.")
+    d = solomon.diagnose(_repo(tmp_path))
+    assert d["category"] == "unknown_error" and not d["auto_safe"]
+
+
+def test_diagnose_noop_streak(tmp_path, monkeypatch):
+    # self-heal-4: 5 consecutive no-change iterations (exhausted/too-hard backlog) were invisible to
+    # gate_red_streak; surface them so the operator (or Ideate) refills the menu.
+    rt = _rt(tmp_path, monkeypatch)
+    _hb(rt, status="sleeping", phase="sleep")
+    _hist(rt, [{"status": "noop", "summary": f"no change {i}"} for i in range(6)])
+    d = solomon.diagnose(_repo(tmp_path))
+    assert d["category"] == "noop_streak" and not d["auto_safe"]
+
+
+def test_recover_revert_failed_anti_thrash_cap(tmp_path, monkeypatch):
+    # self-heal-6: after repeated auto-resets of the same revert_failed cause, escalate instead of
+    # reset+restart-looping forever.
+    rt = _rt(tmp_path, monkeypatch)
+    _hb(rt, status="error", phase="reverted", last_summary="REVERT FAILED — needs manual cleanup")
+    (rt / "supervisor.jsonl").write_text(
+        "\n".join(json.dumps({"category": "revert_failed", "actions": ["reset_to_base"]})
+                  for _ in range(3)) + "\n", encoding="utf-8")
+    monkeypatch.setattr(control, "is_running", lambda repo: False)
+    # if the cap fails, recover() would call reset_to_base (real git on a non-repo) — make it explode
+    monkeypatch.setattr(control, "reset_to_base",
+                        lambda repo: (_ for _ in ()).throw(AssertionError("must not reset past the cap")))
+    r = solomon.recover(_repo(tmp_path))
+    assert r["escalate"] and "repeated auto-resets" in r["message"]
+    assert r["actions_taken"] == []
+
+
+def test_recover_clears_stale_escalation_when_healthy(tmp_path, monkeypatch):
+    # a recovered (healthy) repo must clear a stale escalation.json left by a prior transient error,
+    # so the operator doesn't keep seeing an alert for a repo that self-healed.
+    rt = _rt(tmp_path, monkeypatch)
+    _hb(rt, status="sleeping", phase="sleep")          # healthy now
+    (rt / "escalation.json").write_text(json.dumps({"category": "unknown_error"}), encoding="utf-8")
+    res = solomon.recover(_repo(tmp_path))
+    assert res["category"] == "ok"
+    assert not (rt / "escalation.json").exists()       # stale alert cleared
+
+
 # ---- reversible primitives -------------------------------------------------
 def test_clear_lock_refuses_live(tmp_path, monkeypatch):
     rt = _rt(tmp_path, monkeypatch)

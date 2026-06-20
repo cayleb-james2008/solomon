@@ -181,27 +181,30 @@ def test_something():
         finally:
             run_improver.REPO = original_repo
 
-    def test_default_pytest_expanded(self, tmp_path):
-        """Default pytest gate should be expanded with correlated tests."""
+    def test_default_pytest_not_narrowed(self, tmp_path):
+        """The default gate must NOT be narrowed to the correlated files: the after-gate has to run
+        the SAME full-suite scope as the baseline (run_gate() with no args), or anti-gaming compares
+        a full-suite baseline against a subset and reverts every iteration. Expansion is a no-op."""
         # Create a test directory structure
         test_dir = tmp_path / "tests"
         test_dir.mkdir()
-        
-        # Create a test file that imports config
+
+        # Create a test file that imports config (would have been narrowed-to under the old bug)
         test_file = test_dir / "test_config.py"
         test_file.write_text("""
 import config
 def test_something():
     pass
 """)
-        
+
         original_repo = run_improver.REPO
         run_improver.REPO = tmp_path
-        
+
         try:
             result = run_improver._expand_gate_with_correlated("", ["scripts/config.py"])
-            assert "pytest" in result
-            assert "test_config.py" in result
+            # default gate returned unchanged (empty) -> run_gate runs the FULL suite, not a subset
+            assert result == ""
+            assert "test_config.py" not in result
         finally:
             run_improver.REPO = original_repo
 
