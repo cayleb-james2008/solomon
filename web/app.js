@@ -230,6 +230,17 @@ function repoCard(r) {
     ${ds.flagged ? `<div class="sup-note ${ds.cls}">${icon("bolt", 13)}<span>${esc(ds.esc ? "needs you: " + ds.label : ds.label)}</span></div>` : ""}
     <div class="card-foot"></div>`;
   const foot = $(".card-foot", card);
+  if (r.hygiene && r.hygiene.dirty) {
+    const hyg = el("button", "btn sm accent grow", `${icon("broom", 14)}Clean branch`);
+    hyg.title = r.hygiene.reason || "return to base & prune stray rsi/* branches";
+    hyg.onclick = async (e) => {
+      e.stopPropagation(); hyg.disabled = true;
+      const x = await act("clean_branch", r.name);
+      toast(x.ok ? `${r.name}: cleaned → ${x.checked_out} (removed ${(x.removed || []).length})` : x.error, x.ok ? "ok" : "err");
+      refresh();
+    };
+    foot.appendChild(hyg);
+  }
   const canStart = r.is_git || r.running;
   const tog = el("button", "btn sm grow " + (r.running ? "danger" : "accent"),
     `${icon(r.running ? "stop" : "play", 14)}${r.running ? "Stop" : "Start"}`);
@@ -766,16 +777,19 @@ const mock = (() => {
         log_tail: ["12:01:03Z iteration 47: branch rsi/iter-x — Pi working", "12:03:21Z gate: GREEN {passed:218}", "12:03:30Z opened PR #318"] },
       prs: [{ number: 318, title: "Rotate refresh tokens on reuse detection", headRefName: "rsi/feat/token-rotation", checks: "success", url: "#" },
             { number: 319, title: "Add rate-limit headers to auth endpoints", headRefName: "rsi/feat/rate-limit", checks: "success", url: "#" }],
+      hygiene: { dirty: false },
       contracts: { agent: true, backlog: true }, diagnosis: { category: "ok", healthy: true, evidence: "iterating" }, escalation: null },
     { name: "asmodeus", path: "C:/p/asmodeus", provider: "openrouter", model: "qwen/qwen3-coder", ship: "auto-merge",
       pr_target_branch: "main", reasoning: "medium", interval: 120, max_iterations: 0, gate: null, is_git: true, has_remote: true, running: false,
       heartbeat: { status: "sleeping", iteration: 12, goal: "Migrate the queue worker pool to async batches", tests: { passed: 89, failed: 2 }, last_pr: null, log_tail: [] },
       prs: [{ number: 284, title: "Async batch dispatch for queue workers", headRefName: "rsi/feat/async-batches", checks: "pending", url: "#" }],
+      hygiene: { dirty: false },
       contracts: { agent: true, backlog: true }, diagnosis: { category: "gate_red_streak", healthy: false, auto_safe: false, evidence: "last 3 iterations reverted — the gate keeps failing" }, escalation: null },
     { name: "sover", path: "C:/p/sover", provider: "ollama-cloud", model: "kimi-k2.7-code", ship: "pr",
       pr_target_branch: "main", reasoning: "low", interval: 120, max_iterations: 0, gate: null, is_git: true, has_remote: true, running: false,
       heartbeat: { status: "stopped", iteration: 0, goal: null, tests: null, last_pr: null, log_tail: [] },
       prs: [{ number: 97, title: "Reconcile partial refunds in billing cron", headRefName: "rsi/fix/refund-recon", checks: "success", url: "#" }],
+      hygiene: { dirty: true, reason: "on rsi/iter-x (base main); 2 stray rsi/* branches", current: "rsi/iter-x", base: "main", off_base: true, stray: ["rsi/iter-x", "rsi/iter-y"], uncommitted: 0, running: false },
       contracts: { agent: true, backlog: true },
       diagnosis: { category: "revert_failed", healthy: false, auto_safe: false, evidence: "REVERT FAILED — base needs manual cleanup" },
       escalation: { category: "revert_failed", evidence: "REVERT FAILED — base needs manual cleanup",
@@ -816,6 +830,7 @@ const mock = (() => {
     metrics: () => ({ iterations: 5, shipped: 3, merged: 1, reverted: 1, noop: 1, success_rate: 0.6, tests_series: hist.filter(h => h.tests).map(h => ({ ts: h.ts, passed: h.tests.passed, failed: h.tests.failed })) }),
     health: () => ({ gh: true, git: true, keys: { "ollama-cloud": true, "openrouter": false }, repos: repos.map(r => ({ name: r.name, is_git: true, has_remote: true, venv: true })) }),
     cleanup_worktrees: () => ({ ok: true, pruned: true, removed: ["rsi/iter-old1", "rsi/iter-old2", "rsi/iter-old3"] }),
+    clean_branch: (n) => { const r = find(n); if (r) r.hygiene = { dirty: false }; return { ok: true, from: "rsi/iter-x", checked_out: "main", removed: ["rsi/iter-x", "rsi/iter-y"], pruned: true }; },
     ensure_contracts: () => ({ ok: true, created: [] }),
     enrich_contract: (n) => ({ ok: true, agent_written: 1400, backlog_written: 320, summary: "# " + n + " self-improvement contract" }),
     ideate: () => ({ ok: true, added: 6, top: "- [ ] [architecture] Build the genesis profile-create API" }),

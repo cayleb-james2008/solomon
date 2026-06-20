@@ -1625,6 +1625,81 @@ def list_worktrees(repo):
     return rows
 
 
+def branch_hygiene(repo):
+    """Read-only snapshot of whether the RSI loop left the repo's git state DIRTY — i.e. off its base
+    branch (checked out on an rsi/* iteration branch) and/or with stray rsi/* branches lingering.
+
+    A RUNNING loop sitting on an rsi/* branch mid-iteration is NORMAL, not dirty — so `dirty` is only
+    True when no live runner holds the lock. Never raises: any error or non-git repo returns the
+    not-dirty shape. Drives the dashboard's auto-surfaced "Clean branch" affordance.
+
+    Returns {dirty, reason, current, base, off_base, stray, uncommitted, running}."""
+    clean = {"dirty": False, "reason": "", "current": "", "base": "", "off_base": False,
+             "stray": [], "uncommitted": 0, "running": False}
+    git = _which_git()
+    path = _repo_path(repo)
+    if not git or not path:
+        return clean
+    try:
+        base = project_pr_target_branch(repo)
+        current = (_run([git, "-C", path, "rev-parse", "--abbrev-ref", "HEAD"]).stdout or "").strip()
+        prefix = repo.get("branch_prefix") or "rsi/"
+        stray = [b for b in local_rsi_branches(repo) if b != current]
+        off_base = bool(current) and bool(base) and current != base and current.startswith(prefix)
+        porcelain = _run([git, "-C", path, "status", "--porcelain"]).stdout or ""
+        uncommitted = len([ln for ln in porcelain.splitlines() if ln.strip()])
+        running = is_running(repo)
+    except OSError:
+        return clean
+    dirty = (off_base or bool(stray)) and not running
+    parts = []
+    if off_base:
+        parts.append(f"on {current} (base {base})")
+    if stray:
+        parts.append(f"{len(stray)} stray {prefix}* branch(es)")
+    return {"dirty": dirty, "reason": "; ".join(parts), "current": current, "base": base,
+            "off_base": off_base, "stray": stray, "uncommitted": uncommitted, "running": running}
+
+
+def clean_branch(repo):
+    """Action: clean a DIRTY repo back to its base branch + prune stray rsi/* branches.
+
+    If the repo is OFF its base (checked out on an rsi/* iteration branch), force-checks-out the base
+    (discarding that abandoned iteration's WIP — the intent of cleaning). If it is ALREADY on base
+    (the only dirtiness is a stray rsi/* branch), it does NOT touch the working tree — so unrelated
+    uncommitted work on the base branch is preserved. Then runs cleanup_worktrees to prune worktrees +
+    delete the now-not-current rsi/* branches. Refuses while a loop is live (stop it first). Never raises.
+
+    Returns {ok, from, checked_out, switched, removed, pruned} or {ok:false, error}."""
+    if is_running(repo):
+        return {"ok": False, "error": "loop is running — stop it first"}
+    git = _which_git()
+    path = _repo_path(repo)
+    if not git:
+        return {"ok": False, "error": "git not found"}
+    if not path:
+        return {"ok": False, "error": "repo has no 'path'"}
+    base = project_pr_target_branch(repo)
+    switched = False
+    try:
+        prev = (_run([git, "-C", path, "rev-parse", "--abbrev-ref", "HEAD"]).stdout or "").strip()
+        # Only switch when actually OFF base. Force discards the abandoned rsi-branch WIP (intended).
+        # When ALREADY on base we must NOT force-checkout — that would wipe unrelated uncommitted work
+        # on the base branch even though the only dirtiness is a stray rsi/* branch. (Found by
+        # dogfooding the cleaner: the unconditional force-checkout was a data-loss footgun.)
+        if prev and base and prev != base:
+            co = _run([git, "-C", path, "checkout", "--force", base])
+            if co.returncode != 0:
+                return {"ok": False,
+                        "error": (co.stderr or co.stdout or f"checkout {base} failed").strip()[:200]}
+            switched = True
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    cw = cleanup_worktrees(repo)
+    return {"ok": True, "from": prev, "checked_out": base, "switched": switched,
+            "removed": cw.get("removed", []), "pruned": cw.get("pruned")}
+
+
 def browser_state(repo):
     """Read the latest monitored browser observation without raising into the UI."""
     rt = _runtime_dir(repo)
