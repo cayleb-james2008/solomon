@@ -266,6 +266,16 @@ def recover(repo, allow_pi=False, allow_restart=True, auto_push=True):
         else:
             removed = cw.get("removed") or []
             msg = (f"recovered: reset_to_base, cleanup_worktrees (removed {len(removed)} rsi/* branch(es))")
+        # The wedge is cleared and the base is clean + origin-synced — bring the loop back UP. Otherwise
+        # the lingering status=error/phase=reverted heartbeat permanently blocks should_restart() and the
+        # repo sits idle until a human presses Start (an overnight revert-failure = zero progress). Same
+        # safe gated restart the 'stuck' path uses: only after the loop was confirmed not live and the
+        # supervisor lock was released; anti-thrash caps a recurring cause to escalation, not an infinite
+        # loop (each cycle is reversible — no force-push, no merge).
+        if allow_restart:
+            control.start(repo, auto_push=auto_push)
+            actions.append("restart")
+            msg += ", restart"
         return _finish(repo, d, actions, escalate=False, msg=msg)
 
     if not d["auto_safe"] and cat != "gate_red_streak":

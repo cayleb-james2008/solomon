@@ -193,12 +193,36 @@ def test_recover_revert_failed_auto_resets_when_loop_not_live(tmp_path, monkeypa
     monkeypatch.setattr(control, "reset_to_base", lambda repo: resets.append(repo) or {"ok": True, "base": "main"})
     cleanups = []
     monkeypatch.setattr(control, "cleanup_worktrees", lambda repo: cleanups.append(repo) or {"ok": True})
+    starts = []
+    monkeypatch.setattr(control, "start", lambda repo, auto_push=True: starts.append(repo) or {"ok": True, "pid": 1})
     res = solomon.recover(_repo(tmp_path), allow_pi=False)
     assert not res["escalate"]
     assert "reset_to_base" in res["actions_taken"]
     assert "cleanup_worktrees" in res["actions_taken"]
-    assert len(resets) == 1 and len(cleanups) == 1
-    assert released == ["sup-tok"]          # lock released after the reset
+    assert "restart" in res["actions_taken"]       # loop is brought back UP, not left idle
+    assert len(resets) == 1 and len(cleanups) == 1 and len(starts) == 1
+    assert released == ["sup-tok"]          # lock released BEFORE the restart
+
+
+def test_recover_revert_failed_no_restart_when_allow_restart_false(tmp_path, monkeypatch):
+    """auto_push=False (global gate off) -> allow_restart False -> recover still resets/cleans the
+    wedge but does NOT restart the loop (operator chose not to auto-run)."""
+    import control
+    import solomon
+    rt = _rt(tmp_path, monkeypatch)
+    _hb(rt, status="error", phase="reverted", last_summary="REVERT FAILED")
+    monkeypatch.setattr(control, "is_running", lambda repo: False)
+    monkeypatch.setattr(control, "acquire_supervisor_lock", lambda repo: (True, "sup-tok"))
+    monkeypatch.setattr(control, "release_supervisor_lock", lambda repo, token: None)
+    monkeypatch.setattr(control, "reset_to_base", lambda repo: {"ok": True, "base": "main"})
+    monkeypatch.setattr(control, "cleanup_worktrees", lambda repo: {"ok": True})
+    starts = []
+    monkeypatch.setattr(control, "start", lambda repo, auto_push=True: starts.append(repo) or {"ok": True})
+    res = solomon.recover(_repo(tmp_path), allow_pi=False, allow_restart=False)
+    assert not res["escalate"]
+    assert "reset_to_base" in res["actions_taken"]
+    assert "restart" not in res["actions_taken"]
+    assert starts == []
 
 
 def test_recover_revert_failed_still_escalates_when_loop_live(tmp_path, monkeypatch):

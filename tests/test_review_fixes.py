@@ -333,6 +333,38 @@ def test_pid_alive_exact_csv_match(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# WD-1 — watchdog scheduled-task self-rearm (idempotent, create-only-if-missing)
+# --------------------------------------------------------------------------- #
+def test_ensure_watchdog_task_present_does_not_recreate(monkeypatch):
+    """When SolomonWatchdog already exists, _ensure_watchdog_task must NOT clobber it (query 0 ->
+    'present', no /Create)."""
+    calls = []
+    def fake_run(args, cwd=None):
+        calls.append(args)
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    monkeypatch.setattr(control.sys, "platform", "win32", raising=False)
+    monkeypatch.setattr(control, "_run", fake_run)
+    assert control._ensure_watchdog_task() == "present"
+    assert all("/Create" not in a for a in calls)
+
+
+def test_ensure_watchdog_task_creates_when_missing(monkeypatch):
+    """When the task is missing (query != 0), _ensure_watchdog_task creates it every-2-min, windowless
+    (pythonw monitor.py)."""
+    calls = []
+    def fake_run(args, cwd=None):
+        calls.append(args)
+        rc = 1 if "/Query" in args else 0
+        return type("R", (), {"returncode": rc, "stdout": "", "stderr": "not found"})()
+    monkeypatch.setattr(control.sys, "platform", "win32", raising=False)
+    monkeypatch.setattr(control, "_run", fake_run)
+    monkeypatch.setattr(control, "_watchdog_python", lambda: r"C:\fake\pythonw.exe")
+    assert control._ensure_watchdog_task() == "armed"
+    create = next(a for a in calls if "/Create" in a)
+    assert "SolomonWatchdog" in create and "MINUTE" in create and "2" in create
+
+
+# --------------------------------------------------------------------------- #
 # PKG-1 — _runner_python never returns the frozen exe
 # --------------------------------------------------------------------------- #
 def test_runner_python_guards_frozen(tmp_path, monkeypatch):
