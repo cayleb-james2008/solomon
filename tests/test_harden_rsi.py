@@ -134,3 +134,18 @@ def test_added_test_defs_detection():
     assert m._added_test_defs("+class TestBaz:\n+    pass") != []
     assert m._added_test_defs("+def helper():\n+    return 1") == []     # not a test def
     assert m._added_test_defs("+++ b/tests/test_x.py\n+x=1") == []       # header excluded
+
+
+# --------------------------------------------------------------------------- #
+# HARDEN-F (onboarding-4) — all-alpha credential values are still redacted
+# --------------------------------------------------------------------------- #
+def test_redact_scrubs_alpha_credential_values(monkeypatch):
+    m = _load_runner()
+    monkeypatch.setattr(m, "NAME", "demo")           # no deny_terms in play
+    # a credential-NAMED value with NO digit used to slip through -> must now be redacted
+    assert "[REDACTED]" in m._redact("password: SecretAlphaValueHere")
+    assert "[REDACTED]" in m._redact("github_token=AbcDefGhiJklMnoPq")
+    assert "[REDACTED]" in m._redact("client_secret: OnlyLettersNoDigitsHere")
+    # but a BARE lowercase 'token:'/'secret:' prose word with an alpha value stays untouched
+    assert m._redact("token: validation logic") == "token: validation logic"
+    assert m._redact("secret: be consistent daily") == "secret: be consistent daily"

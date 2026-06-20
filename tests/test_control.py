@@ -577,6 +577,67 @@ def test_github_login_start_already_authed(monkeypatch):
     assert out["ok"] is True and out["already"] is True and out["login"] == "me"
 
 
+def test_github_login_start_uses_visible_console(monkeypatch):
+    """onboarding-1: `gh auth login --web` is interactive (prints a one-time device code, waits). It
+    must run in a VISIBLE console with std streams NOT redirected, or the operator never sees the code
+    and login silently hangs."""
+    monkeypatch.setattr(control, "_which_gh", lambda: "gh")
+    monkeypatch.setattr(control, "gh_ready", lambda: False)
+    monkeypatch.setattr(control, "_clean_subenv", lambda: {})
+    captured = {}
+
+    def _popen(args, **kwargs):
+        captured["args"], captured["kwargs"] = args, kwargs
+        return object()
+
+    monkeypatch.setattr(control.subprocess, "Popen", _popen)
+    out = control.github_login_start()
+    assert out["ok"] and out.get("started")
+    # streams must NOT be swallowed (no DEVNULL) — the device code goes to the console
+    assert "stdout" not in captured["kwargs"] and "stderr" not in captured["kwargs"]
+    assert "--web" in captured["args"]
+    if sys.platform == "win32":  # own visible console window (CREATE_NEW_CONSOLE = 0x10)
+        assert captured["kwargs"].get("creationflags", 0) & 0x00000010
+
+
+def test_connect_project_auto_detects_public_remote(tmp_path, monkeypatch):
+    """onboarding-2: a PUBLIC GitHub remote gets public=true on connect so the leak guard
+    (deny_terms / private_paths / secret-shape block) is active without a manual repos.json edit."""
+    monkeypatch.setattr(control, "HERE", str(tmp_path))
+    monkeypatch.setattr(control, "REPOS_JSON", str(tmp_path / "repos.json"))
+    monkeypatch.setattr(control, "PROJECTS_DIR", str(tmp_path / "projects"))
+    repo_dir = tmp_path / "pub"; (repo_dir / ".git").mkdir(parents=True)
+    monkeypatch.setattr(control, "_has_origin", lambda p: True)
+    monkeypatch.setattr(control, "_gh_repo_visibility", lambda p: True)
+    monkeypatch.setattr(control, "enrich_contract", lambda repo, background=False: {"ok": False})
+    monkeypatch.setattr(control, "ensure_contracts", lambda repo: {"ok": True})
+    monkeypatch.setattr(control, "keys_status", lambda: {"ollama-cloud": True})
+    monkeypatch.setattr(control, "project_sandbox", lambda repo: None)
+    monkeypatch.setattr(control, "has_frontend", lambda repo: False)
+    out = control.connect_project(str(repo_dir), goal="x", ship="pr")
+    assert out["ok"]
+    row = next(r for r in control._read_repos_json(str(tmp_path / "repos.json")) if r["name"] == "pub")
+    assert row.get("public") is True
+
+
+def test_connect_project_auto_picks_present_provider(tmp_path, monkeypatch):
+    """onboarding-3: connect picks the provider whose key the operator actually entered, so the repo
+    is immediately runnable (an OpenRouter-only operator no longer gets a silently non-runnable repo)."""
+    monkeypatch.setattr(control, "HERE", str(tmp_path))
+    monkeypatch.setattr(control, "REPOS_JSON", str(tmp_path / "repos.json"))
+    monkeypatch.setattr(control, "PROJECTS_DIR", str(tmp_path / "projects"))
+    repo_dir = tmp_path / "loc"; repo_dir.mkdir()
+    monkeypatch.setattr(control, "enrich_contract", lambda repo, background=False: {"ok": False})
+    monkeypatch.setattr(control, "ensure_contracts", lambda repo: {"ok": True})
+    monkeypatch.setattr(control, "keys_status", lambda: {"ollama-cloud": False, "openrouter": True})
+    monkeypatch.setattr(control, "project_sandbox", lambda repo: None)
+    monkeypatch.setattr(control, "has_frontend", lambda repo: False)
+    out = control.connect_project(str(repo_dir), goal="x", ship="pr")
+    assert out["ok"]
+    row = next(r for r in control._read_repos_json(str(tmp_path / "repos.json")) if r["name"] == "loc")
+    assert row.get("provider") == "openrouter"
+
+
 def test_list_worktrees_empty_when_no_git(tmp_path, monkeypatch):
     monkeypatch.setattr(control, "_which_git", lambda: None)
     assert control.list_worktrees({"name": "x", "path": str(tmp_path)}) == []

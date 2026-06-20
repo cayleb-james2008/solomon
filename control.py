@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from winproc import hidden_subprocess_kwargs
+from winproc import hidden_subprocess_kwargs, visible_console_kwargs
 
 def _base_dir():
     """The operator data dir (repos.json, improver/, runtime/, .env). When frozen, the PyInstaller
@@ -654,15 +654,34 @@ def github_login_start():
         status = github_status()
         return {"ok": True, "already": True, "login": status.get("login")}
     try:
-        kw = {"cwd": HERE, "env": _clean_subenv()}
+        # `gh auth login --web` is an INTERACTIVE device-code flow: it prints a one-time code and
+        # waits for the operator to authorize in the browser. Spawn it in its OWN VISIBLE console
+        # (no hidden window, no DEVNULL'd streams) so the operator can actually see the code and
+        # complete login — hiding it made GitHub onboarding silently hang (onboarding-1).
         subprocess.Popen(
             [gh, "auth", "login", "--hostname", "github.com", "--git-protocol", "https", "--web"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, **kw,
-            **hidden_subprocess_kwargs(),
+            cwd=HERE, env=_clean_subenv(), close_fds=True, **visible_console_kwargs(),
         )
         return {"ok": True, "started": True}
     except OSError as e:
         return {"ok": False, "error": str(e)}
+
+
+def _gh_repo_visibility(path):
+    """True / False if the repo at `path` has a PUBLIC / PRIVATE GitHub origin, else None (gh missing,
+    not a GitHub remote, or the call failed). gh infers owner/repo from the origin remote in `path`.
+    Used to default repos.json `public` on connect so the leak guard is active without a manual edit."""
+    gh = _which_gh()
+    if not gh:
+        return None
+    try:
+        r = _run([gh, "repo", "view", "--json", "visibility", "--jq", ".visibility"], cwd=path)
+    except OSError:
+        return None
+    if r.returncode != 0:
+        return None
+    v = (r.stdout or "").strip().upper()
+    return True if v == "PUBLIC" else (False if v == "PRIVATE" else None)
 
 
 def _parse_repo_spec(spec):
@@ -720,8 +739,12 @@ def _write_repo_entries(entries):
         return {"ok": False, "error": str(e)}
 
 
-def connect_project(spec, goal=None, ship="pr", visual_gate=None):
-    """Register a local directory or clone/register a GitHub repository in one call."""
+def connect_project(spec, goal=None, ship="pr", visual_gate=None, provider=None):
+    """Register a local directory or clone/register a GitHub repository in one call.
+
+    provider: which LLM provider the loop uses for this repo. None -> auto-pick whichever provider's
+    key the operator has actually entered (so a 'successful' connect is immediately runnable), which
+    fixes the OpenRouter-only operator getting a silently non-runnable repo (onboarding-3)."""
     raw = os.path.expandvars(os.path.expanduser((spec or "").strip()))
     if os.path.isdir(raw):
         path = os.path.abspath(raw)
@@ -746,6 +769,21 @@ def connect_project(spec, goal=None, ship="pr", visual_gate=None):
     }
     if goal is not None:
         entry["goal"] = str(goal).strip()
+    # Provider (onboarding-3): explicit arg wins; else the provider whose key is actually present;
+    # else leave unset (project_provider() then falls back to the default). Written so the runner +
+    # contract enrichment use a key the operator has, instead of silently defaulting to ollama-cloud.
+    if provider is None:
+        ks = keys_status()
+        provider = next((p for p in ("ollama-cloud", "openrouter") if ks.get(p)), None)
+    if provider:
+        entry["provider"] = provider
+    # Public visibility (onboarding-2): auto-detect from the origin so the leak guard
+    # (deny_terms / private_paths / secret-shape block) is ACTIVE by default on a public remote,
+    # instead of being silently off until the operator hand-edits repos.json.
+    if entry["has_remote"]:
+        vis = _gh_repo_visibility(path)
+        if vis is not None:
+            entry["public"] = vis
     resolved_visual_gate = bool(has_frontend(entry)) if visual_gate is None else bool(visual_gate)
     entry["visual_gate"] = resolved_visual_gate
 
