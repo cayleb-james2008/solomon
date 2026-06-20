@@ -207,6 +207,17 @@ def test_recover_revert_failed_anti_thrash_cap(tmp_path, monkeypatch):
     assert r["actions_taken"] == []
 
 
+def test_recover_clears_stale_escalation_when_healthy(tmp_path, monkeypatch):
+    # a recovered (healthy) repo must clear a stale escalation.json left by a prior transient error,
+    # so the operator doesn't keep seeing an alert for a repo that self-healed.
+    rt = _rt(tmp_path, monkeypatch)
+    _hb(rt, status="sleeping", phase="sleep")          # healthy now
+    (rt / "escalation.json").write_text(json.dumps({"category": "unknown_error"}), encoding="utf-8")
+    res = solomon.recover(_repo(tmp_path))
+    assert res["category"] == "ok"
+    assert not (rt / "escalation.json").exists()       # stale alert cleared
+
+
 # ---- reversible primitives -------------------------------------------------
 def test_clear_lock_refuses_live(tmp_path, monkeypatch):
     rt = _rt(tmp_path, monkeypatch)
