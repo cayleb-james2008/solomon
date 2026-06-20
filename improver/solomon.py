@@ -261,6 +261,10 @@ def recover(repo, allow_pi=False, allow_restart=True, auto_push=True):
     d = diagnose(repo)
     cat = d["category"]
     if cat == "ok":
+        # The repo is healthy — clear any STALE escalation.json a prior transient error left behind, so
+        # a recovered repo stops showing an operator alert. This matters more now that the unknown_error
+        # catch-all surfaces transient errors (e.g. a flaky base-gate-red) that then self-resolve.
+        clear_escalation(repo)
         return {"ok": True, "category": "ok", "actions_taken": [], "escalate": False, "message": "healthy"}
 
     actions = []   # actions taken on this run (appended to supervisor.jsonl via _finish)
