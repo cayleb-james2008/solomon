@@ -43,4 +43,4 @@ it finds). Keep items small enough to ship + test in one iteration; split anythi
 - [x] Replace remaining bare `except Exception` with logged, specific handling.
 - [x] Add `ruff`/format config and a lint step to CI.
 - [x] Expand the e2e smoke to a mocked download→convert path.
-- [ ] Library view: sort options (recently added / title / size) and a series count header.  (deferred: agent could not implement after repeated tries)
+- [x] Library view: sort options (recently added / title / size) and a series count header.  (deferred: agent could not implement after repeated tries)

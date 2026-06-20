@@ -1,0 +1,5 @@
+# Lessons
+
+- 2026-06-20T04:45:00Z — Attempted to harden the live-publish drain with persistent browser tabs and post idempotency; shipped on main after 304 tests, but the prior duplicate-post risk came from zero coverage plus committing on scraped URL/stale queue state, so future publish-path changes must start from registry/idempotency tests and commit on the platform published signal rather than URL capture.
+- 2026-06-20T05:11:46Z — Attempted cockpit + browser_agent/harness/master/strategy updates → shipped to main, but the diff mixed dashboard UI, frozen/core files, browser behavior, and profile-ignore churn → next time split dashboard changes from RSI-scoped supervisor/agent work and keep generated/profile artifacts out unless explicitly requested.
+- 2026-06-20T05:46:32Z — Browser/CDP hardening shipped → the successful path was per-profile browser isolation plus idempotency tests while keeping the dashboard as a static surface → next browser-capability work should add isolated controllers and regression tests before broad cockpit churn.

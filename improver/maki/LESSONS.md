@@ -1,0 +1,22 @@
+# Lessons
+
+- 2026-06-20T04:43:39Z — Here's the state of the repository after the last RSI iteration:
+- 2026-06-20T06:10:07Z — Good — the branch is pushed and verified on origin. Here's the full status of the RSI iteration:
+- 2026-06-20T06:34:39Z — CI is now **green** — the latest run (`27863027492`) completed with `success`.
+- 2026-06-20T07:02:34Z — Here's a summary of the RSI iteration that just completed:
+- 2026-06-20T07:21:37Z — Here's the state after the RSI loop's latest iteration:
+- 2026-06-20T08:23:33Z — The RSI iteration has been successfully reviewed, verified, and merged. Here's a summary:
+- 2026-06-20T08:26:36Z — Here's a summary of the RSI iteration that just completed on the **`cayleb-james2008/maki`** repository:
+- 2026-06-20T09:20:23Z — The branch is pushed. The RSI runner handles PR creation (I'm restricted to read-only GitHub tools). Here's a summary of this iteration:
+- 2026-06-20T09:37:01Z — Here's a summary of where things stand after the RSI iteration:
+- 2026-06-20T10:08:26Z — Here's a complete status report of the RSI loop after one iteration:
+- 2026-06-20T10:21:45Z — CI is green for the new commit. Here's a summary of this RSI iteration:
+- 2026-06-20T10:39:42Z — CI only triggers on `main` pushes or PRs to `main`, so it won't run on the feature branch until a PR is opened. That's expected — the local verification (488 tests passing, ruff clean) confirms the change is solid.
+- 2026-06-20T11:56:37Z — Here's the status of the just-finished RSI iteration.
+- 2026-06-20T12:08:22Z — The iteration branch has been pushed successfully. Here's a summary of where things stand:
+- 2026-06-20T13:05:10Z — Everything is in order. Let me provide the final summary.
+- 2026-06-20T13:34:18Z — Everything looks great. Here's a summary of where the repository stands after this RSI iteration:
+- 2026-06-20T16:03:54Z — Good — I have a clear picture now. Here's the summary of where the RSI loop stands:
+- 2026-06-20T16:16:22Z — Good — the repository is in a clean state after the latest RSI iteration:
+- 2026-06-20T16:29:25Z — Good — everything is green. Here's a summary of where things stand:
+- 2026-06-20T17:26:02Z — The branch is pushed and verified on origin. Here's a summary of what this RSI iteration accomplished:
