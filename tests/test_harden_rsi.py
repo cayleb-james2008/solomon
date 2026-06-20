@@ -9,7 +9,11 @@ finding ids so a future reader can trace test -> finding.
 """
 import importlib.util
 import os
+import shutil
+import subprocess
 import sys
+
+import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -173,3 +177,36 @@ def test_ship_outcome_auto_merge_only_shipped_on_confirmed_merge():
     assert m._ship_outcome({"number": None, "state": "reverted (CI red)"}, "auto-merge") == "blocked"
     # pr-mode: an opened PR IS a successful ship (the human merges it later)
     assert m._ship_outcome({"number": 7, "state": "open"}, "pr") == "shipped"
+
+
+# --------------------------------------------------------------------------- #
+# HARDEN-H — _git_add_all skips ignored paths without erroring (the sover wedge)
+# --------------------------------------------------------------------------- #
+@pytest.mark.skipif(not shutil.which("git"), reason="git not available")
+def test_git_add_all_skips_ignored_without_error(tmp_path, monkeypatch):
+    """A public repo with private_paths AND other gitignored dirs (sover: .runtime/data/profiles/ggg)
+    used to fail `git add -A -- . :(exclude)priv` with 'paths are ignored ... Use -f', erroring the
+    whole iteration. Bare `git add -A` must skip ignored files silently, stage the normal change, and
+    leave private paths unstaged."""
+    m = _load_runner()
+
+    def g(*a):
+        return subprocess.run(["git", "-C", str(tmp_path), *a], capture_output=True, text=True)
+
+    subprocess.run(["git", "init", str(tmp_path)], capture_output=True)
+    g("config", "user.email", "t@t"); g("config", "user.name", "t")
+    (tmp_path / ".gitignore").write_text("ignored_dir/\n", encoding="utf-8")
+    (tmp_path / "ignored_dir").mkdir(); (tmp_path / "ignored_dir" / "s.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "normal.py").write_text("y = 1\n", encoding="utf-8")
+    (tmp_path / "priv").mkdir(); (tmp_path / "priv" / "brand.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(m, "REPO", str(tmp_path))
+    monkeypatch.setattr(m, "NAME", "x")
+    monkeypatch.setattr(m, "_repo_is_public", lambda name: True)
+    monkeypatch.setattr(m, "_repo_private_paths", lambda name: ["priv/"])
+
+    r = m._git_add_all()
+    assert r.returncode == 0                                   # no 'paths are ignored' failure
+    staged = g("diff", "--cached", "--name-only").stdout
+    assert "normal.py" in staged                              # the real change is staged
+    assert "priv/brand.json" not in staged                   # private path kept out of the commit
+    assert "ignored_dir" not in staged                       # ignored files skipped silently
