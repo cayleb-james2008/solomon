@@ -263,9 +263,11 @@ def test_untracked_non_ignored_files_empty_when_clean(monkeypatch):
     assert m._untracked_non_ignored_files() == []
 
 
-def test_preflight_refuses_to_delete_untracked_operator_files(tmp_path, monkeypatch):
-    """An untracked operator file on the base branch must NOT be silently `git clean -fd`-ed away —
-    the loop skip+escalates so the operator can commit/stash/remove it."""
+def test_preflight_auto_stashes_untracked_operator_files(tmp_path, monkeypatch):
+    """An untracked operator file on the base branch must NOT be silently `git clean -fd`-ed away.
+    The loop now AUTO-RECOVERS non-destructively: it stashes the file (preserved + recoverable via
+    `git stash`) and proceeds, instead of refusing + self-stopping until a human intervenes. The
+    never-destroy-operator-work keystone still holds — the work survives in the stash."""
     m = _load_runner()
     work = _mk_origin_clone(tmp_path)
     (work / "operator_scratch.py").write_text("# my new test module")   # untracked, non-ignored
@@ -283,11 +285,14 @@ def test_preflight_refuses_to_delete_untracked_operator_files(tmp_path, monkeypa
 
     m.one_iteration()
 
-    assert m._hb["status"] == "error" and m._hb["phase"] == "preflight"
-    assert "Untracked" in m._hb["last_summary"] or "untracked" in m._hb["last_summary"]
-    assert ran["pi"] is False                                # never reached the agent
-    # the operator's untracked file must survive (not deleted by git clean -fd)
-    assert (work / "operator_scratch.py").exists()
+    # the untracked-files REFUSAL no longer fires — the loop auto-stashed and moved on
+    assert "Untracked non-ignored files" not in (m._hb.get("last_summary") or "")
+    # the operator's work was NOT destroyed: it's preserved + recoverable from the stash
+    assert "operator_scratch.py" not in _git(work, "status", "--porcelain").stdout  # stashed off the tree
+    stashes = _git(work, "stash", "list").stdout
+    assert "solomon-auto-preflight" in stashes
+    _git(work, "stash", "pop")
+    assert (work / "operator_scratch.py").read_text() == "# my new test module"
 
 
 def test_preflight_cleans_and_proceeds_when_no_untracked_files(tmp_path, monkeypatch):

@@ -112,6 +112,52 @@ def test_dirty_base_non_base_branch_does_not_count():
     assert m._dirty_base_bail_count == 0
 
 
+# ---- 1b. non-destructive auto-stash recovery of a dirty BASE tree ----------
+@pytest.mark.skipif(not shutil.which("git"), reason="git not available")
+def test_auto_stash_base_recovers_dirty_tree_non_destructively(tmp_path, monkeypatch):
+    """A dirty BASE tree (tracked change + an untracked operator-looking file) is STASHED, not
+    deleted: after _auto_stash_base the working tree is verifiably clean (so the loop self-resumes)
+    AND the work is fully recoverable from the stash list — nothing is destroyed and nothing is
+    pushed (the stash is local)."""
+    m = _load_runner()
+    work = _mk_origin_clone(tmp_path)
+    (work / "f.txt").write_text("CHANGED")              # tracked dirty
+    (work / "operator_note.txt").write_text("keep me")  # untracked operator-looking file
+    monkeypatch.setattr(m, "REPO", str(work))           # git() runs with cwd=REPO
+    monkeypatch.setattr(m, "RUNTIME", tmp_path / "rt")
+    assert m.tree_dirty() is True
+    assert m._untracked_non_ignored_files()             # operator_note.txt present
+    assert m._auto_stash_base("rsi/iter-test") is True
+    # the base tree is now clean -> the iteration can proceed
+    assert m.tree_dirty() is False
+    assert m._untracked_non_ignored_files() == []
+    # the work is preserved in the stash (recoverable, non-destructive)
+    stashes = _git(work, "stash", "list").stdout
+    assert "solomon-auto-preflight" in stashes
+    _git(work, "stash", "pop")
+    assert (work / "operator_note.txt").read_text() == "keep me"
+    assert (work / "f.txt").read_text() == "CHANGED"
+
+
+@pytest.mark.skipif(not shutil.which("git"), reason="git not available")
+def test_auto_stash_leaves_ignored_files_untouched(tmp_path, monkeypatch):
+    """Auto-stash uses `--include-untracked` (NOT `--all`), so .gitignore'd files (e.g. private
+    profiles/ggg/) are left in place — never stashed, never exposed."""
+    m = _load_runner()
+    work = _mk_origin_clone(tmp_path)
+    (work / ".gitignore").write_text("secret/\n")
+    _git(work, "add", ".gitignore")
+    _git(work, "commit", "-m", "ignore secret")
+    (work / "secret").mkdir()
+    (work / "secret" / "creds.txt").write_text("PRIVATE")
+    (work / "f.txt").write_text("CHANGED")              # something to stash
+    monkeypatch.setattr(m, "REPO", str(work))
+    monkeypatch.setattr(m, "RUNTIME", tmp_path / "rt")
+    assert m._auto_stash_base("rsi/iter-test") is True
+    # the ignored private file is still present (not stashed away)
+    assert (work / "secret" / "creds.txt").read_text() == "PRIVATE"
+
+
 # ---- 2. solomon.recover() auto-reset for revert_failed when loop not live ---
 def _rt(tmp_path, monkeypatch, name="x"):
     import control
