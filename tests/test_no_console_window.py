@@ -94,14 +94,20 @@ def _is_os_system(call: ast.Call) -> bool:
     )
 
 
+# Sanctioned console-control spreads: the default windowless helper, OR the deliberate
+# visible-console helper for an INTERACTIVE child the operator must see (e.g. `gh auth login --web`
+# prints a one-time device code and waits). Both keep console behavior intentional, not accidental.
+_SANCTIONED_SPREADS = {"hidden_subprocess_kwargs", "visible_console_kwargs"}
+
+
 def _has_hidden_spread(call: ast.Call) -> bool:
-    """True if the call has ``**hidden_subprocess_kwargs(...)``."""
+    """True if the call spreads a sanctioned console-control helper (windowless OR deliberate-visible)."""
     for kw in call.keywords:
         if kw.arg is not None or not isinstance(kw.value, ast.Call):
             continue
         vf = kw.value.func
         name = vf.attr if isinstance(vf, ast.Attribute) else getattr(vf, "id", "")
-        if name == "hidden_subprocess_kwargs":
+        if name in _SANCTIONED_SPREADS:
             return True
     return False
 

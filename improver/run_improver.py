@@ -450,11 +450,15 @@ _SECRET_KEYVAL_PATTERN = re.compile(
 
 
 def _redact_keyval(m) -> str:
-    """Redact the value of a NAME<sep>value match ONLY when it's a real credential assignment — the
-    value looks token-like (contains a digit) OR the NAME is an UPPERCASE env-var-style identifier.
-    Otherwise it's prose (e.g. 'token: validation logic') — return it untouched."""
+    """Redact the value of a NAME<sep>value match when it is a credential assignment. The pattern's
+    NAME already ends in a credential keyword; a PREFIXED or otherwise non-bare credential name
+    (password, api_key, github_token, client_secret, DB_PASSWORD, ...) is almost never prose, so its
+    value is redacted REGARDLESS of shape — an all-alpha password/token leaks otherwise (onboarding-4).
+    Only a BARE lowercase 'token'/'secret' is prose-prone ('token: validation logic'); for those keep
+    the heuristic (redact only when the value is token-shaped: has a digit, or the NAME is UPPER_SNAKE)."""
     name, sep, value = m.group(1), m.group(2), m.group(3)
-    looks_secret = any(c.isdigit() for c in value) or (name.isupper() and "_" in name)
+    ambiguous_bare = name.lower() in ("token", "secret")
+    looks_secret = (not ambiguous_bare) or any(c.isdigit() for c in value) or (name.isupper() and "_" in name)
     return f"{name}{sep}[REDACTED]" if looks_secret else m.group(0)
 
 
@@ -565,6 +569,14 @@ def log(msg: str) -> None:
 
 
 def heartbeat(**fields) -> None:
+    # Once an iteration parks a TERMINAL ERROR heartbeat (status="error" with a diagnostic
+    # phase="preflight"/"reverted"), a later non-status update — notably reflect()'s
+    # heartbeat(phase="reflect") — must NOT clobber that phase. solomon.diagnose() classifies the
+    # wedge by (status, phase) and monitor.should_restart() refuses a blind restart on phase="reverted";
+    # both break if the phase is overwritten. Freeze status+phase until a caller explicitly sets a new
+    # status (a fresh iteration -> "iterating"/"idle", or the finally -> "stopped").
+    if _hb.get("status") == "error" and "status" not in fields:
+        fields.pop("phase", None)
     _hb.update(fields)
     _hb["updated_at"] = _now()
     _runtime_atomic_write(HEARTBEAT, json.dumps(_hb, indent=2))
@@ -1062,30 +1074,22 @@ def _find_correlated_tests(changed_files: list[str]) -> list[str]:
 
 
 def _expand_gate_with_correlated(gate_cmd: str, changed_files: list[str]) -> str:
-    """Expand the gate command to include correlated tests alongside the default gate.
+    """The after-change gate MUST run the SAME scope as the clean-base baseline (run_gate() with no
+    args) so the runner's anti-gaming pass/collected comparison is like-for-like. The default gate
+    already runs the FULL suite (`python -m pytest -o addopts=` collects from the rootdir), which
+    inherently includes every test correlated with the change — so there is nothing to "expand".
 
-    If the gate is the default pytest (no custom GATE_CMD), append the correlated
-    test files to ensure they're included. If a custom gate is set, return it
-    unchanged (the operator controls custom gates).
-
-    Returns the potentially expanded gate command."""
-    if not changed_files:
-        return gate_cmd
-
-    correlated = _find_correlated_tests(changed_files)
-    if not correlated:
-        return gate_cmd
-
-    # Only expand the default pytest gate, not custom gates
-    if gate_cmd:
-        return gate_cmd
-
-    # Build an expanded pytest command that includes the correlated tests
-    # The default gate is: python -m pytest -o addopts=
-    # We add the correlated test files to ensure they're collected
-    py = str(VENV_PY) if VENV_PY.exists() else sys.executable
-    test_args = " ".join(f'"{t}"' for t in correlated)
-    return f'{py} -m pytest -o addopts= {test_args}'
+    Listing the correlated files here (the previous behavior) would NARROW the after-gate to a subset
+    of the suite while the baseline measured the FULL suite. That broke the gate two ways:
+      (a) a regression in any NON-correlated test file shipped unseen (a green subset over a red full
+          suite), and
+      (b) `_anti_gaming_reason` compared the full-suite baseline count against the subset count, so
+          "pass/collected count fell" fired on EVERY iteration that touched a .py with any correlated
+          test — the change could never ship, escalated, and deferred forever.
+    A custom GATE_CMD is the operator's own command and is run unchanged. So the only correct
+    "expansion" of a full-suite gate is a no-op; correlated discovery is surfaced as a diagnostic in
+    one_iteration (via _find_correlated_tests), not used to scope the gate."""
+    return gate_cmd
 
 
 def _get_changed_files_for_correlation(base_sha: str) -> list[str]:
@@ -1522,6 +1526,49 @@ def _new_skip_markers(diff_text: str) -> list:
             if ln.startswith("+") and not ln.startswith("+++") and _SKIP_MARKER_RE.search(ln)]
 
 
+# A test DEFINITION line (def test_* / async def test_* / class Test*), matched against diff content
+# with the leading +/- stripped. Used by both the count-less-gate deletion rail (gate-2) and the
+# 'add tests but added none' deviation backstop (gate-3).
+_TEST_DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+test\w*\s*\(|^\s*class\s+Test\w*\b")
+
+
+def _added_test_defs(diff_text: str) -> list:
+    """Added (+) diff lines that DEFINE a test. Confirms an 'add tests' item actually added tests
+    before its backlog item is ticked (gate-3)."""
+    return [ln for ln in (diff_text or "").splitlines()
+            if ln.startswith("+") and not ln.startswith("+++") and _TEST_DEF_RE.match(ln[1:])]
+
+
+def _removed_test_defs(diff_text: str) -> list:
+    """Removed (-) diff lines that DELETE a test definition. A count-independent anti-gaming rail for
+    custom gates that emit no parseable counts — the numeric pass/collected rails are inert there, so a
+    test deletion would otherwise ship unseen (gate-2). The '--- ' file-header line is excluded."""
+    return [ln for ln in (diff_text or "").splitlines()
+            if ln.startswith("-") and not ln.startswith("---") and _TEST_DEF_RE.match(ln[1:])]
+
+
+# Two precise branches so "raise X coverage" is caught while "improve the test RUNNER" is NOT (the
+# latter is real non-test-adding work — a false 'deviation' would wrongly defer it):
+#   - an ADD/RESTORE/PORT-style verb near the word "test(s)"   (adds test code), OR
+#   - any RAISE-style verb near the word "coverage"            (raising coverage == adding tests).
+_DEMANDS_TESTS_RE = re.compile(
+    r"\b(?:add|adds|adding|write|writes|writing|create|creates|creating|backfill|backfills|"
+    r"restore|restores|port|ports|porting)\b[^.\n]{0,80}\btests?\b"
+    r"|\b(?:add|adds|adding|increase|increases|increasing|improve|improves|improving|raise|raises|"
+    r"raising|bump|bumps|cover|covers|covering|extend|extends|extending|expand|expands)\b"
+    r"[^.\n]{0,80}\bcoverage\b",
+    re.I)
+
+
+def _item_demands_tests(goal: str) -> bool:
+    """True when the backlog item explicitly asks to ADD/restore tests or RAISE coverage (e.g. 'Add unit
+    tests for X', 'improve coverage', 'backfill tests', 'port tests'). Used to refuse ticking such an
+    item when the committed diff added no test definition at all — the dominant 'narrated-but-not-done'
+    shape on test-writing backlogs. Deliberately does NOT fire on test-infra work like 'improve the test
+    runner' (no 'coverage', and 'improve' is not an add-tests verb), which legitimately adds no test."""
+    return bool(_DEMANDS_TESTS_RE.search(goal or ""))
+
+
 def _anti_gaming_reason(base_tests, tests, diff_text: str):
     """Why a GREEN gate should still be reverted as gamed, or None. Pure (no git/IO) so the rule is
     unit-tested directly: a dropped pass count (tests removed/weakened/skipped) or newly-introduced
@@ -1569,6 +1616,13 @@ def _anti_gaming_reason(base_tests, tests, diff_text: str):
             return (f"skipped count increased significantly {base_skipped}→{current_skipped} "
                     f"(tests being skipped instead of fixed)")
 
+    # Count-less custom gate (gate-2): when the gate emits no parseable counts the numeric rails above
+    # are inert, so a deleted test would ship unseen. Fall back to a diff-based deletion check.
+    if not (base_tests and any(base_tests.get(k) for k in ("passed", "collected"))):
+        removed = _removed_test_defs(diff_text)
+        if removed:
+            return (f"removed {len(removed)} test definition(s) on a gate with no parseable counts "
+                    "(numeric anti-gaming rail inactive)")
     skips = _new_skip_markers(diff_text)
     if skips:
         return f"introduced {len(skips)} skip/xfail marker(s)"
@@ -2205,6 +2259,13 @@ def one_iteration() -> None:
                 "presentation only — do NOT change any source code or behavior. Then stop.")
         system_md = BEAUTIFY_MD
     else:
+        # A fresh real iteration is underway (preflight + base gate passed). Clear any stale error
+        # status a PRIOR non-HALT preflight bail left in the heartbeat, so the status-freeze guard
+        # doesn't suppress the ideate/plan phase labels and a watchdog sweep during planning doesn't
+        # briefly re-diagnose the (now-resolved) wedge. The implement heartbeat below would reset it
+        # anyway; doing it here keeps the pre-implement phases honest.
+        if _hb.get("status") == "error":
+            heartbeat(status="iterating", phase="preflight")
         # IDEATE phase (pipeline.ideate): a divergent pass BEFORE plan that novelty-filters and
         # prepends fresh, ambitious items to the backlog — so the greedy loop selects from a
         # continually-refreshed menu instead of grinding the same stale top item. No-op when disabled.
@@ -2264,10 +2325,14 @@ def one_iteration() -> None:
         tests = None
     else:
         heartbeat(phase="test", last_summary=summary)
-        # Get changed files for correlated test discovery
+        # Diagnostic only: surface which test files correlate with the change. They already run as
+        # part of the full-suite gate — the gate is NOT narrowed to them (see
+        # _expand_gate_with_correlated), so the after-gate scope matches the baseline scope.
         changed_files = _get_changed_files_for_correlation(base)
         if changed_files:
-            log(f"found {len(changed_files)} changed files for correlated test discovery")
+            correlated = _find_correlated_tests(changed_files)
+            if correlated:
+                log(f"{len(correlated)} correlated test file(s) cover this change (run within the full gate)")
         green, tests, tail = run_gate(changed_files)
         heartbeat(tests=tests)
         log(f"gate: {'GREEN' if green else 'RED'} {tests}")
@@ -2372,6 +2437,14 @@ def one_iteration() -> None:
         if _deviated_from_named_files(goal, git("diff", "--name-only", "--no-renames", f"{BASE_BRANCH}..{branch}").stdout):
             log(f"DEVIATION: the item names file(s) the committed diff never touched — agent shipped "
                 f"unrelated work; not ticking '{goal[:60]}'")
+            item_deviated = True
+        # gate-3: a "add tests / coverage" item that landed with NO new test definition was not
+        # actually implemented (the narrated-but-not-done shape on test-writing backlogs). Don't trust
+        # ITEM-STATUS: done — mark it deviated so it defers instead of being consumed as done.
+        elif _item_demands_tests(goal) and not _added_test_defs(
+                git("diff", f"{BASE_BRANCH}..{branch}").stdout or ""):
+            log(f"DEVIATION: item asks to add tests but the committed diff added no test definition — "
+                f"not ticking '{goal[:60]}'")
             item_deviated = True
 
     # LEAK GUARD (PUBLIC repos only) — the change is committed but NOT yet pushed. Scan the committed
@@ -2480,10 +2553,25 @@ def one_iteration() -> None:
             _mark_backlog_done(goal)
             _clear_failure_state(goal)    # a real landed ship resets the item's escalation tally
     heartbeat(status="sleeping", phase="sleep", last_pr=pr, last_summary=summary)
-    # 'shipped' only when the change actually landed (or is in-flight to merge); an auto-merge PR
-    # left un-merged on red/awaiting CI, or a failed push, records 'blocked' so it is not counted as
-    # a success and a streak of them is diagnosable (ci_red_streak) instead of silently 'shipped'.
-    _record_history("shipped" if landed else "blocked", branch, summary)
+    # History status: 'shipped' only when the change truly LANDED; otherwise 'blocked' so it is not
+    # counted as success and a streak is diagnosable (ci_red_streak). In auto-merge mode "landed" means
+    # a CONFIRMED MERGE — a native-auto-merge handoff ('auto-merge queued (awaiting CI)') has NOT yet
+    # merged onto the integration branch, so it records 'blocked'; if it never lands, the streak surfaces
+    # it instead of a dangling PR looking like silent success (hygiene-4). The backlog item is still
+    # ticked above (on _ship_succeeded) so the queued PR isn't re-shipped as a duplicate next iteration.
+    _record_history(_ship_outcome(pr, SHIP), branch, summary)
+
+
+def _ship_outcome(pr: dict, ship_mode: str) -> str:
+    """The history status for a completed ship. 'shipped' = it landed (in pr-mode, the PR is open for
+    the human to merge); 'blocked' = it did NOT land and must not look like success. In auto-merge
+    mode "landed" means a CONFIRMED MERGE — an auto-merge PR left queued/open (awaiting or red CI) is
+    'blocked' so a streak that never merges is diagnosable via ci_red_streak (hygiene-4). pr/push/local
+    keep the _ship_succeeded notion (an opened PR / verified push / kept-local branch is success)."""
+    state = (pr.get("state") or "").lower()
+    if ship_mode == "auto-merge":
+        return "shipped" if ("merged" in state and "not merged" not in state) else "blocked"
+    return "shipped" if _ship_succeeded(pr) else "blocked"
 
 
 def _ship_succeeded(pr: dict) -> bool:
@@ -3211,14 +3299,18 @@ def main(argv=None) -> int:
                 break
             _refresh_config_from_registry()   # pick up dashboard edits to model/gate/reasoning/goal mid-loop
             one_iteration()
-            # REFLECT phase (pipeline.reflect): AFTER the iteration + its cleanup — shipped OR
-            # failed/deferred — distill one durable, deduplicated lesson from the recorded outcome and
-            # append it to the repo's LESSONS.md (ideate's novelty filter then steers away from dead ends).
-            reflect()
             if _HALTED:
                 log("halted after an unrecoverable revert failure — operator action required "
                     "(the repo is left at status=error/reverted for the supervisor to escalate)")
                 break
+            # REFLECT phase (pipeline.reflect): AFTER a NON-error iteration + its cleanup — shipped OR
+            # failed/deferred — distill one durable, deduplicated lesson from the recorded outcome and
+            # append it to the repo's LESSONS.md (ideate's novelty filter then steers away from dead ends).
+            # SKIP it after a terminal ERROR heartbeat (a preflight refusal): reflect() would call
+            # heartbeat(phase="reflect") and bury the diagnostic phase that solomon.diagnose() +
+            # monitor.should_restart() depend on, making a wedged repo look healthy.
+            if _hb.get("status") != "error":
+                reflect()
             if a.once:
                 break
             if a.max_iterations and _hb["iteration"] >= a.max_iterations:

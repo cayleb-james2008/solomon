@@ -28,6 +28,7 @@ from typing import Any
 _CREATE_NO_WINDOW = 0x08000000
 _DETACHED_PROCESS = 0x00000008
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
+_CREATE_NEW_CONSOLE = 0x00000010
 
 
 def hidden_subprocess_kwargs(
@@ -47,4 +48,14 @@ def hidden_subprocess_kwargs(
     return {"creationflags": flags, "startupinfo": startupinfo}
 
 
-__all__ = ["hidden_subprocess_kwargs"]
+def visible_console_kwargs() -> dict[str, Any]:
+    """Windows kwargs giving a child its OWN VISIBLE console window — for an INTERACTIVE child the
+    operator must see and respond to (e.g. ``gh auth login --web`` prints a one-time device code and
+    waits for the operator to authorize in the browser). Do NOT redirect the child's std streams when
+    using this, or the prompt/code is swallowed. No-op off Windows (the child inherits the terminal)."""
+    if sys.platform != "win32":
+        return {}
+    return {"creationflags": _CREATE_NEW_CONSOLE}
+
+
+__all__ = ["hidden_subprocess_kwargs", "visible_console_kwargs"]
