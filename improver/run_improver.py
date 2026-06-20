@@ -765,6 +765,39 @@ def _dirty_blocks_iteration(dirty: bool, cur_branch: str, base_branch: str) -> b
     return dirty and cur_branch == base_branch
 
 
+def _auto_stash_base(label: str) -> bool:
+    """Non-destructively clear a dirty BASE tree by STASHING it (never deleting), so the loop
+    self-resumes instead of wedging on operator-action-required.
+
+    A dirty base (tracked changes) or operator-looking untracked files used to force the loop to
+    refuse + self-stop until a human ran `git commit`/`stash`/`rm`. Stashing achieves the same clean
+    base AUTOMATICALLY while destroying nothing: the content is preserved in the stash list
+    (recover with `git stash list` / `git stash pop`), and nothing is pushed — the stash is local —
+    so this can never leak work to a public remote.
+
+    Returns True iff the tree is VERIFIABLY clean afterward (tracked-clean AND no untracked
+    non-ignored files). Best-effort + fail-safe: on any git error or a still-dirty tree it returns
+    False so the caller falls back to the existing refuse/self-stop path (which also never destroys
+    work). `git stash --include-untracked` leaves ignored files (e.g. private profiles/) untouched."""
+    msg = f"solomon-auto-preflight {label} {_now()}"
+    res = git("stash", "push", "--include-untracked", "-m", msg)
+    if res.returncode != 0:
+        log(f"auto-stash: git stash failed ({(res.stderr or '').strip()[:160]}) — "
+            f"falling back to refuse/self-stop (no work destroyed)")
+        return False
+    if tree_dirty() or _untracked_non_ignored_files():
+        log("auto-stash: tree still dirty after stash — falling back to refuse/self-stop")
+        return False
+    try:                                      # record the stash label so recovery is one command
+        RUNTIME.mkdir(parents=True, exist_ok=True)
+        (RUNTIME / "last_auto_stash.txt").write_text(msg + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    log(f"auto-stash: stashed dirty base into '{msg}' — base clean, resuming "
+        f"(recover with: git -C <repo> stash list / stash pop)")
+    return True
+
+
 def head_sha() -> str:
     return git("rev-parse", "HEAD").stdout.strip()
 
@@ -1910,6 +1943,21 @@ def one_iteration() -> None:
               else f"rsi/iter-{_stamp()}")
 
     cur_branch = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    # AUTO-RECOVER (non-destructive): a dirty BASE tree, or untracked operator-looking files on the
+    # base, used to wedge the loop — it refused + self-stopped, requiring a human to commit/stash/remove
+    # before it could resume. Stash them instead: the work is preserved (git stash list/pop), the base
+    # is left pristine so this iteration proceeds, and nothing is pushed (the stash is local) so it can
+    # never leak to a public remote. Only on the BASE branch (a dirty rsi/* is a dead-run leftover the
+    # forced preflight below clears). The agent-artifact fast-path is left intact: when the base is
+    # tracked-clean and the only untracked files are the agent's OWN debris, auto-stash does NOT fire —
+    # those still flow to the recovery path (staged on the rsi branch, gated, shipped). If the stash
+    # fails, we fall through to the existing refuse/self-stop logic (which also never destroys work).
+    if cur_branch == BASE_BRANCH:
+        _untracked = _untracked_non_ignored_files()
+        _refuse_untracked = bool(_untracked) and (
+            _untracked_recovery_action(_untracked, _repo_artifact_patterns(NAME)) == "refuse")
+        if (tree_dirty() or _refuse_untracked) and _auto_stash_base(branch):
+            log("auto-recover: base tree was dirty/untracked — stashed (recoverable) and resuming")
     if _dirty_blocks_iteration(tree_dirty(), cur_branch, BASE_BRANCH):
         # Review finding #3: a dirty BASE tree blocks preflight every iteration but the runner never
         # stopped — it spun forever on the same refusal while the watchdog kept restarting it. After
