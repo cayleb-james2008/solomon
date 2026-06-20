@@ -1284,13 +1284,20 @@ def _repo_deny_terms(name: str) -> list:
 
 
 def _git_add_all():
-    """`git add -A`, but for a PUBLIC repo exclude its `private_paths` via an exclude pathspec — so an
-    agent that un-ignored a private path (edited .gitignore) STILL cannot stage it into a pushed commit.
-    Non-destructive: excluded files simply stay unstaged and on disk. Private repos: plain `git add -A`."""
-    paths = _repo_private_paths(NAME) if _repo_is_public(NAME) else []
-    if paths:
-        return git("add", "-A", "--", ".", *[f":(exclude){p}" for p in paths])
-    return git("add", "-A")
+    """Stage everything with `git add -A`, then (PUBLIC repo) UNSTAGE its `private_paths` — so an agent
+    that un-ignored a private path (edited .gitignore) STILL cannot land it in a pushed commit.
+
+    Why not `git add -A -- . :(exclude)<priv>`: an explicit '.' pathspec makes git ERROR on ANY ignored
+    path it matches ("paths are ignored ... Use -f", e.g. sover's .runtime/data/profiles/ggg), failing
+    the whole iteration. Bare `git add -A` (no pathspec) silently SKIPS ignored files, which is what we
+    want — then we only need to unstage a private path the agent may have un-ignored. Non-destructive:
+    unstaged files stay on disk."""
+    r = git("add", "-A")
+    if _repo_is_public(NAME):
+        paths = _repo_private_paths(NAME)
+        if paths:
+            git("reset", "-q", "--", *paths)   # unstage any private path that slipped in (no-op if none)
+    return r
 
 
 def _leak_in_diff(diff: str) -> str:
