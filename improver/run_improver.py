@@ -1307,25 +1307,8 @@ def _visual_gate_reason(vr_result) -> str | None:
 
 
 # ---- gate -----------------------------------------------------------------
-def run_gate(changed_files: list[str] | None = None) -> tuple:
-    """Authoritative test gate. Returns (green, {passed,failed,errors,green}, tail).
-
-    If a custom GATE_CMD was supplied (--gate), run THAT via the shell in REPO;
-    green = returncode 0 (pytest-style N passed/failed parsed when present, else
-    passed/failed=0). Otherwise run the built-in pytest gate.
-
-    If changed_files is provided, expand the gate to include correlated tests that
-    import or reference the changed modules. This ensures the gate runs tests that
-    are CORRELATED with the changes, not just the directly-changed files.
-
-    A hung gate (an infinite loop in a test, a test that waits on input) would otherwise
-    freeze the iteration forever with the lock held; GATE_TIMEOUT bounds it — on timeout the
-    gate is reported RED so the iteration reverts instead of hanging."""
-    # Expand gate command to include correlated tests if changed_files provided
-    effective_gate_cmd = GATE_CMD
-    if changed_files:
-        effective_gate_cmd = _expand_gate_with_correlated(GATE_CMD, changed_files)
-
+def _run_gate_once(effective_gate_cmd: str) -> tuple:
+    """Run the gate command ONCE and parse it. Returns (green, {...}, tail). See run_gate."""
     try:
         if effective_gate_cmd:
             # GATE_CMD is a TRUSTED, operator-only shell command (set via repos.json / the Config UI).
@@ -1373,6 +1356,41 @@ def run_gate(changed_files: list[str] | None = None) -> tuple:
     tests = {"passed": passed, "failed": failed, "errors": errors,
              "skipped": skipped, "collected": collected, "green": p.returncode == 0}
     return p.returncode == 0, tests, out[-1500:]
+
+
+def run_gate(changed_files: list[str] | None = None) -> tuple:
+    """Authoritative test gate. Returns (green, {passed,failed,errors,green}, tail).
+
+    If a custom GATE_CMD was supplied (--gate), run THAT via the shell in REPO;
+    green = returncode 0. Otherwise run the built-in pytest gate. If changed_files is
+    provided, expand the gate to include correlated tests. GATE_TIMEOUT bounds a hung gate.
+
+    Retry-on-empty: a run that discovers ZERO tests (pytest exit 5 / empty summary —
+    collected=passed=failed=errors=0, not a timeout) is almost always a TRANSIENT collection
+    glitch (an FS race during the per-iteration branch checkout, a momentary import hiccup) on
+    a managed repo that really has hundreds of tests. Trusting it would bail the whole iteration
+    as a false 'base gate RED'. So retry a few times before accepting an empty result; a repo
+    that genuinely has no tests just retries then accepts 0 (same outcome)."""
+    import time as _time
+    effective_gate_cmd = GATE_CMD
+    if changed_files:
+        effective_gate_cmd = _expand_gate_with_correlated(GATE_CMD, changed_files)
+    last = None
+    for attempt in range(3):
+        green, tests, tail = _run_gate_once(effective_gate_cmd)
+        last = (green, tests, tail)
+        empty = (not tests.get("timeout")
+                 and (tests.get("collected") or 0) == 0
+                 and (tests.get("passed") or 0) == 0
+                 and (tests.get("failed") or 0) == 0
+                 and (tests.get("errors") or 0) == 0)
+        if not empty:
+            return green, tests, tail
+        if attempt < 2:
+            log(f"gate discovered 0 tests (attempt {attempt + 1}/3) — likely a transient "
+                f"collection glitch on a repo that has tests; retrying in 3s")
+            _time.sleep(3)
+    return last
 
 
 # Every way a test can be neutered by a skip/xfail — not just the decorator form: the marker
