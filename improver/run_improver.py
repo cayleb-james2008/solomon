@@ -565,6 +565,14 @@ def log(msg: str) -> None:
 
 
 def heartbeat(**fields) -> None:
+    # Once an iteration parks a TERMINAL ERROR heartbeat (status="error" with a diagnostic
+    # phase="preflight"/"reverted"), a later non-status update — notably reflect()'s
+    # heartbeat(phase="reflect") — must NOT clobber that phase. solomon.diagnose() classifies the
+    # wedge by (status, phase) and monitor.should_restart() refuses a blind restart on phase="reverted";
+    # both break if the phase is overwritten. Freeze status+phase until a caller explicitly sets a new
+    # status (a fresh iteration -> "iterating"/"idle", or the finally -> "stopped").
+    if _hb.get("status") == "error" and "status" not in fields:
+        fields.pop("phase", None)
     _hb.update(fields)
     _hb["updated_at"] = _now()
     _runtime_atomic_write(HEARTBEAT, json.dumps(_hb, indent=2))
@@ -3211,14 +3219,18 @@ def main(argv=None) -> int:
                 break
             _refresh_config_from_registry()   # pick up dashboard edits to model/gate/reasoning/goal mid-loop
             one_iteration()
-            # REFLECT phase (pipeline.reflect): AFTER the iteration + its cleanup — shipped OR
-            # failed/deferred — distill one durable, deduplicated lesson from the recorded outcome and
-            # append it to the repo's LESSONS.md (ideate's novelty filter then steers away from dead ends).
-            reflect()
             if _HALTED:
                 log("halted after an unrecoverable revert failure — operator action required "
                     "(the repo is left at status=error/reverted for the supervisor to escalate)")
                 break
+            # REFLECT phase (pipeline.reflect): AFTER a NON-error iteration + its cleanup — shipped OR
+            # failed/deferred — distill one durable, deduplicated lesson from the recorded outcome and
+            # append it to the repo's LESSONS.md (ideate's novelty filter then steers away from dead ends).
+            # SKIP it after a terminal ERROR heartbeat (a preflight refusal): reflect() would call
+            # heartbeat(phase="reflect") and bury the diagnostic phase that solomon.diagnose() +
+            # monitor.should_restart() depend on, making a wedged repo look healthy.
+            if _hb.get("status") != "error":
+                reflect()
             if a.once:
                 break
             if a.max_iterations and _hb["iteration"] >= a.max_iterations:
