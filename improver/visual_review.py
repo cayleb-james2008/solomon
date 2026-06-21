@@ -19,7 +19,6 @@ import base64
 import json
 import os
 import subprocess
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,52 +32,10 @@ CONTROL = HERE.parent
 # visual_review.md contract — the system prompt for the vision agent
 VISUAL_REVIEW_MD = HERE / "visual_review.md"
 VISION_EXT = HERE / "provider.ts"   # unified provider shim; RSI_PROVIDER=vision-cloud selects the vision config
-CAPTURE_JS = HERE / "capture.js"  # legacy helper path; the active capture function uses AgentBrowser
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _ts_stamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-
-
-def _legacy_playwright_capture(base_url: str, pages: list, timeout: int = 60) -> dict | None:
-    """Run capture.js via node, parse its JSON stdout output. Returns the capture result
-    or None on failure (never raises — visual review is best-effort)."""
-    import shutil
-    node = shutil.which("node")
-    if not node:
-        return None
-    pages_json = json.dumps(pages or ["/"])
-    try:
-        p = subprocess.run(
-            [node, str(CAPTURE_JS), base_url, pages_json],
-            capture_output=True, text=True, timeout=timeout,
-            env=_clean_env_for_capture(), **hidden_subprocess_kwargs(),
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    if p.returncode != 0:
-        return None
-    # parse the last non-empty line as JSON
-    for line in reversed((p.stdout or "").splitlines()):
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                return json.loads(line)
-            except json.JSONDecodeError:
-                break
-    return None
-
-
-def _clean_env_for_capture() -> dict:
-    """Env for the capture subprocess — strip secrets + python path pollution."""
-    env = dict(os.environ)
-    for k in ("PYTHONPATH", "PYTHONHOME", "GITHUB_TOKEN", "GH_TOKEN"):
-        env.pop(k, None)
-    return env
 
 
 def _run_capture(base_url: str, pages: list, runtime_dir: Path,

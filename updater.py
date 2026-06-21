@@ -71,7 +71,7 @@ def _find_solomon_repo() -> Path | None:
     return None
 
 
-def _run(cmd: list[str], cwd: str | None = None, check: bool = False) -> subprocess.CompletedProcess:
+def _run(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
     """Run a subprocess, capturing output. CREATE_NO_WINDOW on win32 so the updater's own
     console is the only window the operator sees."""
     kw = {"capture_output": True, "text": True, "cwd": cwd}
