@@ -114,6 +114,15 @@ class TestNewSkipMarkers:
         assert len(result) == 1
         assert "pytest.mark.xfail" in result[0]
 
+    def test_aliased_mark_skip_decorator(self):
+        """Detect a skip decorator imported under an alias (from pytest import mark -> @mark.skip,
+        import pytest as pt -> @pt.mark.skip) — the prefix-hardcoded regex used to miss these, letting
+        an agent weaken a test past the anti-gaming rail."""
+        for diff in ("+    @mark.skip(reason='x')", "+    @pt.mark.skip()", "+    @mark.xfail"):
+            assert run_improver._new_skip_markers(diff), f"missed aliased skip: {diff}"
+        # guard: an unrelated `.mark.` / benchmark must NOT false-positive
+        assert run_improver._new_skip_markers("+    benchmark.skip_warmup()") == []
+
     def test_pytest_skip_call(self):
         """Detect pytest.skip() call."""
         diff = "+def test_something():\n+    pytest.skip('reason')"
