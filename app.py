@@ -352,6 +352,53 @@ class Api:
         return {"ok": True, "auto_ai_fix": bool(v)}
 
 
+def _health_payload() -> dict:
+    """The JSON body the health endpoint serves: overall readiness + a per-repo diagnose summary.
+    Pure (no socket) so it can be unit-tested directly."""
+    repos = []
+    for r in control.load_repos():
+        if not isinstance(r, dict):
+            continue
+        name = r.get("name")
+        if solomon:
+            try:
+                d = solomon.diagnose(r)
+                repos.append({"name": name, "running": d.get("running"),
+                              "healthy": d.get("healthy"), "category": d.get("category"),
+                              "evidence": d.get("evidence")})
+                continue
+            except Exception as e:  # noqa: BLE001 — one bad repo must not blank the endpoint
+                repos.append({"name": name, "category": "?", "error": str(e)})
+                continue
+        repos.append({"name": name, "running": control.is_running(r)})
+    return {"ok": True, "health": control.health(), "repos": repos}
+
+
+def serve_health(port: int = 8787):
+    """Headless/plug-and-play monitoring: a tiny stdlib HTTP server on 127.0.0.1 that serves the
+    health payload as JSON on GET /health (404 elsewhere). stdlib only — no web framework. Blocks."""
+    import http.server
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 — http.server's required method name
+            if self.path.split("?", 1)[0] != "/health":
+                self.send_error(404, "not found")
+                return
+            body = json.dumps(_health_payload()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):  # silence the default stderr access log
+            pass
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), _H)
+    print(f"Solomon health endpoint: http://127.0.0.1:{httpd.server_address[1]}/health")
+    httpd.serve_forever()
+
+
 def main():
     if sys.platform == "win32":
         try:  # distinct taskbar identity so Windows uses Solomon's icon (not python's) + groups/pins correctly
@@ -400,7 +447,11 @@ if __name__ == "__main__":
             # setting is on; restart only if auto_push. (The interactive Supervise button is RUNG-0 +
             # the explicit 'Allow AI fix' tick only — the global setting never auto-fires it.)
             print(json.dumps(api.supervise(arg, unattended=True), indent=2))
+        elif cmd == "--serve-health":
+            # headless operator: poll http://127.0.0.1:<port>/health for readiness + per-repo state.
+            serve_health(int(arg) if arg and arg.isdigit() else 8787)
         else:
-            print("usage: Solomon --state | --start <name> | --stop <name> | --supervise [name]")
+            print("usage: Solomon --state | --start <name> | --stop <name> | --supervise [name] "
+                  "| --serve-health [port]")
         sys.exit(0)
     main()

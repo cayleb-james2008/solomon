@@ -229,3 +229,34 @@ def test_watchdog_restarts_a_crashed_loop():
     assert mon.should_restart(running=False, hb=halt, paused=False, stop_pending=False) is False
     # a crashed loop the operator paused stays paused (no surprise restart)
     assert mon.should_restart(running=False, hb=crashed, paused=True, stop_pending=False) is False
+
+
+# --------------------------------------------------------------------------- #
+# HARDEN-J — the empty-goal guard skips a dead iteration instead of fabricating work
+# --------------------------------------------------------------------------- #
+def test_needs_goal_skip_fires_on_empty_goal_plus_placeholder(monkeypatch):
+    """No north-star GOAL + the generic placeholder item -> skip (the asmodeus no-objective wedge)."""
+    m = _load_runner()
+    monkeypatch.setattr(m, "GOAL", "   ")          # whitespace-only counts as empty
+    assert m._needs_goal_skip("model-chosen improvement") is True
+
+
+def test_needs_goal_skip_fires_on_empty_goal_plus_deferred(monkeypatch):
+    """No GOAL + an already-deferred item (every real item exhausted) -> skip, don't loop on it."""
+    m = _load_runner()
+    monkeypatch.setattr(m, "GOAL", "")
+    assert m._needs_goal_skip("rewrite the parser  (deferred: agent could not implement)") is True
+
+
+def test_needs_goal_skip_not_fired_when_real_backlog_item(monkeypatch):
+    """A repo with a REAL backlog item but no GOAL still runs (the conjunction is required)."""
+    m = _load_runner()
+    monkeypatch.setattr(m, "GOAL", "")
+    assert m._needs_goal_skip("add a /metrics endpoint") is False
+
+
+def test_needs_goal_skip_not_fired_when_goal_set(monkeypatch):
+    """A real north-star GOAL is enough — even the placeholder item runs (the goal steers it)."""
+    m = _load_runner()
+    monkeypatch.setattr(m, "GOAL", "make the API 2x faster")
+    assert m._needs_goal_skip("model-chosen improvement") is False

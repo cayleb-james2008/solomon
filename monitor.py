@@ -34,9 +34,33 @@ import solomon   # noqa: E402
 DISABLED = os.path.join(HERE, "runtime", "_watchdog.disabled")
 MON_LOG = os.path.join(HERE, "runtime", "_monitor.jsonl")
 
+STALL_SWEEPS = 3   # consecutive error/preflight sweeps (incl. this one) that mark a lane STALLED
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _recent_snapshots(name: str, k: int) -> list:
+    """The last `k` persisted _monitor.jsonl snapshots for repo `name` (oldest→newest), excluding the
+    current sweep (it hasn't been written yet — the caller appends it). [] on missing/corrupt file."""
+    try:
+        with open(MON_LOG, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict) and rec.get("repo") == name:
+            out.append(rec)
+    return out[-k:]
 
 
 def should_restart(running: bool, hb: dict, paused: bool, stop_pending: bool) -> bool:
@@ -142,6 +166,28 @@ def sweep() -> dict:
                 "status": hb2.get("status"), "phase": hb2.get("phase"),
                 "iteration": hb2.get("iteration"), "last_status": last.get("status"),
                 "diagnosis": diag}
+        # STALL DETECTOR: a lane that is STILL RUNNING but has repeated the SAME preflight refusal
+        # (status=error, phase=preflight) every sweep is wedged — it spins forever re-hitting an
+        # un-pushed base commit / untracked-file refusal, and a per-sweep snapshot alone reports it
+        # "running" so the operator never sees it. Compare across sweeps: if this snap AND the prior
+        # STALL_SWEEPS-1 persisted snaps are all error/preflight, escalate (do NOT auto-restart — a
+        # restart just re-hits the refusal). Anti-thrash: escalate once (skip if an escalation.json
+        # with this category already exists).
+        if snap["running"] and snap["status"] == "error" and snap["phase"] == "preflight":
+            window = _recent_snapshots(name, STALL_SWEEPS - 1) + [snap]
+            if (len(window) >= STALL_SWEEPS
+                    and all(s.get("status") == "error" and s.get("phase") == "preflight"
+                            for s in window)):
+                existing = solomon.read_escalation(r) or {}
+                if existing.get("category") != "running_stalled":
+                    actions.append(f"{name} STALLED: stuck in preflight for {STALL_SWEEPS} sweeps")
+                    try:
+                        solomon._write_escalation(r, {
+                            "category": "running_stalled",
+                            "evidence": (f"running but stuck in preflight for {STALL_SWEEPS} consecutive "
+                                         f"sweeps — {(hb2.get('last_summary') or '')[:200]}")})
+                    except Exception:  # noqa: BLE001 — a watchdog must never die on one bad repo
+                        pass
         snapshots.append(snap)
     return {"ts": _now(), "disabled": False, "actions": actions, "snapshots": snapshots}
 
