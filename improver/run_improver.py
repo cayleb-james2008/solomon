@@ -2246,7 +2246,7 @@ def one_iteration() -> None:
             heartbeat(status="error", phase="preflight",
                       last_summary=f"Base gate is RED before any change ({base_tests}). Fix the gate "
                                    f"command or the base; the loop can't measure a gain from a red base.")
-            log(f"base gate RED — skipping (preflight bail, not counted as an iteration)")
+            log("base gate RED — skipping (preflight bail, not counted as an iteration)")
             git("checkout", "--force", BASE_BRANCH)
             git("branch", "-D", branch)
             return
