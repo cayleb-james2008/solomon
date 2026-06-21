@@ -109,8 +109,8 @@ class AgentBrowser:
         try:
             # agent-browser may spawn a persistent daemon. Regular temp files avoid the
             # daemon retaining a PIPE handle and making subprocess.communicate wait forever.
-            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdout_file, \
-                    tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr_file:
+            with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as stdout_file, \
+                    tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as stderr_file:
                 result = subprocess.run(
                     command + args, stdout=stdout_file, stderr=stderr_file, text=True,
                     stdin=subprocess.DEVNULL, timeout=timeout, cwd=self.repo_path,
@@ -308,7 +308,11 @@ class AgentBrowser:
         if self._closed:
             return
         self._closed = True
-        if shutil.which("agent-browser"):
+        # Gate on the SAME resolver launch uses (env SOLOMON_AGENT_BROWSER / frozen bundle / PATH), not
+        # bare shutil.which: in the packaged exe agent-browser is bundled and NOT on PATH, so a which()
+        # gate skips the session-close CLI and leaks the persistent daemon + Chromium. _run_cli no-ops
+        # safely when no binary resolves.
+        if self._base_command()[0]:
             self._run_cli(["close"], timeout=10)
         for path in (self.state_file, self.frame_file):
             try:

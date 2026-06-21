@@ -99,6 +99,22 @@ def test_status_unavailable_when_fetch_fails(monkeypatch):
     assert "origin" in s["reason"]
 
 
+def test_apply_update_strips_pythonhome(monkeypatch, tmp_path):
+    # apply_update must spawn the updater with _clean_subenv (no leaked PYTHONHOME/PYTHONPATH that would
+    # crash the maki-venv 3.12 updater python / its PyInstaller rebuild at interpreter startup).
+    monkeypatch.setenv("PYTHONHOME", "C:/other/python")
+    monkeypatch.setenv("PYTHONPATH", "C:/junk")
+    monkeypatch.setattr(control, "_solomon_repo", lambda: str(tmp_path))
+    monkeypatch.setattr(control.os.path, "isfile", lambda p: True)   # updater exe "present" -> exe branch
+    captured = {}
+    monkeypatch.setattr(control.subprocess, "Popen",
+                        lambda args, **kw: captured.update(env=kw.get("env")) or types.SimpleNamespace())
+    res = control.apply_update()
+    assert res["ok"] and res["started"]
+    assert "PYTHONHOME" not in captured["env"] and "PYTHONPATH" not in captured["env"]
+    assert captured["env"].get("SOLOMON_HOME") == str(tmp_path)
+
+
 def test_current_sha(monkeypatch):
     _fake_git(monkeypatch, sha="deadbee")
     assert control.current_sha() == "deadbee"

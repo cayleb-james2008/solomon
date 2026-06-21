@@ -292,9 +292,16 @@ class Api:
             return {"ok": False, "error": "unknown repo"}
         allow = bool(allow_pi) or (unattended and self.get_auto_ai_fix())
         auto_push = self.get_auto_push()
-        results = [{"name": r.get("name"),
-                    **solomon.recover(r, allow_pi=allow, allow_restart=auto_push, auto_push=auto_push)}
-                   for r in targets]
+        # Per-repo guard (like get_state / _health_payload): one repo whose recover() raises must NOT
+        # abort the whole sweep — under `--supervise` that would exit non-zero with a traceback and leave
+        # every later repo un-recovered. Surface the failure per-repo and keep going.
+        results = []
+        for r in targets:
+            try:
+                results.append({"name": r.get("name"),
+                                **solomon.recover(r, allow_pi=allow, allow_restart=auto_push, auto_push=auto_push)})
+            except Exception as e:  # noqa: BLE001 — one bad repo must not abort the sweep
+                results.append({"name": r.get("name"), "ok": False, "error": str(e), "escalate": True})
         return {"ok": True, "results": results}
 
     def read_supervisor_log(self, name):

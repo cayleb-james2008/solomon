@@ -61,3 +61,32 @@ def test_launch_command_is_argv_not_shell(tmp_path, monkeypatch):
         assert isinstance(captured["args"], list)
         assert captured["kwargs"].get("shell") is False
         assert captured["kwargs"]["cwd"] != str(repo)
+
+
+def test_command_passes_literal_braces_through(tmp_path):
+    # a launch arg with literal { } (JSON blob / brace-glob / {0}) must NOT crash _command via str.format
+    repo = tmp_path / "repo"; repo.mkdir()
+    sb = sandbox.Sandbox(
+        {"launch": ["node", "server.js", '--cfg={"host":"127.0.0.1"}', "src/**/*.{js,ts}", "{port}"]},
+        str(repo))
+    sb.port = 5173
+    sb.state_dir = str(tmp_path / "s")
+    sb.work_dir = str(repo)
+    args = sb._command()
+    assert '--cfg={"host":"127.0.0.1"}' in args             # literal braces preserved (no KeyError)
+    assert "src/**/*.{js,ts}" in args
+    assert "5173" in args                                   # {port} still substituted
+
+
+def test_enter_cleans_up_on_boot_failure(tmp_path):
+    # a missing launch binary (Popen FileNotFoundError) before _wait_health must NOT leak the repo-mirror
+    # temp dir — __exit__ never runs when __enter__ raises, so the boot must self-clean.
+    import glob, tempfile
+    repo = tmp_path / "repo"; repo.mkdir()
+    (repo / "app.py").write_text("print(1)", encoding="utf-8")
+    before = set(glob.glob(os.path.join(tempfile.gettempdir(), "solomon-sandbox-*")))
+    sb = sandbox.Sandbox({"launch": ["this_binary_does_not_exist_xyz_123", "app.py"]}, str(repo))
+    with pytest.raises(Exception):
+        sb.__enter__()
+    after = set(glob.glob(os.path.join(tempfile.gettempdir(), "solomon-sandbox-*")))
+    assert after == before                                  # no leaked sandbox temp dir
