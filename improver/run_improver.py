@@ -1412,7 +1412,10 @@ def run_gate() -> tuple:
 # raise SkipTest. A "green" gate that simply skipped the failing tests is gamed, so anti-gaming
 # watches for any of these being ADDED.
 _SKIP_MARKER_RE = re.compile(
-    r"pytest\.mark\.(?:skip|skipif|xfail)\b"
+    # match the marker decorator under ANY import alias — `pytest.mark.skip`, `mark.skip`
+    # (from pytest import mark), `pt.mark.skip` (import pytest as pt) — so an aliased import can't
+    # weaken a test past the anti-gaming rail. `\b` guard keeps `benchmark.skip` etc. from matching.
+    r"\bmark\.(?:skip|skipif|xfail)\b"
     r"|pytest\.(?:skip|xfail)\s*\("
     r"|unittest\.skip"
     r"|\.skipTest\s*\("
