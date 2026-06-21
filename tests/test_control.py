@@ -192,7 +192,7 @@ def test_set_key_unknown_provider(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# ship mode + gate + publish
+# ship mode + gate
 # --------------------------------------------------------------------------- #
 def test_project_ship_defaults_and_override():
     assert control.project_ship({}) == "pr"            # default
@@ -232,24 +232,6 @@ def test_load_repos_carries_is_git_and_has_remote(tmp_path, monkeypatch):
     assert by_name["plainrepo"]["is_git"] is False
     assert by_name["gitrepo"]["has_remote"] is False   # no origin configured
     assert by_name["plainrepo"]["has_remote"] is False
-
-
-def test_publish_to_github_not_connected(tmp_path, monkeypatch):
-    _projects(tmp_path, monkeypatch, "alpha")
-    _repos_json(tmp_path, monkeypatch, [])
-    # github not connected -> early return, no git/gh/network side effects
-    monkeypatch.setattr(control, "github_status", lambda: {"ready": False, "login": None})
-    r = control.publish_to_github("alpha")
-    assert r["ok"] is False
-    assert "GitHub not connected" in r["error"]
-
-
-def test_publish_to_github_unknown_repo(tmp_path, monkeypatch):
-    monkeypatch.setattr(control, "PROJECTS_DIR", str(tmp_path / "noproj"))
-    _repos_json(tmp_path, monkeypatch, [])
-    monkeypatch.setattr(control, "github_status", lambda: {"ready": True, "login": "me"})
-    r = control.publish_to_github("ghost")
-    assert r["ok"] is False and "unknown repo" in r["error"]
 
 
 # --------------------------------------------------------------------------- #

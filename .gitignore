@@ -12,6 +12,8 @@ runtime/
 # per-operator improver state (backlog + lessons churn per machine, like runtime/)
 improver/*/backlog.md
 improver/*/LESSONS.md
+# test-only default-name ("repo") contract scratch; recreated by the e2e suite, no managed repo uses it
+improver/repo/
 .env
 .solomon.json
 .rsi-control.json

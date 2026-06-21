@@ -227,30 +227,6 @@ def project_sandbox(repo):
     return sb
 
 
-def read_visual_review(repo):
-    """Read the latest visual review report from runtime/<name>/visual_review/report.json.
-    Returns the report dict (with screenshot paths) or None if no review has been run."""
-    rt = _runtime_dir(repo)
-    if not rt:
-        return None
-    p = os.path.join(rt, "visual_review", "report.json")
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            report = json.load(f)
-        # also list screenshot files so the UI can serve them
-        shot_dir = os.path.join(rt, "visual_review")
-        shots = []
-        if os.path.isdir(shot_dir):
-            for fn in sorted(os.listdir(shot_dir)):
-                if fn.endswith(".png"):
-                    shots.append(fn)
-        if isinstance(report, dict):
-            report["screenshot_files"] = shots
-        return report
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
 def set_repo_config(name, provider=None, model=None, ship=None, gate=None,
                     pr_target_branch=None, interval=None, max_iterations=None,
                     reasoning=None, goal=None, sandbox=None, phases=None):
@@ -863,64 +839,6 @@ def connect_project(spec, goal=None, ship="pr", visual_gate=None, provider=None)
         "provider_ready": bool(keys_status().get(project_provider(entry))),
         "sandbox_configured": bool(project_sandbox(entry)),
     }
-
-
-def publish_to_github(name, private=True):
-    """Publish a local project to GitHub: git-init if needed, ensure an initial
-    commit, then `gh repo create <name> --source <path> --remote origin --push`.
-    Returns {ok:true,url} or {ok:false,error}. Requires GitHub connected."""
-    repo = next((r for r in load_repos() if r.get("name") == name), None)
-    if not repo:
-        return {"ok": False, "error": f"unknown repo: {name}"}
-    path = _repo_path(repo)
-    if not path or not os.path.isdir(path):
-        return {"ok": False, "error": "repo has no valid 'path'"}
-    gh_info = github_status()
-    if not gh_info.get("ready"):
-        return {"ok": False, "error": "GitHub not connected — run gh auth login (Connect GitHub)"}
-    git = _which_git()
-    if not git:
-        return {"ok": False, "error": "git not found"}
-    gh = _which_gh()
-    if not gh:
-        return {"ok": False, "error": "gh not found"}
-    login = gh_info.get("login") or "rsi-control"
-
-    def g(*args):
-        return _run([git, "-C", path, *args])
-
-    try:
-        # 1. git init if needed
-        if not os.path.exists(os.path.join(path, ".git")):
-            init = g("init", "-b", "main")
-            if init.returncode != 0:
-                return {"ok": False, "error": (init.stderr or init.stdout or "git init failed").strip()}
-        # 2. ensure a local identity (only set if missing)
-        if not (g("config", "user.name").stdout or "").strip():
-            g("config", "user.name", login)
-            g("config", "user.email", f"{login}@users.noreply.github.com")
-        # 3. ensure an initial commit (HEAD missing == empty repo)
-        if g("rev-parse", "--verify", "HEAD").returncode != 0:
-            g("add", "-A")
-            commit = g("commit", "-m", "Initial commit")
-            if commit.returncode != 0:
-                return {"ok": False,
-                        "error": (commit.stderr or commit.stdout or "initial commit failed").strip()}
-        # 4. create the GitHub repo + push
-        vis = "--private" if private else "--public"
-        create = _run([gh, "repo", "create", name, "--source", path,
-                       "--remote", "origin", "--push", vis], cwd=path)
-    except OSError as e:
-        return {"ok": False, "error": str(e)}
-    if create.returncode != 0:
-        return {"ok": False, "error": (create.stderr or create.stdout or "gh repo create failed").strip()}
-    url = None
-    for line in ((create.stdout or "") + "\n" + (create.stderr or "")).splitlines():
-        line = line.strip()
-        if "github.com/" in line and line.startswith("http"):
-            url = line
-            break
-    return {"ok": True, "url": url}
 
 
 # --------------------------------------------------------------------------- #
