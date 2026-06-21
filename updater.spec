@@ -2,8 +2,10 @@
 """PyInstaller spec for the Solomon Updater — a standalone console exe that pulls the
 latest from the solomon git repo, rebuilds Solomon.exe if needed, then launches it.
 
-Build with:
-  <maki-venv-python> -m PyInstaller --noconfirm --distpath dist --workpath build updater.spec
+Build with (note --distpath dist/updater: PyInstaller names the onedir after the COLLECT
+name 'SolomonUpdater', and control.apply_update looks for it at
+dist/updater/SolomonUpdater/SolomonUpdater.exe):
+  <maki-venv-python> -m PyInstaller --noconfirm --distpath dist/updater --workpath build updater.spec
 
 The updater is a CONSOLE exe (console=True) so the operator sees the update/build progress.
 It depends only on the Python stdlib (no pywebview, no third-party deps) so the build is fast

@@ -41,14 +41,20 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _recent_snapshots(name: str, k: int) -> list:
+def _recent_snapshots(name: str, k: int, max_age_s: float | None = None) -> list:
     """The last `k` persisted _monitor.jsonl snapshots for repo `name` (oldest→newest), excluding the
-    current sweep (it hasn't been written yet — the caller appends it). [] on missing/corrupt file."""
+    current sweep (it hasn't been written yet — the caller appends it). [] on missing/corrupt file.
+
+    `max_age_s`: when set, drop records older than that (and any undated/unparseable record) BEFORE
+    taking the last `k`. A stall window must be temporally adjacent — otherwise stale snapshots from a
+    resolved wedge days ago (e.g. across a kill-switch pause) plus one fresh break would be miscounted
+    as "consecutive sweeps" and false-escalate."""
     try:
         with open(MON_LOG, "r", encoding="utf-8") as f:
             lines = f.read().splitlines()
     except OSError:
         return []
+    now = datetime.now(timezone.utc)
     out = []
     for line in lines:
         line = line.strip()
@@ -58,8 +64,16 @@ def _recent_snapshots(name: str, k: int) -> list:
             rec = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(rec, dict) and rec.get("repo") == name:
-            out.append(rec)
+        if not (isinstance(rec, dict) and rec.get("repo") == name):
+            continue
+        if max_age_s is not None:
+            try:
+                t = datetime.strptime(rec.get("ts"), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue                 # undated/unparseable -> can't prove recency -> not part of a streak
+            if (now - t).total_seconds() > max_age_s:
+                continue
+        out.append(rec)
     return out[-k:]
 
 
@@ -108,6 +122,90 @@ def _base_is_clean(path) -> bool:
     return r.returncode == 0 and not (r.stdout or "").strip()
 
 
+def _sweep_repo(r: dict, auto_push: bool) -> tuple:
+    """Process ONE repo for sweep(): returns (actions:list, snap:dict). The caller runs this inside a
+    blanket try/except so one bad repo can never abort the whole sweep — the module's documented
+    'a watchdog must never die on one bad repo' contract (previously only solomon.recover was guarded)."""
+    actions = []
+    name = r["name"]
+    rt = control._runtime_dir(r)
+    paused = bool(rt and os.path.exists(os.path.join(rt, "paused")))
+    stop_pending = bool(rt and os.path.exists(os.path.join(rt, "stop")))
+    running = control.is_running(r)
+    hb = control.read_heartbeat(r) or {}
+    # Anti-wedge: the runner self-stops on a PERSISTENTLY dirty base (STOP sentinel +
+    # reason="dirty_base_persistent") so it doesn't spin forever — but that sentinel otherwise pins
+    # the lane DEAD until a human clicks Start (the "leave it on, come back to a dead lane" wedge).
+    # If the base is now CLEAN again, clear the self-written sentinel so should_restart heals the
+    # lane automatically. Safe: only fires on the runner's own reason marker AND a verified-clean
+    # tree, so it never thrashes and never touches a true operator Stop (status="stopped", no reason).
+    if (not running and not paused and stop_pending
+            and hb.get("status") == "error"
+            and hb.get("reason") == "dirty_base_persistent"
+            and _base_is_clean(control._repo_path(r))):
+        try:
+            os.remove(os.path.join(rt, "stop"))
+            stop_pending = False
+            actions.append(f"{name} auto-recover: base clean again — cleared dirty_base_persistent stop")
+        except OSError:
+            pass
+    restarted = False
+    if should_restart(running, hb, paused, stop_pending):
+        res = control.start(r, auto_push=auto_push)
+        restarted = bool(res.get("ok") and not res.get("already"))
+        actions.append(f"restarted {name} (pid {res.get('pid')})" if restarted
+                       else f"restart {name} FAILED: {res.get('error')}")
+    # RUNG-0 deterministic recovery (never a pi fix here: allow_pi=False). Skip ALL auto-action on an
+    # operator-PAUSED lane — `paused` means "hands off this lane for the automated sweep" (module
+    # docstring), so the watchdog must not stop/restart/reset_to_base it. should_restart already honors
+    # paused; recover() did NOT, so a paused lane could still be stomped (stuck->stop+start, dirty->reset).
+    if not paused:
+        try:
+            rec = solomon.recover(r, allow_pi=False, allow_restart=auto_push, auto_push=auto_push)
+            if rec.get("actions_taken"):
+                actions.append(f"{name} recover: {','.join(rec['actions_taken'])}")
+            if rec.get("escalate"):
+                actions.append(f"{name} ESCALATED: {rec.get('category')}")
+        except Exception as e:  # noqa: BLE001 — a watchdog must never die on one bad repo
+            actions.append(f"{name} recover error: {e}")
+    hist = control.read_history(r, limit=1)
+    last = hist[-1] if hist else {}
+    hb2 = control.read_heartbeat(r) or {}
+    try:
+        diag = solomon.diagnose(r).get("category")
+    except Exception:  # noqa: BLE001
+        diag = "?"
+    snap = {"ts": _now(), "repo": name, "running": control.is_running(r),
+            "restarted": restarted, "paused": paused,
+            "status": hb2.get("status"), "phase": hb2.get("phase"),
+            "iteration": hb2.get("iteration"), "last_status": last.get("status"),
+            "diagnosis": diag}
+    # STALL DETECTOR: a lane that is STILL RUNNING but has repeated the SAME preflight refusal
+    # (status=error, phase=preflight) every sweep is wedged — it spins forever re-hitting an
+    # un-pushed base commit / untracked-file refusal, and a per-sweep snapshot alone reports it
+    # "running" so the operator never sees it. Compare across RECENT sweeps: if this snap AND the prior
+    # STALL_SWEEPS-1 TEMPORALLY-ADJACENT snaps are all error/preflight, escalate (do NOT auto-restart —
+    # a restart just re-hits the refusal). The max_age_s recency bound stops stale snaps from a resolved
+    # wedge days ago (across a kill-switch pause) from being miscounted as a fresh streak. Anti-thrash:
+    # escalate once (skip if an escalation.json with this category already exists).
+    if snap["running"] and snap["status"] == "error" and snap["phase"] == "preflight":
+        window = _recent_snapshots(name, STALL_SWEEPS - 1, max_age_s=STALL_SWEEPS * 600) + [snap]
+        if (len(window) >= STALL_SWEEPS
+                and all(s.get("status") == "error" and s.get("phase") == "preflight"
+                        for s in window)):
+            existing = solomon.read_escalation(r) or {}
+            if existing.get("category") != "running_stalled":
+                actions.append(f"{name} STALLED: stuck in preflight for {STALL_SWEEPS} sweeps")
+                try:
+                    solomon._write_escalation(r, {
+                        "category": "running_stalled",
+                        "evidence": (f"running but stuck in preflight for {STALL_SWEEPS} consecutive "
+                                     f"sweeps — {(hb2.get('last_summary') or '')[:200]}")})
+                except Exception:  # noqa: BLE001 — a watchdog must never die on one bad repo
+                    pass
+    return actions, snap
+
+
 def sweep() -> dict:
     """One watchdog pass over all repos. Returns {ts, actions:[...], snapshots:[...]}."""
     if os.path.exists(DISABLED):
@@ -117,77 +215,12 @@ def sweep() -> dict:
     for r in control.load_repos():
         if not isinstance(r, dict) or not r.get("name"):
             continue
-        name = r["name"]
-        rt = control._runtime_dir(r)
-        paused = bool(rt and os.path.exists(os.path.join(rt, "paused")))
-        stop_pending = bool(rt and os.path.exists(os.path.join(rt, "stop")))
-        running = control.is_running(r)
-        hb = control.read_heartbeat(r) or {}
-        # Anti-wedge: the runner self-stops on a PERSISTENTLY dirty base (STOP sentinel +
-        # reason="dirty_base_persistent") so it doesn't spin forever — but that sentinel otherwise pins
-        # the lane DEAD until a human clicks Start (the "leave it on, come back to a dead lane" wedge).
-        # If the base is now CLEAN again, clear the self-written sentinel so should_restart heals the
-        # lane automatically. Safe: only fires on the runner's own reason marker AND a verified-clean
-        # tree, so it never thrashes and never touches a true operator Stop (status="stopped", no reason).
-        if (not running and not paused and stop_pending
-                and hb.get("status") == "error"
-                and hb.get("reason") == "dirty_base_persistent"
-                and _base_is_clean(control._repo_path(r))):
-            try:
-                os.remove(os.path.join(rt, "stop"))
-                stop_pending = False
-                actions.append(f"{name} auto-recover: base clean again — cleared dirty_base_persistent stop")
-            except OSError:
-                pass
-        restarted = False
-        if should_restart(running, hb, paused, stop_pending):
-            res = control.start(r, auto_push=auto_push)
-            restarted = bool(res.get("ok") and not res.get("already"))
-            actions.append(f"restarted {name} (pid {res.get('pid')})" if restarted
-                           else f"restart {name} FAILED: {res.get('error')}")
-        # RUNG-0 deterministic recovery (never a pi fix here: allow_pi=False)
         try:
-            rec = solomon.recover(r, allow_pi=False, allow_restart=auto_push, auto_push=auto_push)
-            if rec.get("actions_taken"):
-                actions.append(f"{name} recover: {','.join(rec['actions_taken'])}")
-            if rec.get("escalate"):
-                actions.append(f"{name} ESCALATED: {rec.get('category')}")
+            repo_actions, snap = _sweep_repo(r, auto_push)
         except Exception as e:  # noqa: BLE001 — a watchdog must never die on one bad repo
-            actions.append(f"{name} recover error: {e}")
-        hist = control.read_history(r, limit=1)
-        last = hist[-1] if hist else {}
-        hb2 = control.read_heartbeat(r) or {}
-        try:
-            diag = solomon.diagnose(r).get("category")
-        except Exception:  # noqa: BLE001
-            diag = "?"
-        snap = {"ts": _now(), "repo": name, "running": control.is_running(r),
-                "restarted": restarted, "paused": paused,
-                "status": hb2.get("status"), "phase": hb2.get("phase"),
-                "iteration": hb2.get("iteration"), "last_status": last.get("status"),
-                "diagnosis": diag}
-        # STALL DETECTOR: a lane that is STILL RUNNING but has repeated the SAME preflight refusal
-        # (status=error, phase=preflight) every sweep is wedged — it spins forever re-hitting an
-        # un-pushed base commit / untracked-file refusal, and a per-sweep snapshot alone reports it
-        # "running" so the operator never sees it. Compare across sweeps: if this snap AND the prior
-        # STALL_SWEEPS-1 persisted snaps are all error/preflight, escalate (do NOT auto-restart — a
-        # restart just re-hits the refusal). Anti-thrash: escalate once (skip if an escalation.json
-        # with this category already exists).
-        if snap["running"] and snap["status"] == "error" and snap["phase"] == "preflight":
-            window = _recent_snapshots(name, STALL_SWEEPS - 1) + [snap]
-            if (len(window) >= STALL_SWEEPS
-                    and all(s.get("status") == "error" and s.get("phase") == "preflight"
-                            for s in window)):
-                existing = solomon.read_escalation(r) or {}
-                if existing.get("category") != "running_stalled":
-                    actions.append(f"{name} STALLED: stuck in preflight for {STALL_SWEEPS} sweeps")
-                    try:
-                        solomon._write_escalation(r, {
-                            "category": "running_stalled",
-                            "evidence": (f"running but stuck in preflight for {STALL_SWEEPS} consecutive "
-                                         f"sweeps — {(hb2.get('last_summary') or '')[:200]}")})
-                    except Exception:  # noqa: BLE001 — a watchdog must never die on one bad repo
-                        pass
+            actions.append(f"{r.get('name')} sweep error: {e}")
+            continue
+        actions.extend(repo_actions)
         snapshots.append(snap)
     return {"ts": _now(), "disabled": False, "actions": actions, "snapshots": snapshots}
 

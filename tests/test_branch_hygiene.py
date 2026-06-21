@@ -225,6 +225,25 @@ def test_clean_branch_preserves_base_wip_when_only_stray(tmp_path, monkeypatch):
 
 
 @requires_git
+def test_cleanup_worktrees_keeps_branch_under_detached_head(tmp_path, monkeypatch):
+    # detached HEAD built on an rsi/* branch's commit: cleanup must NOT force-delete that branch
+    # (abbrev-ref returns the literal "HEAD" so the name guard misses it), but still prune a stale rsi/*.
+    import control
+    work = _mk_repo(tmp_path)                                # on main
+    _git(work, "checkout", "-b", "rsi/iter-keep")
+    (work / "g.txt").write_text("wip"); _git(work, "add", "-A"); _git(work, "commit", "-m", "wip")
+    keep_sha = _git(work, "rev-parse", "HEAD").stdout.strip()
+    _git(work, "branch", "rsi/iter-stale", "main")          # stale rsi at the (different) base commit
+    _git(work, "checkout", "--detach", keep_sha)            # detached HEAD on the iter-keep commit
+    repo = _control_repo(tmp_path, monkeypatch, work)
+    res = control.cleanup_worktrees(repo)
+    assert res["ok"] is True
+    branches = _git(work, "branch", "--list", "rsi/*").stdout
+    assert "rsi/iter-keep" in branches                      # preserved (detached HEAD built on it)
+    assert "rsi/iter-stale" not in branches                 # genuinely stale rsi pruned
+
+
+@requires_git
 def test_clean_branch_refuses_when_running(tmp_path, monkeypatch):
     """clean_branch refuses while a loop is live — it must not yank git out from under a runner."""
     import control

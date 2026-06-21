@@ -19,13 +19,16 @@ def _cp(stdout="", returncode=0):
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
 
 
-def _fake_git(monkeypatch, *, behind="0", dirty="", has_origin=True, sha="abc1234", branch="main"):
+def _fake_git(monkeypatch, *, behind="0", ahead="0", dirty="", has_origin=True,
+              fetch_rc=0, sha="abc1234", branch="main"):
     """Patch control._run + _which_git + _solomon_repo to simulate a checkout state.
-    `behind` = stdout of `git rev-list --count HEAD..origin/<branch>`; `dirty` = porcelain stdout."""
+    `behind` = stdout of `git rev-list --count HEAD..origin/<branch>`; `ahead` = stdout of
+    `git rev-list --count origin/<branch>..HEAD` (divergence); `fetch_rc` = the fetch exit code
+    (non-zero simulates offline); `dirty` = porcelain stdout."""
     monkeypatch.setattr(control, "_which_git", lambda: "git")
     monkeypatch.setattr(control, "_solomon_repo", lambda: "C:/repo")
 
-    def run(args, cwd=None):
+    def run(args, cwd=None, timeout=None):
         # control._run is called as [git, "-C", repo, *real_args]; strip the first three.
         a = args[3:] if len(args) > 2 and args[1] == "-C" else args[1:]
         if a[:1] == ["rev-parse"] and "--abbrev-ref" in a:
@@ -35,11 +38,12 @@ def _fake_git(monkeypatch, *, behind="0", dirty="", has_origin=True, sha="abc123
         if a[:2] == ["remote", "get-url"]:
             return _cp("git@x" if has_origin else "", 0 if has_origin else 1)
         if a[:1] == ["fetch"]:
-            return _cp()
+            return _cp(returncode=fetch_rc)
         if a[:1] == ["status"]:
             return _cp(dirty)
         if a[:2] == ["rev-list", "--count"]:
-            return _cp(behind)
+            rng = a[2] if len(a) > 2 else ""
+            return _cp(ahead if rng.startswith("origin/") else behind)  # origin/<b>..HEAD = ahead
         return _cp()
 
     monkeypatch.setattr(control, "_run", run)
@@ -76,6 +80,23 @@ def test_status_no_repo(monkeypatch):
     monkeypatch.setattr(control, "_solomon_repo", lambda: None)
     s = control.update_status()
     assert s["ok"] is False and s["available"] is False
+
+
+def test_status_not_available_when_diverged(monkeypatch):
+    # local is BOTH behind and ahead (diverged) -> _pull_latest would refuse --ff-only, so update_status
+    # must NOT offer it; report unavailable with a divergence reason, mirroring the updater.
+    _fake_git(monkeypatch, behind="1", ahead="1")
+    s = control.update_status()
+    assert s["ok"] and s["available"] is False and s["ahead"] == 1
+    assert "diverged" in s["reason"]
+
+
+def test_status_unavailable_when_fetch_fails(monkeypatch):
+    # a failed fetch (offline) must not let a STALE origin ref report 'available' -> report unavailable.
+    _fake_git(monkeypatch, behind="3", fetch_rc=1)
+    s = control.update_status()
+    assert s["ok"] and s["available"] is False
+    assert "origin" in s["reason"]
 
 
 def test_current_sha(monkeypatch):
