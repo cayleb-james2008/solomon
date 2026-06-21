@@ -430,6 +430,86 @@ def test_cleanup_worktrees_safe(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# bug-bounty cycle 1 regression tests
+# --------------------------------------------------------------------------- #
+def test_read_heartbeat_non_dict_returns_none(tmp_path, monkeypatch):
+    # a parseable-but-non-dict heartbeat (list/number/string) must read as None, not leak a non-dict
+    # that crashes callers doing hb.get(...) and aborts the whole watchdog sweep.
+    rt = _runtime(tmp_path, monkeypatch)
+    (rt / "heartbeat.json").write_text('["iterating"]', encoding="utf-8")
+    assert control.read_heartbeat({"name": "x", "path": str(tmp_path)}) is None
+
+
+def test_pid_alive_survives_tasklist_oserror(monkeypatch):
+    # win32: a tasklist spawn OSError must yield False, never propagate (it would crash is_running -> sweep).
+    if sys.platform != "win32":
+        return
+    def boom(*a, **k):
+        raise OSError("tasklist spawn failed")
+    monkeypatch.setattr(control, "_run", boom)
+    assert control._pid_alive(12345) is False
+
+
+def test_lock_live_window_floor_is_4500(tmp_path, monkeypatch):
+    # control must agree with run_improver/solomon (staleness floor 4500): a live PID whose heartbeat is
+    # ~3700s old (between the old 3600 floor and 4500) is still LIVE, so the supervisor won't clear a
+    # running lock and spawn a second runner (single-flight).
+    from datetime import datetime, timezone, timedelta
+    rt = _runtime(tmp_path, monkeypatch)
+    (rt / "lock").write_text(f"{os.getpid()}\nr1", encoding="utf-8")        # our own (alive) PID
+    old = (datetime.now(timezone.utc) - timedelta(seconds=3700)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    (rt / "heartbeat.json").write_text(
+        json.dumps({"status": "iterating", "phase": "implement", "run_id": "r1", "updated_at": old}),
+        encoding="utf-8")
+    monkeypatch.setattr(control, "project_interval", lambda repo: 120)
+    assert control.is_running({"name": "x", "path": str(tmp_path)}) is True
+
+
+def test_metrics_counts_blocked_in_success_denominator(tmp_path, monkeypatch):
+    # a 'blocked' iteration (auto-merge PR that never landed) must drag success_rate down, not vanish.
+    rt = _runtime(tmp_path, monkeypatch)
+    recs = [{"status": "blocked"}, {"status": "shipped", "pr": {"state": "open"}}, {"status": "blocked"}]
+    (rt / "history.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
+    m = control.metrics({"name": "x", "path": str(tmp_path)})
+    assert m["blocked"] == 2
+    assert m["success_rate"] == round(1 / 3, 3)             # 1 shipped / (1 shipped + 2 blocked)
+
+
+def test_set_repo_config_refuses_corrupt_repos_json(tmp_path, monkeypatch):
+    # a present-but-corrupt repos.json must NOT be rebuilt from an empty base (which would wipe every
+    # repo's config) — set_repo_config aborts ok:False and leaves the file byte-for-byte untouched.
+    p = tmp_path / "repos.json"
+    p.write_text('[{"name": "alpha", "provider": "openrout', encoding="utf-8")   # truncated mid-write
+    monkeypatch.setattr(control, "REPOS_JSON", str(p))
+    before = p.read_text(encoding="utf-8")
+    res = control.set_repo_config("alpha", reasoning="high")
+    assert res["ok"] is False and "corrupt" in res["error"].lower()
+    assert p.read_text(encoding="utf-8") == before
+
+
+def test_acquire_supervisor_lock_refuses_empty_lock(tmp_path, monkeypatch):
+    # an empty/truncated lock is a mid-write racer / corruption — never steal it (single-flight).
+    rt = _runtime(tmp_path, monkeypatch)
+    (rt / "lock").write_text("", encoding="utf-8")
+    ok, token = control.acquire_supervisor_lock({"name": "x", "path": str(tmp_path)})
+    assert ok is False and token is None
+
+
+def test_acquire_supervisor_lock_oserror_returns_false(tmp_path, monkeypatch):
+    # a non-FileExistsError OSError on the lock path (read-only/ACL'd/AV-locked) must return (False, None),
+    # never raise into recover().
+    _runtime(tmp_path, monkeypatch)
+    real_open = os.open
+    def guarded(path, *a, **k):
+        if str(path).endswith("lock"):
+            raise PermissionError("Access is denied")
+        return real_open(path, *a, **k)
+    monkeypatch.setattr(os, "open", guarded)
+    ok, token = control.acquire_supervisor_lock({"name": "x", "path": str(tmp_path)})
+    assert ok is False and token is None
+
+
+# --------------------------------------------------------------------------- #
 # GitHub tools for the pi agent + end-of-loop verification
 # --------------------------------------------------------------------------- #
 def test_github_tools_extension_present():

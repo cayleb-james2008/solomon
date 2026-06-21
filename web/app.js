@@ -339,7 +339,7 @@ async function mergeAllGreen() {
   const green = allPRs().filter(p => p.checks === "success");
   if (!green.length) return toast("No green PRs to merge", "err");
   let n = 0; for (const p of green) { const x = await act("merge", p.repo, p.number); if (x.ok) n++; }
-  toast(`Merged ${n}/${green.length} green PR${green.length === 1 ? "" : "s"}`, "ok"); refresh();
+  toast(`Merged ${n}/${green.length} green PR${green.length === 1 ? "" : "s"}`, n === green.length ? "ok" : "err"); refresh();
 }
 
 /* ---------- approvals full view ---------- */
@@ -351,6 +351,10 @@ function renderApprovals(v) {
   if (!prs.length) { v.appendChild(el("div", "empty", "No open rsi/* pull requests.")); return; }
   const grid = el("div", "appr-grid"); v.appendChild(grid);
   const list = el("div", "appr-list"); grid.appendChild(list);
+  // Prune a stale selection (the selected PR was merged/closed and is gone from the list) so the
+  // re-select below advances to a live PR — otherwise selPR dangles, nothing highlights, and loadDiff
+  // fetches the merged PR's stale diff while the live PR sits unselected.
+  if (state.selPR && !prs.some(p => p.repo === state.selPR.repo && p.number === state.selPR.number)) state.selPR = null;
   if (!state.selPR) state.selPR = prs[0];
   prs.forEach(p => { const row = prRow(p, true); if (state.selPR && p.repo === state.selPR.repo && p.number === state.selPR.number) row.classList.add("sel"); list.appendChild(row); });
   const diff = el("div", "diff", `<div class="diff-head">${esc(state.selPR.repo)} #${esc(state.selPR.number)} &middot; loading diff…</div><div class="diff-body"></div>`);
@@ -360,7 +364,9 @@ function renderApprovals(v) {
 async function loadDiff(p, diffEl) {
   const key = p.repo + "#" + p.number;
   let res = state.diffCache[key];
-  if (!res) { res = await call("pr_diff", p.repo, p.number); state.diffCache[key] = res; }
+  // Cache only SUCCESSFUL diffs — a transient {ok:false} from a gh blip must not be cached forever
+  // (nothing invalidates diffCache), else the PR diff stays "unavailable" all session after gh recovers.
+  if (!res) { res = await call("pr_diff", p.repo, p.number); if (res && res.ok) state.diffCache[key] = res; }
   const body = $(".diff-body", diffEl); $(".diff-head", diffEl).innerHTML = `${esc(p.repo)} #${esc(p.number)} &middot; <code>${esc(p.headRefName || "")}</code>`;
   if (!res || !res.ok) { body.innerHTML = `<div class="ln hh">${esc((res && res.error) || "diff unavailable")}</div>`; return; }
   const lines = (res.diff || "").split("\n").slice(0, 1200);

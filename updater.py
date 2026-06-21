@@ -71,18 +71,22 @@ def _find_solomon_repo() -> Path | None:
     return None
 
 
-def _run(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
+def _run(cmd: list[str], cwd: str | None = None,
+         timeout: float | None = None) -> subprocess.CompletedProcess:
     """Run a subprocess, capturing output. CREATE_NO_WINDOW on win32 so the updater's own
-    console is the only window the operator sees."""
+    console is the only window the operator sees. `timeout` bounds network ops (fetch) so a stalled
+    origin fails loudly instead of hanging; on expiry subprocess.run raises TimeoutExpired."""
     kw = {"capture_output": True, "text": True, "cwd": cwd}
+    if timeout is not None:
+        kw["timeout"] = timeout
     return subprocess.run(cmd, **kw, **hidden_subprocess_kwargs())
 
 
-def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+def _git(repo: Path, *args: str, timeout: float | None = None) -> subprocess.CompletedProcess:
     git = shutil.which("git")
     if not git:
         raise RuntimeError("git not found on PATH")
-    return _run([git, "-C", str(repo), *args])
+    return _run([git, "-C", str(repo), *args], timeout=timeout)
 
 
 def _is_dirty(repo: Path) -> bool:
@@ -103,7 +107,14 @@ def _pull_latest(repo: Path) -> dict:
         out["error"] = "no 'origin' remote — set one, or run the updater from inside the repo"
         return out
     branch = (_git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout or "").strip() or "main"
-    _git(repo, "fetch", "origin", "--quiet")
+    try:
+        fetch = _git(repo, "fetch", "origin", "--quiet", timeout=25)
+    except subprocess.TimeoutExpired:
+        out["error"] = "fetch from origin timed out (offline?) — re-run the updater when connected"
+        return out
+    if fetch.returncode != 0:
+        out["error"] = "could not reach origin (offline?) — re-run the updater when connected"
+        return out
     ahead = _git(repo, "log", "--oneline", f"origin/{branch}..{branch}")
     behind = _git(repo, "log", "--oneline", f"{branch}..origin/{branch}")
     if not (behind.stdout or "").strip():

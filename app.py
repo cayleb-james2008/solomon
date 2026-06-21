@@ -47,12 +47,20 @@ def _load_state() -> dict:
         return {}
 
 
-def _save_state(state: dict) -> None:
+def _save_state(state: dict) -> bool:
+    """Atomically persist state (tmp + os.replace — never truncate-in-place, matching control.py's
+    repos.json/lock writers). A crash/concurrent write mid-dump must not leave a half-written
+    .solomon.json that next launch reads as {} — which silently reverts the auto_push/auto_ai_fix
+    safety dials to their permissive defaults. Returns True on success, False on OSError so the setters
+    can tell the UI whether the dial actually reached disk (its rollback only fires on ok:false)."""
     try:
-        with open(_STATE_FILE, "w", encoding="utf-8") as f:
+        tmp = _STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
+        os.replace(tmp, _STATE_FILE)
+        return True
     except OSError:
-        pass
+        return False
 
 
 class Api:
@@ -319,8 +327,8 @@ class Api:
 
     def set_theme(self, t):
         self._state["theme"] = t
-        _save_state(self._state)
-        return {"ok": True, "theme": t}
+        ok = _save_state(self._state)
+        return {"ok": ok, "theme": t}
 
     def get_auto_push(self):
         """Global auto-push gate (default True). When False, runs ship 'local' (no push/PR)."""
@@ -328,8 +336,8 @@ class Api:
 
     def set_auto_push(self, v):
         self._state["auto_push"] = bool(v)
-        _save_state(self._state)
-        return {"ok": True, "auto_push": bool(v)}
+        ok = _save_state(self._state)
+        return {"ok": ok, "auto_push": bool(v)}
 
     def get_auto_ai_fix(self):
         """Global opt-in: when True the supervisor may run a pi fix-session unattended on a
@@ -338,8 +346,8 @@ class Api:
 
     def set_auto_ai_fix(self, v):
         self._state["auto_ai_fix"] = bool(v)
-        _save_state(self._state)
-        return {"ok": True, "auto_ai_fix": bool(v)}
+        ok = _save_state(self._state)
+        return {"ok": ok, "auto_ai_fix": bool(v)}
 
 
 def _health_payload() -> dict:

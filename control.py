@@ -116,6 +116,21 @@ def _read_repos_json(path=REPOS_JSON):
         return []
 
 
+def _read_repos_json_strict(path=REPOS_JSON):
+    """Like _read_repos_json but distinguishes ABSENT (return []) from PRESENT-but-undecodable
+    (raise). Write paths read via this so a transiently-corrupt repos.json (operator mid-edit, a
+    partial/concurrent write) is NOT silently rebuilt from an empty base and os.replace'd over the
+    good file — which would wipe every repo's config. Read-only display paths keep the lenient reader."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return []
+    if not isinstance(data, list):
+        raise ValueError("repos.json is not a JSON list")
+    return data
+
+
 def load_repos(path=None):
     """Merge auto-discovered projects with repos.json config.
 
@@ -234,7 +249,11 @@ def set_repo_config(name, provider=None, model=None, ship=None, gate=None,
     Creates the entry (carrying its discovered path) if it doesn't exist."""
     if not name:
         return {"ok": False, "error": "name required"}
-    entries = _read_repos_json(REPOS_JSON)  # live module global (monkeypatch-friendly)
+    try:
+        entries = _read_repos_json_strict(REPOS_JSON)  # live module global (monkeypatch-friendly)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {"ok": False,
+                "error": "repos.json is unreadable/corrupt — refusing to overwrite and lose config"}
     entry = None
     for r in entries:
         if isinstance(r, dict) and r.get("name") == name:
@@ -388,9 +407,13 @@ def _clean_subenv():
     return env
 
 
-def _run(args, cwd=None):
-    """Run a subprocess, capturing output. Window-hidden on win32 (no console popup); broken gh token stripped."""
+def _run(args, cwd=None, timeout=None):
+    """Run a subprocess, capturing output. Window-hidden on win32 (no console popup); broken gh token
+    stripped. `timeout` (seconds) bounds network ops (git fetch) so a stalled origin can't hang the
+    synchronous JS bridge forever; on expiry subprocess.run raises TimeoutExpired (caller handles)."""
     kw = {"capture_output": True, "text": True, "cwd": cwd, "env": _clean_subenv()}
+    if timeout is not None:
+        kw["timeout"] = timeout
     return subprocess.run(args, **kw, **hidden_subprocess_kwargs())
 
 
@@ -510,18 +533,35 @@ def update_status():
         branch = (g("rev-parse", "--abbrev-ref", "HEAD").stdout or "").strip() or "main"
         sha = (g("rev-parse", "--short", "HEAD").stdout or "").strip() or None
         if g("remote", "get-url", "origin").returncode != 0:
-            return {"ok": True, "available": False, "behind": 0, "dirty": False,
+            return {"ok": True, "available": False, "behind": 0, "ahead": 0, "dirty": False,
                     "currentSha": sha, "branch": branch, "reason": "no 'origin' remote"}
-        g("fetch", "origin", "--quiet")
         dirty = bool((g("status", "--porcelain", "--untracked-files=no").stdout or "").strip())
+        # Bounded fetch: a stalled origin must not hang the synchronous bridge call forever, and a
+        # FAILED fetch (offline) must not let a STALE origin ref report "available" — surface it as
+        # ok:True/available:False with a reason (renderUpdate already shows that as "unavailable").
+        try:
+            fetch = _run([git, "-C", repo, "fetch", "origin", "--quiet"], timeout=25)
+        except subprocess.TimeoutExpired:
+            fetch = None
+        if fetch is None or fetch.returncode != 0:
+            return {"ok": True, "available": False, "behind": 0, "ahead": 0, "dirty": dirty,
+                    "currentSha": sha, "branch": branch, "reason": "could not reach origin (offline?)"}
         cnt = g("rev-list", "--count", f"HEAD..origin/{branch}")
         behind = int((cnt.stdout or "0").strip() or "0") if cnt.returncode == 0 else 0
+        acnt = g("rev-list", "--count", f"origin/{branch}..HEAD")
+        ahead = int((acnt.stdout or "0").strip() or "0") if acnt.returncode == 0 else 0
     except (OSError, ValueError) as e:
         return {"ok": False, "error": str(e), "available": False, "behind": 0,
-                "dirty": False, "currentSha": None}
+                "ahead": 0, "dirty": False, "currentSha": None}
 
+    if ahead > 0:
+        # Diverged (local ahead AND/OR behind): _pull_latest correctly refuses --ff-only, so offering
+        # "update available" would dead-end in a silent no-op. Report unavailable, mirroring the updater.
+        return {"ok": True, "available": False, "behind": behind, "ahead": ahead, "dirty": dirty,
+                "currentSha": sha, "branch": branch,
+                "reason": f"local {branch} has diverged from origin/{branch} — merge or rebase first"}
     available = behind > 0 and not dirty
-    out = {"ok": True, "available": available, "behind": behind, "dirty": dirty,
+    out = {"ok": True, "available": available, "behind": behind, "ahead": ahead, "dirty": dirty,
            "currentSha": sha, "branch": branch}
     if behind > 0 and dirty:
         out["reason"] = "update available but working tree is dirty — commit or stash first"
@@ -812,7 +852,11 @@ def connect_project(spec, goal=None, ship="pr", visual_gate=None, provider=None)
     resolved_visual_gate = bool(has_frontend(entry)) if visual_gate is None else bool(visual_gate)
     entry["visual_gate"] = resolved_visual_gate
 
-    entries = _read_repos_json(REPOS_JSON)
+    try:
+        entries = _read_repos_json_strict(REPOS_JSON)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {"ok": False,
+                "error": "repos.json is unreadable/corrupt — refusing to overwrite and lose config"}
     existing = next((r for r in entries if isinstance(r, dict) and r.get("name") == name), None)
     if existing is None:
         entries.append(entry)
@@ -851,9 +895,12 @@ def read_heartbeat(repo):
         return None
     try:
         with open(os.path.join(rsi, "heartbeat.json"), "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
+    # A parseable-but-non-dict heartbeat (e.g. `42`, `"x"`, `[1,2]` from a partial/interleaved write
+    # or foreign writer) must read as "no heartbeat", not leak a non-dict that crashes callers' .get().
+    return data if isinstance(data, dict) else None
 
 
 def read_log(repo, max_bytes=16384):
@@ -904,7 +951,11 @@ def _pid_alive(pid):
         # /NH /FO CSV so the PID appears only as a quoted field — an exact match, not a substring of
         # some other column/PID in tasklist's formatted table (the substring form gave false 'alive',
         # wedging start()/clear_lock()). Mirrors run_improver._pid_alive.
-        r = _run(["tasklist", "/FI", f"PID eq {int(pid)}", "/NH", "/FO", "CSV"])
+        try:
+            r = _run(["tasklist", "/FI", f"PID eq {int(pid)}", "/NH", "/FO", "CSV"])
+        except OSError:
+            return False                     # tasklist spawn failure (WinError 6/8 over long runs) must
+                                             # not propagate through is_running and crash the watchdog sweep
         return f'"{int(pid)}"' in (r.stdout or "")
     try:
         os.kill(int(pid), 0)
@@ -975,7 +1026,10 @@ def _lock_is_live(repo, rt=None):
     age = _heartbeat_age(hb)
     if age is None:
         return True                          # no usable timestamp -> don't declare a live PID dead on that alone
-    return age <= max(3 * project_interval(repo), 3600)
+    # ponytail: 4500 must stay in sync with run_improver.acquire_lock and solomon._stale (both floor
+    # at 4500). A lower floor here let the supervisor declare a still-live runner's lock dead in the
+    # (3600,4500] window and clear it -> two runners on one repo (single-flight violation).
+    return age <= max(3 * project_interval(repo), 4500)
 
 
 def is_running(repo):
@@ -1582,10 +1636,10 @@ def metrics(repo):
     """Aggregate runtime/<name>/history.jsonl into headline counters + a test-pass series."""
     hist = read_history(repo, limit=1000)
     out = {"iterations": len(hist), "shipped": 0, "merged": 0, "reverted": 0,
-           "noop": 0, "error": 0, "stopped": 0, "tests_series": []}
+           "noop": 0, "blocked": 0, "error": 0, "stopped": 0, "tests_series": []}
     for rec in hist:
         st = rec.get("status")
-        if st in ("shipped", "reverted", "noop", "error", "stopped"):
+        if st in ("shipped", "reverted", "noop", "blocked", "error", "stopped"):
             out[st] += 1
         pr = rec.get("pr")
         if isinstance(pr, dict) and pr.get("state") == "merged":
@@ -1595,7 +1649,9 @@ def metrics(repo):
             out["tests_series"].append({"ts": rec.get("ts"),
                                         "passed": tests.get("passed") or 0,
                                         "failed": tests.get("failed") or 0})
-    decided = out["shipped"] + out["reverted"] + out["noop"]
+    # 'blocked' (auto-merge PR not confirmed-merged / CI-red / stopped-before-merge) is a real
+    # non-success outcome — counting it in the denominator stops an un-landing repo reading 100%.
+    decided = out["shipped"] + out["reverted"] + out["noop"] + out["blocked"]
     out["success_rate"] = round(out["shipped"] / decided, 3) if decided else None
     return out
 
@@ -1628,11 +1684,21 @@ def cleanup_worktrees(repo):
     try:
         pruned = _run([git, "-C", path, "worktree", "prune"]).returncode == 0
         cur = (_run([git, "-C", path, "rev-parse", "--abbrev-ref", "HEAD"]).stdout or "").strip()
+        # When HEAD is detached, abbrev-ref returns the literal "HEAD", so the name guard below misses
+        # the rsi/* branch the detached HEAD is built on and `branch -D` would force-delete it. Also
+        # skip any branch whose tip == HEAD's commit.
+        head_sha = (_run([git, "-C", path, "rev-parse", "HEAD"]).stdout or "").strip()
     except OSError as e:
         return {"ok": False, "error": str(e)}
     removed = []
+    detached = cur == "HEAD"               # abbrev-ref is the literal "HEAD" only when detached
     for b in local_rsi_branches(repo):
-        if b == cur:                       # never delete the branch we're standing on
+        if b == cur:                       # never delete the branch we're standing on (named HEAD)
+            continue
+        # Detached HEAD only: the name guard above can't protect the branch the detached HEAD is built
+        # on, so skip any rsi/* branch at HEAD's commit. Restricted to the detached case so a stale
+        # rsi/* branch that merely happens to share the base commit is still pruned on a named branch.
+        if detached and head_sha and (_run([git, "-C", path, "rev-parse", b]).stdout or "").strip() == head_sha:
             continue
         try:
             if _run([git, "-C", path, "branch", "-D", b]).returncode == 0:
@@ -1856,7 +1922,10 @@ def acquire_supervisor_lock(repo):
     rt = _runtime_dir(repo)
     if not rt:
         return False, None
-    os.makedirs(rt, exist_ok=True)
+    try:
+        os.makedirs(rt, exist_ok=True)
+    except OSError:
+        return False, None
     lock = os.path.join(rt, "lock")
     token = "sup-" + uuid.uuid4().hex
     content = f"{os.getpid()}\n{token}"
@@ -1869,6 +1938,13 @@ def acquire_supervisor_lock(repo):
         return True, token
     except FileExistsError:
         pass
+    except OSError:
+        return False, None                          # transient lock-file ACL/lock — escalate, never raise into recover()
+    # An empty/unparseable lock means a racer is mid-create (run_improver writes pid+token inside the
+    # same O_EXCL open) or the file is corrupt — treat as HELD and back off, matching
+    # run_improver.acquire_lock ("never treat empty as stale"). Never steal an empty lock.
+    if _read_lock(rt)[0] == 0:
+        return False, None
     if _lock_is_live(repo, rt):                     # a live runner holds it — do NOT mutate git under it
         return False, None
     try:                                            # stale/recycled lock — take it over, then verify we won
@@ -1936,9 +2012,18 @@ def reset_to_base(repo):
         if co.returncode != 0:
             return {"ok": False,
                     "error": (co.stderr or co.stdout or f"checkout {base} failed").strip()[:200]}
-        g("reset", "--hard")
+        # Check each reset's exit code: a failed `git reset --hard` (corrupt object store, locked
+        # index on Windows, absent origin/<base>) must propagate ok:False so the supervisor ESCALATES
+        # (SOLOMON_RSI halt rail) instead of restarting the loop on a base that never reset to origin.
+        rs = g("reset", "--hard")
+        if rs.returncode != 0:
+            return {"ok": False,
+                    "error": (rs.stderr or rs.stdout or "reset --hard failed").strip()[:200]}
         if has_origin:
-            g("reset", "--hard", f"origin/{base}")
+            ro = g("reset", "--hard", f"origin/{base}")
+            if ro.returncode != 0:
+                return {"ok": False,
+                        "error": (ro.stderr or ro.stdout or f"reset --hard origin/{base} failed").strip()[:200]}
     except OSError as e:
         return {"ok": False, "error": str(e)}
     return {"ok": True, "base": base}

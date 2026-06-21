@@ -104,7 +104,23 @@ def diagnose(repo):
     elif has_lock and not running:
         cat, ev, rec, safe = "stale_lock", "lock file present but no live improver PID", ["clear the stale lock"], True
     elif has_stop and not running:
-        cat, ev, rec, safe = "stop_lingering", "stop sentinel present, no live loop", ["clear the stop sentinel"], True
+        # Auto-clear a lingering stop ONLY for a CLEAN exit (status=='stopped'): the stop is then
+        # vestigial. If the loop crashed/was killed mid-run with an operator Stop pending (the last
+        # heartbeat is a live/error value, not 'stopped'), auto-clearing it + the next sweep's restart
+        # would SILENTLY REVOKE the operator's Stop ("Start must not silently revoke a live stop",
+        # SOLOMON_RSI halt switch). In that case escalate-only and leave the stop in place — the operator
+        # presses Start to resume. (The runner's own dirty_base_persistent self-stop is separately
+        # auto-recovered by the watchdog once the base is verified clean, so it doesn't need this arm.)
+        clean_exit = status == "stopped"
+        cat, ev, rec, safe = (
+            "stop_lingering",
+            "stop sentinel present after a clean exit" if clean_exit else
+            "stop sentinel present but the loop did not exit cleanly (crash/kill mid-stop) — "
+            "honoring the operator Stop, not auto-restarting",
+            ["clear the vestigial stop sentinel"] if clean_exit else
+            ["the loop was stopped but did not exit cleanly — press Start to resume, or investigate "
+             "the crash; the watchdog will not auto-restart it"],
+            clean_exit)
     elif running and phase not in (None, "sleep") and _stale(hb, repo):
         # a hang can freeze the heartbeat in ANY active phase (test/commit/ship/pr/merge — e.g. a
         # gate or gh call that wedges), not only 'implement'. Any non-sleep phase that goes stale

@@ -146,7 +146,9 @@ def _stall_env(tmp_path, monkeypatch, *, hb, prior_snaps, existing_escalation=No
 
 
 def _err_preflight(n):
-    return [{"repo": "demo", "status": "error", "phase": "preflight"} for _ in range(n)]
+    # real snapshots always carry a `ts`; stamp these RECENT so the stall window's recency guard keeps them.
+    ts = monitor._now()
+    return [{"repo": "demo", "ts": ts, "status": "error", "phase": "preflight"} for _ in range(n)]
 
 
 def test_stall_escalates_after_three_error_preflight_sweeps(tmp_path, monkeypatch):
@@ -174,13 +176,28 @@ def test_stall_not_flagged_before_threshold(tmp_path, monkeypatch):
 
 def test_stall_not_flagged_when_phase_recovered(tmp_path, monkeypatch):
     # the window is broken by a non-error/preflight snap (the lane recovered between sweeps) -> no stall.
+    ts = monitor._now()
     rt, written = _stall_env(
         tmp_path, monkeypatch,
         hb={"status": "error", "phase": "preflight"},
-        prior_snaps=[{"repo": "demo", "status": "error", "phase": "preflight"},
-                     {"repo": "demo", "status": "iterating", "phase": "implement"}])
+        prior_snaps=[{"repo": "demo", "ts": ts, "status": "error", "phase": "preflight"},
+                     {"repo": "demo", "ts": ts, "status": "iterating", "phase": "implement"}])
     monitor.sweep()
     assert written == {}
+
+
+def test_stall_not_flagged_when_prior_snaps_are_stale(tmp_path, monkeypatch):
+    # Fix J: prior error/preflight snaps are days old (a resolved wedge across a kill-switch pause); one
+    # FRESH break must NOT be miscounted as "3 consecutive sweeps" -> no false 'running_stalled' escalation.
+    old = "2020-01-01T00:00:00Z"
+    rt, written = _stall_env(
+        tmp_path, monkeypatch,
+        hb={"status": "error", "phase": "preflight"},
+        prior_snaps=[{"repo": "demo", "ts": old, "status": "error", "phase": "preflight"},
+                     {"repo": "demo", "ts": old, "status": "error", "phase": "preflight"}])
+    out = monitor.sweep()
+    assert written == {}
+    assert not any("STALLED" in a for a in out["actions"])
 
 
 def test_stall_anti_thrash_escalates_once(tmp_path, monkeypatch):

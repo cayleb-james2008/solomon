@@ -303,6 +303,49 @@ def test_reset_to_base_syncs_clean_tree(tmp_path):
     assert _git(work, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "main"
 
 
+@pytest.mark.skipif(not shutil.which("git"), reason="git not available")
+def test_reset_to_base_propagates_failed_reset(tmp_path):
+    # a FAILED `git reset --hard origin/<base>` (origin/<base> ref absent + dead remote) must propagate
+    # ok:False so the supervisor escalates instead of restarting the loop on a base that never reset.
+    origin = tmp_path / "origin.git"
+    work = tmp_path / "work"
+    subprocess.run(["git", "init", "--bare", str(origin)], capture_output=True)
+    subprocess.run(["git", "clone", str(origin), str(work)], capture_output=True)
+    _git(work, "config", "user.email", "t@t"); _git(work, "config", "user.name", "t")
+    _git(work, "checkout", "-b", "main")
+    (work / "f.txt").write_text("1"); _git(work, "add", "-A"); _git(work, "commit", "-m", "init")
+    _git(work, "push", "-u", "origin", "main")
+    _git(work, "update-ref", "-d", "refs/remotes/origin/main")                  # drop the tracking ref
+    _git(work, "remote", "set-url", "origin", str(tmp_path / "nope.git"))       # dead remote (fetch fails)
+    r = control.reset_to_base({"name": "w", "path": str(work), "pr_target_branch": "main"})
+    assert not r["ok"]
+
+
+def test_stop_lingering_crash_mid_stop_escalates_not_revoked(tmp_path, monkeypatch):
+    # crash-before-finally racing an operator Stop: stop sentinel present, not running, last heartbeat is
+    # a LIVE status (not 'stopped'). diagnose must NOT mark it auto-safe and recover must NOT remove the
+    # operator's Stop -> the halt survives ("Start must not silently revoke a live stop").
+    rt = _rt(tmp_path, monkeypatch)
+    (rt / "stop").write_text("", encoding="utf-8")           # operator Stop (empty sentinel)
+    _hb(rt, status="iterating", phase="implement")           # killed mid-run, not a clean 'stopped'
+    monkeypatch.setattr(control, "is_running", lambda repo: False)
+    d = solomon.diagnose(_repo(tmp_path))
+    assert d["category"] == "stop_lingering" and d["auto_safe"] is False
+    res = solomon.recover(_repo(tmp_path), allow_pi=False)
+    assert res["escalate"] is True
+    assert (rt / "stop").exists()                            # operator Stop NOT revoked
+
+
+def test_stop_lingering_clean_exit_is_auto_safe(tmp_path, monkeypatch):
+    # a vestigial stop after a CLEAN exit (status=='stopped') is still auto-safe (no regression).
+    rt = _rt(tmp_path, monkeypatch)
+    (rt / "stop").write_text("", encoding="utf-8")
+    _hb(rt, status="stopped")
+    monkeypatch.setattr(control, "is_running", lambda repo: False)
+    d = solomon.diagnose(_repo(tmp_path))
+    assert d["category"] == "stop_lingering" and d["auto_safe"] is True
+
+
 def test_read_supervisor_log_tail(tmp_path, monkeypatch):
     rt = _rt(tmp_path, monkeypatch)
     (rt / "supervisor.jsonl").write_text("\n".join(json.dumps({"i": i}) for i in range(3)) + "\n", encoding="utf-8")
