@@ -74,6 +74,7 @@ def _stub_sweep_env(tmp_path, monkeypatch, *, hb, base_clean):
     monkeypatch.setattr(control, "read_heartbeat", lambda r: dict(hb))
     monkeypatch.setattr(control, "read_history", lambda r, limit=1: [])
     monkeypatch.setattr(control, "start", lambda r, auto_push=True: started.update(called=True) or {"ok": True, "pid": 1})
+    monkeypatch.setattr(monitor, "DISABLED", str(tmp_path / "_watchdog.disabled"))  # isolate from a real operator kill-switch
     monkeypatch.setattr(monitor, "_base_is_clean", lambda p: base_clean)
     monkeypatch.setattr(solomon, "recover", lambda *a, **k: {"actions_taken": [], "escalate": False})
     monkeypatch.setattr(solomon, "diagnose", lambda r: {"category": "ok"})
@@ -127,6 +128,7 @@ def _stall_env(tmp_path, monkeypatch, *, hb, prior_snaps, existing_escalation=No
     if prior_snaps:
         mon.write_text("\n".join(_json.dumps(s) for s in prior_snaps) + "\n", encoding="utf-8")
     monkeypatch.setattr(monitor, "MON_LOG", str(mon))
+    monkeypatch.setattr(monitor, "DISABLED", str(tmp_path / "_watchdog.disabled"))  # isolate from a real operator kill-switch
     repo = {"name": "demo", "path": str(tmp_path / "repo")}
     monkeypatch.setattr(control, "load_repos", lambda: [repo])
     monkeypatch.setattr(control, "_runtime_dir", lambda r: str(rt))
