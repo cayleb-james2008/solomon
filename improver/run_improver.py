@@ -415,6 +415,68 @@ def _note_dirty_base_bail(dirty: bool, cur_branch: str, base_branch: str) -> boo
     return True
 
 
+# Un-pushed (out-of-band) base commits and a persistently-RED base gate are the two other preflight
+# wedges that, like a dirty base, used to spin forever needing a human. Each gets the SAME self-stop
+# backstop: count consecutive bails, and at the limit write STOP + an error heartbeat (distinct reason)
+# so the loop parks instead of churning. A clean/resolved iteration resets the counter.
+_UNPUSHED_BASE_PERSISTENT_LIMIT = 3
+_unpushed_base_bail_count = 0
+
+
+def _note_unpushed_base_bail(bail: bool, n_ahead: int = 0, shas: str = "") -> bool:
+    """Track consecutive un-pushed-base bails (the fast-forward sync of the base to origin keeps
+    failing — auth, or a non-FF divergence). Returns True (writing STOP + an error heartbeat) at the
+    limit so the caller stops spinning. bail=False resets the counter (a clean base, a successful
+    auto-sync, or a healthy local-ship iteration). Pure over its module counter for unit-testing."""
+    global _unpushed_base_bail_count
+    if not bail:
+        _unpushed_base_bail_count = 0
+        return False
+    _unpushed_base_bail_count += 1
+    if _unpushed_base_bail_count < _UNPUSHED_BASE_PERSISTENT_LIMIT:
+        return False
+    try:
+        RUNTIME.mkdir(parents=True, exist_ok=True)
+        STOP.write_text("unpushed_base_persistent\n", encoding="utf-8")
+    except OSError:
+        pass
+    heartbeat(status="error", phase="preflight", reason="unpushed_base_persistent",
+              last_summary=f"Base has {n_ahead} un-pushed commit(s) and the fast-forward push to origin "
+                           f"keeps failing — the loop self-stops so it doesn't spin forever. Reconcile "
+                           f"the base with origin, then Start to resume. Commits: {shas[:240]}")
+    _unpushed_base_bail_count = 0
+    return True
+
+
+_BASE_GATE_RED_PERSISTENT_LIMIT = 3
+_base_gate_red_bail_count = 0
+
+
+def _note_base_gate_red_bail(red: bool, summary: str = "") -> bool:
+    """Track consecutive base-gate-RED preflight bails (a non-transient gate failure: pytest missing,
+    a broken venv, a wrong GATE_CMD, a committed test syntax error). Returns True (writing STOP + an
+    error heartbeat) at the limit so the loop parks instead of re-running the same red gate forever.
+    red=False resets the counter (the base gate came back green)."""
+    global _base_gate_red_bail_count
+    if not red:
+        _base_gate_red_bail_count = 0
+        return False
+    _base_gate_red_bail_count += 1
+    if _base_gate_red_bail_count < _BASE_GATE_RED_PERSISTENT_LIMIT:
+        return False
+    try:
+        RUNTIME.mkdir(parents=True, exist_ok=True)
+        STOP.write_text("base_gate_red_persistent\n", encoding="utf-8")
+    except OSError:
+        pass
+    heartbeat(status="error", phase="preflight", reason="base_gate_red_persistent",
+              last_summary=(summary or "Base gate has been RED for several consecutive preflight bails") +
+                           " — the loop self-stops so it doesn't spin forever. Fix the gate command or "
+                           "the base, then Start to resume.")
+    _base_gate_red_bail_count = 0
+    return True
+
+
 # ---- time / env -----------------------------------------------------------
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -893,7 +955,14 @@ def _prune_stale_rsi_branches() -> int:
     pruned = 0
     for line in out.splitlines():
         b = line.replace("*", "").strip()
-        if b and b != cur and git("branch", "-D", b).returncode == 0:
+        if not b or b == cur:
+            continue
+        # NEVER force-delete a branch carrying commits unreachable from the base: a kept gate-green
+        # local-ship branch (the SOLE copy of that iteration's verified work, per the local-mode
+        # keep-the-branch rule) has unmerged commits and must survive. Force-delete only fully-merged /
+        # empty residue (dead-run leftovers, already-shipped branches) — that's the real hygiene target.
+        unmerged = git("rev-list", f"{BASE_BRANCH}..{b}").stdout.strip()
+        if not unmerged and git("branch", "-D", b).returncode == 0:
             pruned += 1
     return pruned
 
@@ -1419,6 +1488,15 @@ def run_gate() -> tuple:
                  and (tests.get("passed") or 0) == 0
                  and (tests.get("failed") or 0) == 0
                  and (tests.get("errors") or 0) == 0)
+        # A HARD, non-transient failure (pytest not installed, an import/collection crash before the
+        # summary line) produces the SAME all-zeros signature as a transient FS-race glitch — but
+        # retrying it is pointless and the "transient glitch" log actively misleads the operator.
+        # Detect the import-error markers and surface it immediately as an unrunnable gate (no retry).
+        if empty and re.search(r"No module named|ModuleNotFoundError|ImportError|INTERNALERROR", tail or ""):
+            tests["gate_unrunnable"] = True
+            log("gate UNRUNNABLE (import/collection error — e.g. pytest not installed): not a transient "
+                "glitch; surfacing as base gate RED")
+            return green, tests, tail
         if not empty:
             return green, tests, tail
         if attempt < 2:
@@ -2161,18 +2239,41 @@ def one_iteration() -> None:
             # them and skip; the loop changes a repo only through gated PRs.
             ahead = git("rev-list", "--count", f"origin/{BASE_BRANCH}..{BASE_BRANCH}")
             n_ahead = int((ahead.stdout or "0").strip() or "0") if ahead.returncode == 0 else 0
+            skip_origin_reset = False
             if n_ahead > 0:
+                # AUTO-HANDLE an out-of-band base instead of wedging forever (the operator asked Solomon to
+                # self-resolve this). We NEVER revert/force — when shipping is enabled we fast-forward
+                # PUBLISH the operator's existing base commits to origin (an FF-only push can't rewrite or
+                # lose origin history), reconciling the base so the loop compounds them. ship=local never
+                # pushes, so origin-sync is moot there: iterate on the local base (which already holds the
+                # commits) — resetting to origin would DISCARD them. Only a push that's enabled-but-FAILS
+                # (auth / non-FF divergence) refuses, and self-stops after N bails instead of spinning.
                 shas = git("log", f"origin/{BASE_BRANCH}..{BASE_BRANCH}", "--oneline").stdout.strip()
-                heartbeat(status="error", phase="preflight",
-                          last_summary=f"{BASE_BRANCH} has {n_ahead} commit(s) not on origin "
-                                       f"(out-of-band / un-pushed base change). Refusing to hard-reset — "
-                                       f"push or revert them; managed repos change only via gated PRs. "
-                                       f"Commits: {shas[:300]}")
-                log(f"REFUSE preflight reset: {n_ahead} un-pushed base commit(s) on {BASE_BRANCH}")
-                return
-            rs = git("reset", "--hard", f"origin/{BASE_BRANCH}")
-            if rs.returncode != 0:
-                log(f"reset to origin/{BASE_BRANCH} failed: {(rs.stderr or '').strip()[:160]} — using local {BASE_BRANCH}")
+                if SHIP == "local":
+                    log(f"base ahead of origin by {n_ahead}; ship=local — iterating on local {BASE_BRANCH} (no reset)")
+                    _note_unpushed_base_bail(False)
+                    skip_origin_reset = True
+                else:
+                    pu = git("push", "origin", f"{BASE_BRANCH}:{BASE_BRANCH}")   # FF-only; never --force
+                    if pu.returncode == 0:
+                        log(f"auto-synced {n_ahead} un-pushed base commit(s) to origin/{BASE_BRANCH} — base reconciled")
+                        _note_unpushed_base_bail(False)
+                    elif _note_unpushed_base_bail(True, n_ahead, shas):
+                        return                       # self-stopped after N consecutive failed FF pushes
+                    else:
+                        heartbeat(status="error", phase="preflight", reason="unpushed_base",
+                                  last_summary=f"{BASE_BRANCH} has {n_ahead} commit(s) not on origin and the "
+                                               f"fast-forward push failed ({(pu.stderr or '').strip()[:120]}). "
+                                               f"Reconcile with origin; managed repos change only via gated "
+                                               f"PRs. Commits: {shas[:240]}")
+                        log(f"REFUSE preflight: {n_ahead} un-pushed base commit(s) — FF push failed")
+                        return
+            else:
+                _note_unpushed_base_bail(False)      # clean base (n_ahead==0): reset the bail counter
+            if not skip_origin_reset:
+                rs = git("reset", "--hard", f"origin/{BASE_BRANCH}")
+                if rs.returncode != 0:
+                    log(f"reset to origin/{BASE_BRANCH} failed: {(rs.stderr or '').strip()[:160]} — using local {BASE_BRANCH}")
     # Branch hygiene: condense any leftover rsi/* branches (dead-run / local-ship residue) so at most
     # ONE rsi/* branch exists at a time — the one cut next. We're on the clean, origin-synced base
     # here, so this never discards in-flight work; it's the deterministic cure for accumulating
@@ -2195,18 +2296,33 @@ def one_iteration() -> None:
         # base by definition (it is invoked precisely to fix the failing gate), so do NOT abort it on a
         # red base — but still keep base_tests so the post-change pass-count anti-gaming check (below)
         # applies to the fix-session too (a recovery path that edits managed code must not game the gate).
+        if bgreen:
+            _note_base_gate_red_bail(False)        # a green base resets the persistent-red counter
         if not bgreen and not SOLOMON:
-            heartbeat(status="error", phase="preflight",
-                      last_summary=f"Base gate is RED before any change ({base_tests}). Fix the gate "
-                                   f"command or the base; the loop can't measure a gain from a red base.")
-            log("base gate RED — skipping (preflight bail, not counted as an iteration)")
+            unrunnable = bool(base_tests and base_tests.get("gate_unrunnable"))
+            summary = ("Base gate is UNRUNNABLE (import/collection error — e.g. pytest not installed, a "
+                       "broken venv, or a wrong gate command). Fix the gate, then Start to resume."
+                       if unrunnable else
+                       f"Base gate is RED before any change ({base_tests}). Fix the gate command or the "
+                       f"base; the loop can't measure a gain from a red base.")
             git("checkout", "--force", BASE_BRANCH)
             git("branch", "-D", branch)
+            # Self-stop after N consecutive red-base bails so a non-transient gate failure (missing
+            # pytest, broken venv, committed test syntax error) parks the loop instead of spinning the
+            # same red gate forever needing a human to notice.
+            if _note_base_gate_red_bail(True, summary):
+                return
+            heartbeat(status="error", phase="preflight",
+                      reason="gate_unrunnable" if unrunnable else "base_gate_red", last_summary=summary)
+            log("base gate RED — skipping (preflight bail, not counted as an iteration)")
             return
         # A custom gate that exits 0 but prints no parseable counts yields passed=0, making the
-        # pass-count anti-gaming check (base 0 vs after 0) a silent no-op. Surface that the numeric rail
-        # is inactive for this gate (returncode + the skip/xfail-marker diff check still apply).
+        # pass-count anti-gaming check (base 0 vs after 0) a silent no-op. Surface it on the heartbeat
+        # (not just a log) so the dashboard shows the numeric rail is inactive for this repo.
         if base_tests and GATE_CMD and not any(base_tests.get(k) for k in ("passed", "failed", "errors")):
+            heartbeat(status="iterating", phase="preflight", reason="gate_no_counts",
+                      last_summary="custom gate emits no parseable test counts — numeric anti-gaming rails "
+                                   "are INACTIVE for this repo (only returncode + skip/xfail-marker checks apply)")
             log("WARNING: custom gate emitted no parseable test counts — the pass-count anti-gaming "
                 "check is INACTIVE for this gate (only returncode + skip/xfail-marker detection apply). "
                 "Have the gate print a pytest-style 'N passed' or unittest 'Ran N tests' summary.")
@@ -2283,6 +2399,14 @@ def one_iteration() -> None:
     except subprocess.TimeoutExpired:
         log("Pi session timed out")
         _drop_branch(branch, "noop", "Pi session timed out.")
+        return
+    except Exception as e:  # noqa: BLE001 — every OTHER phase (plan/review/ideate/reflect/decompose)
+        # fails SOFT; the implement phase must too. A non-timeout pi failure (pi missing/unrunnable, an
+        # OSError on spawn) used to propagate out of one_iteration(), crash the unguarded while-loop, and
+        # strand HEAD on the un-reverted rsi/* branch for the watchdog to blind-restart-thrash. Convert
+        # it to a soft revert + recorded error instead, so the loop survives and the cause is surfaced.
+        log(f"Pi session failed: {str(e)[:160]}")
+        _drop_branch(branch, "error", f"Pi session failed: {str(e)[:160]}")
         return
     # Redact secret-shaped strings at the single source the commit body, PR body, history.jsonl, log,
     # and heartbeat all derive from — so a model that echoed a secret can't leak it downstream (SEC-1).
@@ -2656,8 +2780,11 @@ def _ship(branch: str, title: str, summary: str, tests: dict) -> dict:
 # ---- lock -----------------------------------------------------------------
 def _pid_alive(pid: int) -> bool:
     if sys.platform == "win32":
-        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
-                             capture_output=True, text=True, **hidden_subprocess_kwargs()).stdout
+        try:
+            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+                                 capture_output=True, text=True, **hidden_subprocess_kwargs()).stdout
+        except OSError:
+            return False  # tasklist spawn failure (WinError 6/8 over long runs) must not crash the runner's lock path
         return f'"{pid}"' in (out or "")  # CSV quotes the PID field — exact, no substring FP
     try:
         os.kill(pid, 0)
@@ -2758,7 +2885,15 @@ def acquire_lock() -> bool:
     except OSError:
         return False
     time.sleep(0.1)                      # let any co-racer's replace land before we read back
-    return _read_lock_pid() == mypid
+    won = _read_lock_pid() == mypid
+    if won:
+        # Collapse the run_id-mismatch window: the lock now carries OUR RUN_ID, but heartbeat.json still
+        # has the DEAD runner's old run_id until main() writes the first heartbeat — during which
+        # control._lock_is_live sees lock.run_id != heartbeat.run_id and reports is_running()==False, so
+        # a concurrent start/sweep can spawn a SECOND runner that steals the lock (two runners on one
+        # repo). Stamp the heartbeat now so the lock and heartbeat run_ids match the instant we win.
+        heartbeat(status="idle")
+    return won
 
 
 def release_lock() -> None:
@@ -2948,19 +3083,34 @@ def _recent_history_summaries(limit: int = 30) -> list:
 
 # ---- ideate (divergent backlog generation — the anti-shallowness lane) -----
 def _parse_ideas(text: str):
-    """Parse the ideate lane's `[tier] | leverage | idea` lines into (leverage, tier, idea) tuples,
-    sorted by leverage descending (highest-leverage first). The agent emits candidates; PYTHON owns
-    the backlog write (same steering boundary as provision)."""
-    ideas = []
+    """Parse the ideate lane's idea lines into (leverage, tier, idea) tuples, highest-leverage first.
+    The spec asks for `[tier] | leverage | idea`, but models routinely IGNORE the format and emit plain
+    idea bullets — the old tier-only parser then dropped 100% of them ('no parseable ideas') and the
+    backlog starved into a noop_streak (the #1 unattended-failure mode observed across all four repos).
+    So: parse tier-tagged lines strictly when the model complies; otherwise FALL BACK to plain idea lines
+    (default tier=feature, leverage=3), with noise guards so preamble/headers/section-labels don't leak
+    in. PYTHON owns the backlog write (same steering boundary as provision); the novelty filter + PR
+    review are the downstream guards on a stray line."""
+    tiered, plain = [], []
     for ln in (text or "").splitlines():
-        # tolerant of how a model actually formats it: leading bullets / numbers / markdown bold,
-        # optional brackets around the tier, the 'chore' tier, |/:/-/— separators, multi-digit (or
-        # absent -> 3) leverage. The tier must lead the line so prose ("this feature is nice") is ignored.
+        s = ln.strip()
+        # strict: a real tier tag leads the line (after optional bullet/number/markdown). 'chore' is not
+        # in the group, so chore-tagged lines are dropped (the ideate lane forbids chores).
         m = re.match(r"^[\s\-*\d.)#>]*\**\[?\s*(feature|refactor|architecture)\s*\]?\**"
-                     r"\s*[|:\-–—]*\s*(\d+)?\s*[|:\-–—]*\s*(.+?)\s*$", ln.strip(), re.I)
-        if m and len(m.group(3).strip()) > 8:          # a real idea, not a bare tier/header line (chore dropped)
+                     r"\s*[|:\-–—]*\s*(\d+)?\s*[|:\-–—]*\s*(.+?)\s*$", s, re.I)
+        if m and len(m.group(3).strip()) > 8:          # a real idea, not a bare tier/header line
             lev = min(5, max(1, int(m.group(2)))) if m.group(2) else 3
-            ideas.append((lev, m.group(1).lower(), m.group(3).strip().rstrip("`").strip()))
+            tiered.append((lev, m.group(1).lower(), m.group(3).strip().rstrip("`").strip()))
+            continue
+        # fallback: a plain idea line with no tier tag. Strip a leading bullet/number, then require real
+        # substance and reject obvious meta/preamble/headers/section-labels so prose stays out.
+        body = re.sub(r"^[\s\-*•·\d.)>]+", "", s).strip().rstrip("`").strip()
+        if (len(body) > 30 and " " in body and not body.lower().startswith(("#", "[chore]"))
+                and not body.endswith(":")
+                and not re.match(r"(?i)^(idea lines|here|below|based on|i|no|note|first|second|third|"
+                                 r"next|the following|these|this (is|repo|project)|propose)\b", body)):
+            plain.append((3, "feature", body))
+    ideas = tiered or plain        # trust the model's tiers when it complied; else the plain fallback
     ideas.sort(key=lambda t: -t[0])
     return ideas
 
@@ -3268,6 +3418,13 @@ def main(argv=None) -> int:
     if not os.environ.get(key):
         heartbeat(status="error", last_summary=f"{key} not set — add it to Solomon/.env")
         print(f"ERROR: {key} not set (Solomon/.env or environment).")
+        return 2
+    # The implement phase shells out to `pi`; if it isn't on the detached process PATH the loop would
+    # crash-loop the implement call every iteration. Probe once at startup and escalate cleanly with an
+    # actionable reason (mirrors the no_key guard above) instead of thrashing.
+    if shutil.which("pi") is None:
+        heartbeat(status="error", last_summary="pi CLI not found on PATH — install pi / ensure it is on the detached process PATH")
+        print("ERROR: pi CLI not found on PATH.")
         return 2
     # GitHub-based repo: expose the read-only github_* tools to the agent, and verify the
     # connection works BEFORE iterating when we intend to push — never burn iterations we can't ship.

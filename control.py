@@ -727,10 +727,10 @@ def github_status():
     gh = _which_gh()
     if gh:
         try:
-            r = _run([gh, "api", "user", "--jq", ".login"])
+            r = _run([gh, "api", "user", "--jq", ".login"], timeout=8)
             if r.returncode == 0:
                 login = (r.stdout or "").strip() or None
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
             login = None
     return {"ready": ready, "login": login}
 
@@ -1233,8 +1233,8 @@ def gh_ready():
     if not gh:
         return False
     try:
-        return _run([gh, "auth", "status"]).returncode == 0
-    except OSError:
+        return _run([gh, "auth", "status"], timeout=8).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
         return False
 
 
@@ -1271,12 +1271,12 @@ def list_prs(repo):
         r = _run(
             [gh, "pr", "list", "--json",
              "number,title,headRefName,url,state,createdAt,statusCheckRollup"],
-            cwd=path,
+            cwd=path, timeout=12,
         )
         if r.returncode != 0:
             return []
         prs = json.loads(r.stdout or "[]")
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, subprocess.TimeoutExpired):
         return []
     out = []
     for p in prs:
