@@ -201,9 +201,6 @@ class Api:
     def github_login_start(self):
         return control.github_login_start()
 
-    def publish(self, name, private=True):
-        return control.publish_to_github(name, private=private)
-
     # ---- review / workspace / insights ----------------------------------
     def pr_diff(self, name, number):
         r = self._repo(name)
@@ -229,9 +226,6 @@ class Api:
         r = self._repo(name)
         return control.metrics(r) if r else {}
 
-    def health(self):
-        return control.health()
-
     def cleanup_worktrees(self, name):
         r = self._repo(name)
         return control.cleanup_worktrees(r) if r else {"ok": False, "error": "unknown repo"}
@@ -239,10 +233,6 @@ class Api:
     def clean_branch(self, name):
         r = self._repo(name)
         return control.clean_branch(r) if r else {"ok": False, "error": "unknown repo"}
-
-    def list_worktrees(self, name):
-        r = self._repo(name)
-        return control.list_worktrees(r) if r else []
 
     def start_app_test(self, name):
         r = self._repo(name)

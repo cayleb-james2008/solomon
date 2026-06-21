@@ -273,21 +273,6 @@ class AgentBrowser:
             return self._fail(result.get("error", "browser action failed"), action)
         return self.observe(action)
 
-    # Compatibility helpers for existing callers.
-    def click(self, x_pct: float, y_pct: float) -> dict:
-        return self.act({"kind": "click", "x": self.viewport[0] * float(x_pct) / 100,
-                         "y": self.viewport[1] * float(y_pct) / 100})
-
-    def type_text(self, text: str) -> dict:
-        return self.act({"kind": "type", "text": text})
-
-    def scroll(self, dx: int = 0, dy: int = 300) -> dict:
-        return self.act({"kind": "scroll", "direction": "down" if dy >= 0 else "up",
-                         "pixels": abs(int(dy))})
-
-    def screenshot(self) -> dict:
-        return self.observe({"kind": "observe"})
-
     def write_state(self, ok=True, url="", screenshot_b64="", cursor=None,
                     status="live", phase="active", error=None, current_action=None,
                     elements=None, frame_ok=False, console_errors=None, network_errors=None):
