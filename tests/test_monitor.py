@@ -114,3 +114,80 @@ def test_operator_stop_sentinel_never_auto_cleared(tmp_path, monkeypatch):
     monitor.sweep()
     assert (rt / "stop").exists()                           # operator intent preserved
     assert started["called"] is False
+
+
+# --- stall detector: a RUNNING lane stuck repeating the same preflight refusal ------------------- #
+import json as _json  # noqa: E402
+
+
+def _stall_env(tmp_path, monkeypatch, *, hb, prior_snaps, existing_escalation=None):
+    """Wire a one-repo sweep() with a stubbed _monitor.jsonl tail and capture escalation writes."""
+    rt = tmp_path / "rt"; rt.mkdir()
+    mon = tmp_path / "_monitor.jsonl"
+    if prior_snaps:
+        mon.write_text("\n".join(_json.dumps(s) for s in prior_snaps) + "\n", encoding="utf-8")
+    monkeypatch.setattr(monitor, "MON_LOG", str(mon))
+    repo = {"name": "demo", "path": str(tmp_path / "repo")}
+    monkeypatch.setattr(control, "load_repos", lambda: [repo])
+    monkeypatch.setattr(control, "_runtime_dir", lambda r: str(rt))
+    monkeypatch.setattr(control, "_repo_path", lambda r: r.get("path"))
+    monkeypatch.setattr(control, "is_running", lambda r: True)          # the lane IS still running
+    monkeypatch.setattr(control, "read_heartbeat", lambda r: dict(hb))
+    monkeypatch.setattr(control, "read_history", lambda r, limit=1: [])
+    monkeypatch.setattr(control, "start", lambda r, auto_push=True: {"ok": True, "pid": 1})
+    monkeypatch.setattr(solomon, "recover", lambda *a, **k: {"actions_taken": [], "escalate": False})
+    monkeypatch.setattr(solomon, "diagnose", lambda r: {"category": "base_out_of_band"})
+    written = {}
+    monkeypatch.setattr(solomon, "_write_escalation", lambda r, d: written.update(d))
+    monkeypatch.setattr(solomon, "read_escalation", lambda r: dict(existing_escalation) if existing_escalation else None)
+    return rt, written
+
+
+def _err_preflight(n):
+    return [{"repo": "demo", "status": "error", "phase": "preflight"} for _ in range(n)]
+
+
+def test_stall_escalates_after_three_error_preflight_sweeps(tmp_path, monkeypatch):
+    # a running lane whose last 3 snapshots (2 prior + this one) are all error/preflight is wedged on
+    # a repeated refusal -> escalate with category 'running_stalled' (and NEVER auto-restart).
+    rt, written = _stall_env(
+        tmp_path, monkeypatch,
+        hb={"status": "error", "phase": "preflight", "last_summary": "out-of-band base commit"},
+        prior_snaps=_err_preflight(2))
+    out = monitor.sweep()
+    assert written.get("category") == "running_stalled"
+    assert any("STALLED" in a for a in out["actions"])
+
+
+def test_stall_not_flagged_before_threshold(tmp_path, monkeypatch):
+    # only 1 prior error/preflight snap + this one = 2 < 3 -> not yet a stall, no escalation.
+    rt, written = _stall_env(
+        tmp_path, monkeypatch,
+        hb={"status": "error", "phase": "preflight"},
+        prior_snaps=_err_preflight(1))
+    out = monitor.sweep()
+    assert written == {}
+    assert not any("STALLED" in a for a in out["actions"])
+
+
+def test_stall_not_flagged_when_phase_recovered(tmp_path, monkeypatch):
+    # the window is broken by a non-error/preflight snap (the lane recovered between sweeps) -> no stall.
+    rt, written = _stall_env(
+        tmp_path, monkeypatch,
+        hb={"status": "error", "phase": "preflight"},
+        prior_snaps=[{"repo": "demo", "status": "error", "phase": "preflight"},
+                     {"repo": "demo", "status": "iterating", "phase": "implement"}])
+    monitor.sweep()
+    assert written == {}
+
+
+def test_stall_anti_thrash_escalates_once(tmp_path, monkeypatch):
+    # an escalation.json with category 'running_stalled' already exists -> do NOT re-escalate (no thrash).
+    rt, written = _stall_env(
+        tmp_path, monkeypatch,
+        hb={"status": "error", "phase": "preflight"},
+        prior_snaps=_err_preflight(2),
+        existing_escalation={"category": "running_stalled"})
+    out = monitor.sweep()
+    assert written == {}                                    # _write_escalation NOT called again
+    assert not any("STALLED" in a for a in out["actions"])

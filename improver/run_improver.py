@@ -1654,6 +1654,16 @@ def _strip_tier(text: str):
     return ((text or "").strip(), "chore")
 
 
+def _needs_goal_skip(goal: str) -> bool:
+    """True iff this iteration has NO real objective: the north-star GOAL is empty/whitespace AND the
+    chosen backlog item is the generic placeholder ('model-chosen improvement') or an already-deferred
+    item ('(deferred...)'). In that state running pi just loops on done/too-hard work and fabricates
+    no-op edits — so the caller SKIPs + escalates (needs_goal). A repo with a REAL backlog item but no
+    GOAL still runs (the conjunction is required)."""
+    g = (goal or "").lower()
+    return GOAL.strip() == "" and ("model-chosen improvement" in g or "(deferred" in g)
+
+
 def _top_backlog_item():
     """(text, tier) of the first unchecked `- [ ]` item; tier from its leading tag, default 'chore'."""
     try:
@@ -2282,6 +2292,21 @@ def one_iteration() -> None:
         # continually-refreshed menu instead of grinding the same stale top item. No-op when disabled.
         ideate_phase()
         goal, tier = _top_backlog_item()
+        # EMPTY-GOAL GUARD: with NO north-star GOAL set AND only the generic placeholder
+        # ("model-chosen improvement") or an already-deferred item to chew on, the agent has no real
+        # objective — it loops on done/too-hard work, narrating edits without writing (a fabrication
+        # no-op) and burning tokens silently (the asmodeus failure). SKIP + escalate instead of running
+        # pi on a dead item: write a needs_goal heartbeat (no STOP — the loop self-resumes the instant a
+        # goal/backlog item is set) so the operator is told to set a goal in Config. A repo WITH a real
+        # backlog but no GOAL still runs (this fires only on the empty-GOAL AND placeholder/deferred pair).
+        if _needs_goal_skip(goal):
+            heartbeat(status="error", phase="preflight", reason="needs_goal",
+                      last_summary="This repo has no north-star GOAL set and no actionable backlog — "
+                                   "set a goal in Config so the loop has an objective (it will not "
+                                   "fabricate work).")
+            log("SKIP iteration: no north-star GOAL and no actionable backlog item — needs_goal "
+                "(set a goal in Config; the loop won't fabricate work)")
+            return
         _apply_fallback_model(goal)   # escalation rung 1: a repeatedly-stuck item retries on the fallback model
         task = build_task(goal, tier)
         system_md = None

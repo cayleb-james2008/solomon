@@ -101,6 +101,20 @@ def test_diagnose_no_key(tmp_path, monkeypatch):
     assert d["category"] == "no_key" and not d["auto_safe"]
 
 
+def test_diagnose_needs_goal(tmp_path, monkeypatch):
+    # the empty-goal guard fired (run_improver wrote reason=needs_goal): classify as a NON-auto,
+    # escalate-only needs_goal so the operator sets a goal (Solomon must not auto-restart it).
+    rt = _rt(tmp_path, monkeypatch)
+    _hb(rt, status="error", phase="preflight", reason="needs_goal",
+        last_summary="This repo has no north-star GOAL set and no actionable backlog — set a goal in Config.")
+    d = solomon.diagnose(_repo(tmp_path))
+    assert d["category"] == "needs_goal" and not d["auto_safe"]
+    # the recovery ladder escalates (never auto-restarts) a non-auto category like this
+    res = solomon.recover(_repo(tmp_path))
+    assert res["escalate"] and not res["ok"]
+    assert (rt / "escalation.json").exists()
+
+
 def test_solomon_fix_session_honors_auto_push(tmp_path, monkeypatch):
     # a fix-session must ship LOCAL-only when the global auto_push gate is off (no push/merge),
     # and the repo's configured ship mode when it's on.
@@ -425,3 +439,63 @@ def test_auto_ai_fix_only_on_unattended_sweep(monkeypatch):
     api._state["auto_ai_fix"] = False                       # explicit tick always allows, regardless
     api.supervise("z", allow_pi=True)
     assert seen["allow_pi"] is True
+
+
+# ---- headless HTTP health endpoint (--serve-health) ------------------------
+def test_health_payload_shape(monkeypatch):
+    # the JSON body has the expected keys and a per-repo diagnose summary; pure (no socket).
+    import app
+    fake = {"name": "z", "path": "C:/none"}
+    monkeypatch.setattr(app.control, "load_repos", lambda: [fake])
+    monkeypatch.setattr(app.control, "health", lambda: {"gh": False, "git": True, "keys": {}, "repos": []})
+    monkeypatch.setattr(app.solomon, "diagnose",
+                        lambda r: {"name": "z", "running": False, "healthy": True,
+                                   "category": "ok", "evidence": "idle"})
+    body = app._health_payload()
+    assert body["ok"] is True
+    assert set(body.keys()) == {"ok", "health", "repos"}
+    assert body["repos"] == [{"name": "z", "running": False, "healthy": True,
+                              "category": "ok", "evidence": "idle"}]
+
+
+def test_serve_health_handler_serves_json(monkeypatch):
+    # bind the real server to an ephemeral port (0) and GET /health -> valid JSON; /other -> 404.
+    import json as _json
+    import threading
+    import urllib.request
+    import urllib.error
+    import http.server
+    import app
+
+    monkeypatch.setattr(app.control, "load_repos", lambda: [])
+    monkeypatch.setattr(app.control, "health", lambda: {"gh": True, "git": True, "keys": {}, "repos": []})
+
+    # build the same handler serve_health uses, but bind to port 0 so the test never collides.
+    captured = {}
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path.split("?", 1)[0] != "/health":
+                self.send_error(404, "not found"); return
+            b = _json.dumps(app._health_payload()).encode("utf-8")
+            self.send_response(200); self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+
+        def log_message(self, *a):
+            pass
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _H)
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True); t.start()
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        assert data["ok"] is True and set(data.keys()) == {"ok", "health", "repos"}
+        captured["404"] = None
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/nope", timeout=5)
+        except urllib.error.HTTPError as e:
+            captured["404"] = e.code
+        assert captured["404"] == 404
+    finally:
+        httpd.shutdown(); httpd.server_close()

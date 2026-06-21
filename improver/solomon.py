@@ -64,11 +64,18 @@ def diagnose(repo):
     has_lock = bool(rt and os.path.exists(os.path.join(rt, "lock")))
     has_stop = bool(rt and os.path.exists(os.path.join(rt, "stop")))
     status, phase = hb.get("status"), hb.get("phase")
+    reason = hb.get("reason")
     summary = hb.get("last_summary") or ""
     hist = control.read_history(repo, limit=20)
 
     cat, ev, rec, safe = "ok", (status or ("running" if running else "idle")), [], True
-    if status == "error" and ("not set" in summary or "API key" in summary):
+    if status == "error" and reason == "needs_goal":
+        # the empty-goal guard fired (run_improver): no north-star GOAL and only a placeholder/deferred
+        # backlog, so the loop skips instead of fabricating work. NON-auto, escalate-only (like no_key) —
+        # the operator must set a goal; Solomon must not auto-restart (a restart just re-hits the guard).
+        cat, ev, rec, safe = ("needs_goal", summary[:200] or "no north-star GOAL and no actionable backlog",
+                              ["set this repo's GOAL in Config so the loop has an objective"], False)
+    elif status == "error" and ("not set" in summary or "API key" in summary):
         cat, ev, rec, safe = "no_key", summary[:160], ["add the provider API key in Settings"], False
     elif status == "error" and "GitHub not ready" in summary:
         cat, ev, rec, safe = "gh_not_ready", summary[:160], ["connect GitHub (gh auth login)"], False
@@ -153,6 +160,9 @@ def _suggested_steps(repo, cat):
         return [cd, f"git checkout --force {base}", "git reset --hard", f"git reset --hard origin/{base}", "git status"]
     if cat == "no_key":
         return ["Open Solomon → Settings and add the provider's API key, then retry"]
+    if cat == "needs_goal":
+        return ["Open Solomon → this repo → Config and set a north-star GOAL (or add an actionable",
+                "backlog item in improver/<name>/backlog.md); the loop resumes once it has an objective"]
     if cat == "gh_not_ready":
         return ["gh auth login   # authenticate, then retry"]
     if cat == "stuck":

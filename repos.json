@@ -42,7 +42,23 @@
     "interval": 120,
     "max_iterations": 0,
     "reasoning": "xhigh",
-    "goal": "",
+    "goal": "ASMODEUS NORTH STAR (heavily weighted every iteration): Asmodeus is a live-capable algorithmic trading system whose Layer-2 'strategy builder' LLM must actually produce VALIDATED, PROFITABLE strategy candidates that advance through the anti-overfit funnel toward live. RIGHT NOW THE SECOND LAYER IS BROKEN: the layer2_builder tool registry is mis-wired so every builder tool call fails — observed in builder_*.log as: evaluate_batch() missing 1 required positional argument: 'bars'; backtest() missing 1 required positional argument: 'bars'; backtest() raised 'dict' object has no attribute 'timeframe'; rule_significance() raised 'NoneType' object is not iterable. As a result 0 candidates advance despite ~10M tokens burned. HIGHEST-LEVERAGE FIX FIRST: repair the tool-call wiring in asmodeus/layer2_builder/tools.py and its dispatch from asmodeus/workers/builder_lane.py so the builder's backtest / evaluate_batch / optimize / monte_carlo / rule_significance tools receive the market `bars` and a proper timeframe object, the tool loop runs end-to-end, and candidates actually advance. VERIFY with the pytest gate AND by confirming builder_*.log shows successful tool calls and at least one advancing candidate before claiming success. THEN iterate on strategy quality so the system generates genuinely profitable, statistically-significant strategies. ITERATE FROM MISTAKES: each cycle read the most recent builder_*.log / meta_loop.log errors and fix the highest-leverage failure. A truthful null beats a fabricated 'already done' — never claim a fix you did not write and verify.",
+    "pipeline": { "plan": true, "review": true, "ideate": true, "reflect": true }
+  },
+  {
+    "name": "dotz",
+    "branch_prefix": "rsi/",
+    "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\dotz",
+    "public": true,
+    "provider": "ollama-cloud",
+    "model": "glm-5.2",
+    "ship": "auto-merge",
+    "pr_target_branch": "master",
+    "gate": "npm run typecheck && npm run check",
+    "interval": 120,
+    "max_iterations": 0,
+    "reasoning": "xhigh",
+    "goal": "Improve dotz — a pi.dev-based, Claude-Desktop-style coding-agent dashboard (embedded pi SDK + Fastify backend on 127.0.0.1:4317 + vanilla-JS cyberbrutalist UI, packaged as an Electron .exe). Make additive, high-leverage improvements: fix real bugs, harden the Fastify/WebSocket server and Electron lifecycle, improve agent/session reliability, error handling, and operator UX. Keep every change green under the gate (npm run typecheck = tsc --noEmit, and npm run check = the no-console-window guard — all child processes MUST stay windowless). Do NOT introduce new heavy dependencies or architectural layers; simplicity-first. Strengthen test/verification coverage where cheap. A truthful null beats a fabricated improvement — never claim an edit you did not write.",
     "pipeline": { "plan": true, "review": true, "ideate": true, "reflect": true }
   }
 ]
