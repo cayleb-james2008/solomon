@@ -9,6 +9,9 @@ __pycache__/
 
 # operator runtime + secrets (per-machine, not source)
 runtime/
+# per-operator improver state (backlog + lessons churn per machine, like runtime/)
+improver/*/backlog.md
+improver/*/LESSONS.md
 .env
 .solomon.json
 .rsi-control.json

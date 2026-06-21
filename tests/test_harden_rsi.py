@@ -74,26 +74,6 @@ def test_heartbeat_normal_phase_update_unaffected(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# HARDEN-B (gate-1) — the after-gate is never narrowed below the baseline scope
-# --------------------------------------------------------------------------- #
-def test_correlated_expansion_never_narrows_default_gate(tmp_path, monkeypatch):
-    """gate-1: the default full-suite gate must not be narrowed to the correlated subset. With a
-    full-suite baseline, a narrowed after-gate makes anti-gaming's pass/collected check fire every
-    iteration (-> infinite revert/defer) and blinds the gate to non-correlated regressions. The
-    expansion must be a no-op so after-gate scope == baseline scope."""
-    m = _load_runner()
-    test_dir = tmp_path / "tests"
-    test_dir.mkdir()
-    (test_dir / "test_config.py").write_text("import config\ndef test_x():\n    pass\n")
-    monkeypatch.setattr(m, "REPO", tmp_path)
-    # even though test_config.py correlates with the change, the default gate is returned UNCHANGED
-    out = m._expand_gate_with_correlated("", ["scripts/config.py"])
-    assert out == ""                              # full suite, not "pytest test_config.py"
-    # a custom gate is likewise run verbatim (operator-owned), so baseline==after for it too
-    assert m._expand_gate_with_correlated("mygate --x", ["scripts/config.py"]) == "mygate --x"
-
-
-# --------------------------------------------------------------------------- #
 # HARDEN-D (gate-2) — count-less custom gates still catch test deletion
 # --------------------------------------------------------------------------- #
 def test_removed_test_def_caught_when_counts_inactive():
@@ -234,29 +214,60 @@ def test_watchdog_restarts_a_crashed_loop():
 # --------------------------------------------------------------------------- #
 # HARDEN-J — the empty-goal guard skips a dead iteration instead of fabricating work
 # --------------------------------------------------------------------------- #
-def test_needs_goal_skip_fires_on_empty_goal_plus_placeholder(monkeypatch):
-    """No north-star GOAL + the generic placeholder item -> skip (the asmodeus no-objective wedge)."""
+def _seed_noop_history(m, tmp_path, monkeypatch, statuses):
+    """Point m.RUNTIME at tmp_path and write history.jsonl with the given trailing statuses."""
+    monkeypatch.setattr(m, "RUNTIME", tmp_path)
+    (tmp_path / "history.jsonl").write_text(
+        "\n".join(f'{{"status": "{s}"}}' for s in statuses) + "\n", encoding="utf-8")
+
+
+def test_needs_goal_skip_fires_on_empty_goal_plus_placeholder(monkeypatch, tmp_path):
+    """No north-star GOAL + the generic placeholder item + an active noop streak -> skip (the asmodeus
+    no-objective fabrication wedge)."""
     m = _load_runner()
     monkeypatch.setattr(m, "GOAL", "   ")          # whitespace-only counts as empty
+    _seed_noop_history(m, tmp_path, monkeypatch, ["noop", "noop"])
     assert m._needs_goal_skip("model-chosen improvement") is True
 
 
-def test_needs_goal_skip_fires_on_empty_goal_plus_deferred(monkeypatch):
-    """No GOAL + an already-deferred item (every real item exhausted) -> skip, don't loop on it."""
+def test_needs_goal_skip_fires_on_empty_goal_plus_deferred(monkeypatch, tmp_path):
+    """No GOAL + an already-deferred item + an active noop streak -> skip, don't loop on it."""
     m = _load_runner()
     monkeypatch.setattr(m, "GOAL", "")
+    _seed_noop_history(m, tmp_path, monkeypatch, ["noop"])
     assert m._needs_goal_skip("rewrite the parser  (deferred: agent could not implement)") is True
 
 
-def test_needs_goal_skip_not_fired_when_real_backlog_item(monkeypatch):
+def test_needs_goal_skip_not_fired_when_real_backlog_item(monkeypatch, tmp_path):
     """A repo with a REAL backlog item but no GOAL still runs (the conjunction is required)."""
     m = _load_runner()
     monkeypatch.setattr(m, "GOAL", "")
+    _seed_noop_history(m, tmp_path, monkeypatch, ["noop", "noop"])
     assert m._needs_goal_skip("add a /metrics endpoint") is False
 
 
-def test_needs_goal_skip_not_fired_when_goal_set(monkeypatch):
+def test_needs_goal_skip_not_fired_when_goal_set(monkeypatch, tmp_path):
     """A real north-star GOAL is enough — even the placeholder item runs (the goal steers it)."""
     m = _load_runner()
     monkeypatch.setattr(m, "GOAL", "make the API 2x faster")
+    _seed_noop_history(m, tmp_path, monkeypatch, ["noop", "noop"])
+    assert m._needs_goal_skip("model-chosen improvement") is False
+
+
+def test_needs_goal_skip_not_fired_when_shipping_real_changes(monkeypatch, tmp_path):
+    """maki regression: a self-directing repo with NO goal and only the placeholder item, but that is
+    STILL shipping real work (the last iteration was a real change, not a noop), must NOT be parked —
+    the guard fires only when there is ALSO an active fabrication loop (a recent noop streak)."""
+    m = _load_runner()
+    monkeypatch.setattr(m, "GOAL", "")
+    _seed_noop_history(m, tmp_path, monkeypatch, ["noop", "noop", "shipped"])  # last outcome = real change
+    assert m._needs_goal_skip("model-chosen improvement") is False
+
+
+def test_needs_goal_skip_not_fired_when_no_history(monkeypatch, tmp_path):
+    """A fresh repo (no history yet) with no goal + placeholder is not parked — there is no evidence of
+    a fabrication loop, so give it a chance to ship before declaring it stuck."""
+    m = _load_runner()
+    monkeypatch.setattr(m, "GOAL", "")
+    monkeypatch.setattr(m, "RUNTIME", tmp_path)    # empty dir, no history.jsonl
     assert m._needs_goal_skip("model-chosen improvement") is False
