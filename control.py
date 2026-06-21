@@ -578,7 +578,10 @@ def apply_update():
     repo = _solomon_repo()
     if not repo:
         return {"ok": False, "started": False, "error": "Solomon source repo not found"}
-    env = dict(os.environ)
+    # _clean_subenv() (not raw os.environ): a leaked PYTHONHOME/PYTHONPATH from a dev/Hermes-host parent
+    # crashes the maki-venv (3.12) updater python at interpreter startup ("No module named 'encodings'")
+    # and the PyInstaller rebuild it spawns — the exact pitfall every other spawn here already guards.
+    env = _clean_subenv()
     env["SOLOMON_HOME"] = repo  # so the spawned updater resolves the same checkout
     exe = os.path.join(repo, "dist", "updater", "SolomonUpdater", "SolomonUpdater.exe")
     try:
@@ -651,6 +654,11 @@ def set_key(provider, value):
     key = _PROVIDER_ENV_KEY.get(provider)
     if not key:
         return {"ok": False, "error": f"unknown provider: {provider}"}
+    # Trust boundary: .env is a line-based store. A pasted value with an interior newline would forge
+    # extra provider lines and falsify keys_status() (silent provider misroute). Reject control chars.
+    value = (value or "").strip()
+    if "\n" in value or "\r" in value:
+        return {"ok": False, "error": "key must be a single line"}
     try:
         lines = []
         if os.path.exists(_ENV_FILE):
@@ -1607,6 +1615,11 @@ def ideate(repo):
     name, path = _repo_name(repo), _repo_path(repo)
     if not name or not path:
         return {"ok": False, "error": "repo has no name/path"}
+    # Single-flight: the operator one-shot --ideate prepends to backlog.md with a non-atomic
+    # read-modify-write and never takes the runner's lock; racing a live loop's backlog writes loses a
+    # tick (duplicate PR) or the new items. Refuse while the loop holds the repo — ideation runs in-loop.
+    if is_running(repo):
+        return {"ok": False, "error": "loop is running — stop it first to ideate manually (ideation also runs in-loop)"}
     prov = project_provider(repo)
     if not keys_status().get(prov):
         return {"ok": False, "error": f"{prov} API key not set (add it in Settings)"}

@@ -19,8 +19,10 @@ def test_capture_uses_persistent_agent_browser(tmp_path, monkeypatch):
 
         def navigate(self, url):
             calls.append(url)
-            return {"ok": True, "url": url, "elements": [{"ref": "@e1", "role": "button",
-                                                              "name": "Run"}]}
+            # 'frame' present == this page's screenshot CLI succeeded (real observe() sets it only then);
+            # _run_capture now reads frame_file ONLY when 'frame' is set, so the fixture must include it.
+            return {"ok": True, "url": url, "frame": {"available": True},
+                    "elements": [{"ref": "@e1", "role": "button", "name": "Run"}]}
 
     monkeypatch.setattr(visual_review, "AgentBrowser", FakeBrowser)
     result = visual_review._run_capture("http://127.0.0.1:4000", ["/", "/settings"], tmp_path)
@@ -29,6 +31,48 @@ def test_capture_uses_persistent_agent_browser(tmp_path, monkeypatch):
     assert len(result["pages"]) == 2
     assert result["pages"][0]["screenshot_b64"]
     assert "button" in result["pages"][0]["a11y_yaml"]
+
+
+def test_capture_returns_none_when_no_screenshots(tmp_path, monkeypatch):
+    # every page failing to capture (e.g. agent-browser binary missing -> every navigate fails) must
+    # yield None, not ok:True with zero screenshots — else the mandatory visual gate passes blind.
+    class FailBrowser:
+        def __init__(self, *a, **k):
+            self.frame_file = tmp_path / "f.jpg"
+
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+        def navigate(self, url):
+            return {"ok": False, "error": "agent-browser 0.27.0 is not installed"}
+
+    monkeypatch.setattr(visual_review, "AgentBrowser", FailBrowser)
+    assert visual_review._run_capture("http://127.0.0.1:4000", ["/", "/x"], tmp_path) is None
+
+
+def test_capture_skips_stale_frame_when_screenshot_failed(tmp_path, monkeypatch):
+    # page A succeeds (frame present); page B navigates ok but its screenshot CLI failed (no 'frame').
+    # B must NOT inherit A's reused frame image — its screenshot_b64 stays empty.
+    class MixedBrowser:
+        def __init__(self, *a, **k):
+            self.frame_file = tmp_path / "fr.jpg"
+            self.frame_file.write_bytes(b"PAGE_A_IMAGE")
+
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+        def navigate(self, url):
+            if url.endswith("/a"):
+                return {"ok": True, "frame": {"available": True}, "elements": []}
+            return {"ok": True, "elements": []}            # page B: ok but NO frame (screenshot failed)
+
+    monkeypatch.setattr(visual_review, "AgentBrowser", MixedBrowser)
+    res = visual_review._run_capture("http://127.0.0.1:4000", ["/a", "/b"], tmp_path)
+    assert res["ok"] is True
+    a = next(p for p in res["pages"] if p["path"] == "/a")
+    b = next(p for p in res["pages"] if p["path"] == "/b")
+    assert a["screenshot_b64"]                              # page A's fresh frame embedded
+    assert b["screenshot_b64"] == ""                       # page B did NOT inherit A's image
 
 
 def test_visual_review_uses_unified_provider_shim():

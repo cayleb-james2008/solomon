@@ -55,10 +55,16 @@ def _run_capture(base_url: str, pages: list, runtime_dir: Path,
                     item["nav_error"] = state.get("error") or "navigation failed"
                     captured.append(item)
                     continue
-                try:
-                    item["screenshot_b64"] = base64.b64encode(
-                        browser.frame_file.read_bytes()).decode("ascii")
-                except OSError:
+                # Only embed the frame if THIS page's capture is fresh: observe() sets state['frame']
+                # only when the screenshot CLI succeeded. frame_file is a reused fixed path, so reading it
+                # unconditionally would embed the PRIOR page's image when this page's screenshot failed.
+                if state.get("frame"):
+                    try:
+                        item["screenshot_b64"] = base64.b64encode(
+                            browser.frame_file.read_bytes()).decode("ascii")
+                    except OSError:
+                        item["screenshot_b64"] = ""
+                else:
                     item["screenshot_b64"] = ""
                 item["a11y_yaml"] = "\n".join(
                     f"- {element.get('role', 'element')}: {element.get('name', '')} "
@@ -66,6 +72,12 @@ def _run_capture(base_url: str, pages: list, runtime_dir: Path,
                     for element in state.get("elements") or [] if isinstance(element, dict)
                 )
                 captured.append(item)
+        # If NO page produced a screenshot (e.g. the agent-browser binary is missing -> every navigate
+        # failed), the capture is effectively unavailable: return None so the caller's "capture failed"
+        # guard fires. A silent ok:True with zero screenshots would let the mandatory visual gate pass
+        # blind (GREEN ship with no actual visual review).
+        if captured and not any(p.get("screenshot_b64") for p in captured):
+            return None
         return {"ok": True, "pages": captured}
     except Exception:  # noqa: BLE001 - caller converts unavailable capture into a gate result
         return None

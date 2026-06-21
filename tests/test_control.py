@@ -509,6 +509,18 @@ def test_acquire_supervisor_lock_oserror_returns_false(tmp_path, monkeypatch):
     assert ok is False and token is None
 
 
+def test_set_key_rejects_newline_value(tmp_path, monkeypatch):
+    # trust boundary: a value with an interior newline would forge extra .env lines and falsify
+    # keys_status() (silent provider misroute) — set_key must reject it and write nothing.
+    p = tmp_path / ".env"
+    monkeypatch.setattr(control, "_ENV_FILE", str(p))
+    res = control.set_key("openrouter", "sk-real\nOLLAMA_API_KEY=forged")
+    assert res["ok"] is False and "single line" in res["error"]
+    assert not p.exists()                                   # nothing written
+    assert control.set_key("openrouter", "  sk-valid  ")["ok"] is True   # valid value still works (+strip)
+    assert "OPENROUTER_API_KEY=sk-valid" in p.read_text(encoding="utf-8")
+
+
 # --------------------------------------------------------------------------- #
 # GitHub tools for the pi agent + end-of-loop verification
 # --------------------------------------------------------------------------- #

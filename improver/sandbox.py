@@ -191,7 +191,14 @@ class Sandbox:
             raise ValueError("sandbox config missing 'launch' command")
         values = {"port": str(self.port), "state": str(self.state_dir),
                   "workdir": str(self.work_dir)}
-        args = [arg.format(**values) for arg in args]
+        # token-replace ONLY the known placeholders so a literal { } in a launch arg (a JSON config blob,
+        # a brace-glob like src/**/*.{js,ts}, a {0}) passes through instead of raising KeyError/IndexError
+        # from str.format(**values) and hard-crashing sandbox boot.
+        def _sub(a):
+            for k, v in values.items():
+                a = a.replace("{" + k + "}", v)
+            return a
+        args = [_sub(arg) for arg in args]
         if args:
             first = args[0].replace("/", os.sep).replace("\\", os.sep)
             candidate = os.path.abspath(os.path.join(self.repo_path, first))
@@ -203,30 +210,35 @@ class Sandbox:
     def __enter__(self) -> "Sandbox":
         self.port = _free_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
-        self._create_isolation_root()
-        extra = dict(self.config.get("extra_env") or {})
-        port_env = self.config.get("port_env")
-        state_env = self.config.get("state_env")
-        if port_env:
-            extra[str(port_env)] = str(self.port)
-        if state_env:
-            extra[str(state_env)] = str(self.state_dir)
-        env = _clean_sandbox_env(extra, self.state_dir)
-        env["HOST"] = "127.0.0.1"
-        self._stdout = open(self.stdout_path, "w", encoding="utf-8")
-        self._stderr = open(self.stderr_path, "w", encoding="utf-8")
-        self.proc = subprocess.Popen(
-            self._command(), shell=False, cwd=self.work_dir, env=env,
-            stdout=self._stdout, stderr=self._stderr, stdin=subprocess.DEVNULL,
-            close_fds=True, **hidden_subprocess_kwargs(new_group=True),
-        )
-        self._job_handle = _create_kill_on_close_job()
-        if self._job_handle and not _assign_to_job(self._job_handle, self.proc):
-            _close_job(self._job_handle)
-            self._job_handle = None
+        # Guard the WHOLE boot, not just _wait_health: _create_isolation_root (a full repo copytree),
+        # _command() (KeyError on a bad placeholder), Popen (FileNotFoundError on a missing launch
+        # binary — the common case), and _clean_sandbox_env (ValueError) all raise BEFORE _wait_health,
+        # and __exit__ never runs when __enter__ raises — so the repo-mirror temp dir + the two open
+        # stdout/stderr handles would leak per failed boot. _cleanup() is idempotent/null-safe.
         try:
+            self._create_isolation_root()
+            extra = dict(self.config.get("extra_env") or {})
+            port_env = self.config.get("port_env")
+            state_env = self.config.get("state_env")
+            if port_env:
+                extra[str(port_env)] = str(self.port)
+            if state_env:
+                extra[str(state_env)] = str(self.state_dir)
+            env = _clean_sandbox_env(extra, self.state_dir)
+            env["HOST"] = "127.0.0.1"
+            self._stdout = open(self.stdout_path, "w", encoding="utf-8")
+            self._stderr = open(self.stderr_path, "w", encoding="utf-8")
+            self.proc = subprocess.Popen(
+                self._command(), shell=False, cwd=self.work_dir, env=env,
+                stdout=self._stdout, stderr=self._stderr, stdin=subprocess.DEVNULL,
+                close_fds=True, **hidden_subprocess_kwargs(new_group=True),
+            )
+            self._job_handle = _create_kill_on_close_job()
+            if self._job_handle and not _assign_to_job(self._job_handle, self.proc):
+                _close_job(self._job_handle)
+                self._job_handle = None
             self._wait_health()
-        except Exception:
+        except BaseException:
             self._cleanup()
             raise
         return self

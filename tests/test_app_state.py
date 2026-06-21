@@ -42,3 +42,23 @@ def test_set_auto_push_persists_and_reads_back(tmp_path, monkeypatch):
     res = app.Api().set_auto_push(False)
     assert res["ok"] is True and res["auto_push"] is False
     assert app.Api().get_auto_push() is False
+
+
+def test_supervise_survives_one_repo_raising(tmp_path, monkeypatch):
+    # one repo whose recover() raises must NOT abort the whole --supervise sweep; later repos still run.
+    monkeypatch.setattr(app, "_STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setattr(app, "_LEGACY_STATE_FILE", str(tmp_path / "legacy.json"))
+    repos = [{"name": "good1"}, {"name": "boom"}, {"name": "good2"}]
+    monkeypatch.setattr(app.control, "load_repos", lambda: repos)
+
+    def recover(r, **k):
+        if r["name"] == "boom":
+            raise RuntimeError("kaboom")
+        return {"ok": True, "category": "ok"}
+
+    monkeypatch.setattr(app.solomon, "recover", recover)
+    out = app.Api().supervise(None, unattended=True)
+    assert out["ok"] is True
+    assert [x["name"] for x in out["results"]] == ["good1", "boom", "good2"]   # all processed
+    boom = next(x for x in out["results"] if x["name"] == "boom")
+    assert boom["ok"] is False and boom["escalate"] is True

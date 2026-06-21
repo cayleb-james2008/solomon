@@ -114,6 +114,20 @@ def test_wait_for_ci_queues_auto_when_pending_past_cap(monkeypatch):
     assert any("--auto" in c for c in calls)
 
 
+def test_wait_for_ci_stop_wins_over_green(tmp_path, monkeypatch):
+    # halt-switch: a live operator STOP must leave a green PR OPEN, never auto-merge it to the
+    # integration branch (SOLOMON_RSI: a mid-iteration stop does not ship). The STOP check must win
+    # even when CI is already green.
+    m = _load_runner()
+    stop = tmp_path / "stop"; stop.write_text("", encoding="utf-8")
+    monkeypatch.setattr(m, "STOP", stop)
+    monkeypatch.setattr(m, "_pr_checks", lambda n: "success")   # CI is green this poll
+    calls = _stub_gh(m, monkeypatch)
+    out = m._wait_for_ci_then_merge({"number": 7, "state": "open"})
+    assert out["state"] == "open (stopped before merge)"        # NOT merged
+    assert not any("merge" in c and "--squash" in c for c in calls)   # no squash-merge was issued
+
+
 # --------------------------------------------------------------------------- #
 # control.branch_hygiene + control.clean_branch — the dashboard "Clean branch" tool
 # (auto-detect a dirty managed repo left off its base branch / with stray rsi/* branches,

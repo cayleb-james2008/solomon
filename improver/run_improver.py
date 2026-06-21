@@ -262,7 +262,7 @@ def build_task(goal: str, tier: str = "chore") -> str:
 
     Also CONSUMES any one-time escalation feedback (LAST_GATE_FEEDBACK) from the previous failed
     attempt and clears it, so the corrective note is injected exactly once."""
-    global LAST_GATE_FEEDBACK
+    global LAST_GATE_FEEDBACK, LAST_VISUAL_FEEDBACK
     north_star = (
         f'NORTH-STAR GOAL (weigh above all): {GOAL}\nChoose the change with the most leverage toward '
         f'that goal; if it needs a capability the project lacks, BUILD that capability as this one '
@@ -286,6 +286,7 @@ def build_task(goal: str, tier: str = "chore") -> str:
             "within the current backlog item's scope. Otherwise, note it for a future item. The visual "
             "feedback is ONE-TIME — it does not repeat unless a new E2E sandbox review runs.\n"
         )
+        LAST_VISUAL_FEEDBACK = ""   # consumed — inject exactly once (mirror LAST_GATE_FEEDBACK below)
     if LAST_GATE_FEEDBACK:
         feedback_block += (
             f"\n\nTHE PREVIOUS ATTEMPT ON THIS ITEM FAILED — {LAST_GATE_FEEDBACK}\n"
@@ -596,13 +597,22 @@ def _record_history(status: str, branch: str | None, summary: str, *, extra: dic
 
 
 # ---- git ------------------------------------------------------------------
-def git(*args: str) -> subprocess.CompletedProcess:
+def git(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
     # encoding/errors: git output (diffs, commit messages, non-ASCII paths) can contain UTF-8; without
     # these, text=True decodes as the Windows locale (cp1252) and a UnicodeDecodeError crashes the whole
     # iteration. errors="replace" keeps the loop alive. (Belt-and-suspenders with PYTHONUTF8 in the env.)
-    return subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace",
-                          env=_clean_env(), **hidden_subprocess_kwargs())
+    # timeout: a network git op (fetch/push/ls-remote) on a half-open/proxied/captive-portal stall would
+    # otherwise hang the whole iteration FOREVER with a frozen heartbeat (no watchdog signal — the loop is
+    # 'alive' but stuck). Bound it and surface a TimeoutExpired as a FAILED CompletedProcess so callers
+    # see a failed git op (retried/escalated normally) instead of an invisible hang.
+    try:
+        return subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout,
+                              env=_clean_env(), **hidden_subprocess_kwargs())
+    except subprocess.TimeoutExpired as e:
+        return subprocess.CompletedProcess(["git", *args], returncode=124,
+                                           stdout=(e.stdout or ""),
+                                           stderr=f"git {' '.join(args)} timed out after {timeout}s")
 
 
 def has_remote() -> bool:
@@ -1096,7 +1106,10 @@ def _run_cross_repo_gates(history_rec: dict) -> dict:
         green = p.returncode == 0
         tests = {"passed": passed, "failed": failed, "errors": errors,
                  "skipped": skipped, "collected": collected, "green": green}
-        results[dep_name] = {"green": green, "tests": tests, "tail": out[-800:]}
+        # SEC-5: redact secret-shaped tokens from the dep gate tail before it reaches the log AND
+        # history.jsonl (the primary gate tail at the log site is already redacted; this cross-repo
+        # path was the leak — failing dep-test output can carry tokens).
+        results[dep_name] = {"green": green, "tests": tests, "tail": _redact(out[-800:])}
         history_rec.setdefault("cross_repo_gates", {})[dep_name] = results[dep_name]
         if not green:
             return {"ok": False, "failed_repo": dep_name, "results": results}
@@ -1920,6 +1933,12 @@ def _wait_for_ci_then_merge(pr: dict) -> dict:
     heartbeat(phase="merge")
     deadline = time.time() + CI_WAIT_CEILING_S
     while True:
+        # Halt-switch FIRST: a live operator STOP must win over a green/None CI check. If this were below
+        # the success branch (as before), a STOP pressed mid-wait would be bypassed whenever CI is green
+        # and the PR would still squash-merge to the integration branch — violating SOLOMON_RSI's "a
+        # mid-iteration stop keeps the gate-green branch locally but does not ship it".
+        if STOP.exists():
+            return {**pr, "state": "open (stopped before merge)"}
         checks = _pr_checks(num)
         if checks in ("success", None):
             m = _try_squash_merge(num)
@@ -1932,8 +1951,6 @@ def _wait_for_ci_then_merge(pr: dict) -> dict:
                            cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
             log(f"CI RED on PR {num} — closed PR + deleted branch (auto-revert)")
             return {**pr, "state": "reverted (CI red)"}
-        if STOP.exists():
-            return {**pr, "state": "open (stopped before merge)"}
         if time.time() >= deadline:
             am = subprocess.run([gh_exe(), "pr", "merge", str(num), "--auto", "--squash", "--delete-branch"],
                                 cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
@@ -2467,7 +2484,10 @@ def one_iteration() -> None:
     # exists. Skip only ship=local (there the local branch is the sole copy of the work); auto-merge
     # already merged+deleted it on origin, pr-mode has it pushed, revert/noop deleted it via
     # _abort_branch. A clean-tree tripwire guarantees a pristine base for the next preflight.
-    if SHIP != "local":
+    # Skip deletion when this branch is the SOLE copy of the work: ship=local, OR a push/pr/auto-merge
+    # that DEGRADED to local because there is no remote (state "local (no remote)"). Deleting it there
+    # orphans a gate-green commit (reachable from no branch) while _ship_succeeded still ticks the item.
+    if SHIP != "local" and not (pr.get("state") or "").lower().startswith("local"):
         git("branch", "-D", branch)
     if tree_dirty():
         git("reset", "--hard")
@@ -3268,7 +3288,12 @@ def main(argv=None) -> int:
         # An unhandled-exception CRASH (clean_exit stays False) must NOT report 'stopped' — that would
         # make monitor.should_restart() mistake the crash for an operator stop and leave the loop DEAD;
         # record status=error so the watchdog RESTARTS it (self-heal). (The exception still propagates.)
-        if _HALTED:
+        # A dirty_base_persistent self-stop parks status=error/reason=dirty_base_persistent + a STOP
+        # sentinel; the watchdog's auto-recover-when-clean arm + operator alert require BOTH to survive,
+        # so the clean-exit branch below must NOT overwrite status to 'stopped' nor unlink the sentinel
+        # (otherwise the self-heal is dead code and a clean-base lane wedges dead until a manual Start).
+        _dbp_self_stop = (_hb.get("status") == "error" and _hb.get("reason") == "dirty_base_persistent")
+        if _HALTED or _dbp_self_stop:
             pass
         elif clean_exit:
             heartbeat(status="stopped", phase=None)
@@ -3279,10 +3304,11 @@ def main(argv=None) -> int:
             except Exception:  # noqa: BLE001 — the finally must not mask the original crash
                 pass
         release_lock()
-        try:
-            STOP.unlink()
-        except OSError:
-            pass
+        if not _dbp_self_stop:
+            try:
+                STOP.unlink()
+            except OSError:
+                pass
     return 0
 
 
