@@ -51,7 +51,7 @@ def _stale(hb, repo):
     except (ValueError, TypeError):
         return False
     age = (datetime.now(timezone.utc) - last).total_seconds()
-    return age > max(3 * control.project_interval(repo), 3600)
+    return age > max(3 * control.project_interval(repo), 4500)
 
 
 def diagnose(repo):

@@ -8,5 +8,5 @@
 - [x] Add a test that `asmodeus.workers.run_worker` rejects unknown worker names with a clear exit code.
 - [x] Add tests for `asmodeus.env.load_env` path resolution and idempotency (currently 29% coverage).  (deferred: agent could not implement after repeated tries)
 - [x] Add `--once` worker tests for `builder_lane` and `meta_loop` so their main loops are exercised without real sleep/LLM calls.  (deferred: agent could not implement after repeated tries)
+- [x] Add tests for `asmodeus.runtime.subprocess_util` helpers, especially the Windows-only process helpers (currently 48% coverage).  (deferred: agent could not implement after repeated tries)
 - [ ] Add unit tests for `asmodeus.cli` covering `version`, `kill`, and `unkill` (currently 0% coverage).  (deferred: agent could not implement after repeated tries)
-- [ ] Add tests for `asmodeus.runtime.subprocess_util` helpers, especially the Windows-only process helpers (currently 48% coverage).  (deferred: agent could not implement after repeated tries)

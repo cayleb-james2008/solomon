@@ -30,6 +30,7 @@ curation stays human-owned).
 - Each idea must be **grounded in the real code you read** (name the modules/flow it touches) and
   **tied to the GOAL** (state the leverage in one clause).
 - Each idea must still be **shippable as ONE gated iteration** (or its largest coherent first slice).
+- At most 2 of your proposed ideas may target the same subsystem/module; spread the rest across different files/concerns.
 
 ## Output — EXACTLY this, one idea per line, nothing else
 

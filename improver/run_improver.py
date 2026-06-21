@@ -710,16 +710,7 @@ def _repo_artifact_patterns(name: str) -> list:
     Lets the operator WIDEN recovery for one repo (a new artifact shape a dead run leaves) WITHOUT
     loosening the narrow global default that protects operator work across all repos. Returns [] when
     absent/empty/torn (byte-identical default behavior) — never raises."""
-    try:
-        rows = json.loads((CONTROL / "repos.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    if not isinstance(rows, list):
-        return []
-    row = next((r for r in rows if isinstance(r, dict) and r.get("name") == name), None)
-    if not isinstance(row, dict):
-        return []
-    raw = row.get("agent_artifacts")
+    raw = _repo_row(name).get("agent_artifacts")
     if not isinstance(raw, list):
         return []
     out = []
@@ -1011,102 +1002,6 @@ def _narrated_without_writing(summary: str) -> bool:
     return claims_work and mentions_file
 
 
-# ---- correlated test discovery -------------------------------------------
-def _find_correlated_tests(changed_files: list[str]) -> list[str]:
-    """Given a list of changed .py files, find test files that import or reference
-    those modules. This ensures the gate runs tests that are CORRELATED with the
-    changes, not just the directly-changed files.
-
-    Strategy:
-    1. Extract module names from changed files (e.g. 'scripts/config.py' -> 'config')
-    2. Search test files for imports/references to those modules
-    3. Return the unique list of correlated test files
-
-    Pure function — no side effects, testable without a real repo."""
-    if not changed_files:
-        return []
-
-    # Extract bare module names from changed files
-    modules = set()
-    for f in changed_files:
-        f = f.strip().replace("\\", "/")
-        if not f.endswith(".py") or f.startswith("_"):
-            continue
-        # Get the stem: 'scripts/config.py' -> 'config', 'asmodeus/execution/broker.py' -> 'broker'
-        stem = Path(f).stem
-        if stem and not stem.startswith("_"):
-            modules.add(stem)
-        # Also add the full package path as a module reference
-        # 'asmodeus/execution/broker.py' -> 'asmodeus.execution.broker'
-        parts = f.replace(".py", "").split("/")
-        if len(parts) > 1:
-            modules.add(".".join(parts))
-
-    if not modules:
-        return []
-
-    # Build a regex that matches import statements referencing any changed module
-    # Matches: import X, from X import, from X.something import
-    mod_pattern = "|".join(re.escape(m) for m in modules)
-    import_re = re.compile(
-        rf"(?:^|\s)(?:import\s+(?:{mod_pattern})|from\s+(?:{mod_pattern})(?:\.\w+)*)",
-        re.MULTILINE
-    )
-
-    # Also match direct file references in test strings (e.g. test names, config paths)
-    file_refs_re = re.compile(
-        rf"(?:{mod_pattern})",
-        re.MULTILINE
-    )
-
-    test_dir = REPO / "tests"
-    if not test_dir.is_dir():
-        return []
-
-    correlated = []
-    for tf in test_dir.rglob("test_*.py"):
-        try:
-            content = tf.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        # Check if this test file imports or references any changed module
-        if import_re.search(content) or file_refs_re.search(content):
-            rel = str(tf.relative_to(REPO)).replace("\\", "/")
-            correlated.append(rel)
-
-    return sorted(set(correlated))
-
-
-def _expand_gate_with_correlated(gate_cmd: str, changed_files: list[str]) -> str:
-    """The after-change gate MUST run the SAME scope as the clean-base baseline (run_gate() with no
-    args) so the runner's anti-gaming pass/collected comparison is like-for-like. The default gate
-    already runs the FULL suite (`python -m pytest -o addopts=` collects from the rootdir), which
-    inherently includes every test correlated with the change — so there is nothing to "expand".
-
-    Listing the correlated files here (the previous behavior) would NARROW the after-gate to a subset
-    of the suite while the baseline measured the FULL suite. That broke the gate two ways:
-      (a) a regression in any NON-correlated test file shipped unseen (a green subset over a red full
-          suite), and
-      (b) `_anti_gaming_reason` compared the full-suite baseline count against the subset count, so
-          "pass/collected count fell" fired on EVERY iteration that touched a .py with any correlated
-          test — the change could never ship, escalated, and deferred forever.
-    A custom GATE_CMD is the operator's own command and is run unchanged. So the only correct
-    "expansion" of a full-suite gate is a no-op; correlated discovery is surfaced as a diagnostic in
-    one_iteration (via _find_correlated_tests), not used to scope the gate."""
-    return gate_cmd
-
-
-def _get_changed_files_for_correlation(base_sha: str) -> list[str]:
-    """Get the list of .py files changed between base and current HEAD.
-    Used to find correlated tests before the agent runs."""
-    r = git("diff", "--name-only", "--no-renames", "--diff-filter=ACMR",
-            base_sha, "HEAD")
-    if r.returncode != 0:
-        return []
-    return [ln.strip() for ln in (r.stdout or "").splitlines()
-            if ln.strip().endswith(".py")]
-
-
 # ---- cross-repo correlated test gate --------------------------------------
 # User complaint: 'the loop misses correlated tests or other things when making changes' — across
 # repos that share a module. A repo may declare `cross_repo_deps` in repos.json: a list of repo names
@@ -1236,16 +1131,7 @@ def _eval_cmd(name: str) -> str:
     """THIS repo's EVAL_CMD from repos.json (a benchmark/visual/product-metric command). '' when
     absent (the loop is byte-identical — no eval gate). Read fresh each call so a dashboard edit takes
     effect mid-loop, mirroring the other config keys."""
-    try:
-        rows = json.loads((CONTROL / "repos.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return ""
-    if not isinstance(rows, list):
-        return ""
-    row = next((r for r in rows if isinstance(r, dict) and r.get("name") == name), None)
-    if not isinstance(row, dict):
-        return ""
-    return (row.get("EVAL_CMD") or "").strip()
+    return (_repo_row(name).get("EVAL_CMD") or "").strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -1386,14 +1272,8 @@ def _visual_gate_enabled(name: str) -> bool:
     configured (launch command) for the visual review to actually run — if it isn't, the
     review fails to run and best-effort doesn't block, but the gate is still *enabled* so the
     operator sees it's expected and configures the sandbox."""
-    try:
-        rows = json.loads((CONTROL / "repos.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    if not isinstance(rows, list):
-        return False
-    row = next((r for r in rows if isinstance(r, dict) and r.get("name") == name), None)
-    if not isinstance(row, dict):
+    row = _repo_row(name)
+    if not row:
         return False
     if "visual_gate" in row:
         return bool(row.get("visual_gate"))
@@ -1481,12 +1361,12 @@ def _run_gate_once(effective_gate_cmd: str) -> tuple:
     return p.returncode == 0, tests, out[-1500:]
 
 
-def run_gate(changed_files: list[str] | None = None) -> tuple:
+def run_gate() -> tuple:
     """Authoritative test gate. Returns (green, {passed,failed,errors,green}, tail).
 
     If a custom GATE_CMD was supplied (--gate), run THAT via the shell in REPO;
-    green = returncode 0. Otherwise run the built-in pytest gate. If changed_files is
-    provided, expand the gate to include correlated tests. GATE_TIMEOUT bounds a hung gate.
+    green = returncode 0. Otherwise run the built-in pytest gate. The gate always runs the FULL suite
+    (so the after-change scope == the clean-base baseline scope). GATE_TIMEOUT bounds a hung gate.
 
     Retry-on-empty: a run that discovers ZERO tests (pytest exit 5 / empty summary —
     collected=passed=failed=errors=0, not a timeout) is almost always a TRANSIENT collection
@@ -1496,8 +1376,6 @@ def run_gate(changed_files: list[str] | None = None) -> tuple:
     that genuinely has no tests just retries then accepts 0 (same outcome)."""
     import time as _time
     effective_gate_cmd = GATE_CMD
-    if changed_files:
-        effective_gate_cmd = _expand_gate_with_correlated(GATE_CMD, changed_files)
     last = None
     for attempt in range(3):
         green, tests, tail = _run_gate_once(effective_gate_cmd)
@@ -1590,8 +1468,7 @@ def _anti_gaming_reason(base_tests, tests, diff_text: str):
     2. Collected count fell (tests removed)
     3. Introduced skip/xfail markers (weakening)
     4. Error count increased (new test failures introduced)
-    5. Skipped count increased significantly (tests being skipped instead of fixed)
-    6. Pass count unchanged but collected count increased (added trivial tests to mask removal)"""
+    5. Skipped count increased significantly (tests being skipped instead of fixed)"""
     if base_tests and tests:
         if tests.get("passed", 0) < base_tests.get("passed", 0):
             return (f"pass count fell {base_tests['passed']}→{tests['passed']} "
@@ -1601,17 +1478,6 @@ def _anti_gaming_reason(base_tests, tests, diff_text: str):
         base_c, c = base_tests.get("collected"), tests.get("collected")
         if base_c and c is not None and c < base_c:
             return f"collected count fell {base_c}→{c} (tests removed)"
-
-        # Test count hardening: detect gaming where pass count is held steady by adding trivial tests
-        # while removing real tests. If collected count increased but pass count stayed the same,
-        # it could indicate adding trivial tests to mask removal of real tests.
-        if base_c and c is not None and c > base_c:
-            base_passed = base_tests.get("passed", 0)
-            if tests.get("passed", 0) == base_passed:
-                # Collected increased but passed stayed the same - suspicious but not definitive
-                # Log it as a warning but don't revert (could be legitimate new tests)
-                log(f"WARNING: collected count increased {base_c}→{c} but passed count unchanged "
-                    f"({base_passed}) — possible gaming by adding trivial tests")
 
         # Check for error count increase - new test failures introduced
         base_errors = base_tests.get("errors", 0)
@@ -1654,14 +1520,50 @@ def _strip_tier(text: str):
     return ((text or "").strip(), "chore")
 
 
+def _recent_noop_streak() -> int:
+    """Count of trailing 'noop' iterations in history.jsonl (the active-fabrication signal solomon.py's
+    diagnose() keys on). 0 when the loop is making real changes — the last terminal outcome wasn't a noop."""
+    streak = 0
+    try:
+        lines = (RUNTIME / "history.jsonl").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            if json.loads(line).get("status") == "noop":
+                streak += 1
+            else:
+                break
+        except json.JSONDecodeError:
+            break
+    return streak
+
+
 def _needs_goal_skip(goal: str) -> bool:
-    """True iff this iteration has NO real objective: the north-star GOAL is empty/whitespace AND the
-    chosen backlog item is the generic placeholder ('model-chosen improvement') or an already-deferred
-    item ('(deferred...)'). In that state running pi just loops on done/too-hard work and fabricates
-    no-op edits — so the caller SKIPs + escalates (needs_goal). A repo with a REAL backlog item but no
-    GOAL still runs (the conjunction is required)."""
+    """True iff this iteration has NO real objective AND the loop is already spinning on no-ops: the
+    north-star GOAL is empty/whitespace, the chosen item is the generic placeholder ('model-chosen
+    improvement') or an already-deferred item ('(deferred...)'), AND a recent noop streak shows the loop
+    is fabricating rather than shipping. In that state running pi just loops on done/too-hard work and
+    fabricates no-op edits — so the caller SKIPs + escalates (needs_goal). A repo with a REAL backlog
+    item OR one that is still SHIPPING real changes with no GOAL (maki) still runs (the conjunction is
+    required — an empty goal alone is not enough; the loop must also be producing no-ops)."""
     g = (goal or "").lower()
-    return GOAL.strip() == "" and ("model-chosen improvement" in g or "(deferred" in g)
+    return (GOAL.strip() == ""
+            and ("model-chosen improvement" in g or "(deferred" in g)
+            and _recent_noop_streak() > 0)
+
+
+def _unchecked_backlog_count() -> int:
+    """Count of actionable backlog items: lines starting `- [ ]` that aren't already deferred."""
+    try:
+        lines = BACKLOG.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+    return sum(1 for ln in lines
+               if ln.strip().startswith("- [ ]") and "(deferred" not in ln)
 
 
 def _top_backlog_item():
@@ -2361,15 +2263,7 @@ def one_iteration() -> None:
         tests = None
     else:
         heartbeat(phase="test", last_summary=summary)
-        # Diagnostic only: surface which test files correlate with the change. They already run as
-        # part of the full-suite gate — the gate is NOT narrowed to them (see
-        # _expand_gate_with_correlated), so the after-gate scope matches the baseline scope.
-        changed_files = _get_changed_files_for_correlation(base)
-        if changed_files:
-            correlated = _find_correlated_tests(changed_files)
-            if correlated:
-                log(f"{len(correlated)} correlated test file(s) cover this change (run within the full gate)")
-        green, tests, tail = run_gate(changed_files)
+        green, tests, tail = run_gate()
         heartbeat(tests=tests)
         log(f"gate: {'GREEN' if green else 'RED'} {tests}")
         if not green:
@@ -2793,7 +2687,7 @@ def acquire_lock() -> bool:
         return True                      # already ours
     if pid == 0:
         return False                     # still empty after the grace window — a racer holds it
-    if _pid_alive(pid) and not _heartbeat_stale(max(3 * INTERVAL, 3600)) and not _heartbeat_is_stopped():
+    if _pid_alive(pid) and not _heartbeat_stale(max(3 * INTERVAL, 4500)) and not _heartbeat_is_stopped():
         return False                     # held by a live improver (PID alive, heartbeat fresh, not stopped)
     # Recorded pid is dead, OR alive-but-its-heartbeat-froze (a recycled PID whose original runner is
     # gone), OR the heartbeat says the runner cleanly stopped (lingering lock) -> take over, then VERIFY
@@ -3020,14 +2914,7 @@ def _ideate_research_enabled(name: str) -> bool:
     web/docs lookup for novel ideas to escape local minima. The output is still REVIEWABLE backlog
     items (the runner sorts + prepends; the agent never edits its own menu — menu curation stays
     human-owned)."""
-    try:
-        rows = json.loads((CONTROL / "repos.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    if not isinstance(rows, list):
-        return False
-    row = next((r for r in rows if isinstance(r, dict) and r.get("name") == name), None)
-    return bool(isinstance(row, dict) and row.get("ideate_research"))
+    return bool(_repo_row(name).get("ideate_research"))
 
 
 def _ideate_task() -> str:
@@ -3118,6 +3005,8 @@ def ideate_phase() -> None:
     never wedges the implement phase on an ideation failure (the greedy loop still has the backlog)."""
     if not IDEATE_ENABLED:
         return
+    if _unchecked_backlog_count() >= 5:
+        return                               # refill valve, not a firehose — only ideate when the menu is thin
     try:
         heartbeat(phase="ideate")
         rc = ideate()
@@ -3176,9 +3065,10 @@ def reflect() -> None:
         log(f"reflect phase: error ({str(e)[:160]}) — no lesson recorded")
         return
     text = final_text(p.stdout or "")
+    # Only record an EXPLICIT 'LESSON:' line. Falling back to the model's chatty first line poisoned the
+    # corpus with noise (asmodeus's LESSONS.md was 100% noise) that then fed the ideate novelty filter.
     m = re.search(r"LESSON:\s*(.+)", text, re.I)
-    lesson = (m.group(1) if m else text).strip().splitlines()[0].strip() if (m or text.strip()) else ""
-    lesson = _redact(lesson)[:600].strip()
+    lesson = _redact(m.group(1).strip().splitlines()[0])[:600].strip() if m else ""
     if not lesson:
         log("reflect phase: agent produced no parseable lesson — nothing appended")
         return
