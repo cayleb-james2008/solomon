@@ -31,3 +31,12 @@ Solomon NEVER hand-patches a managed repo. A managed project changes only via it
 gated `rsi/*` branch shipped as a PR, or a supervisor-authorized PR-gated fix-session. The operator
 curates the backlog/contract and toggles dials; the orchestrator provisions, schedules, and
 supervises — but never edits a managed repo's working tree. See `SOLOMON_RSI.md` for all 7 invariants.
+
+## Code style — ponytail
+
+Follow `.claude/skills/ponytail` (vendored MIT skill): YAGNI, stdlib first, native platform
+features before dependencies, one line over fifty, shortest working diff, deletion over addition.
+Never simplify away input validation at trust boundaries, error/data-loss handling, security,
+accessibility, or tests. Mark a deliberate shortcut with a `# ponytail:` comment naming its ceiling
+and the upgrade path. Commands: `/ponytail-review` (flag over-engineering in a diff),
+`/ponytail-audit` (scan the repo).
