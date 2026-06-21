@@ -578,6 +578,12 @@ def heartbeat(**fields) -> None:
     # status (a fresh iteration -> "iterating"/"idle", or the finally -> "stopped").
     if _hb.get("status") == "error" and "status" not in fields:
         fields.pop("phase", None)
+    # A fresh non-error status (e.g. a new iteration's "iterating") starts a clean slate — drop any stale
+    # diagnostic 'reason' (notably a prior dirty_base_persistent) so it can't outlive its cause and
+    # mis-tag a later, unrelated error: the finally's _dbp_self_stop check keys on reason. An error that
+    # carries a reason passes both in the same call (status=="error" here), so it is preserved.
+    if fields.get("status") not in (None, "error"):
+        _hb.pop("reason", None)
     _hb.update(fields)
     _hb["updated_at"] = _now()
     _runtime_atomic_write(HEARTBEAT, json.dumps(_hb, indent=2))
@@ -613,6 +619,21 @@ def git(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(["git", *args], returncode=124,
                                            stdout=(e.stdout or ""),
                                            stderr=f"git {' '.join(args)} timed out after {timeout}s")
+
+
+def _gh(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
+    """Run gh with the same env/window hardening as git() and a BOUNDED timeout. gh network calls (pr
+    view/create/merge/close) can hang on a stalled API/proxy exactly like git, freezing the iteration
+    heartbeat (watchdog sees 'alive' but stuck). A TimeoutExpired is surfaced as a FAILED
+    CompletedProcess (rc=124), so callers handle it as a failed gh op instead of an invisible hang."""
+    try:
+        return subprocess.run([gh_exe(), *args], cwd=REPO, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout,
+                              env=_clean_env(), **hidden_subprocess_kwargs())
+    except subprocess.TimeoutExpired as e:
+        return subprocess.CompletedProcess([gh_exe(), *args], returncode=124,
+                                           stdout=(e.stdout or ""),
+                                           stderr=f"gh {' '.join(args)} timed out after {timeout}s")
 
 
 def has_remote() -> bool:
@@ -1412,10 +1433,17 @@ def run_gate() -> tuple:
 # raise SkipTest. A "green" gate that simply skipped the failing tests is gamed, so anti-gaming
 # watches for any of these being ADDED.
 _SKIP_MARKER_RE = re.compile(
-    # match the marker decorator under ANY import alias — `pytest.mark.skip`, `mark.skip`
-    # (from pytest import mark), `pt.mark.skip` (import pytest as pt) — so an aliased import can't
-    # weaken a test past the anti-gaming rail. `\b` guard keeps `benchmark.skip` etc. from matching.
-    r"\bmark\.(?:skip|skipif|xfail)\b"
+    # Match the skip/xfail marker DECORATOR under any import alias, anchored on the '@' so the broad
+    # `<x>.skip` form can't false-positive on ordinary attribute access: `@mark.skip`, `@m.skip`
+    # (from pytest import mark as m), `@pt.mark.skip` (import pytest as pt), and the bare `@skip`/
+    # `@skipif`/`@xfail` (from pytest import skip / from pytest.mark import skip). The non-decorator
+    # `mark.skip`/`pytest.skip(...)` forms below still cover module-level `pytestmark = ...` use.
+    # `\b` guards keep `benchmark.skip` / `@skipping` etc. from matching.
+    # ponytail: regex over diff text — an in-body aliased CALL like `pt.skip()` (not `pytest.skip()`)
+    # is a rarer vector left uncovered; switch to an AST pass over the changed test files if it shows up.
+    r"@\s*\w+\.(?:skip|skipif|xfail)\b"
+    r"|@\s*(?:skip|skipif|xfail)\b"
+    r"|\bmark\.(?:skip|skipif|xfail)\b"
     r"|pytest\.(?:skip|xfail)\s*\("
     r"|unittest\.skip"
     r"|\.skipTest\s*\("
@@ -1761,17 +1789,14 @@ def _pr_title(goal: str, summary: str = "") -> str:
 
 
 def _gh_ready() -> bool:
-    p = subprocess.run([gh_exe(), "auth", "status"], capture_output=True, text=True,
-                       env=_clean_env(), **hidden_subprocess_kwargs())
-    return p.returncode == 0
+    return _gh("auth", "status", timeout=30).returncode == 0
 
 
 def _pr_checks(number) -> str | None:
     """Reduce a PR's statusCheckRollup to 'success'|'pending'|'failure'|None (no checks) via gh."""
     if not number:
         return None
-    p = subprocess.run([gh_exe(), "pr", "view", str(number), "--json", "statusCheckRollup"],
-                       cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
+    p = _gh("pr", "view", str(number), "--json", "statusCheckRollup")
     if p.returncode != 0:
         return None
     try:
@@ -1816,9 +1841,7 @@ def _existing_open_pr(branch: str) -> tuple:
     agent opened itself (it is told NOT to run gh, but an over-eager model sometimes does) so the runner
     doesn't fall to 'push-only' on a 'gh pr create … already exists' error — which never ticks the item,
     so the loop re-ships the same backlog item forever (the live sover dup-PR spin)."""
-    p = subprocess.run([gh_exe(), "pr", "list", "--head", branch, "--state", "open",
-                        "--json", "number,url"],
-                       cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
+    p = _gh("pr", "list", "--head", branch, "--state", "open", "--json", "number,url")
     if p.returncode != 0:
         return None, None
     try:
@@ -1842,9 +1865,7 @@ def _open_pr(branch: str, title: str, summary: str, tests: dict | None) -> dict:
         body = (f"Autonomous improvement (RSI loop).\n\n{summary}\n\n"
                 f"{gate}_Opened by the Solomon RSI loop — review and merge or close._")
         pr_title = f"rsi: {title}"
-    p = subprocess.run([gh_exe(), "pr", "create", "--base", BASE_BRANCH, "--head", branch,
-                        "--title", pr_title, "--body", body],
-                       cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
+    p = _gh("pr", "create", "--base", BASE_BRANCH, "--head", branch, "--title", pr_title, "--body", body)
     if p.returncode != 0:
         stderr = (p.stderr or "").strip()
         # The agent may have already opened a PR for this branch (it's told NOT to run gh, but a
@@ -1882,8 +1903,7 @@ def _try_squash_merge(num) -> "subprocess.CompletedProcess":
     CompletedProcess (returncode 0 == merged)."""
     m = None
     for attempt in range(3):
-        m = subprocess.run([gh_exe(), "pr", "merge", str(num), "--squash", "--delete-branch"],
-                           cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
+        m = _gh("pr", "merge", str(num), "--squash", "--delete-branch")
         if m.returncode == 0:
             return m
         if attempt < 2:
@@ -1904,8 +1924,7 @@ def _auto_merge(pr: dict) -> dict:
         log(f"auto-merge: CI FAILING on PR {num} — leaving open, NOT merging")
         return {**pr, "state": "open (CI red — not merged)"}
     if checks == "pending":
-        am = subprocess.run([gh_exe(), "pr", "merge", str(num), "--auto", "--squash", "--delete-branch"],
-                            cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
+        am = _gh("pr", "merge", str(num), "--auto", "--squash", "--delete-branch")
         if am.returncode == 0:
             return {**pr, "state": "auto-merge queued (awaiting CI)"}
         log(f"auto-merge: CI pending and native --auto unavailable on PR {num} — leaving open until CI resolves")
@@ -1936,27 +1955,32 @@ def _wait_for_ci_then_merge(pr: dict) -> dict:
     heartbeat(phase="merge")
     deadline = time.time() + CI_WAIT_CEILING_S
     while True:
-        # Halt-switch FIRST: a live operator STOP must win over a green/None CI check. If this were below
-        # the success branch (as before), a STOP pressed mid-wait would be bypassed whenever CI is green
-        # and the PR would still squash-merge to the integration branch — violating SOLOMON_RSI's "a
-        # mid-iteration stop keeps the gate-green branch locally but does not ship it".
-        if STOP.exists():
-            return {**pr, "state": "open (stopped before merge)"}
         checks = _pr_checks(num)
+        if checks is None:
+            # None conflates 'no CI configured' with a transient gh failure (gh non-zero / JSON error).
+            # Re-poll across a short window before treating it as merge-eligible, so a gh blip can't merge
+            # an unverified PR — the same disambiguation the auto-merge path's _await_pr_checks already does.
+            checks = _await_pr_checks(num)
+        if checks == "failure":
+            # CI RED: ALWAYS auto-revert (close PR + delete branch), even if an operator STOP is pending.
+            # A known-red PR must never linger on the integration branch, and reverting is cleanup, not a
+            # ship. Checked BEFORE the STOP halt below so a mid-wait stop can't strand a red PR + branch.
+            _gh("pr", "close", str(num), "--delete-branch")
+            log(f"CI RED on PR {num} — closed PR + deleted branch (auto-revert)")
+            return {**pr, "state": "reverted (CI red)"}
+        if STOP.exists():
+            # Halt-switch: a live operator STOP leaves a green/pending PR OPEN (does not ship) — it must
+            # win over a green/None CI check (SOLOMON_RSI: "a mid-iteration stop keeps the gate-green
+            # branch locally but does not ship it"). Checked AFTER the red-revert so a red PR still cleans up.
+            return {**pr, "state": "open (stopped before merge)"}
         if checks in ("success", None):
             m = _try_squash_merge(num)
             if m.returncode == 0:
                 return {**pr, "state": "merged"}
             log(f"gh pr merge {num} failed after retries: {(m.stderr or '').strip()[:200]} — PR left open")
             return {**pr, "state": "open (merge failed)"}
-        if checks == "failure":
-            subprocess.run([gh_exe(), "pr", "close", str(num), "--delete-branch"],
-                           cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
-            log(f"CI RED on PR {num} — closed PR + deleted branch (auto-revert)")
-            return {**pr, "state": "reverted (CI red)"}
         if time.time() >= deadline:
-            am = subprocess.run([gh_exe(), "pr", "merge", str(num), "--auto", "--squash", "--delete-branch"],
-                                cwd=REPO, capture_output=True, text=True, env=_clean_env(), **hidden_subprocess_kwargs())
+            am = _gh("pr", "merge", str(num), "--auto", "--squash", "--delete-branch")
             return {**pr, "state": "auto-merge queued (awaiting CI)" if am.returncode == 0 else "open (awaiting CI)"}
         time.sleep(CI_POLL_DELAY_S)
 
@@ -2123,25 +2147,32 @@ def one_iteration() -> None:
     else:
         git("clean", "-fd")       # safe now: no untracked non-ignored files to destroy
     if has_remote():
-        git("fetch", "origin", "--quiet")
-        # never-hand-patched keystone (enforced, not prose): REFUSE to adopt a base that moved
-        # without a gated iteration. Committed-but-un-pushed commits on BASE_BRANCH — an operator
-        # hand-patch, or a dead run's local commit — must NOT be silently hard-reset away. Surface
-        # them and skip; the loop changes a repo only through gated PRs.
-        ahead = git("rev-list", "--count", f"origin/{BASE_BRANCH}..{BASE_BRANCH}")
-        n_ahead = int((ahead.stdout or "0").strip() or "0") if ahead.returncode == 0 else 0
-        if n_ahead > 0:
-            shas = git("log", f"origin/{BASE_BRANCH}..{BASE_BRANCH}", "--oneline").stdout.strip()
-            heartbeat(status="error", phase="preflight",
-                      last_summary=f"{BASE_BRANCH} has {n_ahead} commit(s) not on origin "
-                                   f"(out-of-band / un-pushed base change). Refusing to hard-reset — "
-                                   f"push or revert them; managed repos change only via gated PRs. "
-                                   f"Commits: {shas[:300]}")
-            log(f"REFUSE preflight reset: {n_ahead} un-pushed base commit(s) on {BASE_BRANCH}")
-            return
-        rs = git("reset", "--hard", f"origin/{BASE_BRANCH}")
-        if rs.returncode != 0:
-            log(f"reset to origin/{BASE_BRANCH} failed: {(rs.stderr or '').strip()[:160]} — using local {BASE_BRANCH}")
+        fetched = git("fetch", "origin", "--quiet")
+        if fetched.returncode != 0:
+            # Fetch failed (timeout -> rc 124, or offline). origin/<base> is now STALE/untrusted, so do
+            # NOT run the un-pushed-base guard or hard-reset against it — that would sync to an out-of-date
+            # ref. Skip the origin sync and iterate on the local base; the next preflight retries the fetch.
+            log(f"preflight fetch failed (offline?): {(fetched.stderr or '').strip()[:160]} — "
+                f"skipping origin sync, iterating on local {BASE_BRANCH}")
+        else:
+            # never-hand-patched keystone (enforced, not prose): REFUSE to adopt a base that moved
+            # without a gated iteration. Committed-but-un-pushed commits on BASE_BRANCH — an operator
+            # hand-patch, or a dead run's local commit — must NOT be silently hard-reset away. Surface
+            # them and skip; the loop changes a repo only through gated PRs.
+            ahead = git("rev-list", "--count", f"origin/{BASE_BRANCH}..{BASE_BRANCH}")
+            n_ahead = int((ahead.stdout or "0").strip() or "0") if ahead.returncode == 0 else 0
+            if n_ahead > 0:
+                shas = git("log", f"origin/{BASE_BRANCH}..{BASE_BRANCH}", "--oneline").stdout.strip()
+                heartbeat(status="error", phase="preflight",
+                          last_summary=f"{BASE_BRANCH} has {n_ahead} commit(s) not on origin "
+                                       f"(out-of-band / un-pushed base change). Refusing to hard-reset — "
+                                       f"push or revert them; managed repos change only via gated PRs. "
+                                       f"Commits: {shas[:300]}")
+                log(f"REFUSE preflight reset: {n_ahead} un-pushed base commit(s) on {BASE_BRANCH}")
+                return
+            rs = git("reset", "--hard", f"origin/{BASE_BRANCH}")
+            if rs.returncode != 0:
+                log(f"reset to origin/{BASE_BRANCH} failed: {(rs.stderr or '').strip()[:160]} — using local {BASE_BRANCH}")
     # Branch hygiene: condense any leftover rsi/* branches (dead-run / local-ship residue) so at most
     # ONE rsi/* branch exists at a time — the one cut next. We're on the clean, origin-synced base
     # here, so this never discards in-flight work; it's the deterministic cure for accumulating
@@ -2575,7 +2606,10 @@ def _ship(branch: str, title: str, summary: str, tests: dict) -> dict:
         return {"number": None, "url": None, "branch": branch,
                 "state": "local (ship pending gh auth)"}
     heartbeat(phase="ship")
-    push = git("push", "-u", "origin", branch)
+    # A push uploads objects and can legitimately take longer than a read-only fetch over a slow uplink —
+    # give it a larger ceiling than git()'s 120s default so a slow-but-working push isn't false-failed as
+    # a timeout (rc 124), while still bounding a truly hung push so the heartbeat can't freeze forever.
+    push = git("push", "-u", "origin", branch, timeout=300)
     if push.returncode != 0:
         log(f"git push failed: {(push.stderr or '').strip()[:200]}")
         return {"number": None, "url": None, "branch": branch, "state": "push-failed", "verified": False}
@@ -2688,6 +2722,8 @@ def acquire_lock() -> bool:
       3. only a lock whose recorded pid is a confirmed-DEAD process is taken over, and the
          takeover is verified by reading our pid back, so two racers cannot both adopt the
          same stale lock."""
+    import control  # lazy (matches the existing in-function imports): shared LOCK_LIVE_FLOOR_S so this
+                    # floor can't drift from control._lock_is_live / solomon._stale (single-flight).
     RUNTIME.mkdir(parents=True, exist_ok=True)
     mypid = os.getpid()
     try:  # atomic exclusive create WITH the pid written before the handle closes (no empty window)
@@ -2710,7 +2746,7 @@ def acquire_lock() -> bool:
         return True                      # already ours
     if pid == 0:
         return False                     # still empty after the grace window — a racer holds it
-    if _pid_alive(pid) and not _heartbeat_stale(max(3 * INTERVAL, 4500)) and not _heartbeat_is_stopped():
+    if _pid_alive(pid) and not _heartbeat_stale(max(3 * INTERVAL, control.LOCK_LIVE_FLOOR_S)) and not _heartbeat_is_stopped():
         return False                     # held by a live improver (PID alive, heartbeat fresh, not stopped)
     # Recorded pid is dead, OR alive-but-its-heartbeat-froze (a recycled PID whose original runner is
     # gone), OR the heartbeat says the runner cleanly stopped (lingering lock) -> take over, then VERIFY
@@ -3215,8 +3251,12 @@ def main(argv=None) -> int:
     if git("rev-parse", "--verify", "--quiet", BASE_BRANCH).returncode != 0:
         created = False
         if has_remote():
-            git("fetch", "origin", "--quiet")
-            if git("rev-parse", "--verify", "--quiet", f"origin/{BASE_BRANCH}").returncode == 0:
+            # Only TRUST origin/<base> if the fetch actually succeeded — a failed/timed-out fetch (rc 124)
+            # could leave a STALE origin/<base> tracking ref, and creating the local base from it would
+            # bootstrap the loop onto an out-of-date commit. On fetch failure, fall through to the
+            # 'base not found' error (return 2) rather than build from a stale ref.
+            if (git("fetch", "origin", "--quiet").returncode == 0
+                    and git("rev-parse", "--verify", "--quiet", f"origin/{BASE_BRANCH}").returncode == 0):
                 created = git("checkout", "-B", BASE_BRANCH, f"origin/{BASE_BRANCH}").returncode == 0
         if not created:
             heartbeat(status="error",

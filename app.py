@@ -47,19 +47,26 @@ def _load_state() -> dict:
         return {}
 
 
+_UNSET = object()   # sentinel: distinguishes "key was absent" from a real prior value on rollback
+
+
 def _save_state(state: dict) -> bool:
     """Atomically persist state (tmp + os.replace — never truncate-in-place, matching control.py's
     repos.json/lock writers). A crash/concurrent write mid-dump must not leave a half-written
     .solomon.json that next launch reads as {} — which silently reverts the auto_push/auto_ai_fix
     safety dials to their permissive defaults. Returns True on success, False on OSError so the setters
     can tell the UI whether the dial actually reached disk (its rollback only fires on ok:false)."""
+    tmp = _STATE_FILE + ".tmp"
     try:
-        tmp = _STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
         os.replace(tmp, _STATE_FILE)
         return True
     except OSError:
+        try:
+            os.remove(tmp)          # don't leak the half-written tmp when the write/replace fails
+        except OSError:
+            pass
         return False
 
 
@@ -332,19 +339,29 @@ class Api:
     def get_theme(self):
         return self._state.get("theme", "dark")
 
+    def _set_state(self, key, value) -> bool:
+        """Set self._state[key] and persist. On a FAILED persist, ROLL BACK the in-memory value so the
+        getters (read by the supervisor — get_auto_ai_fix / get_auto_push) never report an un-persisted
+        value that disk and the UI don't reflect. Returns whether the value reached disk."""
+        prev = self._state.get(key, _UNSET)
+        self._state[key] = value
+        if _save_state(self._state):
+            return True
+        if prev is _UNSET:
+            self._state.pop(key, None)
+        else:
+            self._state[key] = prev
+        return False
+
     def set_theme(self, t):
-        self._state["theme"] = t
-        ok = _save_state(self._state)
-        return {"ok": ok, "theme": t}
+        return {"ok": self._set_state("theme", t), "theme": t}
 
     def get_auto_push(self):
         """Global auto-push gate (default True). When False, runs ship 'local' (no push/PR)."""
         return bool(self._state.get("auto_push", True))
 
     def set_auto_push(self, v):
-        self._state["auto_push"] = bool(v)
-        ok = _save_state(self._state)
-        return {"ok": ok, "auto_push": bool(v)}
+        return {"ok": self._set_state("auto_push", bool(v)), "auto_push": bool(v)}
 
     def get_auto_ai_fix(self):
         """Global opt-in: when True the supervisor may run a pi fix-session unattended on a
@@ -352,9 +369,7 @@ class Api:
         return bool(self._state.get("auto_ai_fix", False))
 
     def set_auto_ai_fix(self, v):
-        self._state["auto_ai_fix"] = bool(v)
-        ok = _save_state(self._state)
-        return {"ok": ok, "auto_ai_fix": bool(v)}
+        return {"ok": self._set_state("auto_ai_fix", bool(v)), "auto_ai_fix": bool(v)}
 
 
 def _health_payload() -> dict:

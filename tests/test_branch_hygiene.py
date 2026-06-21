@@ -128,6 +128,44 @@ def test_wait_for_ci_stop_wins_over_green(tmp_path, monkeypatch):
     assert not any("merge" in c and "--squash" in c for c in calls)   # no squash-merge was issued
 
 
+def test_wait_for_ci_red_reverts_even_when_stopped(tmp_path, monkeypatch):
+    # CI RED must auto-revert (close PR + delete branch) even with an operator STOP pending — a known-red
+    # PR must never linger. The STOP halt only protects a green/pending PR from shipping, not from cleanup.
+    m = _load_runner()
+    stop = tmp_path / "stop"; stop.write_text("", encoding="utf-8")
+    monkeypatch.setattr(m, "STOP", stop)
+    monkeypatch.setattr(m, "_pr_checks", lambda n: "failure")   # CI is RED this poll
+    calls = _stub_gh(m, monkeypatch)
+    out = m._wait_for_ci_then_merge({"number": 7, "state": "open"})
+    assert out["state"] == "reverted (CI red)"                  # reverted, NOT left stranded by the stop
+    assert any("close" in c for c in calls)                     # the red PR was closed (auto-revert)
+
+
+def test_wait_for_ci_transient_none_reconfirmed_before_merge(tmp_path, monkeypatch):
+    # a transient gh None (a blip) must be RE-CONFIRMED via _await_pr_checks before merging — a single
+    # None must not immediately squash-merge an unverified PR. Here the re-poll resolves to red -> revert.
+    m = _load_runner()
+    monkeypatch.setattr(m, "STOP", tmp_path / "nostop")         # no stop pending
+    monkeypatch.setattr(m, "_pr_checks", lambda n: None)        # first poll: transient None
+    monkeypatch.setattr(m, "_await_pr_checks", lambda n: "failure")  # re-confirm: actually red
+    calls = _stub_gh(m, monkeypatch)
+    out = m._wait_for_ci_then_merge({"number": 7, "state": "open"})
+    assert out["state"] == "reverted (CI red)"                  # disambiguated -> NOT merged on the None
+    assert not any("--squash" in c for c in calls)
+
+
+def test_wait_for_ci_no_ci_configured_still_merges(tmp_path, monkeypatch):
+    # genuine 'no CI configured' (None stays None after re-confirm) still squash-merges — no regression.
+    m = _load_runner()
+    monkeypatch.setattr(m, "STOP", tmp_path / "nostop")
+    monkeypatch.setattr(m, "_pr_checks", lambda n: None)
+    monkeypatch.setattr(m, "_await_pr_checks", lambda n: None)
+    calls = _stub_gh(m, monkeypatch)                            # fake gh returns rc 0 -> merge succeeds
+    out = m._wait_for_ci_then_merge({"number": 7, "state": "open"})
+    assert out["state"] == "merged"
+    assert any("merge" in c and "--squash" in c for c in calls)
+
+
 # --------------------------------------------------------------------------- #
 # control.branch_hygiene + control.clean_branch — the dashboard "Clean branch" tool
 # (auto-detect a dirty managed repo left off its base branch / with stray rsi/* branches,
