@@ -70,6 +70,20 @@ def _auto_push() -> bool:
         return True
 
 
+def _base_is_clean(path) -> bool:
+    """True iff the repo working tree is fully clean — no modified tracked files AND no untracked
+    non-ignored files (`git status --porcelain` empty). Used to auto-recover a `dirty_base_persistent`
+    self-stop ONLY once the operator has actually cleaned the tree, so clearing the stop can never
+    thrash (a still-dirty base stays stopped)."""
+    if not path or not os.path.isdir(path):
+        return False
+    try:
+        r = control._run(["git", "-C", path, "status", "--porcelain"])   # windowless, guarded spawn
+    except OSError:
+        return False
+    return r.returncode == 0 and not (r.stdout or "").strip()
+
+
 def sweep() -> dict:
     """One watchdog pass over all repos. Returns {ts, actions:[...], snapshots:[...]}."""
     if os.path.exists(DISABLED):
@@ -85,6 +99,22 @@ def sweep() -> dict:
         stop_pending = bool(rt and os.path.exists(os.path.join(rt, "stop")))
         running = control.is_running(r)
         hb = control.read_heartbeat(r) or {}
+        # Anti-wedge: the runner self-stops on a PERSISTENTLY dirty base (STOP sentinel +
+        # reason="dirty_base_persistent") so it doesn't spin forever — but that sentinel otherwise pins
+        # the lane DEAD until a human clicks Start (the "leave it on, come back to a dead lane" wedge).
+        # If the base is now CLEAN again, clear the self-written sentinel so should_restart heals the
+        # lane automatically. Safe: only fires on the runner's own reason marker AND a verified-clean
+        # tree, so it never thrashes and never touches a true operator Stop (status="stopped", no reason).
+        if (not running and not paused and stop_pending
+                and hb.get("status") == "error"
+                and hb.get("reason") == "dirty_base_persistent"
+                and _base_is_clean(control._repo_path(r))):
+            try:
+                os.remove(os.path.join(rt, "stop"))
+                stop_pending = False
+                actions.append(f"{name} auto-recover: base clean again — cleared dirty_base_persistent stop")
+            except OSError:
+                pass
         restarted = False
         if should_restart(running, hb, paused, stop_pending):
             res = control.start(r, auto_push=auto_push)

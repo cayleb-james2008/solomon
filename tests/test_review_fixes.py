@@ -370,7 +370,14 @@ def test_ensure_watchdog_task_creates_when_missing(monkeypatch):
 def test_runner_python_guards_frozen(tmp_path, monkeypatch):
     repo = {"name": "x", "path": str(tmp_path)}              # no .venv present
     monkeypatch.setattr(control.sys, "frozen", True, raising=False)
-    assert control._runner_python(repo) is None              # frozen + no venv -> fail loudly
+    # frozen + no venv: fall back to a DISCOVERED system Python host (zero-touch onboarding of a
+    # venv-less repo) — but NEVER the frozen Solomon.exe (which would launch a ghost GUI).
+    monkeypatch.setattr(control, "_discover_host_python", lambda: r"C:\Python312\python.exe")
+    assert control._runner_python(repo) == r"C:\Python312\python.exe"
+    assert control._runner_python(repo) != control.sys.executable
+    # frozen + no venv + no system Python found -> fail loudly (None)
+    monkeypatch.setattr(control, "_discover_host_python", lambda: None)
+    assert control._runner_python(repo) is None
     monkeypatch.delattr(control.sys, "frozen", raising=False)
     assert control._runner_python(repo) == sys.executable    # unfrozen -> current interpreter
 
