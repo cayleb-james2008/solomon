@@ -217,13 +217,15 @@ def test_drop_branch_fail_closed_escalates(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# TEST-2 — preflight refuses to hard-reset an un-pushed base commit
+# TEST-2 — preflight AUTO-HANDLES an out-of-band (un-pushed) base instead of wedging forever.
+# never-hand-patched keystone preserved: the operator's commits are NEVER reverted/discarded — when
+# shipping is enabled they are fast-forward PUBLISHED to origin (reconciling the base); in local-ship
+# the loop iterates on the local base (no reset); a non-FF push self-stops after N consecutive bails.
 # --------------------------------------------------------------------------- #
-@pytest.mark.skipif(not shutil.which("git"), reason="git not available")
-def test_preflight_refuses_unpushed_base_commit(tmp_path, monkeypatch):
-    m = _load_runner()
+def _unpushed_base_fixture(tmp_path, monkeypatch, m):
     work = _mk_origin_clone(tmp_path)
-    (work / "f.txt").write_text("hand-patch"); _git(work, "commit", "-am", "operator hand-patch")  # un-pushed
+    (work / "f.txt").write_text("hand-patch"); _git(work, "commit", "-am", "operator un-pushed commit")
+    sha = _git(work, "rev-parse", "HEAD").stdout.strip()
     rt = tmp_path / "rt"; rt.mkdir()
     monkeypatch.setattr(m, "REPO", work)
     monkeypatch.setattr(m, "BASE_BRANCH", "main")
@@ -233,18 +235,109 @@ def test_preflight_refuses_unpushed_base_commit(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "LOG", rt / "improver.log")
     monkeypatch.setattr(m, "BACKLOG", tmp_path / "backlog.md")
     m._hb["iteration"] = 0
+    m._unpushed_base_bail_count = 0
+    m._base_gate_red_bail_count = 0
+    return work, sha
+
+
+@pytest.mark.skipif(not shutil.which("git"), reason="git not available")
+def test_preflight_autosyncs_unpushed_base_when_shipping(tmp_path, monkeypatch):
+    m = _load_runner()
+    monkeypatch.setattr(m, "SHIP", "pr")                      # push-capable -> fast-forward publish
+    work, sha = _unpushed_base_fixture(tmp_path, monkeypatch, m)
     ran = {"pi": False}
     monkeypatch.setattr(m, "run_pi", lambda *a, **k: ran.__setitem__("pi", True))
-
     m.one_iteration()
+    # the previously-un-pushed commit was fast-forward PUBLISHED to origin (base reconciled, not reverted)
+    assert _git(work, "rev-list", "--count", "origin/main..main").stdout.strip() == "0"
+    assert _git(work, "merge-base", "--is-ancestor", sha, "main").returncode == 0   # preserved, never discarded
+    assert "Refusing to hard-reset" not in (m._hb.get("last_summary") or "")        # not the old wedge
 
-    assert m._hb["status"] == "error" and m._hb["phase"] == "preflight"
-    assert "un-pushed" in m._hb["last_summary"]
-    assert ran["pi"] is False                                # never reached the agent
-    # the operator's un-pushed commit must survive (not hard-reset away)
+
+@pytest.mark.skipif(not shutil.which("git"), reason="git not available")
+def test_preflight_local_ship_iterates_on_unpushed_base(tmp_path, monkeypatch):
+    m = _load_runner()
+    monkeypatch.setattr(m, "SHIP", "local")                   # never pushes
+    work, sha = _unpushed_base_fixture(tmp_path, monkeypatch, m)
+    m.one_iteration()
+    # local mode never pushes — origin stays BEHIND, and the local commit is NOT discarded (no reset)
     assert _git(work, "rev-list", "--count", "origin/main..main").stdout.strip() == "1"
-    # a preflight bail must NOT increment the iteration counter (it's a no-op wedge, not a real iter)
-    assert m._hb["iteration"] == 0
+    assert _git(work, "merge-base", "--is-ancestor", sha, "main").returncode == 0
+    assert "Refusing to hard-reset" not in (m._hb.get("last_summary") or "")
+
+
+def test_unpushed_base_self_stop_after_limit(tmp_path, monkeypatch):
+    """Repeated failed fast-forward pushes of an out-of-band base self-stop after N bails (so the loop
+    parks instead of spinning forever); a resolved base (bail=False) resets the counter."""
+    m = _load_runner()
+    rt = tmp_path / "rt"; rt.mkdir()
+    monkeypatch.setattr(m, "RUNTIME", rt)
+    monkeypatch.setattr(m, "STOP", rt / "stop")
+    monkeypatch.setattr(m, "HEARTBEAT", rt / "heartbeat.json")
+    monkeypatch.setattr(m, "LOG", rt / "log")
+    m._unpushed_base_bail_count = 0
+    for _ in range(m._UNPUSHED_BASE_PERSISTENT_LIMIT - 1):
+        assert m._note_unpushed_base_bail(True, 2, "abc def") is False
+    assert not m.STOP.exists()
+    assert m._note_unpushed_base_bail(True, 2, "abc def") is True     # the Nth bail self-stops
+    assert m.STOP.exists() and m.STOP.read_text().strip() == "unpushed_base_persistent"
+    m._unpushed_base_bail_count = 2
+    assert m._note_unpushed_base_bail(False) is False                 # a resolved base resets the counter
+    assert m._unpushed_base_bail_count == 0
+
+
+def test_base_gate_red_self_stop_after_limit(tmp_path, monkeypatch):
+    """A persistently-RED base gate self-stops after N bails (mirrors the dirty-base backstop) instead
+    of spinning the same red gate forever; a green base resets the counter."""
+    m = _load_runner()
+    rt = tmp_path / "rt"; rt.mkdir()
+    monkeypatch.setattr(m, "RUNTIME", rt)
+    monkeypatch.setattr(m, "STOP", rt / "stop")
+    monkeypatch.setattr(m, "HEARTBEAT", rt / "heartbeat.json")
+    monkeypatch.setattr(m, "LOG", rt / "log")
+    m._base_gate_red_bail_count = 0
+    for _ in range(m._BASE_GATE_RED_PERSISTENT_LIMIT - 1):
+        assert m._note_base_gate_red_bail(True, "red") is False
+    assert not m.STOP.exists()
+    assert m._note_base_gate_red_bail(True, "red") is True            # the Nth bail self-stops
+    assert m.STOP.exists() and m.STOP.read_text().strip() == "base_gate_red_persistent"
+    m._base_gate_red_bail_count = 2
+    assert m._note_base_gate_red_bail(False) is False                 # a green base resets the counter
+    assert m._base_gate_red_bail_count == 0
+
+
+def test_run_gate_classifies_missing_pytest_as_unrunnable_no_retry(monkeypatch):
+    """'No module named pytest' (a hard config error) is the same all-zeros signature as a transient
+    glitch — but it must be flagged gate_unrunnable and NOT retried 3x as 'transient'."""
+    m = _load_runner()
+    calls = {"n": 0}
+    def _fake_once(_cmd):
+        calls["n"] += 1
+        return (False, {"passed": 0, "failed": 0, "errors": 0, "collected": 0, "green": False},
+                "ModuleNotFoundError: No module named pytest")
+    monkeypatch.setattr(m, "_run_gate_once", _fake_once)
+    monkeypatch.setattr(m, "GATE_CMD", "")
+    green, tests, _tail = m.run_gate()
+    assert green is False and tests.get("gate_unrunnable") is True
+    assert calls["n"] == 1                                            # hard error -> no transient retries
+
+
+@pytest.mark.skipif(not shutil.which("git"), reason="git not available")
+def test_prune_keeps_unmerged_rsi_branch(tmp_path, monkeypatch):
+    """Branch hygiene must force-delete only MERGED/empty rsi/* residue — an unmerged rsi branch is a
+    kept gate-green local-ship iteration (the sole copy of verified work) and must survive."""
+    m = _load_runner()
+    work = _mk_origin_clone(tmp_path)
+    monkeypatch.setattr(m, "REPO", work)
+    monkeypatch.setattr(m, "BASE_BRANCH", "main")
+    _git(work, "branch", "rsi/merged")                               # empty/merged residue
+    _git(work, "checkout", "-b", "rsi/unmerged")
+    (work / "w.txt").write_text("verified work"); _git(work, "add", "-A"); _git(work, "commit", "-m", "gate-green work")
+    _git(work, "checkout", "main")
+    m._prune_stale_rsi_branches()
+    branches = _git(work, "branch", "--list", "rsi/*").stdout
+    assert "rsi/unmerged" in branches                                # unmerged verified work preserved
+    assert "rsi/merged" not in branches                              # merged/empty residue pruned
 
 
 # --------------------------------------------------------------------------- #
@@ -422,9 +515,11 @@ def test_open_url_only_allows_http(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# TEST-4 — get_state error-fallback carries the 'goal' key
+# TEST-4 — get_state degrades PER FIELD: a single throwing control call defaults just that field while
+# the rest of the card (name/goal/all UI keys) stays intact. It must NOT blank the whole card to an
+# all-or-nothing fallback (the old behavior lied running:false and hid the real loop state).
 # --------------------------------------------------------------------------- #
-def test_get_state_fallback_includes_goal(monkeypatch):
+def test_get_state_degrades_per_field_not_whole_card(monkeypatch):
     import app
     monkeypatch.setattr(app.control, "load_repos",
                         lambda: [{"name": "x", "path": "p", "is_git": True, "has_remote": False}])
@@ -432,11 +527,16 @@ def test_get_state_fallback_includes_goal(monkeypatch):
     monkeypatch.setattr(app.control, "github_status", lambda: {"ready": False, "login": None})
 
     def boom(_r):
-        raise RuntimeError("repo blew up while building state")
-    monkeypatch.setattr(app.control, "project_provider", boom)   # first call in the try -> except branch
-    st = app.Api().get_state()
-    assert st["repos"][0]["goal"] == ""                      # fallback dict has the same keys the UI reads
-    assert "error" in st["repos"][0]
+        raise RuntimeError("this one field blew up")
+    monkeypatch.setattr(app.control, "project_provider", boom)   # one risky field throws
+    monkeypatch.setattr(app.control, "is_running", boom)         # ...and another (the loop-state field)
+    card = app.Api().get_state()["repos"][0]
+    assert card["name"] == "x"                                # the card SURVIVES, not blanked
+    assert card["provider"] == "ollama-cloud"                # throwing field -> its _safe default
+    assert card["running"] is False                          # throwing field -> its _safe default
+    assert "goal" in card                                    # all UI keys still present
+    for k in ("path", "model", "ship", "heartbeat", "diagnosis", "hygiene", "contracts"):
+        assert k in card
 
 
 # --------------------------------------------------------------------------- #
@@ -956,6 +1056,27 @@ def test_parse_ideas_tolerant_of_formatting():
     assert ideas[0][0] == 5                                   # sorted by leverage desc (architecture first)
     assert not any("not an idea" in i.lower() or "tidy the import" in i.lower()
                    for _l, _t, i in ideas)                    # prose AND chore lines excluded
+
+
+def test_parse_ideas_falls_back_to_plain_lines_when_model_ignores_tier_format():
+    """The real-world failure (observed on maki/dotz/asmodeus/sover overnight): the model emits plain
+    idea bullets with NO [tier] tag, so the tier-only parser dropped 100% -> 'no parseable ideas' ->
+    the backlog starved into a noop_streak. Plain idea lines must now be parsed (default tier=feature,
+    leverage=3) while meta/preamble/headers/section-labels stay excluded."""
+    m = _load_runner()
+    txt = ("Idea lines:\n"                                    # section label (ends ':') -> excluded
+           "# Proposed improvements\n"                        # markdown header -> excluded
+           "Native MTP file copy via PowerShell Windows.Storage stream copy to replace the staging fallback\n"
+           "- backtest: switch the O(n^2) prefix-replay to an O(n) incremental decide() via a cached snapshot\n"
+           "In-app torrent engine so anime downloads are fully self-contained without an external client\n"
+           "ok\n")                                            # too short -> ignored
+    ideas = m._parse_ideas(txt)
+    bodies = [i for _l, _t, i in ideas]
+    assert len(ideas) == 3                                    # the three real idea lines, nothing else
+    assert all(t == "feature" and lev == 3 for lev, t, _i in ideas)   # plain fallback defaults
+    assert any("MTP file copy" in b for b in bodies)
+    assert any(b.startswith("backtest:") for b in bodies)     # leading "- " stripped
+    assert not any("Idea lines" in b or "Proposed improvements" in b for b in bodies)  # meta/header out
 
 
 # --------------------------------------------------------------------------- #

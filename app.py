@@ -110,49 +110,49 @@ class Api:
     def get_state(self):
         repos = control.load_repos()
         gh_ready = control.gh_ready()
+
+        def _safe(fn, default):
+            # PER-FIELD resilience: a single flaky git/gh call (e.g. branch_hygiene/list_worktrees racing
+            # a loop's in-flight git op, an index.lock contention, a hung gh) must degrade ONLY that field
+            # — never throw out of the whole card to a fallback that lies running:False and blinds the
+            # operator about real loop state. fn is invoked immediately (no late-binding over the loop var).
+            try:
+                return fn()
+            except Exception:  # noqa: BLE001
+                return default
+
         out = []
         for r in repos:
             if not isinstance(r, dict):
                 continue
-            try:
-                out.append({
-                    "name": r.get("name"),
-                    "path": r.get("path"),
-                    "provider": control.project_provider(r),
-                    "model": control.project_model(r),
-                    "ship": control.project_ship(r),
-                    "gate": control.project_gate(r),
-                    "pr_target_branch": control.project_pr_target_branch(r),
-                    "reasoning": control.project_reasoning(r),
-                    "goal": control.project_goal(r),
-                    "interval": control.project_interval(r),
-                    "max_iterations": control.project_max_iterations(r),
-                    "phases": r.get("phases") or {},
-                    "is_git": bool(r.get("is_git")),
-                    "has_remote": bool(r.get("has_remote")),
-                    "running": control.is_running(r),
-                    "heartbeat": control.read_heartbeat(r),
-                    "prs": control.list_prs(r) if gh_ready else [],
-                    "local_branches": control.local_rsi_branches(r),
-                    "worktrees": control.list_worktrees(r),
-                    "hygiene": control.branch_hygiene(r),
-                    "frontend": control.has_frontend(r),
-                    "browser": control.browser_state(r),
-                    "contracts": control.contracts_present(r),
-                    "diagnosis": (solomon.diagnose(r) if solomon else {"category": "ok", "healthy": True}),
-                    "escalation": (solomon.read_escalation(r) if solomon else None),
-                })
-            except Exception as e:  # noqa: BLE001 — one bad repo must not blank the dashboard
-                out.append({"name": r.get("name") or "?", "path": r.get("path"),
-                            "provider": "ollama-cloud", "model": None,
-                            "ship": "pr", "gate": None, "pr_target_branch": "main",
-                            "reasoning": "", "goal": "", "interval": 120, "max_iterations": 0,
-                            "is_git": bool(r.get("is_git")), "has_remote": bool(r.get("has_remote")),
-                            "running": False, "heartbeat": None, "prs": [], "local_branches": [],
-                            "hygiene": {"dirty": False},
-                            "contracts": {"agent": False, "backlog": False},
-                            "diagnosis": {"category": "ok", "healthy": True}, "escalation": None,
-                            "error": str(e)})
+            out.append({
+                "name": r.get("name"),
+                "path": r.get("path"),
+                "provider": _safe(lambda: control.project_provider(r), "ollama-cloud"),
+                "model": _safe(lambda: control.project_model(r), None),
+                "ship": _safe(lambda: control.project_ship(r), "pr"),
+                "gate": _safe(lambda: control.project_gate(r), None),
+                "pr_target_branch": _safe(lambda: control.project_pr_target_branch(r), "main"),
+                "reasoning": _safe(lambda: control.project_reasoning(r), ""),
+                "goal": _safe(lambda: control.project_goal(r), ""),
+                "interval": _safe(lambda: control.project_interval(r), 120),
+                "max_iterations": _safe(lambda: control.project_max_iterations(r), 0),
+                "phases": r.get("phases") or {},
+                "is_git": bool(r.get("is_git")),
+                "has_remote": bool(r.get("has_remote")),
+                "running": _safe(lambda: control.is_running(r), False),
+                "heartbeat": _safe(lambda: control.read_heartbeat(r), None),
+                "prs": (_safe(lambda: control.list_prs(r), []) if gh_ready else []),
+                "local_branches": _safe(lambda: control.local_rsi_branches(r), []),
+                "worktrees": _safe(lambda: control.list_worktrees(r), []),
+                "hygiene": _safe(lambda: control.branch_hygiene(r), {"dirty": False}),
+                "frontend": _safe(lambda: control.has_frontend(r), False),
+                "browser": _safe(lambda: control.browser_state(r), {"ok": False}),
+                "contracts": _safe(lambda: control.contracts_present(r), {"agent": False, "backlog": False}),
+                "diagnosis": (_safe(lambda: solomon.diagnose(r), {"category": "ok", "healthy": True})
+                              if solomon else {"category": "ok", "healthy": True}),
+                "escalation": (_safe(lambda: solomon.read_escalation(r), None) if solomon else None),
+            })
         return {"repos": out, "gh_ready": gh_ready, "theme": self.get_theme(),
                 "auto_push": self.get_auto_push(), "auto_ai_fix": self.get_auto_ai_fix(),
                 "providers": ["ollama-cloud", "openrouter"],
@@ -419,6 +419,29 @@ def serve_health(port: int = 8787):
     httpd.serve_forever()
 
 
+def _single_instance_or_foreground() -> bool:
+    """Single-instance guard. Returns True if we are the sole dashboard (open the window). If another
+    Solomon dashboard is already running, FOREGROUND its window and return False (this process exits) —
+    so launching Solomon again (taskbar / open_application) re-focuses the one window instead of opening
+    a DUPLICATE. Windows-only (ctypes, no new dep); a no-op (always True) elsewhere."""
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.CreateMutexW(None, False, "Global\\Solomon.Dashboard.SingleInstance")  # handle held until process exit
+        if k32.GetLastError() != 183:        # 183 = ERROR_ALREADY_EXISTS -> we're the first instance
+            return True
+        user32 = ctypes.windll.user32        # another instance exists — bring its window to the front
+        hwnd = user32.FindWindowW(None, "Solomon")
+        if hwnd:
+            user32.ShowWindow(hwnd, 9)       # SW_RESTORE (un-minimize)
+            user32.SetForegroundWindow(hwnd)
+        return False
+    except Exception:  # noqa: BLE001 — a guard failure must never block opening the dashboard
+        return True
+
+
 def main():
     if sys.platform == "win32":
         try:  # distinct taskbar identity so Windows uses Solomon's icon (not python's) + groups/pins correctly
@@ -426,6 +449,8 @@ def main():
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Solomon.Dashboard")
         except Exception:  # noqa: BLE001 — best-effort cosmetic
             pass
+    if not _single_instance_or_foreground():
+        return                               # a dashboard is already open — we foregrounded it; don't duplicate
     import threading
 
     # Re-arm the keep-alive watchdog if its scheduled task was deleted/disabled (idempotent, best-

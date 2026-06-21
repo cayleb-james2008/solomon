@@ -399,9 +399,12 @@ def recover(repo, allow_pi=False, allow_restart=True, auto_push=True):
         if control.is_running(repo):
             return _finish(repo, d, actions, escalate=True,
                            msg="loop would not stop — manual kill required (Solomon will not force-kill)")
-        if allow_restart:
-            control.start(repo, auto_push=auto_push)
-            actions.append("restart")
+        # Restart UNCONDITIONALLY: a stuck loop must be re-spawned even with auto_push OFF. control.start
+        # ships local-only when auto_push is False (effective_ship -> "local"; never pushes/merges), so a
+        # restart is not a push-bearing action and must not be gated by allow_restart — gating it left
+        # local-ship lanes silently dead (stopped, no restart, no escalation) until a human pressed Start.
+        control.start(repo, auto_push=auto_push)
+        actions.append("restart")
     elif cat == "gate_red_streak":
         if not (allow_pi and control.keys_status().get(control.project_provider(repo))):
             return _finish(repo, d, actions, escalate=True,
