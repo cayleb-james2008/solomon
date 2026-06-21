@@ -32,6 +32,7 @@ def test_save_state_is_atomic_no_truncation_on_failure(tmp_path, monkeypatch):
                         lambda *a, **k: (_ for _ in ()).throw(OSError("replace failed")))
     assert app._save_state({"auto_push": True}) is False
     assert sf.read_text(encoding="utf-8") == '{"auto_push": false}'   # original intact, not truncated
+    assert not (tmp_path / "state.json.tmp").exists()                 # the failed-write tmp is cleaned up
 
 
 def test_set_auto_push_persists_and_reads_back(tmp_path, monkeypatch):
@@ -42,6 +43,23 @@ def test_set_auto_push_persists_and_reads_back(tmp_path, monkeypatch):
     res = app.Api().set_auto_push(False)
     assert res["ok"] is True and res["auto_push"] is False
     assert app.Api().get_auto_push() is False
+
+
+def test_set_dial_rolls_back_in_memory_on_write_failure(tmp_path, monkeypatch):
+    # the safety bug: a FAILED persist must NOT leave the dial 'on' IN MEMORY while disk + the UI show
+    # 'off'. The supervisor reads get_auto_ai_fix() from in-memory state, so an un-rolled-back value would
+    # run unattended fix-sessions the operator believes are disabled.
+    sf = tmp_path / "state.json"
+    sf.write_text('{"auto_ai_fix": false}', encoding="utf-8")
+    monkeypatch.setattr(app, "_STATE_FILE", str(sf))
+    monkeypatch.setattr(app, "_LEGACY_STATE_FILE", str(tmp_path / "legacy.json"))
+    api = app.Api()
+    assert api.get_auto_ai_fix() is False                  # loaded from disk
+    monkeypatch.setattr(app.os, "replace",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("replace failed")))
+    res = api.set_auto_ai_fix(True)
+    assert res["ok"] is False                              # the write failed
+    assert api.get_auto_ai_fix() is False                 # rolled back in memory — NOT the un-persisted True
 
 
 def test_supervise_survives_one_repo_raising(tmp_path, monkeypatch):

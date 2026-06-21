@@ -41,9 +41,10 @@ def _fake_git(monkeypatch, *, behind="0", ahead="0", dirty="", has_origin=True,
             return _cp(returncode=fetch_rc)
         if a[:1] == ["status"]:
             return _cp(dirty)
-        if a[:2] == ["rev-list", "--count"]:
-            rng = a[2] if len(a) > 2 else ""
-            return _cp(ahead if rng.startswith("origin/") else behind)  # origin/<b>..HEAD = ahead
+        if a[:1] == ["rev-list"]:
+            # update_status now does ONE call: rev-list --left-right --count origin/<b>...HEAD,
+            # which prints "behind<TAB>ahead".
+            return _cp(f"{behind}\t{ahead}")
         return _cp()
 
     monkeypatch.setattr(control, "_run", run)

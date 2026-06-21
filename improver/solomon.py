@@ -51,7 +51,7 @@ def _stale(hb, repo):
     except (ValueError, TypeError):
         return False
     age = (datetime.now(timezone.utc) - last).total_seconds()
-    return age > max(3 * control.project_interval(repo), 4500)
+    return age > max(3 * control.project_interval(repo), control.LOCK_LIVE_FLOOR_S)
 
 
 def diagnose(repo):
@@ -82,7 +82,13 @@ def diagnose(repo):
     elif status == "error" and phase == "reverted":
         cat, ev, rec, safe = ("revert_failed", (summary[:200] or "revert failed"),
                               ["attempt a reset of the base branch to origin", "else manual cleanup"], False)
-    elif status == "error" and phase == "preflight" and "dirty" in summary.lower():
+    elif (status == "error" and phase == "preflight" and "dirty" in summary.lower()
+          and reason != "dirty_base_persistent"):
+        # NOTE: the runner's OWN dirty_base_persistent self-stop also has status=error/phase=preflight and
+        # 'dirty' in its summary, but it must NOT be treated as an auto-safe dirty_tree (which recover()
+        # would hard-reset, destroying the operator's uncommitted base work the self-stop exists to
+        # protect). Excluding reason here lets it fall through to stop_lingering (escalate-only while the
+        # base stays dirty); monitor's auto-recover arm clears it once the base is verified clean.
         cat, ev, rec, safe = "dirty_tree", summary[:160], ["reset the base branch to origin"], True
     elif status == "error" and phase == "preflight" and (
             "out-of-band" in summary.lower() or "refusing to hard-reset" in summary.lower()):

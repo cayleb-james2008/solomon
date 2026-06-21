@@ -59,6 +59,12 @@ PROJECTS_DIR = os.path.join(os.path.dirname(HERE), "projects")
 
 _GH_FALLBACK = r"C:\Program Files\GitHub CLI\gh.exe"
 
+# Single source of truth for the lock-liveness staleness floor (seconds). A heartbeat older than
+# max(3*interval, this) means the runner is dead/stale and its lock may be taken over. control._lock_is_live,
+# run_improver.acquire_lock, and solomon._stale MUST all use this same floor — a lower value at any one site
+# lets the supervisor declare a still-live runner's lock dead and clear it -> two runners on one repo.
+LOCK_LIVE_FLOOR_S = 4500
+
 # provider defaults — keep in sync with improver/run_improver.py PROVIDERS
 _PROVIDER_DEFAULT_MODEL = {
     "ollama-cloud": "glm-5.2",
@@ -107,12 +113,10 @@ def _discover_projects():
 
 
 def _read_repos_json(path=REPOS_JSON):
-    """Raw list read of repos.json. Returns [] on missing/corrupt/non-list."""
+    """Raw list read of repos.json. Returns [] on missing/corrupt/non-list (lenient — display paths)."""
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except (OSError, json.JSONDecodeError):
+        return _read_repos_json_strict(path)
+    except (OSError, ValueError, json.JSONDecodeError):
         return []
 
 
@@ -129,6 +133,17 @@ def _read_repos_json_strict(path=REPOS_JSON):
     if not isinstance(data, list):
         raise ValueError("repos.json is not a JSON list")
     return data
+
+
+def _read_repos_for_write():
+    """Read repos.json for a WRITE path. Returns (entries, None) on success, or (None, error_dict) when
+    the file is present-but-corrupt — so the caller aborts instead of rebuilding from an empty base and
+    os.replace'ing over the good file (which would wipe every repo's config)."""
+    try:
+        return _read_repos_json_strict(REPOS_JSON), None   # live module global (monkeypatch-friendly)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None, {"ok": False,
+                      "error": "repos.json is unreadable/corrupt — refusing to overwrite and lose config"}
 
 
 def load_repos(path=None):
@@ -249,11 +264,9 @@ def set_repo_config(name, provider=None, model=None, ship=None, gate=None,
     Creates the entry (carrying its discovered path) if it doesn't exist."""
     if not name:
         return {"ok": False, "error": "name required"}
-    try:
-        entries = _read_repos_json_strict(REPOS_JSON)  # live module global (monkeypatch-friendly)
-    except (OSError, ValueError, json.JSONDecodeError):
-        return {"ok": False,
-                "error": "repos.json is unreadable/corrupt — refusing to overwrite and lose config"}
+    entries, err = _read_repos_for_write()
+    if err:
+        return err
     entry = None
     for r in entries:
         if isinstance(r, dict) and r.get("name") == name:
@@ -515,16 +528,16 @@ def update_status():
     (uncommitted tracked changes block an ff pull). An update is 'available' only when behind>0
     AND not dirty (a dirty tree must be committed/stashed first — surfaced via reason).
 
-    Returns a dict: {ok, available, behind, dirty, currentSha, branch, reason?, error?}.
+    Returns a dict: {ok, available, behind, ahead, dirty, currentSha, branch, reason?, error?}.
     Pure-read + network fetch only; never modifies the tree. Safe (ok:False) on any error."""
     repo = _solomon_repo()
     git = _which_git()
     if not repo:
         return {"ok": False, "error": "Solomon source repo not found (needs solomon.spec + control.py)",
-                "available": False, "behind": 0, "dirty": False, "currentSha": None}
+                "available": False, "behind": 0, "ahead": 0, "dirty": False, "currentSha": None}
     if not git:
         return {"ok": False, "error": "git not found on PATH",
-                "available": False, "behind": 0, "dirty": False, "currentSha": None}
+                "available": False, "behind": 0, "ahead": 0, "dirty": False, "currentSha": None}
 
     def g(*args):
         return _run([git, "-C", repo, *args])
@@ -540,16 +553,20 @@ def update_status():
         # FAILED fetch (offline) must not let a STALE origin ref report "available" — surface it as
         # ok:True/available:False with a reason (renderUpdate already shows that as "unavailable").
         try:
-            fetch = _run([git, "-C", repo, "fetch", "origin", "--quiet"], timeout=25)
+            fetch = _run([git, "-C", repo, "fetch", "origin", "--quiet"], timeout=15)
         except subprocess.TimeoutExpired:
             fetch = None
         if fetch is None or fetch.returncode != 0:
             return {"ok": True, "available": False, "behind": 0, "ahead": 0, "dirty": dirty,
                     "currentSha": sha, "branch": branch, "reason": "could not reach origin (offline?)"}
-        cnt = g("rev-list", "--count", f"HEAD..origin/{branch}")
-        behind = int((cnt.stdout or "0").strip() or "0") if cnt.returncode == 0 else 0
-        acnt = g("rev-list", "--count", f"origin/{branch}..HEAD")
-        ahead = int((acnt.stdout or "0").strip() or "0") if acnt.returncode == 0 else 0
+        # One subprocess for both counts: `--left-right --count A...B` prints "left<TAB>right" where the
+        # left count is reachable-from-origin-not-HEAD (behind) and the right is the reverse (ahead).
+        behind, ahead = 0, 0
+        lr = g("rev-list", "--left-right", "--count", f"origin/{branch}...HEAD")
+        if lr.returncode == 0:
+            parts = (lr.stdout or "").split()
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                behind, ahead = int(parts[0]), int(parts[1])
     except (OSError, ValueError) as e:
         return {"ok": False, "error": str(e), "available": False, "behind": 0,
                 "ahead": 0, "dirty": False, "currentSha": None}
@@ -860,11 +877,9 @@ def connect_project(spec, goal=None, ship="pr", visual_gate=None, provider=None)
     resolved_visual_gate = bool(has_frontend(entry)) if visual_gate is None else bool(visual_gate)
     entry["visual_gate"] = resolved_visual_gate
 
-    try:
-        entries = _read_repos_json_strict(REPOS_JSON)
-    except (OSError, ValueError, json.JSONDecodeError):
-        return {"ok": False,
-                "error": "repos.json is unreadable/corrupt — refusing to overwrite and lose config"}
+    entries, err = _read_repos_for_write()
+    if err:
+        return err
     existing = next((r for r in entries if isinstance(r, dict) and r.get("name") == name), None)
     if existing is None:
         entries.append(entry)
@@ -1034,10 +1049,9 @@ def _lock_is_live(repo, rt=None):
     age = _heartbeat_age(hb)
     if age is None:
         return True                          # no usable timestamp -> don't declare a live PID dead on that alone
-    # ponytail: 4500 must stay in sync with run_improver.acquire_lock and solomon._stale (both floor
-    # at 4500). A lower floor here let the supervisor declare a still-live runner's lock dead in the
-    # (3600,4500] window and clear it -> two runners on one repo (single-flight violation).
-    return age <= max(3 * project_interval(repo), 4500)
+    # LOCK_LIVE_FLOOR_S is the shared floor (see its definition) — run_improver.acquire_lock and
+    # solomon._stale use the SAME constant so the (3600,4500] window can't reopen via drift.
+    return age <= max(3 * project_interval(repo), LOCK_LIVE_FLOOR_S)
 
 
 def is_running(repo):
@@ -1944,11 +1958,23 @@ def acquire_supervisor_lock(repo):
     content = f"{os.getpid()}\n{token}"
     try:                                            # atomic exclusive create — no lock present at all
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        write_ok = True
         try:
             os.write(fd, content.encode("ascii"))
+        except OSError:
+            write_ok = False
         finally:
-            os.close(fd)
-        return True, token
+            os.close(fd)                            # close BEFORE any remove (Windows can't unlink an open file)
+        if write_ok:
+            return True, token
+        # Partial create: O_EXCL succeeded but the write failed (disk full / interrupted), leaving a 0-byte
+        # lock that the empty-lock guard below — and run_improver.acquire_lock — would refuse to ever steal,
+        # wedging the lane for automated recovery until a manual clear_lock. Remove the file we just created.
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
+        return False, None
     except FileExistsError:
         pass
     except OSError:

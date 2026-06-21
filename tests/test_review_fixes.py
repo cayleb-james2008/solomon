@@ -253,13 +253,13 @@ def test_preflight_refuses_unpushed_base_commit(tmp_path, monkeypatch):
 def test_untracked_non_ignored_files_parses_status(monkeypatch):
     m = _load_runner()
     status = " M tracked.py\n?? new_test.py\n?? scratch/notes.md\n## branch.main\n"
-    monkeypatch.setattr(m, "git", lambda *a: type("R", (), {"stdout": status, "returncode": 0})())
+    monkeypatch.setattr(m, "git", lambda *a, **k: type("R", (), {"stdout": status, "returncode": 0})())
     assert m._untracked_non_ignored_files() == ["new_test.py", "scratch/notes.md"]
 
 
 def test_untracked_non_ignored_files_empty_when_clean(monkeypatch):
     m = _load_runner()
-    monkeypatch.setattr(m, "git", lambda *a: type("R", (), {"stdout": "", "returncode": 0})())
+    monkeypatch.setattr(m, "git", lambda *a, **k: type("R", (), {"stdout": "", "returncode": 0})())
     assert m._untracked_non_ignored_files() == []
 
 
@@ -821,7 +821,7 @@ def test_ship_push_unverified_blocks_pr(monkeypatch):
     m.SHIP = "auto-merge"
     monkeypatch.setattr(m, "has_remote", lambda: True)
     monkeypatch.setattr(m, "_gh_ready", lambda: True)
-    monkeypatch.setattr(m, "git", lambda *a: type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})())
+    monkeypatch.setattr(m, "git", lambda *a, **k: type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})())
     monkeypatch.setattr(m, "_branch_on_remote", lambda b: False)   # push 'succeeded' but branch not on origin
     monkeypatch.setattr(m, "heartbeat", lambda **k: None)
     opened = []

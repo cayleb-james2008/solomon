@@ -346,6 +346,28 @@ def test_stop_lingering_clean_exit_is_auto_safe(tmp_path, monkeypatch):
     assert d["category"] == "stop_lingering" and d["auto_safe"] is True
 
 
+def test_dirty_base_persistent_self_stop_not_reset(tmp_path, monkeypatch):
+    # A dirty_base_persistent self-stop has status=error/phase=preflight + 'dirty' in its summary, exactly
+    # like an auto-safe dirty_tree — but recover() must NOT hard-reset it (that destroys the operator's
+    # uncommitted base work the self-stop exists to protect). diagnose must classify it stop_lingering
+    # (escalate-only, NOT dirty_tree), and recover must escalate, leave the operator Stop in place, and
+    # NEVER call reset_to_base.
+    rt = _rt(tmp_path, monkeypatch)
+    (rt / "stop").write_text("dirty_base_persistent\n", encoding="utf-8")
+    _hb(rt, status="error", phase="preflight", reason="dirty_base_persistent",
+        last_summary="Base branch 'main' has been dirty for 3 consecutive preflight bails")
+    monkeypatch.setattr(control, "is_running", lambda repo: False)
+    called = {"reset": False}
+    monkeypatch.setattr(control, "reset_to_base",
+                        lambda repo: called.__setitem__("reset", True) or {"ok": True})
+    d = solomon.diagnose(_repo(tmp_path))
+    assert d["category"] == "stop_lingering" and d["auto_safe"] is False     # NOT dirty_tree/auto_safe
+    res = solomon.recover(_repo(tmp_path), allow_pi=False)
+    assert res["escalate"] is True
+    assert called["reset"] is False                                          # base NOT hard-reset
+    assert (rt / "stop").exists()                                            # operator Stop preserved
+
+
 def test_read_supervisor_log_tail(tmp_path, monkeypatch):
     rt = _rt(tmp_path, monkeypatch)
     (rt / "supervisor.jsonl").write_text("\n".join(json.dumps({"i": i}) for i in range(3)) + "\n", encoding="utf-8")
