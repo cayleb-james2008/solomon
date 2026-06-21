@@ -335,16 +335,59 @@ def _venv_python(repo):
 
 def _runner_python(repo):
     """The interpreter to spawn run_improver.py with: the repo's own .venv python when it exists, else
-    the current interpreter — but NEVER when frozen. When frozen, sys.executable is Solomon.exe, and
+    the current interpreter — but NEVER the frozen exe. When frozen, sys.executable is Solomon.exe, and
     spawning [Solomon.exe, run_improver.py, ...] would fall through to main() and launch a ghost
-    dashboard window instead of running the provisioner. Returns a path, or None when frozen with no
-    repo .venv (so the caller fails loudly instead of spawning a stray GUI)."""
+    dashboard window. In that case fall back to a DISCOVERED system Python host (run_improver.py is
+    stdlib-only, so any Python >=3.11 can host it) — this makes onboarding a venv-less repo (e.g. a Node
+    project) zero-touch. Returns a path, or None only when frozen AND no repo .venv AND no system Python
+    is found (so the caller fails loudly with actionable guidance instead of spawning a stray GUI)."""
     py = _venv_python(repo)
     if py and os.path.exists(py):
         return py
-    if getattr(sys, "frozen", False):
-        return None
-    return sys.executable
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+    return _discover_host_python()
+
+
+_HOST_PY_CACHE = None
+
+
+def _discover_host_python():
+    """A real Python >=3.11 to host run_improver.py when Solomon is frozen and the target repo has no
+    .venv. Tries the `py` launcher (py -3), then common names on PATH. Verifies the candidate is a real
+    Python >=3.11 and not Solomon.exe. Cached for the process. Returns a path or None.
+
+    This is pure host discovery — it creates NO venv inside the target repo, so it cannot produce an
+    untracked `.venv/` (the onboarding refusal we hit) or a locked-interpreter stash failure."""
+    global _HOST_PY_CACHE
+    if _HOST_PY_CACHE is not None:
+        return _HOST_PY_CACHE or None
+    candidates = []
+    launcher = shutil.which("py")
+    if launcher:
+        try:
+            out = _run([launcher, "-3", "-c", "import sys;print(sys.executable)"]).stdout.strip()
+            if out:
+                candidates.append(out)
+        except OSError:
+            pass
+    for name in ("python3.12", "python3.11", "python3", "python"):
+        w = shutil.which(name)
+        if w:
+            candidates.append(w)
+    for c in candidates:
+        try:
+            if not c or not os.path.exists(c) or os.path.basename(c).lower().startswith("solomon"):
+                continue
+            ver = _run([c, "-c", "import sys;print('%d.%d' % sys.version_info[:2])"]).stdout.strip()
+            maj, _, minr = ver.partition(".")
+            if maj == "3" and minr.isdigit() and int(minr) >= 11:
+                _HOST_PY_CACHE = c
+                return c
+        except (OSError, ValueError):
+            continue
+    _HOST_PY_CACHE = ""
+    return None
 
 
 def _clean_subenv():
@@ -1063,10 +1106,11 @@ def start(repo, auto_push=True, once=False):
     except OSError:
         pass
 
-    py = _venv_python(repo)
+    py = _runner_python(repo)   # repo .venv python if present, else a discovered system Python host
     runner = os.path.join(HERE, "improver", "run_improver.py")
-    if not os.path.exists(py):
-        return {"ok": False, "error": f"venv python not found: {py}"}
+    if not py:
+        return {"ok": False, "error": "no Python host found to run the improver — add a .venv to the "
+                "repo or install Python 3.11+ (py launcher or on PATH)"}
     if not os.path.exists(runner):
         return {"ok": False, "error": f"runner not found: {runner}"}
 
