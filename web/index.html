@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dusk">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -8,38 +8,40 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <div id="app">
-    <header class="topbar">
-      <div class="brand">
-        <span class="brand-mark">&#8734;</span>
-        <span class="brand-name">Solomon</span>
-        <span class="brand-ver" id="brandVer" title="Current version (git commit)"></span>
-      </div>
-      <div class="update-box" id="updateBox" hidden>
-        <span class="update-msg" id="updateMsg">Up to date</span>
-        <button class="update-btn" id="updateBtn" hidden>Update &amp; restart</button>
-      </div>
-      <div class="topbar-actions">
-        <div class="ap-toggle">
-          <span>Auto-push</span>
-          <button class="switch" id="autoPush" title="Global auto-push gate" aria-label="Auto-push"><span class="knob"></span></button>
-        </div>
-        <div class="theme-row" id="themeRow"></div>
-        <button class="icon-btn" id="refreshBtn" title="Refresh">
-          <svg viewBox="0 0 256 256"><path fill="currentColor" d="M224 128a96 96 0 0 1-163.9 67.9L33.9 168H72a8 8 0 0 0 0-16H16a8 8 0 0 0-8 8v56a8 8 0 0 0 16 0v-36.7l27.1 27.1A112 112 0 1 0 16 128a8 8 0 0 0 16 0 96 96 0 0 1 192 0Z"/></svg>
-        </button>
-      </div>
-    </header>
+  <!-- aurora backdrop: soft drifting glows behind the frosted glass -->
+  <div class="aurora" aria-hidden="true"><span></span><span></span><span></span></div>
 
-    <div class="shell" id="shell">
-      <nav class="rail" id="rail"></nav>
-      <main class="main" id="view">
-        <div class="loading"><div class="spinner"></div>Loading Solomon…</div>
-      </main>
-      <aside class="dock" id="dock"></aside>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">&#9671;</span>
+      <span class="brand-name">Solomon</span>
+      <span class="brand-sub">recursive self-improvement</span>
     </div>
-  </div>
-  <div class="toasts" id="toasts"></div>
+    <div class="topbar-actions">
+      <button id="addPanel" class="btn ghost" title="Add a panel to your workspace">
+        <svg viewBox="0 0 24 24" class="ic"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><path d="M17.5 14v7M14 17.5h7"/></svg>
+        <span>Add panel</span>
+      </button>
+      <button id="openSettings" class="btn ghost icon-only" title="Settings">
+        <svg viewBox="0 0 24 24" class="ic"><circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg>
+      </button>
+      <span id="version" class="version" title="Solomon build"></span>
+    </div>
+  </header>
+
+  <main id="workspace" class="workspace">
+    <div class="boot"><div class="spinner"></div><span>Loading Solomon…</span></div>
+  </main>
+
+  <!-- add-panel popover -->
+  <div id="bento" class="bento hidden"></div>
+
+  <!-- settings slide-over -->
+  <div id="settingsScrim" class="scrim hidden"></div>
+  <aside id="settings" class="drawer hidden"></aside>
+
+  <div id="toasts" class="toasts"></div>
+
   <script src="app.js"></script>
 </body>
 </html>
