@@ -24,3 +24,6 @@ repos/
 
 # generated icon verification scratch (icon.ico / icon.png are kept)
 web/assets/_exe_icon_verify.png
+
+# Rust build output (the exe is built from src-tauri/ and shipped via the release workflow)
+/Solomon.exe

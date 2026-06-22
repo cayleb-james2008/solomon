@@ -340,6 +340,19 @@ async function boot() {
   if (!Array.isArray(saved) || !saved.length) { try { saved = JSON.parse(localStorage.getItem("solomon.layout") || "null"); } catch {} }
   layout = (Array.isArray(saved) && saved.length ? saved : DEFAULT_LAYOUT()).map(p => ({ id: p.id || uid(), type: p.type, repo: p.repo, span2: !!p.span2 }));
   try { const sha = await call("current_sha"); $("#version").textContent = (sha && (sha.sha || sha)) ? String(sha.sha || sha).slice(0, 7) : ""; } catch {}
+  // Auto-update: when a newer signed release exists (tauri-plugin-updater checks GitHub Releases),
+  // turn the version label into a clickable "Update available" pill. Click -> apply_update() downloads,
+  // installs (NSIS), and relaunches. ponytail: no extra UI chrome — reuse the existing #version slot.
+  try {
+    const u = await call("update_status");
+    if (u && u.available) {
+      const v = $("#version");
+      v.textContent = "⬆ Update available";
+      v.style.cursor = "pointer";
+      v.title = "Click to update Solomon" + (u.version ? " to " + u.version : "");
+      v.onclick = async () => { v.textContent = "updating…"; const r = await act("apply_update"); if (r && r.ok === false) { v.textContent = "update failed"; toast("Update failed: " + ((r && r.error) || "?"), "err"); } };
+    }
+  } catch {}
 
   renderWorkspace(); applyState();
   setInterval(refresh, 4000);
