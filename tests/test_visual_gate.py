@@ -100,17 +100,22 @@ def test_visual_gate_decision_handles_missing_findings_key():
     assert "unavailable" in m._visual_gate_reason(None).lower()
 
 
-# ---- Feature 1a: mandatory visual testing for frontend repos -------------
-def test_visual_gate_auto_on_for_frontend_repo(tmp_path, monkeypatch):
-    """When visual_gate is ABSENT and the repo has a detected frontend (index.html), the gate
-    is ON by default — mandatory visual testing phase for frontend repos."""
+# ---- Visual gate is OPT-IN (a detected frontend no longer auto-enables it) ----
+def test_visual_gate_opt_in_only(tmp_path, monkeypatch):
+    """Opt-in contract: a detected frontend (index.html) WITHOUT an explicit visual_gate flag is
+    OFF (it no longer auto-launches a dev server / mandatory visual phase); only an explicit
+    visual_gate: true turns it ON. This is the intentional project-agnostic change."""
     m = _load_runner()
     repo_dir = tmp_path / "a"
     repo_dir.mkdir()
     (repo_dir / "index.html").write_text("<!DOCTYPE html><html></html>", encoding="utf-8")
     repos_json = tmp_path / "repos.json"
-    repos_json.write_text(json.dumps([{"name": "a", "path": str(repo_dir)}]), encoding="utf-8")
     monkeypatch.setattr(m, "CONTROL", tmp_path)
+    # frontend present but NO flag -> OFF (the behavior change)
+    repos_json.write_text(json.dumps([{"name": "a", "path": str(repo_dir)}]), encoding="utf-8")
+    assert m._visual_gate_enabled("a") is False
+    # explicit opt-in -> ON
+    repos_json.write_text(json.dumps([{"name": "a", "path": str(repo_dir), "visual_gate": True}]), encoding="utf-8")
     assert m._visual_gate_enabled("a") is True
 
 
