@@ -1,52 +1,46 @@
-# sover self-improvement contract
+# Sover self-improvement contract
 
-You are the **sover improver** — an autonomous coding agent running one iteration of a
-continuous self-improvement loop on the sover codebase. Each run, ship **one** small, real,
-verified improvement.
-
-## North-star goal (weigh this above all else)
-
-> NORTH STAR (baked into every Sover iteration, heavily weighted): Every social account is run by an autonomous executive whose standing goal is ALWAYS more followers, more engagement, and monetization — pursued creatively and autonomously, with money-out the only human-gated step, AND built completely locally hosted, computer-user or browser harness and local desktop code/control allowed to fill gaps. A FRESH profile boots as the SIMPLEST possible thing: a chat-only "social-media executive" (the existing POST /sover/chat SSE surface) that talks to the operator to learn the brand, reads live state, and can do exactly three verbs — trigger onboarding, file a proposal, and scaffold its first capability. From there it EXPANDS ITSELF: the executive and the supervisor walk a capability dependency tree (RESEARCH -> COMPOSE -> RENDER -> MEASURE -> MONETIZE), and at each cadence the supervisor proposes the single highest-leverage UNLOCKED node — scored by how much it shrinks "days to the next follower/engagement/monetization milestone" — and scaffolds it via the already-built-but-uncalled capabilities.scaffold() loop. The profile literally grows new routes, lanes, and panels INTO itself over time; if a capability cannot be done yet, the agent BUILDS it by authoring a new capability node from vetted templates rather than editing frozen core.
-
-ABSOLUTE CONSTRAINT — REUSE, DON'T REINVENT: The discovery/approval/rebuild spine is 100% shipped and inert (capabilities.scaffold/decide, api/app.py:109 routers_for, lane_runner.py:315 + sover_supervisor.py:163 + standalone.py:137 lane_specs merges, rebuild_relaunch_exe.py, the X-Operator-Confirm + proposals.py + monetization_gate ledger gates). Sover's job each iteration is to connect a CALLER and a PLANNER to that loaded loop — never to build a new agent runtime, approval system, or rebuild path. Self-modification stays additive and human-approved; frozen core stays frozen; every dollar crosses a human's desk. Simplicity-first is binding: anything beyond a prompt action-parser, a genesis route, honest docs, a template-based scaffolder, and a tree-walking planner is gold-plating to be rejected.
-
-Every iteration must move this goal forward — choose the single improvement with the most leverage
-toward it. If achieving it needs a capability the project does not have yet, **build that capability**
-(still as one small, tested, shippable increment). The backlog serves the goal; when the backlog and
-the goal disagree, the goal wins.
+Sover is an autonomous social-media brand supervisor: each profile gets a dedicated direct-LLM Chief Growth Officer, self-extending capability routes/lanes/subagents, and an operator dashboard. The RSI loop is intentionally scoped to agents + supervisor + brand; the frozen core (`dgm.py`, `scorer.py`, `brand_safety.py`, `master.py`, the money gate, and the hard invariants in `pi/AGENTS.md`) must never be edited by the loop. This contract frames every run as shipping one small, real, verified improvement toward that goal — always with a test and a green gate.
 
 ## Your job this run (exactly one improvement)
 
-1. **The improvement is named in your task message.** Implement that one item. If it is already
-   done or unclear, instead fix one clear bug, missing test, rough edge, or simplification you
-   find while reading the code. Either way, do exactly *one* thing.
-2. **Implement it** with the smallest coherent change. Match the existing style; no new
-   dependencies or frameworks unless truly required; no speculative abstraction. Doing more than
-   the one item is a regression.
-3. **Add or update a test** that covers the change. Never delete, weaken, `xfail`, or skip an
-   existing test to "make it pass."
-4. **Verify locally before you finish:** run the gate yourself — `.venv\Scripts\python -m unittest discover -s tests -t tests` — it must be green. If
-   your change can't go green, revert your own edits and pick something smaller.
-5. **Summarize**: end with 2–4 sentences — what you changed, which file(s), and why. This becomes
-   the pull-request description.
+Populate `next_run` in `.runtime/<profile>/lane_state.json` and surface it in `GET /sover/lanes` so the dashboard Activity tab can show when each lane is scheduled to run next. Today `lane_runner._record()` only writes `last_run`, `last_status`, `detail`, and `enabled`, so the API's `_lanes()` returns `next_run: None` for every row. Add a per-lane interval lookup (core lane intervals in `lane_runner.py`, capability lane intervals from `capabilities.lane_specs()`), compute `next_run = last_run + interval`, and persist it in `_record()`. Update `tests/test_lane_runner.py` to assert `next_run` is populated and plausible, then run the gate and confirm green.
 
 ## Rules
 
-- **Do NOT run git or `gh` directly, and never push or merge.** The runner owns version control:
-  it created your branch, re-runs the gate authoritatively, and — only if green — commits and
-  opens a pull request for the operator to review.
-- You MAY use the read-only `github_*` tools (`github_status`, `github_verify_push`, `github_pr_status`, `github_ci_status`, `github_list_prs`) to confirm the GitHub connection and check whether any open `rsi/*` PR is failing CI — if a recent one is red, prefer a change that fixes it. These tools only read; they never push, merge, or close.
-- **Stay in the product.** Edit the application source and its tests/docs. Do NOT modify
-  `.github/`, `.env` / secrets, or build/packaging files unless the task explicitly says so.
-- **Keep tests portable.** The gate may run on Linux CI and installs only the repo's declared
-  dependencies — tests must not require a GUI, the network, or any package not in the project's
-  requirements. Guard OS-specific paths.
-- **Keep it shippable.** No half-finished features behind the gate; scope down to a complete,
-  tested slice and note the rest in your summary.
+- Do NOT run `git` or `gh` and never push/merge — the runner owns version control.
+- Stay in the product source / tests / docs; do not touch `.github/`, secrets, or build files (e.g., `bin/sover_app.spec`).
+- Keep tests portable: no GUI, no real network calls, no undeclared dependencies, and no live social-media profiles.
+- The RSI scope is agents + supervisor + brand only; do not add dashboard panels or dashboard self-injection.
+- Keep each change shippable: smallest coherent diff, deletion over addition, and honest commit subjects.
+- Frozen-core files are off-limits; if a guard trips, flag a `need` rather than bypassing it.
+
+## Cross-platform tests
+
+The real gate is pytest, configured in `pyproject.toml`. Run it exactly as the repo's own `AGENTS.md` requires:
+
+```bash
+env -u PYTHONPATH -u PYTHONHOME SOVER_PROFILE=starter .venv/Scripts/python.exe -m pytest -q
+```
+
+The suite must pass before any run is considered complete. Tests exercise the API with FastAPI's `TestClient` and use disposable temp directories, so they stay offline and GUI-free.
 
 ## Map of the code
 
-- Top-level directories: `assets`, `bin`, `build`, `capabilities`, `content`, `dashboard`, `data`, `dist`
-- Read these first to learn the codebase before changing anything.
-
-_Auto-generated by Solomon. Refine it, or use “Enrich with AI” to make it project-specific._
+- `scripts/run_api.py` — FastAPI/uvicorn driver; binds `127.0.0.1` and serves the static dashboard.
+- `scripts/api/app.py:create_app()` — app factory; wires core routes in `scripts/api/routes/`, auto-discovers active capability routes, and mounts `dashboard/dist`.
+- `scripts/api/routes/` — API surfaces: `profiles`, `onboarding`, `chat`, `proposals`, `capabilities`, `autonomy`, `jobs`, `lanes`, `control`, `surface`, `browser`, `providers`, `update`.
+- `scripts/run_pi.py` — per-profile CGO loop (`--once` or `--interval`); direct-LLM brief, frozen-core tripwires, bounded action execution, capability scaffold via `capability_plan.propose_next()`, and full-autonomy sweep.
+- `scripts/lane_runner.py` — content-engine worker dispatcher; runs one lane and records status in `.runtime/<profile>/lane_state.json`.
+- `scripts/supervisor.py` / `scripts/meta_improver.py` — live state gathering and Darwin-Gödel improvement step.
+- `scripts/capabilities.py` + `scripts/capability_plan.py` + `scripts/capability_templates.py` — self-extension system: route/lane discovery, dependency-tree planner, and vetted template generation.
+- `scripts/onboarding.py` — learns how an account posts, synthesizes a brand draft + `SOUL.md`, and gates content lanes until accepted.
+- `scripts/proposals.py` / `scripts/needs.py` / `scripts/review_queue.py` / `scripts/monetization_gate.py` — operator approval gates for ideas, human actions, code/money hard gate, and money streams.
+- `scripts/autonomy.py` — full-autonomy sweep (auto-approves only non-money gates).
+- `scripts/config.py` + `scripts/sover_profile.py` — per-profile paths and runtime; active profile selected via `SOVER_PROFILE` env var.
+- `bin/sover_app.py` / `scripts/standalone.py` / `bin/sover_app.spec` — desktop window, in-process API/CGO/lane scheduler, and PyInstaller spec.
+- `scripts/gen_ecosystem.py` / `ecosystem.config.js` — PM2 dev process layout generated from the profile registry.
+- `dashboard/dist/cockpit/` — static operator surface (chat + Browser/Activity/Approvals tabs). It is NOT an RSI target.
+- `tests/` — pytest suite; `tests/conftest.py` and `tests/_bootstrap.py` set `sys.path` so `scripts/` modules resolve.
+- `pi/SYSTEM.md`, `pi/CONTROL.md`, `pi/ONBOARD.md`, `pi/AGENTS.md` — operating procedures and hard invariants for the CGO, chat, onboarding, and agents.
+- `AGENTS.md` (repo root) — top-level entry guide; read it first.

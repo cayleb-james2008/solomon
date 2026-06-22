@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Solomon main window capability",
+  "windows": ["main"],
+  "permissions": ["core:default", "updater:default"]
+}

@@ -1,0 +1,28 @@
+[package]
+name = "solomon"
+version = "0.1.0"
+edition = "2021"
+description = "Solomon — RSI control plane"
+default-run = "solomon"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-updater = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+which = "6"
+wait-timeout = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+regex = "1"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "s"
+codegen-units = 1
+# NB: panic=unwind (the default) is intentional — the watchdog sweep uses catch_unwind to isolate
+# a panicking repo so it cannot abort crash-recovery for the others (matches monitor.py per-repo try/except).

@@ -1,0 +1,673 @@
+//! Native Rust port of the git-operations layer of improver/run_improver.py — the preflight clean,
+//! branch lifecycle, and per-repo config readers that gate what may reach a published repo.
+//!
+//! Bug-for-bug with run_improver.py. Every git/gh call goes through `ctx.git(...)` (cwd = the target
+//! repo). The agent-artifact recovery heuristic, the dirty-tree predicates, and the public-repo leak
+//! guards are ported with their CONSERVATIVE design intact (a false positive destroys operator work).
+//!
+//! Python `re.match` anchors at the START of the string only (not the end); the artifact patterns
+//! supply their own END anchor (`$` / `\Z`). The Rust `regex` crate has no direct `re.match`, so
+//! `pattern_match` compiles each pattern unanchored and checks that a match begins at offset 0,
+//! reproducing Python's start-anchored semantics exactly.
+
+use crate::improver::ctx::{self, Ctx};
+use regex::Regex;
+use serde_json::{json, Value};
+use std::sync::OnceLock;
+
+// --------------------------------------------------------------------------- #
+// agent-artifact patterns (run_improver._AGENT_ARTIFACT_PATTERNS / _ARTIFACT_CANARY_PATHS)
+// --------------------------------------------------------------------------- #
+
+/// run_improver._AGENT_ARTIFACT_PATTERNS — the CONSERVATIVE global heuristic for a dead run's OWN
+/// untracked debris (never operator work). Each is start-anchored via `^` AND end-anchored, matched
+/// against the repo-relative POSIX path. Compiled once.
+fn global_artifact_patterns() -> &'static [Regex] {
+    static PATS: OnceLock<Vec<Regex>> = OnceLock::new();
+    PATS.get_or_init(|| {
+        vec![
+            Regex::new(r"^AGENT_LOG\.md$").unwrap(), // the agent's per-run log (exact name)
+            Regex::new(r"^capabilities/[^/]+(?:/.+)?$").unwrap(), // capabilities/<name>[/<anything>]
+            Regex::new(r"^profiles/[^/]+(?:/.+)?$").unwrap(), // profiles/<id>[/<anything>]
+            Regex::new(r"^start_[^/]+\.sh$").unwrap(), // start_<id>.sh launcher script
+            Regex::new(r"^\.agent_artifacts/.+").unwrap(), // the explicit operator-opted-in sentinel dir
+        ]
+    })
+    .as_slice()
+}
+
+/// run_improver._ARTIFACT_CANARY_PATHS — canonical operator files that must NEVER be classified as
+/// agent artifacts; a per-repo `agent_artifacts` entry matching ANY of these is rejected as too broad.
+const ARTIFACT_CANARY_PATHS: &[&str] = &[
+    "README.md",
+    "main.py",
+    "app.py",
+    "setup.py",
+    "pyproject.toml",
+    "src/app.py",
+    "tests/test_x.py",
+    "index.js",
+    "package.json",
+    "notes.txt",
+];
+
+/// Python `pat.match(s)` semantics: a match that begins at offset 0 (start-anchored, not end-anchored).
+/// The patterns carry their own end anchors; `regex::find` is unanchored, so we require `start()==0`.
+fn pattern_match(pat: &Regex, s: &str) -> bool {
+    matches!(pat.find(s), Some(m) if m.start() == 0)
+}
+
+// --------------------------------------------------------------------------- #
+// dirty-tree / sha primitives
+// --------------------------------------------------------------------------- #
+
+/// run_improver.tree_dirty (~732-736): True if there are uncommitted changes to TRACKED files
+/// (work the loop must not clobber). Untracked files are NOT counted (untracked_non_ignored_files
+/// guards those separately).
+pub fn tree_dirty(ctx: &Ctx) -> bool {
+    !ctx.git(&["status", "--porcelain", "--untracked-files=no"], 120)
+        .stdout
+        .trim()
+        .is_empty()
+}
+
+/// run_improver._untracked_non_ignored_files (~739-748): non-ignored UNTRACKED files (`??` entries)
+/// in the working tree, each stripped of the leading `"?? "` and trailing whitespace. Pure
+/// (delegates to git()) so the guard rule is unit-testable.
+pub fn untracked_non_ignored_files(ctx: &Ctx) -> Vec<String> {
+    let out = ctx
+        .git(&["status", "--porcelain", "--untracked-files=normal"], 120)
+        .stdout;
+    let mut files = Vec::new();
+    for line in out.lines() {
+        if let Some(rest) = line.strip_prefix("?? ") {
+            files.push(rest.trim().to_string());
+        }
+    }
+    files
+}
+
+/// run_improver.head_sha (~919-920): `git rev-parse HEAD` stdout, stripped.
+pub fn head_sha(ctx: &Ctx) -> String {
+    ctx.git(&["rev-parse", "HEAD"], 120).stdout.trim().to_string()
+}
+
+// --------------------------------------------------------------------------- #
+// agent-artifact classification (pure)
+// --------------------------------------------------------------------------- #
+
+/// run_improver._compile_artifact_pattern (~780-808): compile ONE operator-supplied `agent_artifacts`
+/// entry to a fully-anchored regex matched the same way as the global patterns (`.match` vs the POSIX
+/// path). A glob metachar (`*`/`?`) routes through an fnmatch translation; any other entry is treated
+/// as a regex. Both forms are END-anchored (`\Z`/`$`). Returns None for an empty/uncompilable entry,
+/// OR for a too-broad entry that would match a canonical operator file.
+pub fn compile_artifact_pattern(spec: &str) -> Option<Regex> {
+    let s = spec.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let pat: Regex = if s.contains('*') || s.contains('?') {
+        // glob: normalize separators to POSIX, drop a trailing slash, translate via fnmatch (end-anchored)
+        let normalized = s.replace('\\', "/");
+        let normalized = normalized.trim_end_matches('/');
+        match Regex::new(&fnmatch_translate(normalized)) {
+            Ok(p) => p,
+            Err(_) => return None, // re.error -> None
+        }
+    } else {
+        // regex: end-anchor for parity with the global patterns (strip a trailing '$', add \Z == \z)
+        let body = s.strip_suffix('$').unwrap_or(s);
+        match Regex::new(&format!(r"{body}\z")) {
+            Ok(p) => p,
+            Err(_) => return None,
+        }
+    };
+    // breadth guard: reject a pattern that matches a canonical operator file
+    if ARTIFACT_CANARY_PATHS.iter().any(|c| pattern_match(&pat, c)) {
+        return None;
+    }
+    Some(pat)
+}
+
+/// run_improver._repo_artifact_patterns (~811-826): per-repo EXTRA artifact patterns from THIS repo's
+/// `agent_artifacts` list in repos.json (glob/regex strings), read fresh each call. [] when
+/// absent/empty/torn; uncompilable/too-broad entries are silently skipped.
+pub fn repo_artifact_patterns(ctx: &Ctx, name: &str) -> Vec<Regex> {
+    let raw = repo_row(ctx, name);
+    let arr = match raw.get("agent_artifacts") {
+        Some(Value::Array(a)) => a,
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in arr {
+        if let Value::String(spec) = entry {
+            if let Some(pat) = compile_artifact_pattern(spec) {
+                out.push(pat);
+            }
+        }
+    }
+    out
+}
+
+/// run_improver._is_agent_artifact (~829-848): True if `path` matches the CONSERVATIVE global
+/// heuristic OR one of the per-repo `extra_patterns`. Matched against the repo-relative POSIX form;
+/// a leading `./` is stripped (but NOT a bare `.`), and a trailing `/` (a git `??` dir entry) is
+/// trimmed. Pure so it is unit-tested without a real repo.
+pub fn is_agent_artifact(path: &str, extra_patterns: Option<&[Regex]>) -> bool {
+    let mut p = path.trim().replace('\\', "/");
+    if p.is_empty() {
+        return false;
+    }
+    // strip a leading './' relative prefix (NOT a bare '.' — that would strip '.agent_artifacts/...')
+    while p.starts_with("./") {
+        p.drain(..2);
+    }
+    // a git status `??` dir entry has a trailing slash; normalize it (trim_end_matches strips ALL,
+    // matching Python str.rstrip("/"))
+    let p = p.trim_end_matches('/');
+    if p.is_empty() {
+        return false;
+    }
+    if global_artifact_patterns().iter().any(|pat| pattern_match(pat, p)) {
+        return true;
+    }
+    if let Some(extra) = extra_patterns {
+        if extra.iter().any(|pat| pattern_match(pat, p)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// run_improver._all_agent_artifacts (~851-858): True ONLY when `files` is non-empty AND every entry
+/// matches an agent-artifact heuristic. An empty list returns False.
+pub fn all_agent_artifacts(files: &[String], extra_patterns: Option<&[Regex]>) -> bool {
+    if files.is_empty() {
+        return false;
+    }
+    files.iter().all(|f| is_agent_artifact(f, extra_patterns))
+}
+
+/// run_improver._untracked_recovery_action (~861-873): pure decision over untracked non-ignored files:
+///   "recover" — ALL files are agent artifacts -> stage them on the rsi branch and gate as usual
+///   "refuse"  — at least one file is operator work -> refuse the clean + escalate
+///   "none"    — empty list -> the clean path handles it.
+pub fn untracked_recovery_action(
+    ctx: &Ctx,
+    files: &[String],
+    extra_patterns: Option<&[Regex]>,
+) -> String {
+    let _ = ctx; // pure over `files`/`extra_patterns`; ctx kept for signature parity with siblings
+    if files.is_empty() {
+        return "none".to_string();
+    }
+    if all_agent_artifacts(files, extra_patterns) {
+        "recover".to_string()
+    } else {
+        "refuse".to_string()
+    }
+}
+
+/// run_improver._dirty_blocks_iteration (~876-883): whether a dirty tree must SKIP the iteration.
+/// ONLY a dirty BASE branch is protected operator work; a dirty rsi/* (or any non-base / detached)
+/// branch is a dead run's leftover the forced preflight clears. Pure.
+pub fn dirty_blocks_iteration(ctx: &Ctx, dirty: bool, cur: &str, base: &str) -> bool {
+    let _ = ctx; // pure over the three args; ctx for signature parity
+    dirty && cur == base
+}
+
+// --------------------------------------------------------------------------- #
+// auto-stash / branch lifecycle
+// --------------------------------------------------------------------------- #
+
+/// run_improver._auto_stash_base (~886-916): non-destructively clear a dirty BASE tree by STASHING it
+/// (never deleting), so the loop self-resumes instead of wedging on operator-action-required. Returns
+/// True iff the tree is VERIFIABLY clean afterward (tracked-clean AND no untracked non-ignored files).
+/// Best-effort + fail-safe: on any git error or a still-dirty tree returns False.
+pub fn auto_stash_base(ctx: &mut Ctx, label: &str) -> bool {
+    let msg = format!("solomon-auto-preflight {label} {}", ctx::now());
+    let res = ctx.git(&["stash", "push", "--include-untracked", "-m", &msg], 120);
+    if res.code != 0 {
+        let err: String = res.stderr.trim().chars().take(160).collect();
+        ctx.log(&format!(
+            "auto-stash: git stash failed ({err}) — falling back to refuse/self-stop (no work destroyed)"
+        ));
+        return false;
+    }
+    if tree_dirty(ctx) || !untracked_non_ignored_files(ctx).is_empty() {
+        ctx.log("auto-stash: tree still dirty after stash — falling back to refuse/self-stop");
+        return false;
+    }
+    // record the stash label so recovery is one command (best-effort; OSError -> pass)
+    let _ = std::fs::create_dir_all(&ctx.runtime);
+    let _ = std::fs::write(
+        ctx.runtime.join("last_auto_stash.txt"),
+        format!("{msg}\n"),
+    );
+    ctx.log(&format!(
+        "auto-stash: stashed dirty base into '{msg}' — base clean, resuming \
+         (recover with: git -C <repo> stash list / stash pop)"
+    ));
+    true
+}
+
+/// run_improver._abort_branch (~923-938): revert the working tree and delete `branch`, fail-closed.
+/// Returns True only when verifiably back on BASE_BRANCH with the branch removed; logs + returns False
+/// otherwise so the caller surfaces an error.
+pub fn abort_branch(ctx: &Ctx, branch: &str) -> bool {
+    // DEVIATION: Python's _abort_branch calls log() (print + append to LOG + push onto hb["log_tail"]).
+    // The entry-point signature for this port is `abort_branch(&Ctx, &str)` (read-only), so the
+    // hb["log_tail"] mutation is dropped; the print + LOG-file append are preserved verbatim via
+    // log_ro (the read-only slice of ctx.log). drop_branch's error-heartbeat path re-surfaces the same
+    // diagnostic when a revert fails.
+    ctx.git(&["reset", "--hard"], 120);
+    let co = ctx.git(&["checkout", "--force", &ctx.base_branch], 120);
+    if co.code != 0 {
+        let err: String = co.stderr.trim().chars().take(200).collect();
+        log_ro(ctx, &format!("CRITICAL: could not return to {}: {err}", ctx.base_branch));
+        return false;
+    }
+    let head = ctx
+        .git(&["rev-parse", "--abbrev-ref", "HEAD"], 120)
+        .stdout
+        .trim()
+        .to_string();
+    if head != ctx.base_branch {
+        log_ro(
+            ctx,
+            &format!("CRITICAL: not on {} after checkout; refusing to delete {branch}", ctx.base_branch),
+        );
+        return false;
+    }
+    let d = ctx.git(&["branch", "-D", branch], 120);
+    if d.code != 0 {
+        let err: String = d.stderr.trim().chars().take(200).collect();
+        log_ro(ctx, &format!("branch -D {branch} failed: {err}"));
+    }
+    true
+}
+
+/// The read-only slice of `ctx.log` (print + append to the LOG file), for the `&Ctx` abort_branch path
+/// where the hb["log_tail"] push (which needs `&mut`) cannot run. Same `{now} {msg}` line format.
+fn log_ro(ctx: &Ctx, msg: &str) {
+    let line = format!("{} {}", ctx::now(), msg);
+    println!("{line}");
+    ctx.runtime_append(&ctx.log_path, &line);
+}
+
+/// run_improver._drop_branch (~941-953): abort a branch and write the matching heartbeat — escalating
+/// to status="error" (and HALTING the loop) if the revert could not complete, so the loop never
+/// silently keeps branching off poisoned state. `status` defaults to "sleeping" in Python; callers
+/// pass it explicitly here.
+pub fn drop_branch(ctx: &mut Ctx, branch: &str, phase: &str, summary: &str, status: &str) {
+    if abort_branch(ctx, branch) {
+        ctx.heartbeat(json!({"status": status, "phase": phase, "last_summary": summary}));
+        ctx.record_history(phase, Some(branch), summary, None);
+    } else {
+        ctx.halted = true; // halt the loop — don't bulldoze a known-bad tree next preflight
+        ctx.heartbeat(json!({
+            "status": "error",
+            "phase": "reverted",
+            "last_summary": format!(
+                "REVERT FAILED — {branch} needs manual cleanup before the loop can safely continue. {summary}"
+            ),
+        }));
+        ctx.record_history("error", Some(branch), summary, None);
+    }
+}
+
+/// run_improver._prune_stale_rsi_branches (~957-978): branch hygiene — delete every local rsi/*
+/// iteration branch except the current one, and prune stale worktrees. Called in preflight on the
+/// CLEAN base so it never discards in-flight work. NEVER force-deletes a branch carrying commits
+/// unreachable from the base (a kept gate-green local-ship branch); only fully-merged/empty residue.
+/// Returns the count pruned.
+pub fn prune_stale_rsi_branches(ctx: &Ctx) -> i64 {
+    ctx.git(&["worktree", "prune"], 120);
+    let cur = ctx
+        .git(&["rev-parse", "--abbrev-ref", "HEAD"], 120)
+        .stdout
+        .trim()
+        .to_string();
+    let out = ctx.git(&["branch", "--list", "rsi/*"], 120).stdout;
+    let mut pruned: i64 = 0;
+    for line in out.lines() {
+        let b = line.replace('*', "");
+        let b = b.trim();
+        if b.is_empty() || b == cur {
+            continue;
+        }
+        let unmerged = ctx
+            .git(&["rev-list", &format!("{}..{}", ctx.base_branch, b)], 120)
+            .stdout
+            .trim()
+            .to_string();
+        if unmerged.is_empty() && ctx.git(&["branch", "-D", b], 120).code == 0 {
+            pruned += 1;
+        }
+    }
+    pruned
+}
+
+// --------------------------------------------------------------------------- #
+// staging + per-repo config (the public-repo leak guards)
+// --------------------------------------------------------------------------- #
+
+/// run_improver._git_add_all (~1296-1310): stage everything with `git add -A`, then (PUBLIC repo)
+/// UNSTAGE its `private_paths` — so an agent that un-ignored a private path STILL cannot land it in a
+/// pushed commit. Bare `git add -A` (no pathspec) silently SKIPS ignored files. Non-destructive.
+/// Returns the `git add -A` RunOut (Python returns `r`).
+pub fn git_add_all(ctx: &Ctx) -> crate::control::proc::RunOut {
+    let r = ctx.git(&["add", "-A"], 120);
+    if repo_is_public(ctx, &ctx.name) {
+        let paths = repo_private_paths(ctx, &ctx.name);
+        if !paths.is_empty() {
+            // git reset -q -- <p1> <p2> ...  (unstage any private path that slipped in; no-op if none)
+            let mut argv: Vec<&str> = vec!["reset", "-q", "--"];
+            for p in &paths {
+                argv.push(p.as_str());
+            }
+            ctx.git(&argv, 120);
+        }
+    }
+    r
+}
+
+/// run_improver._repo_row (~1260-1269): THIS repo's repos.json row (read fresh so a dashboard edit
+/// takes effect mid-loop), or {} on absent/torn/non-list/missing.
+pub fn repo_row(ctx: &Ctx, name: &str) -> Value {
+    let bytes = match std::fs::read(ctx.control.join("repos.json")) {
+        Ok(b) => b,
+        Err(_) => return json!({}), // OSError -> {}
+    };
+    let rows: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return json!({}), // ValueError -> {}
+    };
+    let arr = match rows {
+        Value::Array(a) => a,
+        _ => return json!({}), // not a list -> {}
+    };
+    arr.into_iter()
+        .find(|r| r.is_object() && r.get("name").and_then(Value::as_str) == Some(name))
+        .filter(|r| r.is_object())
+        .unwrap_or_else(|| json!({}))
+}
+
+/// run_improver._repo_is_public (~1272-1275): whether the repo is PUBLIC (repos.json `public: true`).
+pub fn repo_is_public(ctx: &Ctx, name: &str) -> bool {
+    py_bool(repo_row(ctx, name).get("public"))
+}
+
+/// run_improver._repo_private_paths (~1278-1284): repo-relative paths that must NEVER be staged into a
+/// PUBLIC repo's commit (repos.json `private_paths`). POSIX, trailing slash trimmed; empty entries
+/// dropped. [] when absent/non-list.
+pub fn repo_private_paths(ctx: &Ctx, name: &str) -> Vec<String> {
+    let row = repo_row(ctx, name);
+    let arr = match row.get("private_paths") {
+        Some(Value::Array(a)) => a,
+        _ => return Vec::new(),
+    };
+    arr.iter()
+        .filter_map(|p| {
+            let s = value_to_py_str(p);
+            if s.trim().is_empty() {
+                None // `if str(p).strip()` — drop blank entries
+            } else {
+                Some(s.trim().replace('\\', "/").trim_end_matches('/').to_string())
+            }
+        })
+        .collect()
+}
+
+/// run_improver._repo_deny_terms (~1287-1293): operator brand/account identity strings to scrub/block
+/// (repos.json `deny_terms`). [] when absent. Entries kept iff `str(t).strip()` is truthy, but the
+/// VALUE stored is `str(t)` (NOT stripped) — preserved verbatim.
+pub fn repo_deny_terms(ctx: &Ctx, name: &str) -> Vec<String> {
+    let row = repo_row(ctx, name);
+    let arr = match row.get("deny_terms") {
+        Some(Value::Array(a)) => a,
+        _ => return Vec::new(),
+    };
+    arr.iter()
+        .map(value_to_py_str)
+        .filter(|t| !t.trim().is_empty())
+        .collect()
+}
+
+// --------------------------------------------------------------------------- #
+// helpers
+// --------------------------------------------------------------------------- #
+
+/// Python `bool(x)` truthiness for a repos.json value (null/false/0/""/[]/{} -> false). Mirrors
+/// ctx.rs's private `py_bool` (kept module-local since it is not pub-exported there).
+fn py_bool(v: Option<&Value>) -> bool {
+    match v {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(Value::Object(o)) => !o.is_empty(),
+    }
+}
+
+/// Python `str(x)` of a repos.json scalar (private_paths/deny_terms do `str(p)`/`str(t)`). Strings
+/// pass through verbatim; other scalars get their Python-ish text form.
+fn value_to_py_str(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => "None".to_string(),
+        Value::Bool(true) => "True".to_string(),
+        Value::Bool(false) => "False".to_string(),
+        Value::Number(n) => n.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Translate an fnmatch glob into a regex string equivalent to Python `fnmatch.translate`, which
+/// produces a `(?s:...)\Z` body where `*` -> `.*`, `?` -> `.`, `[...]` -> a char class, and every
+/// other char is escaped. `\Z` (Python end-of-string) maps to `\z` in the `regex` crate. The leading
+/// `(?s:` enables DOTALL so `.` matches `/` — matching Python's translate exactly.
+fn fnmatch_translate(pat: &str) -> String {
+    let chars: Vec<char> = pat.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    let mut res = String::from("(?s:");
+    while i < n {
+        let c = chars[i];
+        i += 1;
+        match c {
+            '*' => res.push_str(".*"),
+            '?' => res.push('.'),
+            '[' => {
+                // find the matching ']'
+                let mut j = i;
+                if j < n && chars[j] == '!' {
+                    j += 1;
+                }
+                if j < n && chars[j] == ']' {
+                    j += 1;
+                }
+                while j < n && chars[j] != ']' {
+                    j += 1;
+                }
+                if j >= n {
+                    // no closing bracket: literal '['
+                    res.push_str("\\[");
+                } else {
+                    let inner: String = chars[i..j].iter().collect();
+                    // Python: stuff = inner.replace('\\', r'\\'); leading '!' -> '^'
+                    let mut stuff = inner.replace('\\', "\\\\");
+                    if let Some(rest) = stuff.strip_prefix('!') {
+                        stuff = format!("^{rest}");
+                    } else if stuff.starts_with('^') {
+                        stuff = format!("\\{stuff}");
+                    }
+                    res.push('[');
+                    res.push_str(&stuff);
+                    res.push(']');
+                    i = j + 1;
+                }
+            }
+            other => {
+                // re.escape(c)
+                res.push_str(&regex::escape(&other.to_string()));
+            }
+        }
+    }
+    res.push_str(r")\z");
+    res
+}
+
+// --------------------------------------------------------------------------- #
+// tests — load-bearing pure logic (artifact classification + recovery decision)
+// --------------------------------------------------------------------------- #
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- is_agent_artifact: the CONSERVATIVE global heuristic ----
+    #[test]
+    fn global_artifact_matches() {
+        assert!(is_agent_artifact("AGENT_LOG.md", None));
+        assert!(is_agent_artifact("capabilities/foo", None));
+        assert!(is_agent_artifact("capabilities/foo/bar.py", None));
+        assert!(is_agent_artifact("profiles/ggg", None));
+        assert!(is_agent_artifact("profiles/ggg/state.json", None));
+        assert!(is_agent_artifact("start_ggg.sh", None));
+        assert!(is_agent_artifact(".agent_artifacts/anything.txt", None));
+    }
+
+    #[test]
+    fn global_artifact_non_matches() {
+        // bare dir forms are NOT matched (they'd sweep any operator dir of that name)
+        assert!(!is_agent_artifact("capabilities", None));
+        assert!(!is_agent_artifact("profiles", None));
+        // canonical operator files
+        assert!(!is_agent_artifact("README.md", None));
+        assert!(!is_agent_artifact("main.py", None));
+        // a near-miss: AGENT_LOG must be the EXACT name (end-anchored)
+        assert!(!is_agent_artifact("AGENT_LOG.md.bak", None));
+        // start_ must end in .sh
+        assert!(!is_agent_artifact("start_ggg.py", None));
+    }
+
+    #[test]
+    fn trailing_slash_and_dot_prefix_normalized() {
+        // a git `??` dir entry has a trailing slash -> capabilities/foo/ matches capabilities/foo[/...]
+        assert!(is_agent_artifact("capabilities/foo/", None));
+        // leading './' stripped (but NOT a bare '.')
+        assert!(is_agent_artifact("./AGENT_LOG.md", None));
+        assert!(is_agent_artifact("./.agent_artifacts/x", None));
+        // backslashes normalized to POSIX
+        assert!(is_agent_artifact("capabilities\\foo\\bar", None));
+        // empty / whitespace -> false
+        assert!(!is_agent_artifact("", None));
+        assert!(!is_agent_artifact("   ", None));
+    }
+
+    // ---- all_agent_artifacts ----
+    #[test]
+    fn all_artifacts_requires_nonempty_and_every() {
+        assert!(!all_agent_artifacts(&[], None)); // empty -> False
+        assert!(all_agent_artifacts(
+            &["AGENT_LOG.md".to_string(), "profiles/x".to_string()],
+            None
+        ));
+        // one operator file among artifacts -> the whole set fails
+        assert!(!all_agent_artifacts(
+            &["AGENT_LOG.md".to_string(), "src/real_module.py".to_string()],
+            None
+        ));
+    }
+
+    // ---- untracked_recovery_action: the 3 exact decision strings ----
+    #[test]
+    fn recovery_action_strings() {
+        let ctx = test_ctx();
+        assert_eq!(untracked_recovery_action(&ctx, &[], None), "none");
+        assert_eq!(
+            untracked_recovery_action(&ctx, &["AGENT_LOG.md".to_string()], None),
+            "recover"
+        );
+        assert_eq!(
+            untracked_recovery_action(&ctx, &["operator_notes.md".to_string()], None),
+            "refuse"
+        );
+        // mixed -> refuse (a single operator file keeps the set protected)
+        assert_eq!(
+            untracked_recovery_action(
+                &ctx,
+                &["AGENT_LOG.md".to_string(), "operator_notes.md".to_string()],
+                None
+            ),
+            "refuse"
+        );
+    }
+
+    // ---- compile_artifact_pattern: glob, regex, breadth guard, empties ----
+    #[test]
+    fn compile_pattern_glob_and_regex() {
+        // glob entry
+        let p = compile_artifact_pattern("*.log").unwrap();
+        assert!(pattern_match(&p, "pi_runner.log"));
+        assert!(!pattern_match(&p, "pi_runner.log.keep"));
+        // glob with a trailing slash dropped + dir
+        let p2 = compile_artifact_pattern("scaffold_*/").unwrap();
+        assert!(pattern_match(&p2, "scaffold_x"));
+        // regex entry (char class is NOT routed to glob since only */? signal a glob)
+        let p3 = compile_artifact_pattern(r"lane_[0-9]+\.json").unwrap();
+        assert!(pattern_match(&p3, "lane_42.json"));
+        assert!(!pattern_match(&p3, "lane_42.json.bak")); // end-anchored
+        // a trailing '$' is stripped then re-anchored (parity)
+        let p4 = compile_artifact_pattern(r"foo\.txt$").unwrap();
+        assert!(pattern_match(&p4, "foo.txt"));
+    }
+
+    #[test]
+    fn compile_pattern_rejects_broad_and_empty() {
+        // empty / whitespace -> None
+        assert!(compile_artifact_pattern("").is_none());
+        assert!(compile_artifact_pattern("   ").is_none());
+        // too-broad: matches a canonical operator file -> None
+        assert!(compile_artifact_pattern("*").is_none());
+        assert!(compile_artifact_pattern("*.py").is_none()); // would match main.py
+        assert!(compile_artifact_pattern(r".+").is_none());
+        // a narrow operator pattern that hits NO canary survives
+        assert!(compile_artifact_pattern("pi_runner_heartbeat.json").is_some());
+    }
+
+    // ---- extra patterns widen recovery without loosening the default ----
+    #[test]
+    fn extra_patterns_widen() {
+        let extra = vec![compile_artifact_pattern("*.scratch").unwrap()];
+        assert!(is_agent_artifact("tmp.scratch", Some(&extra)));
+        assert!(!is_agent_artifact("tmp.scratch", None)); // not a global artifact
+    }
+
+    // ---- dirty_blocks_iteration: only a dirty BASE blocks ----
+    #[test]
+    fn dirty_blocks_only_on_base() {
+        let ctx = test_ctx();
+        assert!(dirty_blocks_iteration(&ctx, true, "main", "main"));
+        assert!(!dirty_blocks_iteration(&ctx, false, "main", "main")); // clean base
+        assert!(!dirty_blocks_iteration(&ctx, true, "rsi/iter-x", "main")); // dirty rsi branch
+        assert!(!dirty_blocks_iteration(&ctx, true, "", "main")); // detached
+    }
+
+    // ---- fnmatch_translate sanity (the friendly default) ----
+    #[test]
+    fn fnmatch_translate_basic() {
+        let re = Regex::new(&fnmatch_translate("*.log")).unwrap();
+        assert!(pattern_match(&re, "a.log"));
+        assert!(pattern_match(&re, "deep/path/a.log")); // DOTALL: . matches /
+        let q = Regex::new(&fnmatch_translate("file?.txt")).unwrap();
+        assert!(pattern_match(&q, "file1.txt"));
+        assert!(!pattern_match(&q, "file12.txt"));
+    }
+
+    fn test_ctx() -> Ctx {
+        Ctx::configure("C:/nonexistent/repo", "testrepo", "ollama-cloud", None)
+    }
+}
