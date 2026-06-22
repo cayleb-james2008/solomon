@@ -5,18 +5,20 @@
     "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\maki",
     "public": true,
     "provider": "ollama-cloud",
-    "model": "glm-5.2",
+    "model": "kimi-k2.7-code",
     "ship": "auto-merge",
     "pr_target_branch": "main",
     "gate": ".venv\\Scripts\\python -m pytest",
     "reasoning": "xhigh",
     "pipeline": {
-      "plan": true,
-      "review": true,
-      "ideate": true,
-      "reflect": true
+      "plan": false,
+      "review": false,
+      "ideate": false,
+      "reflect": false
     },
-    "goal": "Improve maki (a local AI media-library desktop app: natural-language chat -> search/download/convert manga + video -> transfer to Kindle/device; pywebview + pi agent). Each iteration make ONE real, high-leverage improvement: fix a genuine bug, harden the download->KCC-convert->transfer pipeline, improve reliability/error-handling, or add missing test coverage. Keep all tests green and ruff clean. PONYTAIL STYLE: the laziest solution that fully works -- stdlib over deps, native over custom, delete over add; add no abstraction or dependency you do not need. A truthful 'nothing worth changing this cycle' beats a fabricated or cosmetic change."
+    "goal": "Improve maki (a local AI media-library desktop app: natural-language chat -> search/download/convert manga + video -> transfer to Kindle/device; pywebview + pi agent). Each iteration make ONE real, high-leverage improvement: fix a genuine bug, harden the download->KCC-convert->transfer pipeline, improve reliability/error-handling, or add missing test coverage. Keep all tests green and ruff clean. PONYTAIL STYLE: the laziest solution that fully works -- stdlib over deps, native over custom, delete over add; add no abstraction or dependency you do not need. A truthful 'nothing worth changing this cycle' beats a fabricated or cosmetic change.",
+    "interval": 120,
+    "max_iterations": 0
   },
   {
     "name": "sover",
@@ -41,10 +43,10 @@
     "max_iterations": 0,
     "reasoning": "xhigh",
     "pipeline": {
-      "plan": true,
-      "review": true,
-      "ideate": true,
-      "reflect": true
+      "plan": false,
+      "review": false,
+      "ideate": false,
+      "reflect": false
     }
   },
   {
@@ -61,10 +63,10 @@
     "reasoning": "high",
     "goal": "ASMODEUS NORTH STAR (heavily weighted): a live-capable algorithmic trading system whose Layer-2 strategy builder must produce VALIDATED, PROFITABLE candidates that advance through the anti-overfit funnel toward live. The earlier builder tool-wiring bug is FIXED (verify it stays fixed via builder_*.log) -- do NOT keep re-fixing it. Each iteration, make the system generate genuinely profitable, statistically-significant strategies and advance MORE candidates: improve strategy generation, the backtest/optimize/monte_carlo/rule_significance tools, the anti-overfit funnel, and risk/sizing -- while keeping kill-switch, breaker, and capital_guard intact (this trades REAL money; never weaken a safety rail). ITERATE FROM MISTAKES: each cycle read the latest builder_*.log / meta_loop.log + the funnel state and fix the highest-leverage failure (a candidate that should have advanced but did not, an overfit that slipped through, a silent error). Fitness = more validated candidates advancing + realized PnL, not just green tests. PONYTAIL STYLE: simplest solution that works, stdlib-first, delete > add. A truthful null beats a fabricated already-done -- never claim a fix you did not write and verify.",
     "pipeline": {
-      "plan": true,
+      "plan": false,
       "review": true,
-      "ideate": true,
-      "reflect": true
+      "ideate": false,
+      "reflect": false
     }
   },
   {
@@ -73,7 +75,7 @@
     "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\dotz",
     "public": true,
     "provider": "ollama-cloud",
-    "model": "glm-5.2",
+    "model": "kimi-k2.7-code",
     "ship": "auto-merge",
     "pr_target_branch": "master",
     "gate": "npm run typecheck && npm run check",
@@ -82,10 +84,10 @@
     "reasoning": "xhigh",
     "goal": "Improve dotz \u00e2\u20ac\u201d a pi.dev-based, Claude-Desktop-style coding-agent dashboard (embedded pi SDK + Fastify backend on 127.0.0.1:4317 + vanilla-JS cyberbrutalist UI, packaged as an Electron .exe). Make additive, high-leverage improvements: fix real bugs, harden the Fastify/WebSocket server and Electron lifecycle, improve agent/session reliability, error handling, and operator UX. Keep every change green under the gate (npm run typecheck = tsc --noEmit, and npm run check = the no-console-window guard \u00e2\u20ac\u201d all child processes MUST stay windowless). Do NOT introduce new heavy dependencies or architectural layers; simplicity-first. Strengthen test/verification coverage where cheap. A truthful null beats a fabricated improvement \u00e2\u20ac\u201d never claim an edit you did not write.",
     "pipeline": {
-      "plan": true,
-      "review": true,
-      "ideate": true,
-      "reflect": true
+      "plan": false,
+      "review": false,
+      "ideate": false,
+      "reflect": false
     }
   }
 ]

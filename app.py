@@ -371,6 +371,14 @@ class Api:
     def set_auto_ai_fix(self, v):
         return {"ok": self._set_state("auto_ai_fix", bool(v)), "auto_ai_fix": bool(v)}
 
+    def get_layout(self):
+        """The operator's arranged dashboard panels (list of {id,type,repo}), or None if unset."""
+        return self._state.get("layout")
+
+    def set_layout(self, layout):
+        """Persist the operator's arranged dashboard panels (reuses the atomic state writer)."""
+        return {"ok": self._set_state("layout", layout)}
+
 
 def _health_payload() -> dict:
     """The JSON body the health endpoint serves: overall readiness + a per-repo diagnose summary.
