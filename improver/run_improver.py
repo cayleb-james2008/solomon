@@ -134,7 +134,7 @@ _CHEAP_MODEL = {"ollama-cloud": "minimax-m3", "openrouter": "qwen/qwen3-coder"}
 #   rung 2  decompose the goal into smaller sub-items (decompose.md) — else defer (prior behavior).
 # This turns the three observed dead-ends (gamed-then-reverted forever; "made no changes"; "deferred after
 # repeated tries") into adaptive progress. _FALLBACK_MODEL/_CHEAP_MODEL are keyed by provider NAME.
-_FALLBACK_MODEL = {"ollama-cloud": "kimi-k2.7", "openrouter": "z-ai/glm-4.6"}
+_FALLBACK_MODEL = {"ollama-cloud": "kimi-k2.7-code", "openrouter": "z-ai/glm-4.6"}
 _ESCALATE_TO_FALLBACK = 2             # cumulative failures on an item before switching to the fallback model
 DECOMPOSE_ENABLED = False             # rung-2 goal decomposition (decompose.md). Opt-in per repo until
                                       # validated live; when off, the final rung defers (prior behavior).
@@ -268,8 +268,19 @@ def build_task(goal: str, tier: str = "chore") -> str:
         f'that goal; if it needs a capability the project lacks, BUILD that capability as this one '
         f'increment.\n\n' if GOAL else ""
     )
+    # The gate the runner will ENFORCE: a custom GATE_CMD (operator-set in repos.json) or the built-in
+    # pytest gate. Parameterize the task wording on it so a non-pytest repo (JS/TS/Go/Rust) is told to
+    # run its OWN gate and add a test in its OWN framework — not the pytest-specific instructions.
+    _custom_gate = bool((GATE_CMD or "").strip())
+    _test_phrase = "a test for it" if _custom_gate else "a pytest test for it"
+    if _custom_gate:
+        _gate_instr = (f"Then run the project's test gate (`{GATE_CMD}`) yourself to confirm it is green, "
+                       "and add or adjust a test for your change in the repo's OWN test framework.")
+    else:
+        _gate_instr = ("Then run the test suite (`.venv/Scripts/python -m pytest`) yourself to confirm "
+                       "it is green.")
     if tier == "chore":
-        sizing = ("Make the SMALLEST coherent change and add or update a pytest test for it; doing more "
+        sizing = (f"Make the SMALLEST coherent change and add or update {_test_phrase}; doing more "
                   "than this one item is a regression.")
     else:
         sizing = (f"This is a {tier.upper()}-tier item — SIZE THE CHANGE TO THE OPPORTUNITY: a "
@@ -296,8 +307,8 @@ def build_task(goal: str, tier: str = "chore") -> str:
         )
         LAST_GATE_FEEDBACK = ""   # consumed — inject exactly once
     return (
-        f'{north_star}Implement exactly ONE improvement in this repository: "{goal}". {sizing} Then run '
-        "the test suite (`.venv/Scripts/python -m pytest`) yourself to confirm it is green. Do NOT run "
+        f'{north_star}Implement exactly ONE improvement in this repository: "{goal}". {sizing} {_gate_instr} '
+        "Do NOT run "
         "git or gh — the runner commits and opens the pull request. If that item is already done or "
         "unclear, instead fix one clear small bug or cleanup you find. End with a 2-4 sentence summary "
         f"of what you changed, then a FINAL line that is exactly `ITEM-STATUS: done` if you implemented "
@@ -1027,7 +1038,13 @@ def _agent_shim_dir() -> "Path | None":
 
 
 def run_pi(task: str, timeout: int = 1800, system_md: Path | None = None) -> subprocess.CompletedProcess:
-    args = [pi_exe(), "--print", "--mode", "json",
+    # -ne (--no-extensions): do NOT auto-discover the TARGET repo's own .pi/extensions. A managed
+    # repo's project extensions (e.g. dotz's .pi/extensions/subagent imports @earendil-works/pi-ai
+    # which isn't installed there) crash the global pi at startup — rc=1, empty stdout, before any
+    # model turn — which solomon then miscounts as a model "noop". Explicit -e paths below (the
+    # shared provider + github-tools) still load. This keeps solomon project-agnostic: a managed
+    # repo's pi config can never break solomon's improver.
+    args = [pi_exe(), "--print", "--mode", "json", "-ne",
             "--provider", PI_PROVIDER, "--model", PI_MODEL]
     if REASONING:
         args += ["--thinking", REASONING]
@@ -1358,36 +1375,19 @@ def _run_eval_gate(base_score) -> dict:
 # SUCCESSFUL review WITH critical findings to blocking. A review that itself FAILED to run still
 # does NOT block (best-effort — the RSI loop must not break if the visual infra is down).
 def _visual_gate_enabled(name: str) -> bool:
-    """True if THIS repo should run the mandatory visual testing phase. Read fresh each call so
-    a dashboard edit takes effect mid-loop.
+    """True if THIS repo should run the visual testing phase. Read fresh each call so a dashboard
+    edit takes effect mid-loop.
 
-    Rules (Feature 1a — mandatory visual testing for frontend repos):
-      1. `visual_gate: true` in repos.json → on (explicit opt-in, unchanged).
-      2. `visual_gate: false` in repos.json → OFF even if a frontend is detected (explicit
-         opt-out — e.g. a headless API repo that happens to have a templates/ dir).
-      3. `visual_gate` ABSENT and the repo has a detected frontend → ON (mandatory). This is
-         the new behavior: frontend repos get a mandatory visual test phase after each RSI loop.
-      4. `visual_gate` ABSENT and no frontend → off (byte-identical to the legacy behavior for
-         non-UI repos).
-
-    A frontend is detected via control.has_frontend (index.html, SPA framework in package.json,
-    public/ or dist/ build dir, templates/ for server-rendered). The sandbox must still be
-    configured (launch command) for the visual review to actually run — if it isn't, the
-    review fails to run and best-effort doesn't block, but the gate is still *enabled* so the
-    operator sees it's expected and configures the sandbox."""
+    EXPLICIT OPT-IN ONLY: the visual gate is OFF by default and turns on ONLY when repos.json sets a
+    truthy `visual_gate`. A detected frontend NO LONGER auto-enables it — auto-enabling would (per the
+    sandbox launch config) risk auto-launching a long-lived dev server for any repo that merely has a
+    templates/ or dist/ dir, which the operator never asked for. So:
+      1. `visual_gate` truthy in repos.json → on (explicit opt-in).
+      2. `visual_gate` falsy / ABSENT → off (no frontend auto-detection)."""
     row = _repo_row(name)
     if not row:
         return False
-    if "visual_gate" in row:
-        return bool(row.get("visual_gate"))
-    # absent: mandatory for detected frontends. Import control lazily to avoid a circular import
-    # at module load (run_improver.py is imported by control.py's enrich/ideate paths).
-    try:
-        import control
-        repo_path = row.get("path") or ""
-        return bool(repo_path and control.has_frontend({"path": repo_path}))
-    except Exception:  # noqa: BLE001 — never let frontend detection break the gate
-        return False
+    return bool(row.get("visual_gate"))
 
 
 def _visual_gate_reason(vr_result) -> str | None:
@@ -1479,6 +1479,12 @@ def run_gate() -> tuple:
     that genuinely has no tests just retries then accepts 0 (same outcome)."""
     import time as _time
     effective_gate_cmd = GATE_CMD
+    # A CUSTOM gate command is an operator-defined, possibly non-pytest gate (any framework / language).
+    # Its returncode is authoritative: an empty-count result is NOT a "missing tests" signal, and the
+    # pytest-shaped retry/"transient glitch"/"has tests" framing below would actively MISLEAD. So for a
+    # custom gate, TRUST the returncode and run exactly once — the empty-retry loop is built-in-pytest only.
+    if effective_gate_cmd:
+        return _run_gate_once(effective_gate_cmd)
     last = None
     for attempt in range(3):
         green, tests, tail = _run_gate_once(effective_gate_cmd)
@@ -1525,7 +1531,17 @@ _SKIP_MARKER_RE = re.compile(
     r"|pytest\.(?:skip|xfail)\s*\("
     r"|unittest\.skip"
     r"|\.skipTest\s*\("
-    r"|raise\s+(?:unittest\.)?SkipTest")
+    r"|raise\s+(?:unittest\.)?SkipTest"
+    # JS/TS (jest/mocha/vitest/jasmine): it.skip/test.only/describe.skip/xit/xdescribe/fit + Playwright
+    # test.skip()/test.fixme(). REQUIRE call syntax `(` and forbid a leading `.`/word char via the
+    # negative lookbehind, so a Python attribute/method like `model.fit(`, `self.test.only`, or
+    # `best fit` can NEVER match — these markers are real JS focus/skip vectors only at a call head.
+    r"|(?<![\w.])(?:it|test|describe|context)\.(?:skip|only|fixme)\s*\("
+    r"|(?<![\w.])(?:xit|xdescribe|xtest|fit|fdescribe)\s*\("
+    # Go: t.Skip()/t.SkipNow()/t.Skipf() inside a test, and the build-tag exclusion //go:build ignore.
+    r"|\bt\.Skip(?:Now|f)?\s*\("
+    # Rust: the #[ignore] attribute disables a #[test].
+    r"|#\s*\[\s*ignore\b")
 
 
 def _new_skip_markers(diff_text: str) -> list:
@@ -1537,10 +1553,16 @@ def _new_skip_markers(diff_text: str) -> list:
             if ln.startswith("+") and not ln.startswith("+++") and _SKIP_MARKER_RE.search(ln)]
 
 
-# A test DEFINITION line (def test_* / async def test_* / class Test*), matched against diff content
-# with the leading +/- stripped. Used by both the count-less-gate deletion rail (gate-2) and the
-# 'add tests but added none' deviation backstop (gate-3).
-_TEST_DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+test\w*\s*\(|^\s*class\s+Test\w*\b")
+# A test DEFINITION line, matched against diff content with the leading +/- stripped. Used by both the
+# count-less-gate deletion rail (gate-2) and the 'add tests but added none' deviation backstop (gate-3).
+# Python: def test_* / async def test_* / class Test*. JS/TS (jest/mocha/vitest): a top-level it(/test(/
+# describe( CALL (the de-facto test definition). Go: func TestXxx(. Rust: a #[test]-attributed fn.
+_TEST_DEF_RE = re.compile(
+    r"^\s*(?:async\s+)?def\s+test\w*\s*\("
+    r"|^\s*class\s+Test\w*\b"
+    r"|^\s*(?:it|test|describe)\s*(?:\.\w+)?\s*\(\s*[\"'`]"   # JS/TS test/spec call (string-named, not a py call)
+    r"|^\s*func\s+Test\w*\s*\("                              # Go test function
+    r"|^\s*#\s*\[\s*test\b")                                 # Rust #[test] attribute
 
 
 def _added_test_defs(diff_text: str) -> list:
@@ -2414,6 +2436,23 @@ def one_iteration() -> None:
     summary, item_deviated = _split_item_status(summary)   # don't tick the item if the agent deviated
     log(f"Pi rc={p.returncode}: {summary[:200]}")
 
+    # CRASH-NOT-NOOP: a pi process that exited NONZERO with EMPTY stdout (no model turn at all) whose
+    # stderr is an extension/startup load failure ('Failed to load extension', 'Cannot find module …')
+    # never reached the model — it is the AGENT being unrunnable, not the model declining to change
+    # anything. Counting it as a noop would (wrongly) escalate the item to the fallback model / defer it.
+    # Surface it like the gate's 'gate_unrunnable' (status=error/phase=preflight/reason=agent_unrunnable)
+    # and BAIL before the noop accounting — no _note_noop, no escalation.
+    if p.returncode != 0 and not (p.stdout or "").strip() and re.search(
+            r"Failed to load extension|Cannot find module", p.stderr or ""):
+        why = _redact((p.stderr or "").strip())[-300:]
+        log("Pi UNRUNNABLE (extension/startup load error — agent never started; not a model no-op): "
+            + why)
+        _drop_branch(branch, "preflight",
+                     f"Pi agent is UNRUNNABLE (extension/startup load error — not a model no-op): {why}",
+                     status="error")
+        heartbeat(reason="agent_unrunnable")   # distinguishing diagnostic (mirrors gate_unrunnable)
+        return
+
     if not tree_dirty() and head_sha() == base:
         # An agent that writes ONLY a new untracked file (no tracked changes, no commit) looks like a
         # noop to tree_dirty() (tracked-only) + head_sha()==base — but the untracked file IS real work.
@@ -2916,7 +2955,7 @@ def smoke() -> int:
     if not os.environ.get(key):
         print(f"SMOKE: FAIL — {key} not set (put it in Solomon/.env)")
         return 1
-    args = [pi_exe(), "--print", "--mode", "json", "--provider", PI_PROVIDER,
+    args = [pi_exe(), "--print", "--mode", "json", "-ne", "--provider", PI_PROVIDER,
             "--model", PI_MODEL, "-e", str(PI_EXT), "--no-tools",
             "--system-prompt", "Connectivity smoke test. Output exactly the single word READY.",
             "READY?"]
@@ -3441,6 +3480,25 @@ def main(argv=None) -> int:
     if not acquire_lock():
         print(f"Another improver is already running for {NAME} (runtime lock held).")
         return 3
+    # Lock-release-on-kill: the finally below releases the lock on a normal/Ctrl-C/crash exit, but an
+    # EXTERNAL kill (watchdog SIGTERM, a Windows taskkill/console-close SIGBREAK) skips finally and would
+    # ORPHAN runtime/<repo>/lock — forcing a clear_lock recovery cycle before the loop can restart. Register
+    # an atexit hook AND signal handlers that call the (idempotent, only-unlinks-if-ours) release_lock().
+    # The SIGTERM/SIGBREAK handlers re-raise as a clean exit so atexit still runs and the OS still terminates.
+    import atexit as _atexit
+    import signal as _signal
+    _atexit.register(release_lock)
+
+    def _release_and_exit(signum, _frame):   # noqa: ANN001 — signal handler signature
+        release_lock()
+        raise SystemExit(128 + signum)
+    for _signame in ("SIGTERM", "SIGBREAK"):   # SIGBREAK is Windows-only; absent elsewhere
+        _sig = getattr(_signal, _signame, None)
+        if _sig is not None:
+            try:
+                _signal.signal(_sig, _release_and_exit)
+            except (ValueError, OSError):   # not on the main thread / unsupported — atexit still covers us
+                pass
     if STOP.exists():
         STOP.unlink()
 

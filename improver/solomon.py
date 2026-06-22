@@ -54,6 +54,55 @@ def _stale(hb, repo):
     return age > max(3 * control.project_interval(repo), control.LOCK_LIVE_FLOOR_S)
 
 
+def _provider_has_fallback(repo):
+    """True if the runner has a configured FALLBACK model for this repo's provider (run_improver's
+    _FALLBACK_MODEL, keyed by provider NAME). Used by the noop_streak auto-heal as the signal the
+    provider has stronger headroom worth refilling+retrying against before escalating to a human.
+    Lazy-imported (the runner module runs argparse/heavy setup at import) and best-effort: any import
+    failure -> no fallback -> escalate (the prior behavior)."""
+    try:
+        from run_improver import _FALLBACK_MODEL
+    except Exception:  # noqa: BLE001 — never let a runner-import hiccup break the watchdog
+        return False
+    return bool(_FALLBACK_MODEL.get(control.project_provider(repo)))
+
+
+def _push_base_if_ahead(repo):
+    """Fast-forward PUBLISH a base that is merely AHEAD of origin to origin (never --force, never reset).
+    Mirrors the runner's start-time auto-sync. Returns {pushed:bool, ahead:int, diverged:bool, error?}.
+    Diverged (also behind) or any git failure -> pushed=False so recover() escalates."""
+    git = control._which_git()
+    path = control._repo_path(repo)
+    base = control.project_pr_target_branch(repo)
+    if not git or not path:
+        return {"pushed": False, "diverged": False, "error": "git/path unavailable"}
+
+    def g(*a):
+        return control._run([git, "-C", path, *a])
+
+    try:
+        if g("remote", "get-url", "origin").returncode != 0:
+            return {"pushed": False, "diverged": False, "error": "no origin remote"}
+        g("fetch", "origin", "--quiet")                       # current truth before counting
+        lr = g("rev-list", "--left-right", "--count", f"origin/{base}...{base}")
+        behind, ahead = 0, 0
+        if lr.returncode == 0:
+            parts = (lr.stdout or "").split()
+            if len(parts) == 2:
+                behind, ahead = int(parts[0]), int(parts[1])
+        if ahead <= 0:
+            return {"pushed": False, "ahead": ahead, "diverged": False}
+        if behind > 0:
+            return {"pushed": False, "ahead": ahead, "diverged": True}   # not a fast-forward
+        pu = g("push", "origin", f"{base}:{base}")            # FF-only; never --force
+        if pu.returncode != 0:
+            return {"pushed": False, "ahead": ahead, "diverged": False,
+                    "error": (pu.stderr or pu.stdout or "push failed").strip()[:200]}
+        return {"pushed": True, "ahead": ahead, "diverged": False}
+    except (OSError, ValueError) as e:
+        return {"pushed": False, "diverged": False, "error": str(e)}
+
+
 def diagnose(repo):
     """Deterministic, file-only health classification (no git shell-out — cheap on every poll).
     Returns {name, healthy, category, evidence, recommended:[...], auto_safe, running}."""
@@ -247,6 +296,18 @@ def clear_escalation(repo):
 
 def _finish(repo, d, actions, escalate, msg):
     rung = 1 if d["category"] == "gate_red_streak" else (2 if escalate and not actions else 0)
+    # LOG-ONCE (self-heal-5c): a still-wedged repo hits the SAME escalation every sweep (~2min), so the
+    # watchdog re-emitted an identical supervisor.jsonl line + 'ESCALATED' action forever. escalation.json
+    # is already category-deduped (single overwrite); apply the same dedupe to the emitted line — only the
+    # category TRANSITION is recorded/announced. A pure escalation (no actions) whose category matches the
+    # last supervisor record is a repeat: keep the existing escalation.json, skip the duplicate log append,
+    # and report escalate=False so the monitor's per-sweep action line fires once per transition, not every
+    # sweep. (Categories with actions still log every time — those represent real recovery work performed.)
+    if escalate and not actions:
+        prior = control.read_supervisor_log(repo, limit=1)
+        if prior and prior[-1].get("escalate") and prior[-1].get("category") == d["category"]:
+            return {"ok": False, "category": d["category"], "actions_taken": actions,
+                    "escalate": False, "message": msg, "escalate_deduped": True}
     _append_jsonl(repo, "supervisor.jsonl",
                   {"ts": _now(), "category": d["category"], "rung": rung,
                    "actions": actions, "escalate": escalate, "message": msg})
@@ -357,6 +418,67 @@ def recover(repo, allow_pi=False, allow_restart=True, auto_push=True):
             actions.append("restart")
             msg += ", restart"
         return _finish(repo, d, actions, escalate=False, msg=msg)
+
+    # RUNG-0.5 base_out_of_band auto-heal (self-heal-5b): the keystone refused to hard-reset a base
+    # that is merely AHEAD of origin (the operator/dead-run committed local base commits but never
+    # pushed). The runner's own preflight already auto-syncs this at START time by FF-PUBLISHING those
+    # commits to origin; extend the same heal to the per-sweep diagnose path so a base that goes
+    # out-of-band MID-run doesn't sit escalated until a human pushes. ONLY when ahead and NOT diverged
+    # (a behind/diverged base can't fast-forward — never --force) and ONLY when pushing is enabled
+    # (auto_push gate; ship=local never pushes). A push mutates origin, not the local tree, so it is
+    # safe under a live loop. Diverged / push-failed / push-disabled all fall through to escalation.
+    if cat == "base_out_of_band":
+        if auto_push:
+            pr = _push_base_if_ahead(repo)
+            if pr.get("pushed"):
+                actions.append("push_base")
+                return _finish(repo, d, actions, escalate=False,
+                               msg=f"recovered: pushed {pr.get('ahead')} ahead base commit(s) to origin")
+            if pr.get("diverged"):
+                return _finish(repo, d, [], escalate=True,
+                               msg="base diverged from origin (not a fast-forward) — operator must "
+                                   "reconcile (push/rebase or revert)")
+        # auto_push off (ship=local), push failed, or no fast-forward: escalate as before.
+        return _finish(repo, d, [], escalate=True, msg="escalated — operator action required")
+
+    # RUNG-0.5 noop_streak auto-heal (self-heal-5a): 5 noops running means the backlog is exhausted or
+    # too hard for the current model. Today that escalated to the human ONLY (re-logged every sweep, no
+    # remediation). Add an auto rung BEFORE human escalation: if the provider has a configured FALLBACK
+    # model (the runner's _FALLBACK_MODEL keyed by provider name — its signal the provider has stronger
+    # headroom), refill the backlog with fresh ideated items (control.ideate) so the loop has new,
+    # different work; the runner's per-goal escalation then promotes hard items onto the fallback model.
+    # ideate needs the loop quiesced (it refuses under a live lock + does a non-atomic backlog write), so
+    # stop -> ideate -> restart, mirroring the 'stuck' rung. Anti-thrash: cap auto-heals at N; HUMAN
+    # escalation is the terminal rung once auto-heal has been tried-and-failed (or no fallback exists).
+    if cat == "noop_streak":
+        if _provider_has_fallback(repo):
+            prior_heals = sum(1 for s in control.read_supervisor_log(repo, limit=8)
+                              if s.get("category") == "noop_streak"
+                              and "ideate" in (s.get("actions") or []))
+            if prior_heals < 3:
+                control.stop(repo)
+                actions.append("stop")
+                for _ in range(10):                  # grace window for the loop to exit cleanly
+                    if not control.is_running(repo):
+                        break
+                    time.sleep(1)
+                if control.is_running(repo):
+                    return _finish(repo, d, actions, escalate=True,
+                                   msg="loop would not stop for backlog refill — manual kill required")
+                ir = control.ideate(repo)
+                actions.append("ideate")
+                if allow_restart:
+                    control.start(repo, auto_push=auto_push)
+                    actions.append("restart")
+                if not ir.get("ok"):
+                    # refill failed (e.g. key/model error) — restart already re-armed the lane; escalate
+                    # so the operator knows the backlog wasn't refilled and the noop streak may persist.
+                    return _finish(repo, d, actions, escalate=True,
+                                   msg=f"backlog refill failed ({ir.get('error', '?')}) — escalating")
+                return _finish(repo, d, actions, escalate=False,
+                               msg=f"recovered: refilled backlog (ideate added {ir.get('added', '?')})")
+        # no fallback model for the provider, or auto-heal already tried N times: terminal human rung.
+        return _finish(repo, d, [], escalate=True, msg="escalated — operator action required")
 
     if not d["auto_safe"] and cat != "gate_red_streak":
         return _finish(repo, d, [], escalate=True, msg="escalated — operator action required")
