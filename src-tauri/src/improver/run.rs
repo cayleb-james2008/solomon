@@ -372,7 +372,16 @@ set this repo's PR-target branch to a real branch in Config."
             break;
         }
         ctx.refresh_config_from_registry();
-        iteration::one_iteration(&mut ctx);
+        // run_improver.py wraps the loop body in try/…/finally: an unhandled exception in
+        // one_iteration must fall through to the cleanup (release_lock + error/crashed heartbeat),
+        // never kill the process with the runner lock still held. catch_unwind restores that
+        // (panic=unwind is intentional — see Cargo.toml / the watchdog sweep).
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| iteration::one_iteration(&mut ctx)))
+            .is_err()
+        {
+            ctx.log("one_iteration panicked — treating as a crashed iteration (will be restarted)");
+            break; // clean_exit stays false -> finally writes error/crashed and releases the lock
+        }
         if ctx.halted {
             ctx.log(
                 "halted after an unrecoverable revert failure — operator action required \

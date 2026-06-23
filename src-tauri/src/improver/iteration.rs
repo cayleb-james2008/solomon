@@ -1004,7 +1004,15 @@ fn parse_ideas(text: &str) -> Vec<(i64, String, String)> {
             let idea_raw = caps.get(3).map(|m| m.as_str()).unwrap_or("");
             if idea_raw.trim().chars().count() > 8 {
                 let lev = match caps.get(2).map(|m| m.as_str()) {
-                    Some(d) if !d.is_empty() => d.parse::<i64>().map(|v| v.clamp(1, 5)).unwrap_or(3),
+                    Some(d) if !d.is_empty() => match d.parse::<i64>() {
+                        Ok(v) => v.clamp(1, 5),
+                        // a huge all-ASCII-digit run overflows i64 — Python's arbitrary-precision
+                        // int() would clamp it to 5, not fall back to the default 3. Any OTHER parse
+                        // failure (a Unicode `\d` digit that Rust's i64::parse rejects but Python's
+                        // int() would accept) keeps the prior default rather than wrongly saturating.
+                        Err(e) if *e.kind() == std::num::IntErrorKind::PosOverflow => 5,
+                        Err(_) => 3,
+                    },
                     _ => 3,
                 };
                 let tier = caps.get(1).map(|m| m.as_str()).unwrap_or("feature").to_lowercase();
@@ -1359,6 +1367,16 @@ mod tests {
         assert_eq!(ideas[0].1, "refactor");
         assert_eq!(ideas[1].0, 3);
         assert_eq!(ideas[1].1, "feature");
+    }
+
+    #[test]
+    fn parse_ideas_leverage_overflow_saturates_to_five() {
+        // a leverage int too large for i64 overflows parse() — Python's int() would clamp the huge
+        // value to 5, so it must saturate to 5, not fall back to the default 3.
+        let text = "[feature] 99999999999999999999999999 add an overflow-resistant cache layer";
+        let ideas = parse_ideas(text);
+        assert_eq!(ideas.len(), 1);
+        assert_eq!(ideas[0].0, 5);
     }
 
     #[test]

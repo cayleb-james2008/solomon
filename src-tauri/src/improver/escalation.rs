@@ -236,13 +236,16 @@ pub fn edit_mandated_files(text: &str) -> std::collections::HashSet<String> {
 /// run_improver._EDIT_MANDATE_RE (~342-346): an edit verb, then within 0-15 non-`.`/non-newline/
 /// non-backtick chars, a backticked path ending in a known code/config extension. Bounded
 /// quantifiers (no catastrophic backtracking), case-insensitive.
-fn edit_mandate_re() -> regex::Regex {
-    regex::RegexBuilder::new(
-        r"\b(?:edit|edits|editing|change|changes|changed|rewrite|rewrites|rewriting|modif\w+|replace|replaces|recreate|create|creates)\b[^.\n`]{0,15}?`([^`]{1,80}?\.(?:py|ts|tsx|js|jsx|json|toml|md|ya?ml|cfg|ini|txt|html|css|svg|rs|go|sh))`",
-    )
-    .case_insensitive(true)
-    .build()
-    .expect("edit-mandate regex is valid")
+fn edit_mandate_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::RegexBuilder::new(
+            r"\b(?:edit|edits|editing|change|changes|changed|rewrite|rewrites|rewriting|modif\w+|replace|replaces|recreate|create|creates)\b[^.\n`]{0,15}?`([^`]{1,80}?\.(?:py|ts|tsx|js|jsx|json|toml|md|ya?ml|cfg|ini|txt|html|css|svg|rs|go|sh))`",
+        )
+        .case_insensitive(true)
+        .build()
+        .expect("edit-mandate regex is valid")
+    })
 }
 
 /// run_improver._deviated_from_named_files (~360-373): True when the item explicitly mandates editing
