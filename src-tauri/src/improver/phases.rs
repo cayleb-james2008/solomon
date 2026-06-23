@@ -25,9 +25,22 @@
 use std::path::Path;
 
 use regex::Regex;
+use std::sync::OnceLock;
 
 use crate::improver::ctx::{self, Ctx};
 use crate::improver::{gitops, pi};
+
+/// `(?i)REVIEW:\s*(approve|reject)\b([^\n]*)` — the review-verdict line. Compiled once.
+fn review_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)REVIEW:\s*(approve|reject)\b([^\n]*)").unwrap())
+}
+
+/// `(?i)LESSON:\s*(.+)` — the reflect-lesson line. Compiled once.
+fn lesson_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)LESSON:\s*(.+)").unwrap())
+}
 
 // ---- REVIEW phase ---------------------------------------------------------- #
 
@@ -63,7 +76,7 @@ and read the changed files. Judge per review.md, then end with EXACTLY one line:
     let p = pi::phase_run_pi(ctx, "review", &task, Some(review_md.as_path()), 600);
     let text = pi::final_text(&p.stdout);
 
-    let re = Regex::new(r"(?i)REVIEW:\s*(approve|reject)\b([^\n]*)").unwrap();
+    let re = review_re();
     let m = match re.captures(&text) {
         None => {
             ctx.log("review/judge: no parseable verdict — fail-open, not blocking ship");
@@ -209,7 +222,7 @@ pub fn reflect(ctx: &mut Ctx) {
     let text = pi::final_text(&p.stdout);
     // m = re.search(r"LESSON:\s*(.+)", text, re.I)
     // lesson = _redact(m.group(1).strip().splitlines()[0])[:600].strip() if m else ""
-    let re = Regex::new(r"(?i)LESSON:\s*(.+)").unwrap();
+    let re = lesson_re();
     let lesson = match re.captures(&text) {
         Some(c) => {
             let g1 = c.get(1).map(|x| x.as_str()).unwrap_or("");
@@ -416,7 +429,7 @@ mod tests {
     // ---- review verdict parsing (regex + reason lstrip/trim) ----
 
     fn parse_verdict(text: &str) -> Option<(String, String)> {
-        let re = Regex::new(r"(?i)REVIEW:\s*(approve|reject)\b([^\n]*)").unwrap();
+        let re = review_re();
         let c = re.captures(text)?;
         let verdict = c.get(1).unwrap().as_str().to_lowercase();
         let reason = trim200(lstrip_chars(
@@ -469,7 +482,7 @@ mod tests {
     // ---- lesson parsing ----
 
     fn parse_lesson(text: &str) -> String {
-        let re = Regex::new(r"(?i)LESSON:\s*(.+)").unwrap();
+        let re = lesson_re();
         match re.captures(text) {
             Some(c) => {
                 let g1 = c.get(1).unwrap().as_str();
