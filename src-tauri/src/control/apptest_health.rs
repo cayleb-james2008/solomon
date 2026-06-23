@@ -1,7 +1,6 @@
 //! Port of control.py's `apptest_health` module: managed monitored-frontend app-test sessions
 //! (browser_state / start/stop / state / frame / report), the frontend detector `has_frontend`,
-//! the operator readiness snapshot `health()`, Solomon's own short sha `current_sha()`, and the
-//! best-effort SolomonWatchdog scheduled-task re-arm `ensure_watchdog_task()`.
+//! the operator readiness snapshot `health()`, and Solomon's own short sha `current_sha()`.
 //!
 //! Bug-for-bug with control.py + improver/app_test_runtime.py. Bridge-return dicts are
 //! `serde_json::Value` whose keys are byte-identical to the Python dicts. Spec + golden vectors:
@@ -595,10 +594,13 @@ pub fn current_sha() -> Option<String> {
 }
 
 /// control._solomon_repo: locate Solomon's own git checkout (the source-rebuild target). SOLOMON_HOME
-/// if it is a repo, else a walk UP (<=8 levels) from HERE (and the exe dir) looking for solomon.spec
-/// + control.py. Returns the path, or None.
+/// if it is a repo, else a walk UP (<=8 levels) from HERE (and the exe dir) looking for the
+/// Rust/Tauri repo markers (src-tauri/Cargo.toml + SOLOMON_RSI.md). Returns the path, or None.
 fn solomon_repo() -> Option<PathBuf> {
-    let is_repo = |d: &Path| d.join("solomon.spec").is_file() && d.join("control.py").is_file();
+    // Post-port markers: the Rust crate manifest + the canonical RSI spec doc (was solomon.spec +
+    // control.py pre-port; both removed in the Python->Rust/Tauri rewrite).
+    let is_repo =
+        |d: &Path| d.join("src-tauri").join("Cargo.toml").is_file() && d.join("SOLOMON_RSI.md").is_file();
 
     if let Ok(env_home) = std::env::var("SOLOMON_HOME") {
         let p = PathBuf::from(&env_home);
@@ -627,76 +629,10 @@ fn solomon_repo() -> Option<PathBuf> {
     None
 }
 
-// --------------------------------------------------------------------------- //
-// ensure_watchdog_task (best-effort SolomonWatchdog re-arm)
-// --------------------------------------------------------------------------- //
-
-/// control._watchdog_python: a windowless python (pythonw.exe) for the scheduled sweep. Prefer the
-/// maki .venv pythonw (the established watchdog interpreter), else None (the native binary has no
-/// "current interpreter" pythonw beside it, so the unfrozen fallback collapses to None).
-fn watchdog_python() -> Option<PathBuf> {
-    let cand = paths::projects_dir()
-        .join("maki")
-        .join(".venv")
-        .join("Scripts")
-        .join("pythonw.exe");
-    if cand.is_file() {
-        Some(cand)
-    } else {
-        None
-    }
-}
-
-/// control._ensure_watchdog_task: idempotently ensure the SolomonWatchdog scheduled task exists
-/// (windowless `pythonw monitor.py`, every 2 min). Query first; CREATE only if MISSING. Best-effort;
-/// any failure is swallowed. Windows-only. Returns a short status string (not a dict).
-pub fn ensure_watchdog_task() -> String {
-    if !cfg!(windows) {
-        return "skipped (not win32)".to_string();
-    }
-    // The whole body is wrapped to mirror Python's `except OSError`: a spawn failure (== OSError)
-    // surfaces as "arm-error: <e>".
-    match ensure_watchdog_task_inner() {
-        Ok(s) => s,
-        Err(e) => format!("arm-error: {}", e),
-    }
-}
-
-fn ensure_watchdog_task_inner() -> std::io::Result<String> {
-    if proc::run(&["schtasks", "/Query", "/TN", "SolomonWatchdog"], None, None)?.code == 0 {
-        return Ok("present".to_string());
-    }
-    let py = watchdog_python();
-    let monitor = paths::here().join("monitor.py");
-    let py = match py {
-        Some(p) if monitor.is_file() => p,
-        _ => return Ok("missing (no python/monitor to arm)".to_string()),
-    };
-    let tr = format!(
-        "\"{}\" \"{}\"",
-        py.to_string_lossy(),
-        monitor.to_string_lossy()
-    );
-    let c = proc::run(
-        &[
-            "schtasks", "/Create", "/TN", "SolomonWatchdog", "/TR", &tr, "/SC", "MINUTE", "/MO",
-            "2", "/F",
-        ],
-        None,
-        None,
-    )?;
-    if c.code == 0 {
-        Ok("armed".to_string())
-    } else {
-        let msg = if !c.stderr.is_empty() {
-            &c.stderr
-        } else {
-            &c.stdout
-        };
-        let trimmed: String = msg.trim().chars().take(120).collect();
-        Ok(format!("arm-failed: {}", trimmed))
-    }
-}
+// The Python-era best-effort `ensure_watchdog_task()` (auto-arm a `pythonw monitor.py` scheduled
+// task) was removed in the Rust/Tauri port: monitor.py + the maki pythonw it shelled out to are
+// gone, and nothing in the app called it. The SolomonWatchdog task now runs `solomon watchdog`
+// (native subcommand, see main.rs) and is armed/repointed by the operator via Set-ScheduledTask.
 
 // --------------------------------------------------------------------------- //
 // tests — built from the spec's golden vectors
@@ -1060,13 +996,6 @@ mod tests {
         assert_eq!(cfg3.get("extra"), Some(&json!(1)));
 
         let _ = std::fs::remove_dir_all(&base);
-    }
-
-    // ---- ensure_watchdog_task non-windows short-circuit ----
-    #[cfg(not(windows))]
-    #[test]
-    fn watchdog_skipped_off_win32() {
-        assert_eq!(ensure_watchdog_task(), "skipped (not win32)");
     }
 
     // ---- uuid_hex12 shape ----
