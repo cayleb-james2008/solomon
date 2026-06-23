@@ -8,22 +8,25 @@ the 7 invariants live in **`SOLOMON_RSI.md`** — read it before touching the ha
 
 ## Distribution
 
-**Operator preference: ship a single self-contained Windows exe** (`dist\Solomon\Solomon.exe`,
-PyInstaller onedir via `build.ps1`, built with the maki venv python). The operator runs the exe
-directly — assume no dev shell or separate runtime on the target machine. An updater companion exe
-(`SolomonUpdater.exe`, the update+open entry point) is the one sanctioned companion; do not add
-other executables or an external-runtime dependency without operator sign-off.
+**Operator preference: ship a single self-contained Windows exe** — `Solomon.exe`, one native
+Rust/Tauri binary built from `src-tauri/` (`cargo build --release` → `src-tauri/target/release/solomon.exe`,
+copied to the repo-root `Solomon.exe`; the Tauri bundler produces the NSIS installer). The exe is
+both the GUI dashboard and every headless subcommand — there is no separate runtime, dev shell,
+Python, or companion exe. In-app updates run through `tauri-plugin-updater` (GitHub Releases). Do
+not reintroduce a Python interpreter, a second executable, or an external-runtime dependency
+without operator sign-off.
 
 ## Run / test / build
 
-`<maki-venv-python>` = `C:\Users\Cayleb\Desktop\workspace\projects\maki\.venv\Scripts\python.exe`
-(Solomon has no own venv — it borrows the maki interpreter, which has pywebview + pyinstaller).
+All commands run in `src-tauri/`. The app is pure Rust now — there is no Python venv or pytest suite.
 
-- **Gate / tests:** `<maki-venv-python> -m pytest tests/` (collection scoped to `tests/` by `pytest.ini`).
-- **Dashboard:** `<maki-venv-python> app.py` (pywebview / WebView2).
-- **Build exe:** `./build.ps1` → `dist/Solomon/Solomon.exe`.
-- **One RSI iteration (dry run):** `<maki-venv-python> improver/run_improver.py --repo <path> --name <name> --once`.
-- **Watchdog sweep:** `<maki-venv-python> monitor.py`.
+- **Gate / tests:** `cargo test` in `src-tauri/` (≈400 unit tests in `#[cfg(test)]` modules).
+- **Dashboard:** `solomon.exe` with no args → the Tauri GUI (WebView2; frontend in `web/`).
+- **Build exe:** `cargo build --release` in `src-tauri/` → `src-tauri/target/release/solomon.exe`
+  (copy to repo-root `Solomon.exe`); or the Tauri bundler for the NSIS installer.
+- **One RSI iteration (dry run):** `solomon run-improver --repo <path> --name <name> --once`.
+- **Watchdog sweep:** `solomon watchdog` (the SolomonWatchdog scheduled task runs this).
+- **Other headless subcommands:** `solomon state | start <name> | stop <name> | supervise [name] | serve-health [port]` (see `src-tauri/src/main.rs`).
 
 ## Keystone invariant
 
