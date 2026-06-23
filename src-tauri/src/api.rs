@@ -685,22 +685,39 @@ fn open_url(url: &str) -> Value {
     }
 }
 
+/// The argv (program first) that opens `url` in the OS default browser WITHOUT a shell. On Windows
+/// this is `rundll32 url.dll,FileProtocolHandler <url>`: rundll32 hands the URL straight to the
+/// registered protocol handler, so URL metacharacters (`&` `|` `^`) are passed LITERALLY and cannot
+/// inject a command the way the old `cmd /C start "" <url>` did — which also corrupted legitimate
+/// `?a=1&b=2` query strings, since cmd treats `&` as a command separator. Pure so the no-shell
+/// guarantee is unit-tested without spawning.
+#[cfg(windows)]
+fn browser_argv(url: &str) -> Vec<String> {
+    vec![
+        "rundll32".to_string(),
+        "url.dll,FileProtocolHandler".to_string(),
+        url.to_string(),
+    ]
+}
+
 /// webbrowser.open equivalent: hand the URL to the OS default handler. The http(s) gate in open_url
-/// has already rejected non-web schemes (local exe / UNC / file://), so this only ever opens a web URL.
+/// has already rejected non-web schemes (local exe / UNC / file://), and no shell is involved, so the
+/// URL can neither change scheme nor inject a command.
 fn open_in_browser(url: &str) -> Result<(), String> {
+    use std::process::Command;
     #[cfg(windows)]
     {
-        use std::process::Command;
-        // `cmd /c start "" <url>` — the empty title arg keeps a quoted URL from being read as a title.
-        let mut cmd = Command::new("cmd");
-        cmd.args(["/C", "start", "", url]);
-        cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
+        let argv = browser_argv(url);
+        Command::new(&argv[0])
+            .args(&argv[1..])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
     #[cfg(not(windows))]
     {
-        use std::process::Command;
         let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-        std::process::Command::new(opener)
+        Command::new(opener)
             .arg(url)
             .spawn()
             .map(|_| ())
@@ -921,6 +938,25 @@ mod tests {
             dispatch("open_url", &[json!(5)]).unwrap(),
             json!({"ok": false, "error": "only http(s) URLs are allowed"})
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn open_url_uses_no_shell_and_keeps_query_string_verbatim() {
+        // Security regression guard: the URL opener must NEVER route through a shell (cmd /C start was
+        // a command-injection vector via `&`), and must pass a legitimate query string through verbatim.
+        let url = "https://example.com/?a=1&b=2&q=x";
+        let argv = browser_argv(url);
+        assert_eq!(argv[0], "rundll32");
+        assert!(
+            !argv.iter().any(|a| {
+                let l = a.to_lowercase();
+                l == "cmd" || l == "cmd.exe" || l == "/c" || l == "start"
+            }),
+            "URL opener must not invoke a shell: {argv:?}"
+        );
+        // the full URL (including the `&` metacharacters) is one verbatim argv element
+        assert!(argv.contains(&url.to_string()));
     }
 
     #[test]

@@ -28,7 +28,9 @@ pub fn here() -> &'static Path {
         }
         if let Ok(exe) = std::env::current_exe() {
             let mut probe = exe.parent().map(Path::to_path_buf);
-            for _ in 0..8 {
+            // depth 6 (NOT 8): control._base_dir uses range(6) — the exe dir + up to 5 ancestors.
+            // solomon_repo() (apptest_health.rs) uses 8, a deliberately different constant; do not unify.
+            for _ in 0..6 {
                 match probe {
                     Some(ref dir) if dir.join("improver").is_dir() => return dir.clone(),
                     Some(ref dir) => probe = dir.parent().map(Path::to_path_buf),

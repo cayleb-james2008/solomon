@@ -1155,8 +1155,8 @@ fn read_lessons(ctx: &Ctx) -> String {
 const STOPWORDS: &[&str] = &[
     "a", "an", "the", "and", "or", "but", "for", "to", "of", "in", "on", "at", "by", "with",
     "from", "into", "as", "is", "are", "be", "it", "this", "that", "these", "those", "add", "adds",
-    "added", "use", "uses", "using", "into", "via", "per", "its", "it's", "not", "no", "than",
-    "then", "so", "we", "i",
+    "added", "use", "uses", "using", "make", "makes", "made", "into", "via", "per", "its", "it's",
+    "not", "no", "than", "then", "so", "we", "i",
 ];
 
 /// run_improver._tokenize (~3051-3054): lowercase `[a-z0-9]+` tokens, dropping stopwords + len<=2.

@@ -103,12 +103,11 @@ pub fn discover_projects() -> Vec<Value> {
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let mut out = Vec::new();
     for (name, p) in entries {
-        let abs = std::fs::canonicalize(&p)
-            .unwrap_or(p.clone())
-            .to_string_lossy()
-            .into_owned();
-        // strip the Windows \\?\ verbatim prefix that canonicalize adds, to match os.path.abspath.
-        let abs = abs.strip_prefix(r"\\?\").unwrap_or(&abs).to_string();
+        // os.path.abspath (lexical, no symlink resolution) — NOT canonicalize: a junctioned/symlinked
+        // project dir must keep the operator-configured link path, matching _discover_projects's
+        // `os.path.abspath(e.path)` and connect_project's clone branch (the lone canonicalize here was
+        // an internal inconsistency that resolved links to their target).
+        let abs = abspath(&p.to_string_lossy());
         let is_git = Path::new(&abs).join(".git").exists();
         let has_remote = if is_git { has_origin(&abs) } else { false };
         out.push(json!({
