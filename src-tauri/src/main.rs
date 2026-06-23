@@ -255,6 +255,10 @@ fn main() {
 }
 
 fn run_gui() {
+    // Arm the kill-on-close job BEFORE any improver child can be spawned (children are spawned via the
+    // bridge once the window is up). Every backend loop the GUI starts is bound to this job and dies
+    // when the GUI process exits — closing the app shuts down its backend processes.
+    control::proc::init_app_job();
     tauri::Builder::default()
         // single-instance MUST be registered FIRST (Tauri 2 requirement) so it runs before other
         // plugins. Launching solomon.exe again focuses the running dashboard instead of opening a

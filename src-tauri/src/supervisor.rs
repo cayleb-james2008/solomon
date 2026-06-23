@@ -584,7 +584,10 @@ pub fn solomon_fix_session(repo: &Value, auto_push: bool) -> Value {
     #[cfg(windows)]
     cmd.creation_flags(proc::hidden_flags(true, false));
     match cmd.spawn() {
-        Ok(child) => json!({"ok": true, "pid": child.id()}),
+        Ok(child) => {
+            proc::bind_to_app_job(&child); // die with the GUI app (no-op in headless subcommands)
+            json!({"ok": true, "pid": child.id()})
+        }
         Err(e) => json!({"ok": false, "error": e.to_string()}),
     }
 }

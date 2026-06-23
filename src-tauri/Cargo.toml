@@ -19,6 +19,11 @@ wait-timeout = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 regex = "1"
 
+# Windows job objects — bind spawned improver children to the GUI process so closing the app
+# (normal exit, crash, or kill) terminates the whole backend tree (see control::proc::init_app_job).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
 [profile.release]
 strip = true
 lto = true

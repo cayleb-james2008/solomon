@@ -159,6 +159,120 @@ pub fn run<S: AsRef<OsStr>>(
     }
 }
 
+// --------------------------------------------------------------------------- #
+// app job object — bind spawned improver children to the GUI process lifetime
+// --------------------------------------------------------------------------- #
+
+/// Create THIS process's kill-on-close job object. Call ONCE at GUI startup (run_gui). Idempotent.
+/// Children later passed to [`bind_to_app_job`] (and, via Windows nested jobs, all their descendants)
+/// are terminated by the OS when this process's last handle to the job closes — i.e. when the GUI
+/// exits, whether by normal close, panic, or TerminateProcess/taskkill. Headless subcommands
+/// (`run-improver`, `watchdog`) never call this, so their spawns stay unbounded BY DESIGN: the
+/// watchdog must be able to restart loops that outlive a single sweep.
+#[cfg(windows)]
+pub fn init_app_job() {
+    app_job::init();
+}
+#[cfg(not(windows))]
+pub fn init_app_job() {}
+
+/// Assign a freshly-spawned child to the GUI job so it dies with the app. No-op when [`init_app_job`]
+/// was never called (headless subcommands) or the job could not be created. Best-effort: an assign
+/// failure leaves the child running unbounded rather than failing the spawn.
+#[cfg(windows)]
+pub fn bind_to_app_job(child: &std::process::Child) {
+    app_job::assign(child);
+}
+#[cfg(not(windows))]
+pub fn bind_to_app_job(_child: &std::process::Child) {}
+
+#[cfg(windows)]
+mod app_job {
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    // The job handle stored as isize so the OnceLock is Send+Sync (a raw HANDLE is not). Set once in
+    // the GUI process and never closed by us; the OS closes it at process exit, which (with
+    // KILL_ON_JOB_CLOSE armed) terminates every assigned child. 0 means "no usable job".
+    static JOB: OnceLock<isize> = OnceLock::new();
+
+    pub fn init() {
+        JOB.get_or_init(create_kill_on_close_job);
+    }
+
+    /// Create a job object with KILL_ON_JOB_CLOSE armed; returns the raw HANDLE as isize, or 0 on any
+    /// failure (CreateJobObjectW / SetInformationJobObject). Factored out so the FFI is unit-testable.
+    fn create_kill_on_close_job() -> isize {
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return 0;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let armed = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if armed == 0 {
+                return 0; // could not arm kill-on-close — treat as no job
+            }
+            job as isize
+        }
+    }
+
+    pub fn assign(child: &Child) {
+        let Some(&raw) = JOB.get() else { return };
+        if raw == 0 {
+            return;
+        }
+        // Nested jobs (Win8+) let this succeed even if the child is already in a job; a failure here
+        // (e.g. the child already exited) is non-fatal — there is nothing to clean up. ponytail:
+        // microsecond race between spawn and assign — if the GUI is killed in that window one child
+        // may orphan; CREATE_SUSPENDED+resume would close it but isn't worth the complexity.
+        unsafe {
+            AssignProcessToJobObject(raw as HANDLE, child.as_raw_handle() as HANDLE);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::process::{Command, Stdio};
+
+        // Exercises the exact FFI the GUI relies on: create+arm a kill-on-close job and assign a real
+        // spawned child to it. Catches the silent failure modes — wrong cargo features, bad struct
+        // layout, or AssignProcessToJobObject returning ACCESS_DENIED. (Kill-on-PARENT-exit is an OS
+        // guarantee once these three calls succeed; it can't be observed without exiting this process.)
+        #[test]
+        fn job_creates_arms_and_assigns_a_real_child() {
+            let raw = create_kill_on_close_job();
+            assert_ne!(raw, 0, "create+arm kill-on-close job failed");
+            let mut child = Command::new("cmd")
+                .args(["/c", "ping -n 30 127.0.0.1 >NUL"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn long-lived child");
+            let assigned =
+                unsafe { AssignProcessToJobObject(raw as HANDLE, child.as_raw_handle() as HANDLE) };
+            let _ = child.kill();
+            let _ = child.wait();
+            assert_ne!(assigned, 0, "AssignProcessToJobObject failed (likely ACCESS_DENIED)");
+        }
+    }
+}
+
 /// Atomic JSON write: serialize like json.dump(indent=2), write `<path>.tmp`, rename over `path`.
 ///
 /// ponytail: serde emits raw UTF-8 where Python's ensure_ascii=True emits `\uXXXX`. Both parse
