@@ -68,7 +68,10 @@ fn spawn_detached(argv: &[String], cwd: &str) -> Result<u32, String> {
     #[cfg(windows)]
     cmd.creation_flags(proc::hidden_flags(true, false));
     match cmd.spawn() {
-        Ok(child) => Ok(child.id()),
+        Ok(child) => {
+            proc::bind_to_app_job(&child); // die with the GUI app (no-op in headless subcommands)
+            Ok(child.id())
+        }
         Err(e) => Err(e.to_string()),
     }
 }
