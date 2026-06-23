@@ -352,7 +352,10 @@ fn recent_history_summaries(ctx: &Ctx, limit: usize) -> Vec<String> {
         Ok(c) => c,
         Err(_) => return out,
     };
-    let lines: Vec<&str> = content.split('\n').collect();
+    // .lines() (NOT split('\n')): history.jsonl is always newline-terminated, so split('\n') yields a
+    // trailing empty element that eats one slot of the [-limit:] window — dropping the oldest in-window
+    // record. Matches iteration.rs's in-loop corpus and Python's .splitlines()[-limit:].
+    let lines: Vec<&str> = content.lines().collect();
     let start = lines.len().saturating_sub(limit);
     for line in &lines[start..] {
         let line = line.trim();

@@ -106,28 +106,49 @@ pub fn run<S: AsRef<OsStr>>(
         }
         Some(d) => {
             use wait_timeout::ChildExt;
-            // ponytail: drains pipes after exit; fine for the small git/gh outputs that use timeouts.
-            // If a future timeout call site pipes >64KB, drain on threads to avoid pipe-fill deadlock.
+            // Drain stdout/stderr on dedicated threads so a child that fills the ~64KB OS pipe buffer
+            // (e.g. `gh pr list --json …statusCheckRollup` on a busy repo) can't block-on-write and
+            // never exit — the old post-exit drain would deadlock, spuriously time out, and silently
+            // return empty output (an empty PR list). Mirrors CPython communicate(): drain concurrently
+            // with the wait, then join the readers.
             let mut child = cmd.spawn()?;
+            let out_h = child.stdout.take().map(|mut s| {
+                std::thread::spawn(move || {
+                    let mut buf = String::new();
+                    let _ = s.read_to_string(&mut buf);
+                    buf
+                })
+            });
+            let err_h = child.stderr.take().map(|mut s| {
+                std::thread::spawn(move || {
+                    let mut buf = String::new();
+                    let _ = s.read_to_string(&mut buf);
+                    buf
+                })
+            });
+            let join = |h: Option<std::thread::JoinHandle<String>>| -> String {
+                h.and_then(|h| h.join().ok()).unwrap_or_default()
+            };
             match child.wait_timeout(d)? {
-                Some(status) => {
-                    let mut out = String::new();
-                    let mut err = String::new();
-                    if let Some(mut s) = child.stdout.take() {
-                        let _ = s.read_to_string(&mut out);
-                    }
-                    if let Some(mut s) = child.stderr.take() {
-                        let _ = s.read_to_string(&mut err);
-                    }
-                    Ok(RunOut {
-                        code: status.code().unwrap_or(-1),
-                        stdout: out,
-                        stderr: err,
-                    })
-                }
+                Some(status) => Ok(RunOut {
+                    code: status.code().unwrap_or(-1),
+                    stdout: join(out_h),
+                    stderr: join(err_h),
+                }),
                 None => {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // Do NOT join the reader threads here. child.kill() is TerminateProcess on the
+                    // DIRECT child only (we set just CREATE_NO_WINDOW — no job object / process group),
+                    // so a surviving grandchild that inherited the write handle can hold the pipe open;
+                    // joining would then block read_to_string forever and turn this prompt timeout into
+                    // an INVISIBLE HANG — the exact failure the timeout exists to prevent. Detach the
+                    // readers (drop the handles) and return promptly, as the pre-drain code did.
+                    // ponytail: at most a couple parked reader threads per (rare) timeout; a prompt
+                    // FAILED result beats a hung orchestrator. Upgrade to a job-object tree-kill only if
+                    // leaked readers ever actually bite.
+                    drop(out_h);
+                    drop(err_h);
                     Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "subprocess timed out",
@@ -187,6 +208,27 @@ mod tests {
         let out = run(&["echo", "hello"], None, None).unwrap();
         assert_eq!(out.code, 0);
         assert!(out.stdout.contains("hello"));
+    }
+
+    // The timeout branch must drain pipes concurrently: a child emitting far more than the ~64KB OS
+    // pipe buffer must NOT block-on-write and time out. The old post-exit drain returned Err(TimedOut)
+    // here (and lost the output); the thread-drain captures it all and exits fast.
+    #[cfg(windows)]
+    #[test]
+    fn run_timeout_drains_large_output_without_deadlock() {
+        // `for /L` emits ~8000 * 28-byte lines (~230KB) to stdout, well past one pipe buffer.
+        let out = run(
+            &["cmd", "/c", "for /L %i in (1,1,8000) do @echo XXXXXXXXXXXXXXXXXXXXXXXXXX"],
+            None,
+            Some(Duration::from_secs(30)),
+        )
+        .expect("timeout branch must not error on large output");
+        assert_eq!(out.code, 0);
+        assert!(
+            out.stdout.len() > 100_000,
+            "expected the full large stdout, got {} bytes",
+            out.stdout.len()
+        );
     }
 
     #[test]

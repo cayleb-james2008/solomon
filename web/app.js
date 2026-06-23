@@ -259,7 +259,7 @@ function renderWorkspace() {
 function applyState() { panels.forEach(p => { try { p.update(); } catch (e) { /* one panel must not break the rest */ } }); }
 
 /* ---------- data ---------- */
-async function refresh() { try { const s = await call("get_state"); Object.assign(state, s); applyState(); $("#version").textContent = ""; } catch (e) { /* keep prior */ } }
+async function refresh() { try { const s = await call("get_state"); Object.assign(state, s); applyState(); } catch (e) { /* keep prior */ } }
 function saveLayout() { const clean = layout.map(({ id, type, repo, span2 }) => ({ id, type, repo, span2 })); act("set_layout", clean); try { localStorage.setItem("solomon.layout", JSON.stringify(clean)); } catch {} }
 
 /* ---------- bento (add panel) ---------- */
@@ -289,12 +289,10 @@ function openSettings() {
   // API keys
   const keys = h("div", "sect", `<h4>API keys</h4>`);
   state.providers.forEach(p => {
-    const row = h("div", "row");
     const inp = h("input"); inp.type = "password"; inp.placeholder = (state.keys && state.keys[p]) ? "•••••• (set)" : `${PROV[p] || p} key`;
+    inp.setAttribute("aria-label", `${PROV[p] || p} API key`);
     const save = h("button", "btn sm", "Save");
     save.onclick = async () => { if (!inp.value) return; const x = await act("set_key", p, inp.value); toast(x && x.ok ? `${PROV[p] || p} key saved` : `Failed: ${(x && x.error) || "?"}`, x && x.ok ? "ok" : "err"); inp.value = ""; refresh(); };
-    row.append(h("span", "lbl", PROV[p] || p), h("span", "spacer"));
-    const wrap = h("div", "sect"); wrap.style.margin = "0 0 12px";
     const line = h("div", "row"); line.style.marginTop = "6px"; line.append(inp, save);
     keys.append(h("div", "row", `<span class="lbl">${esc(PROV[p] || p)}</span>`), line);
   });
@@ -310,7 +308,7 @@ function openSettings() {
 
   // Add project
   const add = h("div", "sect", `<h4>Add a repo</h4>`);
-  const path = h("input"); path.type = "text"; path.placeholder = "C:\\path\\to\\repo  or  owner/repo";
+  const path = h("input"); path.type = "text"; path.placeholder = "C:\\path\\to\\repo  or  owner/repo"; path.setAttribute("aria-label", "Repo path or owner/repo");
   const addBtn = h("button", "btn sm primary", "Add");
   addBtn.onclick = async () => { if (!path.value.trim()) return; addBtn.disabled = true; const x = await act("add_project", path.value.trim()); toast(x && x.ok ? `Added ${x.name || ""} — provisioning…` : `Failed: ${(x && x.error) || "?"}`, x && x.ok ? "ok" : "err"); path.value = ""; addBtn.disabled = false; refresh(); };
   const addLine = h("div", "row"); addLine.append(path, addBtn); add.append(addLine); d.appendChild(add);
