@@ -89,5 +89,26 @@
             "ideate": false,
             "reflect": false
         }
+    },
+    {
+        "name": "solomon",
+        "branch_prefix": "rsi/",
+        "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\solomon",
+        "public": true,
+        "provider": "ollama-cloud",
+        "model": "kimi-k2.7-code",
+        "ship": "local",
+        "pr_target_branch": "main",
+        "gate": "cd src-tauri && cargo test",
+        "interval": 120,
+        "max_iterations": 0,
+        "reasoning": "xhigh",
+        "pipeline": {
+            "plan": false,
+            "review": false,
+            "ideate": false,
+            "reflect": false
+        },
+        "goal": "Improve Solomon itself — the Rust/Tauri RSI control plane that runs autonomous improvement loops on other repos (the improver runner + supervisor recovery ladder + overnight watchdog + git/gh integration + the web dashboard). Each iteration make ONE real, high-leverage improvement: fix a genuine bug, harden the improver loop / gate execution / lock & heartbeat handling / subprocess lifecycle, improve crash-recovery or the dashboard, or add missing test coverage. Keep `cargo test` (run from src-tauri) green. PONYTAIL STYLE: the laziest solution that fully works — stdlib over deps, native over custom, delete over add; add no abstraction or dependency you do not need. Much of the codebase is a deliberately bug-for-bug faithful port of the original Python (per-call-site truthiness mirrors, exact log strings, byte-identical argv) — do NOT 'simplify' those away. A truthful 'nothing worth changing this cycle' beats a fabricated or cosmetic change."
     }
 ]
