@@ -89,7 +89,12 @@ function inputField(label, value, onCommit, listId, list) {
   f.appendChild(h("label", null, label));
   const inp = h("input"); inp.type = "text"; inp.value = value || "";
   if (listId) { inp.setAttribute("list", listId); if (list && !$("#" + listId)) { const dl = h("datalist"); dl.id = listId; list.forEach(v => { const o = h("option"); o.value = v; dl.appendChild(o); }); document.body.appendChild(dl); } }
-  const commit = () => { if (inp.value !== (value || "")) onCommit(inp.value.trim()); };
+  // baseline is re-snapshotted at focus, not captured at build: a background refresh (setInp) can
+  // rewrite inp.value while unfocused, so comparing against the build-time `value` would re-commit
+  // that refreshed value on a no-op focus→blur. Snapshotting at focus makes blur a true no-op.
+  let baseline = value || "";
+  inp.onfocus = () => { baseline = inp.value; };
+  const commit = () => { if (inp.value !== baseline) onCommit(inp.value.trim()); };
   inp.onblur = commit; inp.onkeydown = e => { if (e.key === "Enter") inp.blur(); };
   f.appendChild(inp); f._inp = inp; return f;
 }
