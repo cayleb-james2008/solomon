@@ -171,8 +171,10 @@ fn apply_hidden(_cmd: &mut Command) {}
 fn strip_code_fence(text: &str) -> String {
     let mut lines: Vec<&str> = text.split('\n').collect();
     // leading fence: re.match(r"^```\w*\s*$", lines[0].strip())
-    let lead = regex::Regex::new(r"^```\w*\s*$").unwrap();
-    let trail = regex::Regex::new(r"^```\s*$").unwrap();
+    static LEAD: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static TRAIL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let lead = LEAD.get_or_init(|| regex::Regex::new(r"^```\w*\s*$").unwrap());
+    let trail = TRAIL.get_or_init(|| regex::Regex::new(r"^```\s*$").unwrap());
     if let Some(first) = lines.first() {
         if lead.is_match(first.trim()) {
             lines.remove(0);
@@ -195,7 +197,7 @@ fn parse_provision(text: &str) -> (Option<String>, Option<String>) {
         return (None, None);
     }
     // after = text.split("===AGENT.md===", 1)[1]
-    let after = text.splitn(2, "===AGENT.md===").nth(1).unwrap_or("");
+    let after = text.split_once("===AGENT.md===").map_or("", |(_, a)| a);
     // agent_part, backlog_part = after.split("===backlog.md===", 1)
     let mut it = after.splitn(2, "===backlog.md===");
     let agent_part = it.next().unwrap_or("");
@@ -379,20 +381,27 @@ fn recent_history_summaries(ctx: &Ctx, limit: usize) -> Vec<String> {
 /// (tier='feature', leverage=3) with noise guards. Returns the chosen list sorted by -leverage.
 fn parse_ideas(text: &str) -> Vec<(i64, String, String)> {
     // strict tier regex (re.I)
-    let tier_re = regex::RegexBuilder::new(
-        r"^[\s\-*\d.)#>]*\**\[?\s*(feature|refactor|architecture)\s*\]?\**\s*[|:\-–—]*\s*(\d+)?\s*[|:\-–—]*\s*(.+?)\s*$",
-    )
-    .case_insensitive(true)
-    .build()
-    .unwrap();
+    static TIER_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static BULLET_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static META_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let tier_re = TIER_RE.get_or_init(|| {
+        regex::RegexBuilder::new(
+            r"^[\s\-*\d.)#>]*\**\[?\s*(feature|refactor|architecture)\s*\]?\**\s*[|:\-–—]*\s*(\d+)?\s*[|:\-–—]*\s*(.+?)\s*$",
+        )
+        .case_insensitive(true)
+        .build()
+        .unwrap()
+    });
     // fallback bullet-strip + meta-reject (re.I on the meta-prefix check)
-    let bullet_re = regex::Regex::new(r"^[\s\-*•·\d.)>]+").unwrap();
-    let meta_re = regex::RegexBuilder::new(
-        r"^(idea lines|here|below|based on|i|no|note|first|second|third|next|the following|these|this (is|repo|project)|propose)\b",
-    )
-    .case_insensitive(true)
-    .build()
-    .unwrap();
+    let bullet_re = BULLET_RE.get_or_init(|| regex::Regex::new(r"^[\s\-*•·\d.)>]+").unwrap());
+    let meta_re = META_RE.get_or_init(|| {
+        regex::RegexBuilder::new(
+            r"^(idea lines|here|below|based on|i|no|note|first|second|third|next|the following|these|this (is|repo|project)|propose)\b",
+        )
+        .case_insensitive(true)
+        .build()
+        .unwrap()
+    });
 
     let mut tiered: Vec<(i64, String, String)> = Vec::new();
     let mut plain: Vec<(i64, String, String)> = Vec::new();
