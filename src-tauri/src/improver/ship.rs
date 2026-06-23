@@ -270,11 +270,16 @@ pub fn open_pr(c: &mut Ctx, branch: &str, title: &str, summary: &str, tests: &Va
             "state": "push-only",
         });
     }
-    // url = last non-blank stdout line if stdout.strip() else None
-    let url: Option<String> = if p.stdout.trim().is_empty() {
-        None
-    } else {
-        p.stdout.lines().last().map(str::to_string)
+    // url = last line of STRIPPED stdout if stdout.strip() else None. Strip the WHOLE stdout FIRST
+    // (Python `(p.stdout or "").strip().splitlines()[-1]`): a trailing blank/whitespace line would
+    // otherwise make `.lines().last()` return "" and null a successfully-created PR's url + number.
+    let url: Option<String> = {
+        let trimmed = p.stdout.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            trimmed.lines().last().map(str::to_string)
+        }
     };
     // num from url's trailing /pull/<n> segment (int() of the last "/"-split element)
     let mut num: Option<i64> = None;
