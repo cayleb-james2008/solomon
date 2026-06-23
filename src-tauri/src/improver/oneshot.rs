@@ -296,11 +296,13 @@ add adds added use uses using make makes made into via per its it's not no than 
 
 /// run_improver._tokenize (~3051-3054): lowercase word tokens (r"[a-z0-9]+"), len>2, stopwords dropped.
 fn tokenize(text: &str) -> std::collections::HashSet<String> {
+    // r"[a-z0-9]+" over a lowercased string == maximal runs of ascii-alphanumerics; stdlib split gives
+    // the same tokens with no regex compile (this runs per corpus item inside is_novel's O(N) loop).
     let sw = stopwords();
-    let re = regex::Regex::new(r"[a-z0-9]+").unwrap();
     let lower = text.to_lowercase();
-    re.find_iter(&lower)
-        .map(|m| m.as_str().to_string())
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .map(str::to_string)
         .filter(|w| w.chars().count() > 2 && !sw.contains(w.as_str()))
         .collect()
 }

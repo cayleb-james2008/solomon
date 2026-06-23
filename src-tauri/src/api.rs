@@ -248,44 +248,20 @@ fn get_state(st: &AppState) -> Value {
     let repos = safe(|| registry::load_repos(), Vec::new());
     let gh_ready = safe(|| gh::gh_ready(), false);
 
-    let mut out: Vec<Value> = Vec::new();
-    for r in &repos {
-        if !r.is_object() {
-            continue;
-        }
-        let r = r.clone();
-        out.push(json!({
-            "name": r.get("name").cloned().unwrap_or(Value::Null),
-            "path": r.get("path").cloned().unwrap_or(Value::Null),
-            "provider": safe(|| Value::String(registry::project_provider(&r)), json!("ollama-cloud")),
-            "model": safe(|| Value::String(registry::project_model(&r)), Value::Null),
-            "ship": safe(|| Value::String(registry::project_ship(&r)), json!("pr")),
-            "gate": safe(|| registry::project_gate(&r).map(Value::String).unwrap_or(Value::Null), Value::Null),
-            "pr_target_branch": safe(|| Value::String(registry::project_pr_target_branch(&r)), json!("main")),
-            "reasoning": safe(|| Value::String(registry::project_reasoning(&r)), json!("")),
-            "goal": safe(|| Value::String(registry::project_goal(&r)), json!("")),
-            "interval": safe(|| json!(registry::project_interval(&r)), json!(120)),
-            "max_iterations": safe(|| json!(registry::project_max_iterations(&r)), json!(0)),
-            "phases": phases_or_empty(&r),
-            "is_git": json_bool(r.get("is_git")),
-            "has_remote": json_bool(r.get("has_remote")),
-            "running": safe(|| Value::Bool(crate::control::locks::is_running(&r)), Value::Bool(false)),
-            "heartbeat": safe(|| heartbeat::read_heartbeat(&r).unwrap_or(Value::Null), Value::Null),
-            "prs": if gh_ready {
-                safe(|| Value::Array(gh::list_prs(&r)), json!([]))
-            } else {
-                json!([])
-            },
-            "local_branches": safe(|| Value::Array(branches::local_rsi_branches(&r).into_iter().map(Value::String).collect()), json!([])),
-            "worktrees": safe(|| Value::Array(branches::list_worktrees(&r)), json!([])),
-            "hygiene": safe(|| branches::branch_hygiene(&r), json!({"dirty": false})),
-            "frontend": safe(|| Value::Bool(apptest_health::has_frontend(&r)), Value::Bool(false)),
-            "browser": safe(|| apptest_health::browser_state(&r), json!({"ok": false})),
-            "contracts": safe(|| contracts::contracts_present(&r), json!({"agent": false, "backlog": false})),
-            "diagnosis": safe(|| supervisor::diagnose(&r), json!({"category": "ok", "healthy": true})),
-            "escalation": safe(|| supervisor::read_escalation(&r).unwrap_or(Value::Null), Value::Null),
-        }));
-    }
+    // Each repo's payload is independent — its own git/gh/fs probes, including a network `gh pr list`
+    // and ~5 git spawns. The old serial loop made one 4s dashboard refresh cost N×(those spawns).
+    // Fan out one thread per repo and collect IN ORDER: O(N×per_repo) -> O(per_repo).
+    // ponytail: one OS thread per repo (unbounded); cap with a small pool if the repo count grows large.
+    let objs: Vec<&Value> = repos.iter().filter(|r| r.is_object()).collect();
+    let out: Vec<Value> = std::thread::scope(|scope| {
+        objs.iter()
+            .map(|&r| scope.spawn(move || repo_state(r, gh_ready)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap_or(Value::Null))
+            .filter(|v| !v.is_null())
+            .collect()
+    });
 
     json!({
         "repos": out,
@@ -296,6 +272,43 @@ fn get_state(st: &AppState) -> Value {
         "providers": ["ollama-cloud", "openrouter"],
         "keys": safe(|| keys::keys_status(), json!({})),
         "github": safe(|| gh::github_status(), json!({})),
+    })
+}
+
+/// One repo's get_state payload. Independent git/gh/fs probes, each field guarded by `safe()` so a
+/// flaky call degrades only that field (never blanks the card or lies `running:false`). Extracted from
+/// get_state's loop so the loop can run one of these per thread (the fields share no state).
+fn repo_state(r: &Value, gh_ready: bool) -> Value {
+    json!({
+        "name": r.get("name").cloned().unwrap_or(Value::Null),
+        "path": r.get("path").cloned().unwrap_or(Value::Null),
+        "provider": safe(|| Value::String(registry::project_provider(r)), json!("ollama-cloud")),
+        "model": safe(|| Value::String(registry::project_model(r)), Value::Null),
+        "ship": safe(|| Value::String(registry::project_ship(r)), json!("pr")),
+        "gate": safe(|| registry::project_gate(r).map(Value::String).unwrap_or(Value::Null), Value::Null),
+        "pr_target_branch": safe(|| Value::String(registry::project_pr_target_branch(r)), json!("main")),
+        "reasoning": safe(|| Value::String(registry::project_reasoning(r)), json!("")),
+        "goal": safe(|| Value::String(registry::project_goal(r)), json!("")),
+        "interval": safe(|| json!(registry::project_interval(r)), json!(120)),
+        "max_iterations": safe(|| json!(registry::project_max_iterations(r)), json!(0)),
+        "phases": phases_or_empty(r),
+        "is_git": json_bool(r.get("is_git")),
+        "has_remote": json_bool(r.get("has_remote")),
+        "running": safe(|| Value::Bool(crate::control::locks::is_running(r)), Value::Bool(false)),
+        "heartbeat": safe(|| heartbeat::read_heartbeat(r).unwrap_or(Value::Null), Value::Null),
+        "prs": if gh_ready {
+            safe(|| Value::Array(gh::list_prs(r)), json!([]))
+        } else {
+            json!([])
+        },
+        "local_branches": safe(|| Value::Array(branches::local_rsi_branches(r).into_iter().map(Value::String).collect()), json!([])),
+        "worktrees": safe(|| Value::Array(branches::list_worktrees(r)), json!([])),
+        "hygiene": safe(|| branches::branch_hygiene(r), json!({"dirty": false})),
+        "frontend": safe(|| Value::Bool(apptest_health::has_frontend(r)), Value::Bool(false)),
+        "browser": safe(|| apptest_health::browser_state(r), json!({"ok": false})),
+        "contracts": safe(|| contracts::contracts_present(r), json!({"agent": false, "backlog": false})),
+        "diagnosis": safe(|| supervisor::diagnose(r), json!({"category": "ok", "healthy": true})),
+        "escalation": safe(|| supervisor::read_escalation(r).unwrap_or(Value::Null), Value::Null),
     })
 }
 
@@ -702,29 +715,37 @@ fn open_in_browser(url: &str) -> Result<(), String> {
 /// app._health_payload: overall readiness + a per-repo diagnose summary. Per-repo guard: a repo whose
 /// diagnose() panics is reported with `category:"?"` and an error, never blanking the endpoint.
 pub fn health_payload() -> Value {
-    let mut repos: Vec<Value> = Vec::new();
-    for r in registry::load_repos() {
-        if !r.is_object() {
-            continue;
-        }
-        let name = r.get("name").cloned().unwrap_or(Value::Null);
-        let r2 = r.clone();
-        match std::panic::catch_unwind(move || supervisor::diagnose(&r2)) {
-            Ok(d) => {
-                repos.push(json!({
-                    "name": name,
-                    "running": d.get("running").cloned().unwrap_or(Value::Null),
-                    "healthy": d.get("healthy").cloned().unwrap_or(Value::Null),
-                    "category": d.get("category").cloned().unwrap_or(Value::Null),
-                    "evidence": d.get("evidence").cloned().unwrap_or(Value::Null),
-                }));
-            }
-            Err(e) => {
-                repos.push(json!({"name": name, "category": "?", "error": panic_message(e)}));
-            }
-        }
-    }
+    // Per-repo diagnose() is independent (and spawns git), so fan out one thread per repo and collect
+    // in order — same serial-loop win as get_state.
+    let all = registry::load_repos();
+    let objs: Vec<&Value> = all.iter().filter(|r| r.is_object()).collect();
+    let repos: Vec<Value> = std::thread::scope(|scope| {
+        objs.iter()
+            .map(|&r| scope.spawn(move || health_repo(r)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap_or(Value::Null))
+            .filter(|v| !v.is_null())
+            .collect()
+    });
     json!({"ok": true, "health": apptest_health::health(), "repos": repos})
+}
+
+/// One repo's health entry: diagnose() under a per-repo catch_unwind so a panicking repo is reported
+/// (category "?") rather than blanking the endpoint. Extracted so health_payload can run one per thread.
+fn health_repo(r: &Value) -> Value {
+    let name = r.get("name").cloned().unwrap_or(Value::Null);
+    let r2 = r.clone();
+    match std::panic::catch_unwind(move || supervisor::diagnose(&r2)) {
+        Ok(d) => json!({
+            "name": name,
+            "running": d.get("running").cloned().unwrap_or(Value::Null),
+            "healthy": d.get("healthy").cloned().unwrap_or(Value::Null),
+            "category": d.get("category").cloned().unwrap_or(Value::Null),
+            "evidence": d.get("evidence").cloned().unwrap_or(Value::Null),
+        }),
+        Err(e) => json!({"name": name, "category": "?", "error": panic_message(e)}),
+    }
 }
 
 // --------------------------------------------------------------------------- #

@@ -25,26 +25,30 @@ use std::process::Command;
 use std::time::Duration;
 
 use regex::Regex;
+use std::sync::OnceLock;
 
 // --------------------------------------------------------------------------- #
 // regex sources (run_improver module-level patterns)
 // --------------------------------------------------------------------------- #
 //
-// DEVIATION (lookbehind): the Rust `regex` crate does NOT support lookbehind, and `once_cell` /
-// `fancy_regex` are NOT declared dependencies (and Cargo.toml is owned by the integrator). So, exactly
-// as ctx.rs does, regexes are compiled inline (off the hot path) and the source's two `(?<![\w.])`
-// lookbehinds in _SKIP_MARKER_RE are emulated in `new_skip_markers` by checking the char preceding each
-// candidate match (it must not be a word char or `.`) — behaviorally identical to the Python regex.
+// Each constant-pattern regex is compiled once and cached process-global in an `OnceLock` (matching
+// gitops::global_artifact_patterns), so the per-iteration gates don't recompile them.
+//
+// DEVIATION (lookbehind): the Rust `regex` crate does NOT support lookbehind, so the source's two
+// `(?<![\w.])` lookbehinds in _SKIP_MARKER_RE are emulated in `new_skip_markers` by checking the char
+// preceding each candidate match (it must not be a word char or `.`) — behaviorally identical.
 
 /// run_improver._EVAL_FLOAT_RE.
-fn eval_float_re() -> Regex {
-    Regex::new(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?").unwrap()
+fn eval_float_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?").unwrap())
 }
 
 /// The lookbehind-FREE alternatives of run_improver._SKIP_MARKER_RE (decorator/in-body/Go/Rust forms).
 /// These match anywhere; the two JS/TS lookbehind alternatives are handled separately.
-fn skip_marker_plain_re() -> Regex {
-    Regex::new(concat!(
+fn skip_marker_plain_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(concat!(
         r"@\s*\w+\.(?:skip|skipif|xfail)\b",
         r"|@\s*(?:skip|skipif|xfail)\b",
         r"|\bmark\.(?:skip|skipif|xfail)\b",
@@ -55,56 +59,83 @@ fn skip_marker_plain_re() -> Regex {
         r"|\bt\.Skip(?:Now|f)?\s*\(",
         r"|#\s*\[\s*ignore\b",
     ))
-    .unwrap()
+    .unwrap())
 }
 
 /// The two `(?<![\w.])`-guarded JS/TS alternatives of _SKIP_MARKER_RE, WITHOUT the lookbehind (which
 /// `new_skip_markers` enforces by inspecting the preceding char). `it.skip(`/`test.only(`/... and
 /// `xit(`/`fdescribe(`/... at a call head.
-fn skip_marker_js_re() -> Regex {
-    Regex::new(concat!(
-        r"(?:it|test|describe|context)\.(?:skip|only|fixme)\s*\(",
-        r"|(?:xit|xdescribe|xtest|fit|fdescribe)\s*\(",
-    ))
-    .unwrap()
+fn skip_marker_js_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(concat!(
+            r"(?:it|test|describe|context)\.(?:skip|only|fixme)\s*\(",
+            r"|(?:xit|xdescribe|xtest|fit|fdescribe)\s*\(",
+        ))
+        .unwrap()
+    })
 }
 
 /// run_improver._TEST_DEF_RE — a test DEFINITION line (matched against diff content with the leading
 /// +/- stripped). Python / JS-TS / Go / Rust forms.
-fn test_def_re() -> Regex {
-    Regex::new(concat!(
-        r"^\s*(?:async\s+)?def\s+test\w*\s*\(",
-        r"|^\s*class\s+Test\w*\b",
-        r#"|^\s*(?:it|test|describe)\s*(?:\.\w+)?\s*\(\s*["'`]"#,
-        r"|^\s*func\s+Test\w*\s*\(",
-        r"|^\s*#\s*\[\s*test\b",
-    ))
-    .unwrap()
+fn test_def_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(concat!(
+            r"^\s*(?:async\s+)?def\s+test\w*\s*\(",
+            r"|^\s*class\s+Test\w*\b",
+            r#"|^\s*(?:it|test|describe)\s*(?:\.\w+)?\s*\(\s*["'`]"#,
+            r"|^\s*func\s+Test\w*\s*\(",
+            r"|^\s*#\s*\[\s*test\b",
+        ))
+        .unwrap()
+    })
 }
 
 /// run_improver._DEMANDS_TESTS_RE — ADD/RESTORE/PORT verb near "test(s)", OR RAISE-style verb near
 /// "coverage". Case-insensitive (`re.I`).
-fn demands_tests_re() -> Regex {
-    Regex::new(concat!(
-        r"(?i)",
-        r"\b(?:add|adds|adding|write|writes|writing|create|creates|creating|backfill|backfills|",
-        r"restore|restores|port|ports|porting)\b[^.\n]{0,80}\btests?\b",
-        r"|\b(?:add|adds|adding|increase|increases|increasing|improve|improves|improving|raise|raises|",
-        r"raising|bump|bumps|cover|covers|covering|extend|extends|extending|expand|expands)\b",
-        r"[^.\n]{0,80}\bcoverage\b",
-    ))
-    .unwrap()
+fn demands_tests_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(concat!(
+            r"(?i)",
+            r"\b(?:add|adds|adding|write|writes|writing|create|creates|creating|backfill|backfills|",
+            r"restore|restores|port|ports|porting)\b[^.\n]{0,80}\btests?\b",
+            r"|\b(?:add|adds|adding|increase|increases|increasing|improve|improves|improving|raise|raises|",
+            r"raising|bump|bumps|cover|covers|covering|extend|extends|extending|expand|expands)\b",
+            r"[^.\n]{0,80}\bcoverage\b",
+        ))
+        .unwrap()
+    })
 }
 
 /// run_improver._SECRET_TOKEN_PATTERNS — the four secret-shaped token patterns the leak guard scans
 /// for in a public repo's added diff lines (also used by ctx.redact, compiled there separately).
-fn secret_token_patterns() -> Vec<Regex> {
-    vec![
-        Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b").unwrap(),
-        Regex::new(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b").unwrap(),
-        Regex::new(r"\bsk-[A-Za-z0-9_-]{20,}\b").unwrap(),
-        Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{20,}").unwrap(),
-    ]
+/// Compiled once (process-global cache).
+fn secret_token_patterns() -> &'static [Regex] {
+    static PATS: OnceLock<Vec<Regex>> = OnceLock::new();
+    PATS.get_or_init(|| {
+        vec![
+            Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b").unwrap(),
+            Regex::new(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b").unwrap(),
+            Regex::new(r"\bsk-[A-Za-z0-9_-]{20,}\b").unwrap(),
+            Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{20,}").unwrap(),
+        ]
+    })
+}
+
+/// Collection-failure markers in gate output (empty run + one of these = unrunnable, not green).
+fn missing_module_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"No module named|ModuleNotFoundError|ImportError|INTERNALERROR").unwrap()
+    })
+}
+
+/// `re.search(r"`[^`]+\.[A-Za-z]{1,4}`", summary)` — a backtick-quoted filename mention.
+fn mentions_file_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"`[^`]+\.[A-Za-z]{1,4}`").unwrap())
 }
 
 // --------------------------------------------------------------------------- #
@@ -250,10 +281,7 @@ pub fn run_gate(c: &mut Ctx) -> (bool, Value, String) {
             && tests.get("passed").and_then(Value::as_i64).unwrap_or(0) == 0
             && tests.get("failed").and_then(Value::as_i64).unwrap_or(0) == 0
             && tests.get("errors").and_then(Value::as_i64).unwrap_or(0) == 0;
-        if empty
-            && Regex::new(r"No module named|ModuleNotFoundError|ImportError|INTERNALERROR")
-                .unwrap()
-                .is_match(&tail)
+        if empty && missing_module_re().is_match(&tail)
         {
             // a HARD, non-transient failure with the same all-zeros signature: surface immediately.
             let mut tests = tests;
@@ -666,10 +694,7 @@ pub fn narrated_without_writing(summary: &str) -> bool {
         .iter()
         .any(|w| s.contains(w));
     // mentions_file = bool(re.search(r"`[^`]+\.[A-Za-z]{1,4}`", summary)) or ".py" in s
-    let mentions_file = Regex::new(r"`[^`]+\.[A-Za-z]{1,4}`")
-        .unwrap()
-        .is_match(summary)
-        || s.contains(".py");
+    let mentions_file = mentions_file_re().is_match(summary) || s.contains(".py");
     claims_work && mentions_file
 }
 

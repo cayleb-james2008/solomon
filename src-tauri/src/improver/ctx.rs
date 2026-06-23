@@ -13,6 +13,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use chrono::Utc;
 
@@ -92,24 +93,30 @@ fn phase_default(phase: &str) -> Option<(&'static str, bool)> {
 }
 
 /// run_improver._SECRET_TOKEN_PATTERNS — secret-shaped strings scrubbed from agent free-text before
-/// it reaches a commit / PR body / history.jsonl / log. Compiled once per `redact` call (no global
-/// regex cache needed; redaction is off the hot path).
-fn secret_token_patterns() -> Vec<regex::Regex> {
-    vec![
-        regex::Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b").unwrap(), // GitHub PAT/OAuth/server/refresh
-        regex::Regex::new(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b").unwrap(), // fine-grained PAT
-        regex::Regex::new(r"\bsk-[A-Za-z0-9_-]{20,}\b").unwrap(),      // OpenAI/Anthropic-style keys
-        regex::Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{20,}").unwrap(), // Authorization: Bearer <tok>
-    ]
+/// it reaches a commit / PR body / history.jsonl / log. Compiled once (process-global cache).
+fn secret_token_patterns() -> &'static [regex::Regex] {
+    static PATS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
+    PATS.get_or_init(|| {
+        vec![
+            regex::Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b").unwrap(), // GitHub PAT/OAuth/server/refresh
+            regex::Regex::new(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b").unwrap(), // fine-grained PAT
+            regex::Regex::new(r"\bsk-[A-Za-z0-9_-]{20,}\b").unwrap(),      // OpenAI/Anthropic-style keys
+            regex::Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{20,}").unwrap(), // Authorization: Bearer <tok>
+        ]
+    })
 }
 
 /// run_improver._SECRET_KEYVAL_PATTERN — NAME<sep>value where NAME looks like a credential and value
 /// is secret-length. Captures the separator (group 2) so legitimate text is not punctuation-rewritten.
-fn secret_keyval_pattern() -> regex::Regex {
-    regex::Regex::new(
-        r"(?i)\b([A-Za-z0-9_]*(?:API_?KEY|ACCESS_TOKEN|AUTH_TOKEN|SECRET|PASSWORD|TOKEN))\b(\s*[=:]\s*)([A-Za-z0-9_\-\.]{8,})",
-    )
-    .unwrap()
+/// Compiled once (process-global cache).
+fn secret_keyval_pattern() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)\b([A-Za-z0-9_]*(?:API_?KEY|ACCESS_TOKEN|AUTH_TOKEN|SECRET|PASSWORD|TOKEN))\b(\s*[=:]\s*)([A-Za-z0-9_\-\.]{8,})",
+        )
+        .unwrap()
+    })
 }
 
 /// run_improver._ENV_KEYS — provider API keys (+ OLLAMA_BASE_URL) loaded from Solomon/.env.
