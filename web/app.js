@@ -171,13 +171,24 @@ function activityPanel(body, spec) {
   const pre = h("div", "log", "(loading…)");
   function fillRepos() {
     sel.innerHTML = ""; state.repos.forEach(r => { const o = h("option"); o.value = r.name; o.textContent = r.name; if (r.name === spec.repo) o.selected = true; sel.appendChild(o); });
-    if (!spec.repo && state.repos[0]) { spec.repo = state.repos[0].name; sel.value = spec.repo; saveLayout(); }
+    // reset spec.repo to a LIVE repo when it is unset OR names a repo that has been removed/renamed,
+    // so it stays in sync with what the <select> actually displays (a stale name -> permanently blank log).
+    if (state.repos.length && !state.repos.some(r => r.name === spec.repo)) { spec.repo = state.repos[0].name; sel.value = spec.repo; saveLayout(); }
   }
   sel.onchange = () => { spec.repo = sel.value; saveLayout(); refreshLog(); };
   head.append(h("span", "muted", "Repo"), sel);
   body.append(head, pre);
   fillRepos(); refreshLog();
-  return { update() { fillRepos(); refreshLog(); } };
+  // Rebuild the <select> only when the repo set changes AND the dropdown isn't focused — an
+  // unconditional 4s rebuild clobbers an open/keyboard-navigated dropdown. (name-set cache mirrors
+  // the loops panel's update(); the activeElement focus-guard mirrors loopRow's setSel.) refreshLog
+  // still runs every tick.
+  let names = state.repos.map(r => r.name).join();
+  return { update() {
+    const n = state.repos.map(r => r.name).join();
+    if (n !== names && document.activeElement !== sel) { names = n; fillRepos(); }
+    refreshLog();
+  } };
 }
 
 /* ---------- panel: approvals / PRs ---------- */

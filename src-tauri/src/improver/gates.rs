@@ -806,22 +806,41 @@ fn run_command_timed(mut cmd: Command, timeout: Option<Duration>) -> std::io::Re
         }
         Some(d) => {
             use wait_timeout::ChildExt;
+            // Drain stdout/stderr on reader threads BEFORE waiting (same fix as proc::run): a verbose
+            // gate (`cargo test`, a chatty pytest/`npm test`, or any GATE_CMD) that fills the ~64KB OS
+            // pipe buffer would otherwise block-on-write, never exit, and burn the full GATE_TIMEOUT —
+            // a GREEN suite misreported as a timed-out RED gate, auto-reverting a correct change.
             let mut child = cmd.spawn()?;
+            let out_h = child.stdout.take().map(|mut s| {
+                std::thread::spawn(move || {
+                    let mut buf = String::new();
+                    let _ = s.read_to_string(&mut buf);
+                    buf
+                })
+            });
+            let err_h = child.stderr.take().map(|mut s| {
+                std::thread::spawn(move || {
+                    let mut buf = String::new();
+                    let _ = s.read_to_string(&mut buf);
+                    buf
+                })
+            });
+            let join = |h: Option<std::thread::JoinHandle<String>>| -> String {
+                h.and_then(|h| h.join().ok()).unwrap_or_default()
+            };
             match child.wait_timeout(d)? {
-                Some(status) => {
-                    let mut out = String::new();
-                    let mut err = String::new();
-                    if let Some(mut s) = child.stdout.take() {
-                        let _ = s.read_to_string(&mut out);
-                    }
-                    if let Some(mut s) = child.stderr.take() {
-                        let _ = s.read_to_string(&mut err);
-                    }
-                    Ok(proc::RunOut { code: status.code().unwrap_or(-1), stdout: out, stderr: err })
-                }
+                Some(status) => Ok(proc::RunOut {
+                    code: status.code().unwrap_or(-1),
+                    stdout: join(out_h),
+                    stderr: join(err_h),
+                }),
                 None => {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // detach the readers (don't join): a surviving grandchild holding the write handle
+                    // could keep the pipe open and hang the join — return promptly. See proc::run.
+                    drop(out_h);
+                    drop(err_h);
                     Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "subprocess timed out"))
                 }
             }

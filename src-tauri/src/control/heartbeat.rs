@@ -139,9 +139,11 @@ pub fn metrics(repo: &Value) -> Value {
                 // Python: `tests.get("passed") is not None` — present AND not JSON null.
                 let passed = tests.get("passed");
                 if passed.is_some() && passed != Some(&Value::Null) {
-                    // `tests.get("passed") or 0` / `tests.get("failed") or 0`: falsy (0/null/missing) -> 0.
-                    let p = json_truthy_int(tests.get("passed"));
-                    let f = json_truthy_int(tests.get("failed"));
+                    // `tests.get("passed") or 0` / `tests.get("failed") or 0`: keep a TRUTHY value
+                    // VERBATIM (incl. a float 7.5, a string "7", or a negative int — the spec forbids
+                    // i64-coercion); only a falsy value (0/0.0/null/missing/""/[]/{}/false) becomes 0.
+                    let p = or_zero(tests.get("passed"));
+                    let f = or_zero(tests.get("failed"));
                     tests_series.push(json!({
                         "ts": rec.get("ts").cloned().unwrap_or(Value::Null),
                         "passed": p,
@@ -231,13 +233,24 @@ fn splitlines(s: &str) -> Vec<&str> {
     out
 }
 
-/// Python `value or 0` for the metrics test counts: a JSON int that is non-zero -> itself; 0, null,
-/// missing, or any non-int -> 0. (Real heartbeats carry integer test counts; this matches the
-/// `tests.get("passed") or 0` coercion exactly for the int/null/falsy cases.)
-fn json_truthy_int(v: Option<&Value>) -> i64 {
-    match v.and_then(Value::as_i64) {
-        Some(n) => n, // 0 stays 0; `0 or 0` is still 0
-        None => 0,
+/// Python `value or 0` for the metrics test counts: keep the JSON value VERBATIM when truthy, falling
+/// back to 0 only on a falsy value. control-port-spec.json's metrics edge_cases mandates that non-int
+/// counts round-trip unchanged — a string "7", a float 7.5, or a negative int -5 must NOT be
+/// i64-coerced (it explicitly flags that as a Rust typing trap); only 0/0.0/null/missing/""/[]/{}/false
+/// collapse to 0.
+fn or_zero(v: Option<&Value>) -> Value {
+    let truthy = match v {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(Value::Object(o)) => !o.is_empty(),
+    };
+    if truthy {
+        v.cloned().unwrap_or_else(|| json!(0))
+    } else {
+        json!(0)
     }
 }
 
@@ -463,6 +476,12 @@ mod tests {
         assert_eq!(m["noop"], 1);
         assert_eq!(m["tests_series"], json!([{"ts":1,"passed":0,"failed":0}]));
         assert_eq!(m["success_rate"], json!(0.0));
+
+        // spec fidelity: a TRUTHY non-int test count round-trips VERBATIM (NOT i64-coerced) — a string
+        // "7" and a float 7.5 are kept as-is; only a falsy value collapses to 0 (per control-port-spec).
+        std::fs::write(&hf, "{\"status\":\"noop\",\"tests\":{\"passed\":\"7\",\"failed\":7.5},\"ts\":1}\n").unwrap();
+        let m = metrics(&repo);
+        assert_eq!(m["tests_series"], json!([{"ts":1,"passed":"7","failed":7.5}]));
 
         // tests passed=null NOT appended
         std::fs::write(&hf, "{\"status\":\"noop\",\"tests\":{\"failed\":3}}\n").unwrap();
