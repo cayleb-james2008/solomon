@@ -6,6 +6,7 @@ use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -151,22 +152,26 @@ pub fn atomic_write_json(path: &Path, value: &serde_json::Value) -> std::io::Res
     std::fs::rename(&tmp, path)
 }
 
-/// control._which_git: shutil.which("git").
+/// control._which_git: shutil.which("git"). Memoized: the resolved path is stable for the process
+/// lifetime, but get_state probes it several times per repo every 4s — a PATH scan per call is wasted
+/// filesystem work. ponytail: cached for the process; a git installed AFTER launch isn't picked up
+/// (restart to re-detect) — a non-issue for a desktop orchestrator.
 pub fn which_git() -> Option<PathBuf> {
-    which::which("git").ok()
+    static GIT: OnceLock<Option<PathBuf>> = OnceLock::new();
+    GIT.get_or_init(|| which::which("git").ok()).clone()
 }
 
-/// control._which_gh: shutil.which("gh") or the GitHub CLI default install path if present.
+/// control._which_gh: shutil.which("gh") or the GitHub CLI default install path if present. Memoized
+/// for the same reason as which_git (see its note).
 pub fn which_gh() -> Option<PathBuf> {
-    if let Ok(p) = which::which("gh") {
-        return Some(p);
-    }
-    let fb = Path::new(GH_FALLBACK);
-    if fb.exists() {
-        Some(fb.to_path_buf())
-    } else {
-        None
-    }
+    static GH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    GH.get_or_init(|| {
+        which::which("gh").ok().or_else(|| {
+            let fb = Path::new(GH_FALLBACK);
+            fb.exists().then(|| fb.to_path_buf())
+        })
+    })
+    .clone()
 }
 
 #[cfg(test)]

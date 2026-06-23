@@ -282,10 +282,12 @@ const STOPWORDS: &[&str] = &[
 /// run_improver._tokenize (~3051-3054): lowercase `[a-z0-9]+` word tokens, dropping stopwords and
 /// tokens of length <= 2 — the unit of similarity.
 fn tokenize(text: &str) -> std::collections::HashSet<String> {
+    // r"[a-z0-9]+" over a lowercased string == maximal runs of ascii-alphanumerics; stdlib split gives
+    // the same tokens with no regex compile (this runs per corpus item inside is_novel's O(N) loop).
     let lower = text.to_lowercase();
-    let re = Regex::new(r"[a-z0-9]+").unwrap();
-    re.find_iter(&lower)
-        .map(|m| m.as_str().to_string())
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .map(str::to_string)
         .filter(|w| w.chars().count() > 2 && !STOPWORDS.contains(&w.as_str()))
         .collect()
 }

@@ -27,6 +27,7 @@ use crate::improver::ctx::{self, Ctx};
 use crate::improver::{backlog, escalation, gates, gitops, phases, pi, ship, visual};
 
 use regex::Regex;
+use std::sync::OnceLock;
 use std::collections::HashSet;
 
 /// The `limit` argument the source's `_note_noop`/`_note_deviation`/`_note_revert` default to (3).
@@ -427,8 +428,9 @@ set a goal in Config so the loop has an objective (it will not fabricate work)."
 
     // CRASH-NOT-NOOP: an extension/startup load failure is the AGENT being unrunnable, not a no-op.
     let stderr = p.stderr.clone();
-    let load_fail = Regex::new(r"Failed to load extension|Cannot find module")
-        .unwrap()
+    static LOAD_FAIL_RE: OnceLock<Regex> = OnceLock::new();
+    let load_fail = LOAD_FAIL_RE
+        .get_or_init(|| Regex::new(r"Failed to load extension|Cannot find module").unwrap())
         .is_match(&stderr);
     if p.code != 0 && p.stdout.trim().is_empty() && load_fail {
         // why = _redact((p.stderr or "").strip())[-300:]
@@ -983,11 +985,15 @@ fn ideate_research_enabled(ctx: &Ctx, name: &str) -> bool {
 /// back to plain idea lines (tier=feature, leverage=3) with noise guards. Pure.
 fn parse_ideas(text: &str) -> Vec<(i64, String, String)> {
     let strict = strict_idea_re();
-    let plain_strip = Regex::new(r"^[\s\-*•·\d.)>]+").unwrap();
-    let meta_re = Regex::new(
-        r"(?i)^(idea lines|here|below|based on|i|no|note|first|second|third|next|the following|these|this (is|repo|project)|propose)\b",
-    )
-    .unwrap();
+    static PLAIN_STRIP: OnceLock<Regex> = OnceLock::new();
+    let plain_strip = PLAIN_STRIP.get_or_init(|| Regex::new(r"^[\s\-*•·\d.)>]+").unwrap());
+    static META_RE: OnceLock<Regex> = OnceLock::new();
+    let meta_re = META_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)^(idea lines|here|below|based on|i|no|note|first|second|third|next|the following|these|this (is|repo|project)|propose)\b",
+        )
+        .unwrap()
+    });
 
     let mut tiered: Vec<(i64, String, String)> = Vec::new();
     let mut plain: Vec<(i64, String, String)> = Vec::new();
@@ -1031,13 +1037,16 @@ fn parse_ideas(text: &str) -> Vec<(i64, String, String)> {
 /// The strict tier-line regex of _parse_ideas (~3138-3139), `re.I`, anchored at the start:
 /// optional bullet/number/markdown, then a `(feature|refactor|architecture)` tag (chore excluded),
 /// an optional leverage int, then the idea body. Groups: 1=tier, 2=leverage(optional), 3=idea.
-fn strict_idea_re() -> Regex {
-    regex::RegexBuilder::new(
-        r"^[\s\-*\d.)#>]*\**\[?\s*(feature|refactor|architecture)\s*\]?\**\s*[|:\-–—]*\s*(\d+)?\s*[|:\-–—]*\s*(.+?)\s*$",
-    )
-    .case_insensitive(true)
-    .build()
-    .expect("strict idea regex compiles")
+fn strict_idea_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::RegexBuilder::new(
+            r"^[\s\-*\d.)#>]*\**\[?\s*(feature|refactor|architecture)\s*\]?\**\s*[|:\-–—]*\s*(\d+)?\s*[|:\-–—]*\s*(.+?)\s*$",
+        )
+        .case_insensitive(true)
+        .build()
+        .expect("strict idea regex compiles")
+    })
 }
 
 /// run_improver._recent_history_summaries (~3101-3120): the last `limit` history.jsonl iteration
@@ -1152,10 +1161,12 @@ const STOPWORDS: &[&str] = &[
 
 /// run_improver._tokenize (~3051-3054): lowercase `[a-z0-9]+` tokens, dropping stopwords + len<=2.
 fn tokenize(text: &str) -> HashSet<String> {
+    // r"[a-z0-9]+" over a lowercased string == maximal runs of ascii-alphanumerics; stdlib split gives
+    // the same tokens with no regex compile (this runs per corpus item inside is_novel's O(N) loop).
     let lower = text.to_lowercase();
-    let re = Regex::new(r"[a-z0-9]+").unwrap();
-    re.find_iter(&lower)
-        .map(|m| m.as_str().to_string())
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .map(str::to_string)
         .filter(|w| w.chars().count() > 2 && !STOPWORDS.contains(&w.as_str()))
         .collect()
 }
