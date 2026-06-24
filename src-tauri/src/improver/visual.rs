@@ -563,10 +563,20 @@ fn spawn_pi(ctx: &Ctx, args: &[String], vision_model: &str, timeout: Duration) -
         Err(_) => return None, // OSError (pi not executable) → caller continues
     };
 
-    // Drain stderr on a thread; read stdout after the timed wait. (pi can emit a large JSONL stream.)
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    let stderr_handle = stderr_pipe.take().map(|mut s| {
+    // Drain BOTH pipes on dedicated threads so a full stdout buffer can't block pi before it exits.
+    // pi --mode json streams a large JSONL event stream; reading stdout only AFTER wait_timeout
+    // deadlocked — pi blocks on write() once the ~64KB OS pipe fills, never exits, the wait burns the
+    // whole timeout, and the mandatory visual gate is falsely reported SKIPPED ("no output"). Join on
+    // clean exit; on timeout/err detach the readers (plain kill may leave a node grandchild holding
+    // the pipe, so a join could hang) — None is returned with no output in that case anyway.
+    let stdout_handle = child.stdout.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut s| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = s.read_to_end(&mut buf);
@@ -576,27 +586,17 @@ fn spawn_pi(ctx: &Ctx, args: &[String], vision_model: &str, timeout: Duration) -
     use wait_timeout::ChildExt;
     match child.wait_timeout(timeout) {
         Ok(Some(_status)) => {}
-        Ok(None) => {
-            // TimeoutExpired
+        Ok(None) | Err(_) => {
             let _ = child.kill();
             let _ = child.wait();
-            if let Some(h) = stderr_handle {
-                let _ = h.join();
-            }
-            return None;
-        }
-        Err(_) => {
-            if let Some(h) = stderr_handle {
-                let _ = h.join();
-            }
+            drop(stdout_handle);
+            drop(stderr_handle);
             return None;
         }
     }
 
-    let mut out = Vec::new();
-    if let Some(mut s) = stdout_pipe.take() {
-        let _ = s.read_to_end(&mut out);
-    }
+    // Normal exit: write ends are closed, so the readers have finished; join for the full output.
+    let out = stdout_handle.and_then(|h| h.join().ok()).unwrap_or_default();
     if let Some(h) = stderr_handle {
         let _ = h.join();
     }
@@ -1160,9 +1160,18 @@ fn run_browser_cli(args: &[String], cwd: &Path, timeout: Duration) -> Option<(i3
     apply_hidden(&mut cmd);
 
     let mut child = cmd.spawn().ok()?;
-    let mut stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let stderr_handle = stderr_pipe.map(|mut s| {
+    // Drain BOTH pipes on dedicated threads. Reading stdout only AFTER wait_timeout deadlocked: a
+    // large `snapshot` a11y-tree JSON overflows the OS pipe buffer, the child blocks on write() and
+    // never exits, the wait times out, and agent-browser is falsely reported unavailable. Join on a
+    // clean exit; on timeout/err detach (plain kill may leave the pipe held) — None is returned anyway.
+    let stdout_handle = child.stdout.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut s| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = s.read_to_end(&mut buf);
@@ -1173,28 +1182,16 @@ fn run_browser_cli(args: &[String], cwd: &Path, timeout: Duration) -> Option<(i3
     use wait_timeout::ChildExt;
     let code = match child.wait_timeout(timeout) {
         Ok(Some(status)) => status.code().unwrap_or(-1),
-        Ok(None) => {
+        Ok(None) | Err(_) => {
             let _ = child.kill();
             let _ = child.wait();
-            if let Some(h) = stderr_handle {
-                let _ = h.join();
-            }
-            return None;
-        }
-        Err(_) => {
-            if let Some(h) = stderr_handle {
-                let _ = h.join();
-            }
+            drop(stdout_handle);
+            drop(stderr_handle);
             return None;
         }
     };
-    let mut out = Vec::new();
-    if let Some(mut s) = stdout_pipe.take() {
-        let _ = s.read_to_end(&mut out);
-    }
-    let err = stderr_handle
-        .map(|h| h.join().unwrap_or_default())
-        .unwrap_or_default();
+    let out = stdout_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    let err = stderr_handle.and_then(|h| h.join().ok()).unwrap_or_default();
     Some((
         code,
         String::from_utf8_lossy(&out).into_owned(),

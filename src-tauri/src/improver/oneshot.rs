@@ -128,16 +128,29 @@ fn run_with_timeout(mut cmd: Command, dur: Duration) -> std::io::Result<RunCaptu
     use std::io::Read;
     use wait_timeout::ChildExt;
     let mut child = cmd.spawn()?;
+    // Drain BOTH pipes on dedicated threads CONCURRENTLY with the wait. Reading them only AFTER
+    // wait_timeout deadlocks if the smoke child writes more than the ~64KB OS pipe buffer before it
+    // exits (it blocks on write(), never exits, and the wait spuriously times out -> false SMOKE
+    // FAIL). Mirrors control::proc::run. Join on clean exit; detach on timeout (plain kill may leave a
+    // grandchild holding the pipe, so a join could hang) — Err(TimedOut) is returned with no output anyway.
+    let out_h = child.stdout.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let err_h = child.stderr.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    });
     match child.wait_timeout(dur)? {
         Some(_status) => {
-            let mut out = Vec::new();
-            let mut err = Vec::new();
-            if let Some(mut s) = child.stdout.take() {
-                let _ = s.read_to_end(&mut out);
-            }
-            if let Some(mut s) = child.stderr.take() {
-                let _ = s.read_to_end(&mut err);
-            }
+            let out = out_h.and_then(|h| h.join().ok()).unwrap_or_default();
+            let err = err_h.and_then(|h| h.join().ok()).unwrap_or_default();
             Ok(RunCapture {
                 stdout: String::from_utf8_lossy(&out).into_owned(),
                 stderr: String::from_utf8_lossy(&err).into_owned(),
@@ -146,6 +159,8 @@ fn run_with_timeout(mut cmd: Command, dur: Duration) -> std::io::Result<RunCaptu
         None => {
             let _ = child.kill();
             let _ = child.wait();
+            drop(out_h);
+            drop(err_h);
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "subprocess timed out",
@@ -624,6 +639,31 @@ pub fn ideate(ctx: &mut Ctx) -> i32 {
         json!({"ok": true, "added": new_lines.len(), "top": top})
     );
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Concurrent-drain regression for the wait-then-read deadlock class (also fixed in pi::run_pi,
+    // visual::spawn_pi, visual::run_browser_cli): a child that floods stdout past the OS pipe buffer
+    // must be captured IN FULL without spuriously timing out. Pre-fix this returned Err(TimedOut)
+    // (and lost the output) because the child blocked on write() while we sat in wait_timeout.
+    #[cfg(windows)]
+    #[test]
+    fn run_with_timeout_drains_large_output_without_deadlock() {
+        use std::process::Stdio;
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/c", "for /L %i in (1,1,8000) do @echo XXXXXXXXXXXXXXXXXXXXXXXXXX"]);
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let out = run_with_timeout(cmd, Duration::from_secs(30))
+            .expect("must capture large output, not time out");
+        assert!(
+            out.stdout.len() > 100_000,
+            "expected the full large stdout, got {} bytes",
+            out.stdout.len()
+        );
+    }
 }
 
 // --------------------------------------------------------------------------- #

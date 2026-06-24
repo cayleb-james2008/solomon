@@ -406,9 +406,11 @@ set a goal in Config so the loop has an objective (it will not fabricate work)."
     let p = pi::run_pi(ctx, &task, implement_timeout, system_md.as_deref());
     // pi::run_pi never panics: a timeout returns rc=124, a spawn failure rc<0 with empty stdout.
     // The Python TimeoutExpired -> _drop_branch(noop, "Pi session timed out.") path is reproduced
-    // by detecting the rc=124 timeout marker; any other nonzero+empty would be the generic Exception
-    // path -> _drop_branch(error, ...). A normal (rc=0) run proceeds.
-    if p.code == 124 && p.stdout.trim().is_empty() {
+    // by detecting the rc=124 timeout marker ALONE (run_pi sets 124 only on a timeout, and pi streams
+    // a partial JSONL stdout before the kill, so a real timeout almost always has non-empty stdout —
+    // gating an extra `&& stdout.is_empty()` here let timed-out, half-finished work fall through to
+    // the gate/ship path). Any other nonzero+empty is the generic Exception path (handled below).
+    if p.code == 124 {
         ctx.log("Pi session timed out");
         gitops::drop_branch(ctx, &branch, "noop", "Pi session timed out.", "sleeping");
         return;
