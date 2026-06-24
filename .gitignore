@@ -27,3 +27,5 @@ web/assets/_exe_icon_verify.png
 
 # Rust build output (the exe is built from src-tauri/ and shipped via the release workflow)
 /Solomon.exe
+# transient backup when overwriting a locked (running) Solomon.exe — rename-aside then copy
+/Solomon.exe.old
