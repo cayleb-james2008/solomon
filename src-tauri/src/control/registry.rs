@@ -800,14 +800,29 @@ fn normpath(p: &str) -> String {
     }
 }
 
-// Split a leading drive letter (C:) on Windows-style paths.
+// Split a leading drive letter (C:) OR a UNC root (\\server\share) on Windows-style paths (`p` is in
+// unified forward-slash form). Mirrors ntpath.splitdrive: without the UNC branch the two leading
+// separators collapse to one in normpath, mangling \\server\share\proj into \server\share\proj so a
+// UNC-hosted project path no longer resolves.
 fn split_drive(p: &str) -> (String, &str) {
     let b = p.as_bytes();
+    // Drive letter "C:".
     if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
-        (p[..2].to_string(), &p[2..])
-    } else {
-        (String::new(), p)
+        return (p[..2].to_string(), &p[2..]);
     }
+    // UNC root "//server/share": exactly two leading separators, then a non-empty server AND share.
+    if b.len() > 2 && b[0] == b'/' && b[1] == b'/' && b[2] != b'/' {
+        if let Some(rel_sep) = p[2..].find('/') {
+            let server_end = 2 + rel_sep; // index of the '/' after the server component
+            let share_rel = &p[server_end + 1..]; // "share" or "share/rest..."
+            let share_len = share_rel.find('/').unwrap_or(share_rel.len());
+            if share_len > 0 {
+                let drive_end = server_end + 1 + share_len; // end of "//server/share"
+                return (p[..drive_end].to_string(), &p[drive_end..]);
+            }
+        }
+    }
+    (String::new(), p)
 }
 
 #[cfg(test)]
@@ -1055,5 +1070,23 @@ mod tests {
             parse_repo_spec("https://github.com/acme/widget.git"),
             Some(("acme".to_string(), "widget".to_string()))
         );
+    }
+
+    #[test]
+    fn normpath_preserves_unc_root() {
+        // Regression: a UNC \\server\share path must keep its double-leading separator (ntpath parity),
+        // not collapse to a single one (which made connect_project reject UNC-hosted projects).
+        let sep = if cfg!(windows) { "\\" } else { "/" };
+        let unc = |segs: &[&str]| format!("{0}{0}{1}", sep, segs.join(sep));
+        assert_eq!(normpath("\\\\server\\share\\proj"), unc(&["server", "share", "proj"]));
+        assert_eq!(normpath("//server/share/proj"), unc(&["server", "share", "proj"]));
+        // .. inside a UNC path resolves lexically while the \\server\share root is retained.
+        assert_eq!(normpath("//server/share/a/../b"), unc(&["server", "share", "b"]));
+        // split_drive recognizes the UNC root and a drive letter; other rooted/relative paths unaffected.
+        assert_eq!(split_drive("//server/share/proj"), ("//server/share".to_string(), "/proj"));
+        assert_eq!(split_drive("C:/x"), ("C:".to_string(), "/x"));
+        assert_eq!(split_drive("/just/rooted"), (String::new(), "/just/rooted"));
+        // a lone //server with no share component is NOT a drive (ntpath returns no drive).
+        assert_eq!(split_drive("//server"), (String::new(), "//server"));
     }
 }

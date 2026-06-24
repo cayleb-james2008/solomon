@@ -417,12 +417,19 @@ set this repo's PR-target branch to a real branch in Config."
         }
     }
 
-    // finally: HALT or dirty_base_persistent self-stop keep their error heartbeat; a deliberate exit
-    // reports 'stopped'; a crash (clean_exit==false) reports error/crashed so the watchdog restarts.
-    let dbp_self_stop = ctx.hb.get("status").and_then(Value::as_str) == Some("error")
-        && ctx.hb.get("reason").and_then(Value::as_str) == Some("dirty_base_persistent");
-    if ctx.halted || dbp_self_stop {
-        // keep the error/reverted (or dirty_base_persistent) heartbeat untouched
+    // finally: HALT or a PERSISTENT self-stop keep their error heartbeat + STOP sentinel; a deliberate
+    // exit reports 'stopped'; a crash (clean_exit==false) reports error/crashed so the watchdog
+    // restarts. All three persistent preflight self-stops (dirty/unpushed-base/base-gate-red) wrote an
+    // operator-action error heartbeat + pinned a STOP; overwriting them with 'stopped' and deleting
+    // the sentinel would erase the diagnostic supervisor.diagnose() surfaces and un-pin the loop —
+    // previously only dirty_base_persistent was exempted, silently clobbering the other two.
+    let persistent_self_stop = ctx.hb.get("status").and_then(Value::as_str) == Some("error")
+        && matches!(
+            ctx.hb.get("reason").and_then(Value::as_str),
+            Some("dirty_base_persistent" | "unpushed_base_persistent" | "base_gate_red_persistent")
+        );
+    if ctx.halted || persistent_self_stop {
+        // keep the error/reverted (or persistent self-stop) heartbeat untouched
     } else if clean_exit {
         ctx.heartbeat(json!({"status": "stopped", "phase": Value::Null}));
     } else {
@@ -433,7 +440,7 @@ set this repo's PR-target branch to a real branch in Config."
         }));
     }
     release_lock(&ctx);
-    if !dbp_self_stop {
+    if !persistent_self_stop {
         let _ = std::fs::remove_file(&ctx.stop_path);
     }
     0

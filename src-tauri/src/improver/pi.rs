@@ -255,25 +255,51 @@ pub fn run_pi(ctx: &mut Ctx, task: &str, timeout: i64, system_md: Option<&Path>)
     let pid = child.id();
 
     // ---- communicate(timeout) ---------------------------------------------- #
+    // Drain BOTH pipes on dedicated threads CONCURRENTLY with the wait. Reading stdout only AFTER
+    // wait_timeout (the old post-exit drain()) deadlocked: pi --print --mode json streams a large
+    // JSONL event stream, and once it fills the ~64KB OS pipe buffer pi blocks on write() and never
+    // exits — so wait_timeout burned the whole timeout and returned a spurious rc=124 with truncated
+    // output on essentially every real implement run. Mirrors control::proc::run + CPython
+    // communicate() (both read the pipes concurrently). UTF-8 lossy == errors="replace".
+    use std::io::Read;
     use wait_timeout::ChildExt;
+    let out_h = child.stdout.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    });
+    let err_h = child.stderr.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    });
+    let join = |h: Option<std::thread::JoinHandle<String>>| -> String {
+        h.and_then(|h| h.join().ok()).unwrap_or_default()
+    };
     let dur = std::time::Duration::from_secs(timeout.max(0) as u64);
     match child.wait_timeout(dur) {
         Ok(Some(status)) => {
-            // Normal exit: drain both pipes (utf-8 lossy == errors="replace").
-            let (out, err) = drain(&mut child);
+            // Normal exit: the write ends are closed, so the readers finish; join for full output.
             RunOut {
                 code: status.code().unwrap_or(-1),
-                stdout: out,
-                stderr: err,
+                stdout: join(out_h),
+                stderr: join(err_h),
             }
         }
         Ok(None) => {
-            // TimeoutExpired: kill the whole tree, then a 20s grace communicate, then surface.
+            // TimeoutExpired: kill the whole tree (taskkill /T closes pi's AND the node grandchild's
+            // write ends, so the reader threads unblock and the joins below cannot hang), a 20s grace,
+            // then join the readers for the partial streams.
             kill_tree(pid);
             let dur20 = std::time::Duration::from_secs(20);
-            let _ = child.wait_timeout(dur20); // proc.communicate(timeout=20) — out/err drained below
+            let _ = child.wait_timeout(dur20); // proc.communicate(timeout=20)
             let _ = child.kill(); // ensure reaped even if the 20s grace also expired
-            let (out, err) = drain(&mut child);
+            let out = join(out_h);
+            let err = join(err_h);
             // raise subprocess.TimeoutExpired(args, timeout, output=out, stderr=err) — surfaced as a
             // rc=124 failed RunOut carrying the partial streams + the timed-out marker (see fn doc).
             let argv0 = args
@@ -292,11 +318,17 @@ pub fn run_pi(ctx: &mut Ctx, task: &str, timeout: i64, system_md: Option<&Path>)
                 stderr,
             }
         }
-        Err(e) => RunOut {
-            code: -1,
-            stdout: String::new(),
-            stderr: e.to_string(),
-        },
+        Err(e) => {
+            // wait itself errored (unusual): kill and DETACH the readers (don't risk a join hang).
+            let _ = child.kill();
+            drop(out_h);
+            drop(err_h);
+            RunOut {
+                code: -1,
+                stdout: String::new(),
+                stderr: e.to_string(),
+            }
+        }
     }
 }
 
@@ -309,26 +341,6 @@ fn apply_spawn_flags(cmd: &mut Command) {
 }
 #[cfg(not(windows))]
 fn apply_spawn_flags(_cmd: &mut Command) {}
-
-/// Drain a child's stdout+stderr to String with UTF-8 lossy decode (errors="replace"). Mirrors
-/// Popen(text=True, encoding="utf-8", errors="replace").communicate() after the process has been
-/// waited on.
-fn drain(child: &mut std::process::Child) -> (String, String) {
-    use std::io::Read;
-    let mut out = String::new();
-    let mut err = String::new();
-    if let Some(mut s) = child.stdout.take() {
-        let mut buf = Vec::new();
-        let _ = s.read_to_end(&mut buf);
-        out = String::from_utf8_lossy(&buf).into_owned();
-    }
-    if let Some(mut s) = child.stderr.take() {
-        let mut buf = Vec::new();
-        let _ = s.read_to_end(&mut buf);
-        err = String::from_utf8_lossy(&buf).into_owned();
-    }
-    (out, err)
-}
 
 // --------------------------------------------------------------------------- #
 // final_text
