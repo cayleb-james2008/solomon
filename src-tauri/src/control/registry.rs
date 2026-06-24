@@ -699,6 +699,12 @@ fn expandvars(s: &str) -> String {
         let c = bytes[i];
         if c == '%' {
             if let Some(end) = bytes[i + 1..].iter().position(|&ch| ch == '%') {
+                // ntpath.expandvars collapses an escaped `%%` (empty var name) to a single `%`.
+                if end == 0 {
+                    out.push('%');
+                    i += 2;
+                    continue;
+                }
                 let name: String = bytes[i + 1..i + 1 + end].iter().collect();
                 if let Ok(v) = std::env::var(&name) {
                     out.push_str(&v);
@@ -1088,5 +1094,19 @@ mod tests {
         assert_eq!(split_drive("/just/rooted"), (String::new(), "/just/rooted"));
         // a lone //server with no share component is NOT a drive (ntpath returns no drive).
         assert_eq!(split_drive("//server"), (String::new(), "//server"));
+    }
+
+    #[test]
+    fn expandvars_collapses_escaped_percent() {
+        // ntpath.expandvars parity: an escaped `%%` collapses to a single `%`.
+        assert_eq!(expandvars("a%%b"), "a%b");
+        assert_eq!(expandvars("%%"), "%");
+        assert_eq!(expandvars("100%%done"), "100%done");
+        assert_eq!(expandvars("%%FOO%%"), "%FOO%");
+        // an unknown %VAR% (non-empty name) is still left intact.
+        assert_eq!(
+            expandvars("%DEFINITELY_UNSET_VAR_XYZ%"),
+            "%DEFINITELY_UNSET_VAR_XYZ%"
+        );
     }
 }
