@@ -78,7 +78,10 @@ async fn apply_update(app: &tauri::AppHandle) -> Value {
             }
             Err(e) => json!({"ok": false, "error": e.to_string()}),
         },
-        Ok(None) => json!({"ok": true, "available": false}),
+        // Release vanished between the boot-time check and this click (yanked/re-tagged, or a transient
+        // backend hiccup). Return ok:false so the dashboard's `if (r.ok === false)` handler shows
+        // "update failed" instead of leaving the pill frozen on "updating…" with no feedback.
+        Ok(None) => json!({"ok": false, "available": false, "error": "update no longer available"}),
         Err(e) => json!({"ok": false, "error": e.to_string()}),
     }
 }

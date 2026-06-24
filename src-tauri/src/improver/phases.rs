@@ -68,12 +68,19 @@ and read the changed files. Judge per review.md, then end with EXACTLY one line:
     );
 
     // _phase_run_pi("review", task, system_md=REVIEW_MD, timeout=600). In Python a spawn/timeout
-    // failure raises and the `except Exception` branch logs "review/judge: error (...) — fail-open,
-    // not blocking" and returns "skip". phase_run_pi here returns proc::RunOut directly (timeouts
-    // map to rc=124 RunOut, not a panic), so that error branch is structurally unreachable — but the
-    // verdict-parse fail-open below preserves the same observable "skip" outcome.
+    // failure raises and the `except Exception` branch logs "review/judge: ... — fail-open" and returns
+    // "skip". phase_run_pi here returns a RunOut (a timeout maps to rc=124, not a panic), so the
+    // timeout fail-open must be done EXPLICITLY: run_pi drains the WHOLE partial stream before the kill,
+    // so a reviewer that streamed a complete "REVIEW: reject" and THEN hung on teardown would otherwise
+    // parse as a real reject and REVERT gate-green, verified work. Honor rc==124 as "skip" BEFORE
+    // parsing (the same timeout marker iteration.rs trusts); a flaky/slow reviewer must never discard
+    // shipped work. The no-verdict fail-open below covers the rest.
     let review_md = ctx.review_md.clone();
     let p = pi::phase_run_pi(ctx, "review", &task, Some(review_md.as_path()), 600);
+    if p.code == 124 {
+        ctx.log("review/judge: pi timed out — fail-open, not blocking ship");
+        return "skip".to_string();
+    }
     let text = pi::final_text(&p.stdout);
 
     let re = review_re();

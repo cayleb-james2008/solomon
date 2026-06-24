@@ -130,6 +130,7 @@ function loopRow(r) {
     const running = (repoByName(r.name) || r).running;
     const x = await act(running ? "stop" : "start", r.name);
     toast(x && x.ok ? `${r.name}: ${running ? "stopping" : "starting"}…` : `${(x && x.error) || "failed"}`, x && x.ok ? "ok" : "err");
+    btn.disabled = false; // re-enable now (like addBtn) — a failed get_state refresh must not freeze the control
     setTimeout(refresh, 600);
   }
   btn.onclick = toggle;
@@ -219,7 +220,9 @@ function approvalsPanel(body) {
   }
   build();
   let sig = "";
-  return { update() { const s = JSON.stringify(state.repos.map(r => [r.name, (r.prs || []).map(p => p.number)])); if (s !== sig) { sig = s; build(); } } };
+  // include gh_ready: a connect (gh_ready false->true) with an unchanged PR set must still rebuild,
+  // else the panel stays stuck on "GitHub not connected" until a PR appears.
+  return { update() { const s = JSON.stringify([state.gh_ready, state.repos.map(r => [r.name, (r.prs || []).map(p => p.number)])]); if (s !== sig) { sig = s; build(); } } };
 }
 
 /* ---------- panel shell ---------- */
@@ -354,22 +357,26 @@ async function boot() {
   if (!Array.isArray(saved) || !saved.length) { try { saved = JSON.parse(localStorage.getItem("solomon.layout") || "null"); } catch {} }
   layout = (Array.isArray(saved) && saved.length ? saved : DEFAULT_LAYOUT()).map(p => ({ id: p.id || uid(), type: p.type, repo: p.repo, span2: !!p.span2 }));
   try { const sha = await call("current_sha"); $("#version").textContent = (sha && (sha.sha || sha)) ? String(sha.sha || sha).slice(0, 7) : ""; } catch {}
-  // Auto-update: when a newer signed release exists (tauri-plugin-updater checks GitHub Releases),
-  // turn the version label into a clickable "Update available" pill. Click -> apply_update() downloads,
-  // installs (NSIS), and relaunches. ponytail: no extra UI chrome — reuse the existing #version slot.
-  try {
-    const u = await call("update_status");
-    if (u && u.available) {
-      const v = $("#version");
-      v.textContent = "⬆ Update available";
-      v.style.cursor = "pointer";
-      v.title = "Click to update Solomon" + (u.version ? " to " + u.version : "");
-      v.onclick = async () => { v.textContent = "updating…"; const r = await act("apply_update"); if (r && r.ok === false) { v.textContent = "update failed"; toast("Update failed: " + ((r && r.error) || "?"), "err"); } };
-    }
-  } catch {}
-
+  // Render the dashboard NOW — first paint must NOT be gated on the network update check below.
   renderWorkspace(); applyState();
   setInterval(refresh, 4000);
+
+  // Auto-update (background, non-blocking): a newer signed release (tauri-plugin-updater checks GitHub
+  // Releases) turns the version label into a clickable "Update available" pill. Click -> apply_update()
+  // downloads, installs (NSIS), relaunches. Detached so a slow/offline GitHub round-trip can't hold the
+  // "Loading Solomon…" spinner up. ponytail: reuse the existing #version slot.
+  (async () => {
+    try {
+      const u = await call("update_status");
+      if (u && u.available) {
+        const v = $("#version");
+        v.textContent = "⬆ Update available";
+        v.style.cursor = "pointer";
+        v.title = "Click to update Solomon" + (u.version ? " to " + u.version : "");
+        v.onclick = async () => { v.textContent = "updating…"; const r = await act("apply_update"); if (r && r.ok === false) { v.textContent = "update failed"; toast("Update failed: " + ((r && r.error) || "?"), "err"); } };
+      }
+    } catch {}
+  })();
 }
 
 /* pywebview readiness: api is injected after load; also handle the already-ready + mock cases.
