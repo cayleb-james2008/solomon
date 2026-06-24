@@ -254,24 +254,15 @@ fn or_zero(v: Option<&Value>) -> Value {
     }
 }
 
-/// Python round(x, ndigits): round-half-to-even (banker's rounding). Rust's f64::round is
-/// half-away-from-zero, which would diverge on the rare exact-half case (e.g. 0.0625 -> 0.062).
+/// Python round(x, ndigits): round-half-to-even (banker's rounding) on the TRUE binary value of x.
+/// Rust's `{:.N}` float formatter is correctly-rounded ties-to-even, so format-then-parse matches
+/// CPython's round() byte-for-byte. The earlier `x*10^n` scale-then-round masked x's true value
+/// whenever the product snapped to an exact .5 (e.g. 1/80 -> 0.012 instead of 0.013). Only ever
+/// called with ndigits >= 0 (success_rate uses 3).
 fn round_half_even(x: f64, ndigits: i32) -> f64 {
-    let factor = 10f64.powi(ndigits);
-    let scaled = x * factor;
-    let floor = scaled.floor();
-    let diff = scaled - floor;
-    let rounded = if (diff - 0.5).abs() < f64::EPSILON {
-        // exactly halfway -> round to even
-        if (floor as i64) % 2 == 0 {
-            floor
-        } else {
-            floor + 1.0
-        }
-    } else {
-        scaled.round()
-    };
-    rounded / factor
+    format!("{:.*}", ndigits.max(0) as usize, x)
+        .parse::<f64>()
+        .unwrap_or(x)
 }
 
 #[cfg(test)]
@@ -551,5 +542,12 @@ mod tests {
         assert_eq!(round_half_even(0.0625, 3), 0.062);
         assert_eq!(round_half_even(1.0 / 3.0, 3), 0.333);
         assert_eq!(round_half_even(0.75, 3), 0.75);
+        // Divergent class the old x*1000 scale-then-round impl got WRONG: each ratio's *1000 product
+        // snaps to an exact .5 that masks the true binary value, which CPython's round() rounds by.
+        // python -c "print(round(1/80,3),round(3/80,3),round(7/80,3),round(9/80,3))" -> 0.013 0.037 0.087 0.113
+        assert_eq!(round_half_even(1.0 / 80.0, 3), 0.013);
+        assert_eq!(round_half_even(3.0 / 80.0, 3), 0.037);
+        assert_eq!(round_half_even(7.0 / 80.0, 3), 0.087);
+        assert_eq!(round_half_even(9.0 / 80.0, 3), 0.113);
     }
 }

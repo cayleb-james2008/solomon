@@ -124,6 +124,21 @@ fn secret_token_patterns() -> &'static [Regex] {
     })
 }
 
+/// run_improver._SECRET_KEYVAL_PATTERN — NAME<sep>value where NAME looks like a credential and value
+/// is secret-length. The leak guard MUST scan this too (it is what ctx.redact uses); without it a
+/// `DB_PASSWORD=hunter2hunter2` / `OPENAI_API_KEY=sk_underscore_no_known_prefix...` added line matches
+/// no token shape, passes Gate #5, and is pushed to a PUBLIC repo while still being redacted from logs
+/// (so the leak is invisible to the operator). Mirrors ctx.rs's pattern. Compiled once.
+fn secret_keyval_pattern() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b([A-Za-z0-9_]*(?:API_?KEY|ACCESS_TOKEN|AUTH_TOKEN|SECRET|PASSWORD|TOKEN))\b(\s*[=:]\s*)([A-Za-z0-9_\-\.]{8,})",
+        )
+        .unwrap()
+    })
+}
+
 /// Collection-failure markers in gate output (empty run + one of these = unrunnable, not green).
 fn missing_module_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -676,6 +691,11 @@ pub fn leak_in_diff(c: &Ctx, diff: &str) -> String {
             return "a secret-shaped token is present in the diff".to_string();
         }
     }
+    // Also scan the NAME=value credential shape (what ctx.redact scrubs) — a `PASSWORD=...` /
+    // `API_KEY=...` add-line matches no token shape but is still a secret leaked to a public repo.
+    if secret_keyval_pattern().is_match(&added) {
+        return "a secret-shaped token is present in the diff".to_string();
+    }
     String::new()
 }
 
@@ -1168,6 +1188,24 @@ mod tests {
         let diff = "- token = ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
         assert_eq!(leak_in_diff(&c, diff), "");
         assert_eq!(leak_in_diff(&c, ""), "");
+    }
+
+    #[test]
+    fn leak_in_diff_secret_keyval() {
+        // Regression guard: a NAME=value credential that matches NONE of the token shapes
+        // (ghp_/github_pat_/sk-/Bearer) must still be caught by the keyval pattern, or it gets
+        // pushed to a public repo (the port-spec check the leak guard had dropped).
+        let c = ctx();
+        assert_eq!(
+            leak_in_diff(&c, "+DB_PASSWORD=hunter2hunter2\n+ok"),
+            "a secret-shaped token is present in the diff"
+        );
+        assert_eq!(
+            leak_in_diff(&c, "+OPENAI_API_KEY = sk_underscore_not_a_known_prefix_123\n+fine"),
+            "a secret-shaped token is present in the diff"
+        );
+        // the same credential on a REMOVED line is not scanned (added-only)
+        assert_eq!(leak_in_diff(&c, "-DB_PASSWORD=hunter2hunter2"), "");
     }
 
     // ---- narrated_without_writing ----

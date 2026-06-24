@@ -320,9 +320,14 @@ impl AppTestManager {
                 if std::time::Instant::now() >= deadline {
                     still_alive = true;
                     // Leave the (finished-eventually) thread detached; re-insert so a retry can see it.
+                    // Guard on session_id: a concurrent start() during our 20s join may have already
+                    // replaced this slot with a NEW live session — cross-wiring our old handle onto it
+                    // would corrupt the map. Only re-attach if the slot is still OURS.
                     let mut sessions = self.sessions.lock().unwrap();
                     if let Some(s) = sessions.get_mut(name) {
-                        s.handle = Some(h);
+                        if s.session_id == session_id {
+                            s.handle = Some(h);
+                        }
                     }
                     break;
                 }
@@ -332,7 +337,15 @@ impl AppTestManager {
         if still_alive {
             return json!({"ok": false, "error": "app test did not stop within 20 seconds"});
         }
-        self.sessions.lock().unwrap().remove(name);
+        // Only remove the slot if it is STILL ours. A concurrent start() during our join may have
+        // replaced it with a fresh live session; removing that would leak an untracked worker and
+        // make the next stop() a no-op (already:true) against a running app-test.
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            if sessions.get(name).map(|s| s.session_id == session_id).unwrap_or(false) {
+                sessions.remove(name);
+            }
+        }
         json!({"ok": true, "sessionId": session_id})
     }
 }
@@ -915,6 +928,66 @@ mod tests {
         if paths::here() != home.as_path() {
             let _ = std::fs::remove_dir_all(&home);
         }
+    }
+
+    #[test]
+    fn stop_does_not_clobber_a_session_replaced_during_join() {
+        // Regression guard for the start/stop race: stop() that captured session "A" must NOT
+        // remove (or cross-wire) a NEW session "B" that a concurrent start() installed while stop()
+        // was in its join loop. A worker blocked on a controllable gate keeps stop()'s join loop
+        // spinning so we can deterministically perform the swap mid-flight (no timing-of-the-bug).
+        let mgr = AppTestManager::new();
+        let name = "race_foo".to_string();
+
+        // Session A's worker waits on `gate_a` (ignoring the Session.stop signal), so stop()'s join
+        // loop keeps polling until we release it.
+        let gate_a = Arc::new((Mutex::new(false), Condvar::new()));
+        let ga = Arc::clone(&gate_a);
+        let handle_a = std::thread::spawn(move || {
+            let (l, c) = &*ga;
+            let mut done = l.lock().unwrap();
+            while !*done {
+                done = c.wait(done).unwrap();
+            }
+        });
+        mgr.sessions.lock().unwrap().insert(
+            name.clone(),
+            Session {
+                handle: Some(handle_a),
+                stop: Arc::new((Mutex::new(false), Condvar::new())),
+                session_id: "A".into(),
+            },
+        );
+
+        std::thread::scope(|s| {
+            let stopper = s.spawn(|| mgr.stop(&name));
+            // Let stop() take A's handle and enter its (lock-free) join loop.
+            std::thread::sleep(Duration::from_millis(80));
+            // A concurrent start() replaces the slot with a fresh live session "B".
+            let handle_b = std::thread::spawn(|| {});
+            mgr.sessions.lock().unwrap().insert(
+                name.clone(),
+                Session {
+                    handle: Some(handle_b),
+                    stop: Arc::new((Mutex::new(false), Condvar::new())),
+                    session_id: "B".into(),
+                },
+            );
+            // Release A's worker so stop()'s join completes and it reaches the guarded remove.
+            let (l, c) = &*gate_a;
+            *l.lock().unwrap() = true;
+            c.notify_all();
+            let r = stopper.join().unwrap();
+            assert_eq!(r.get("sessionId"), Some(&json!("A")));
+        });
+
+        // The guard must have kept session B intact (un-fixed code would have removed it).
+        let sessions = mgr.sessions.lock().unwrap();
+        assert_eq!(
+            sessions.get(&name).map(|s| s.session_id.as_str()),
+            Some("B"),
+            "stop() that captured A must not remove the B session a concurrent start() installed"
+        );
     }
 
     // ---- has_frontend golden vectors ----
