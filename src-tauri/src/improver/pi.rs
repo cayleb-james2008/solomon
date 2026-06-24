@@ -91,10 +91,14 @@ fn set_executable(_path: &Path) {
 
 /// run_improver._agent_shim_dir (~1003-1037): create (idempotently) a dir of PATH shims that REFUSE
 /// the version-control verbs that escape the runner's branch-per-iteration sandbox — `gh` entirely
-/// (the agent must use the read-only github_* tools) and `git push|pull|merge|rebase`. Read-only git
-/// and pi's own internal git PASS THROUGH to the real binary. Prepended to the agent's PATH in
-/// run_pi. Returns the dir, or None if it can't be created (best-effort). Both POSIX shell shims and
-/// Windows .cmd shims are written into the same dir; only the matching platform's are on PATH-resolve.
+/// (the agent must use the read-only github_* tools), `git push|pull|merge|rebase`, AND the
+/// branch-switching verbs (`git switch` any form, `git checkout -b`/`-B` or `git checkout <branch>`,
+/// `git branch <name>`) — the 2026-06-24 escape was `git checkout -b chore/...` which committed
+/// off the runner's rsi/* branch and wedged the gate/ship/revert. File-restore stays allowed
+/// (`git checkout -- <file>`, `git checkout .`) and `git branch` (list). Read-only git and pi's own
+/// internal git PASS THROUGH to the real binary. Prepended to the agent's PATH in run_pi. Returns the
+/// dir, or None if it can't be created (best-effort). Both POSIX shell shims and Windows .cmd shims
+/// are written into the same dir; only the matching platform's are on PATH-resolve.
 ///
 /// The shim error strings differ POSIX vs Windows VERBATIM (debugging-load-bearing) and must match
 /// run_improver byte-for-byte.
@@ -126,28 +130,117 @@ not the gh CLI (the runner owns GitHub)\" >&2\nexit 1\n",
         }
     });
     if let Some(real_git) = real_git {
-        // git (POSIX): case-statement; the blocked branch interpolates the verb via `$1`.
+        // git (POSIX): case-statement. The VC verbs interpolate via `$1`; the branch verbs (switch,
+        // checkout -b/<branch>, branch <name>) are refused too, but file-restore (`checkout -- <file>`,
+        // `checkout .`) and `branch` (list) PASS THROUGH. Branch names can't start with `-`, so a `-*`
+        // `$2` (incl. `--`) is always a flag/pathspec form and is safe to forward.
         let git_sh = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  \
+            "#!/bin/sh\ncase \"$1\" in\n\
 push|pull|merge|rebase) echo \"blocked by Solomon: the runner owns version control \
-(no git $1 in the agent)\" >&2; exit 1;;\n  \
+(no git $1 in the agent)\" >&2; exit 1;;\n\
+switch) echo \"blocked by Solomon: the runner owns branches (no git switch in the agent)\" >&2; exit 1;;\n\
+checkout) case \"$2\" in\n\
+-b|-B) echo \"blocked by Solomon: the runner owns branches (no git checkout -b in the agent)\" >&2; exit 1;;\n\
+\"\"|.|-*) exec \"{real_git}\" \"$@\";;\n\
+*) echo \"blocked by Solomon: the runner owns branches \
+(use git checkout -- <file> to discard, no branch switch in the agent)\" >&2; exit 1;;\n\
+esac;;\n\
+branch) case \"$2\" in\n\
+\"\"|-*) exec \"{real_git}\" \"$@\";;\n\
+*) echo \"blocked by Solomon: the runner owns branches (no git branch <name> in the agent)\" >&2; exit 1;;\n\
+esac;;\n\
 *) exec \"{real_git}\" \"$@\";;\nesac\n"
         );
         write_shim(&d.join("git"), &git_sh);
-        // git.cmd (Windows): /I case-insensitive verb checks; the blocked message does NOT name the verb.
+        // git.cmd (Windows): /I case-insensitive verb checks; the blocked messages do NOT name the verb.
+        // VC verbs -> :blk; branch-switching verbs -> :blkbr. checkout/branch dispatch to sub-labels
+        // that forward file-restore/list forms (empty $2, `.`, or a `-`-led flag incl. `--`) to real git
+        // and refuse a bare branch token. (Branch names can't start with `-`, so a `-`-led $2 is safe.)
         let git_cmd = format!(
             "@echo off\r\n\
 if /I \"%~1\"==\"push\" goto blk\r\n\
 if /I \"%~1\"==\"pull\" goto blk\r\n\
 if /I \"%~1\"==\"merge\" goto blk\r\n\
 if /I \"%~1\"==\"rebase\" goto blk\r\n\
+if /I \"%~1\"==\"switch\" goto blkbr\r\n\
+if /I \"%~1\"==\"checkout\" goto chk\r\n\
+if /I \"%~1\"==\"branch\" goto br\r\n\
 \"{real_git}\" %*\r\n\
 goto :eof\r\n\
-:blk\r\necho blocked by Solomon: the runner owns version control 1>&2\r\nexit /b 1\r\n"
+:chk\r\n\
+if /I \"%~2\"==\"-b\" goto blkbr\r\n\
+if /I \"%~2\"==\"-B\" goto blkbr\r\n\
+if \"%~2\"==\"\" goto run\r\n\
+if \"%~2\"==\".\" goto run\r\n\
+set \"a2=%~2\"\r\n\
+if \"%a2:~0,1%\"==\"-\" goto run\r\n\
+goto blkbr\r\n\
+:br\r\n\
+if \"%~2\"==\"\" goto run\r\n\
+set \"b2=%~2\"\r\n\
+if \"%b2:~0,1%\"==\"-\" goto run\r\n\
+goto blkbr\r\n\
+:run\r\n\
+\"{real_git}\" %*\r\n\
+goto :eof\r\n\
+:blk\r\necho blocked by Solomon: the runner owns version control 1>&2\r\nexit /b 1\r\n\
+:blkbr\r\necho blocked by Solomon: the runner owns branches 1>&2\r\nexit /b 1\r\n"
         );
         write_shim(&d.join("git.cmd"), &git_cmd);
     }
     Some(d)
+}
+
+// --------------------------------------------------------------------------- #
+// resolve_pi_invocation — Windows batch-shim → node bypass (CVE-2024-24576 workaround)
+// --------------------------------------------------------------------------- #
+
+/// Resolve the `(program, leading_args)` to spawn for `pi`. On Windows, when `pi` resolves to an npm
+/// `pi.CMD`/`pi.bat` shim, return `(node, [<cli.js>])` extracted from the shim so we spawn the real
+/// `node.exe` (Command never sanitizes args for a real exe) instead of the batch file (whose multi-line
+/// args Rust refuses — see run_pi's deviation note). Everywhere else: `(pi, [])` — unchanged.
+///
+/// The npm shim's launch line is `"%_prog%" "%dp0%\node_modules\…\cli.js" %*`; we read the shim, take
+/// the `node_modules…*.js` token, resolve it against the shim's own directory, and verify it exists.
+/// If anything is off (not a batch shim, can't read, no js token, js missing) we fall back to the
+/// resolved `pi` path verbatim so behavior degrades to the prior (possibly-failing) path, never worse.
+pub(crate) fn resolve_pi_invocation(pi: &str) -> (String, Vec<String>) {
+    #[cfg(windows)]
+    {
+        let lower = pi.to_ascii_lowercase();
+        if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+            if let Some(cli_js) = node_cli_from_shim(pi) {
+                // node via which() (full path) or the bare "node" last-resort (same as _which).
+                let node = match which::which("node") {
+                    Ok(p) => p.to_string_lossy().into_owned(),
+                    Err(_) => "node".to_string(),
+                };
+                return (node, vec![cli_js]);
+            }
+        }
+    }
+    let _ = pi; // (no-op read off Windows)
+    (pi.to_string(), Vec::new())
+}
+
+/// Extract the `<dir>\node_modules\…\*.js` entry an npm batch shim wraps. Reads the shim file, finds
+/// the first `node_modules` token through the next `.js`, and resolves it against the shim's directory
+/// (`%dp0%`). Returns the absolute js path iff it exists on disk. The earlier `PATHEXT` `.JS` mention
+/// in the shim sits before `node_modules`, so it never matches.
+#[cfg(windows)]
+fn node_cli_from_shim(cmd_path: &str) -> Option<String> {
+    let text = std::fs::read_to_string(cmd_path).ok()?;
+    let dir = Path::new(cmd_path).parent()?;
+    let lower = text.to_ascii_lowercase();
+    let start = lower.find("node_modules")?;
+    let rel_end = lower[start..].find(".js")? + start + 3; // include ".js"
+    let rel = &text[start..rel_end]; // original-case relative path (backslash-separated)
+    let js = dir.join(rel);
+    if js.exists() {
+        Some(js.to_string_lossy().into_owned())
+    } else {
+        None
+    }
 }
 
 // --------------------------------------------------------------------------- #
@@ -180,9 +273,21 @@ goto :eof\r\n\
 /// the caller's existing timeout handling applies uniformly. Normal (non-timeout) returns are exact.
 pub fn run_pi(ctx: &mut Ctx, task: &str, timeout: i64, system_md: Option<&Path>) -> RunOut {
     // ---- argv -------------------------------------------------------------- #
+    // DEVIATION (Windows): the Python `run_pi` spawned `pi` (which resolves to the npm `pi.CMD`
+    // batch shim) directly. Rust's std::process::Command REFUSES to spawn a `.cmd`/`.bat` when ANY
+    // argument contains a character it cannot safely escape into a batch command line — newlines in
+    // particular (the CVE-2024-24576 hardening, Rust ≥1.77.2): `spawn()` returns
+    // io::ErrorKind::InvalidInput "batch file arguments are invalid" INSTANTLY. The implement task is
+    // almost always multi-line (backlog item + gate/visual feedback), so every real iteration failed
+    // with an instant rc=-1 that the caller miscounted as a model no-op. Fix: when `pi` resolves to a
+    // batch shim, invoke the underlying `node <cli.js>` it wraps instead — node.exe is a real
+    // executable, so Command passes the multi-line arg through verbatim (byte-identical argv to what
+    // `pi.CMD` would have forwarded). Off Windows / non-batch pi: unchanged (program = the pi path).
     let pi = ctx.pi_exe();
-    let mut args: Vec<String> = vec![
-        pi.clone(),
+    let (program, lead) = resolve_pi_invocation(&pi);
+    let mut args: Vec<String> = vec![program];
+    args.extend(lead);
+    args.extend([
         "--print".into(),
         "--mode".into(),
         "json".into(),
@@ -191,7 +296,7 @@ pub fn run_pi(ctx: &mut Ctx, task: &str, timeout: i64, system_md: Option<&Path>)
         ctx.pi_provider.clone(),
         "--model".into(),
         ctx.pi_model.clone(),
-    ];
+    ]);
     if !ctx.reasoning.is_empty() {
         args.push("--thinking".into());
         args.push(ctx.reasoning.clone());
@@ -561,6 +666,39 @@ mod tests {
         assert_eq!(TIMEOUT_PHASE_400, 400);
     }
 
+    // ---- resolve_pi_invocation: Windows npm batch shim -> node <cli.js> bypass ----
+    // Regression guard for the CVE-2024-24576 batch-spawn bug: a `.cmd` pi shim must resolve to
+    // (node, [cli.js]) so multi-line tasks spawn; the PATHEXT `.JS` line must NOT be mistaken for the
+    // entry. (Windows-only — node_cli_from_shim is cfg(windows).)
+    #[cfg(windows)]
+    #[test]
+    fn node_cli_from_shim_extracts_js_entry() {
+        let base = std::env::temp_dir().join(format!("solomon_pishim_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cli = base
+            .join("node_modules")
+            .join("@scope")
+            .join("pkg")
+            .join("dist")
+            .join("cli.js");
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(&cli, "// entry").unwrap();
+        let shim = base.join("pi.cmd");
+        // npm-shim shape: the PATHEXT `.JS` mention precedes the node_modules launch line.
+        std::fs::write(
+            &shim,
+            "@ECHO off\r\nSET PATHEXT=%PATHEXT:;.JS;=;%\r\n\"%_prog%\"  \"%dp0%\\node_modules\\@scope\\pkg\\dist\\cli.js\" %*\r\n",
+        )
+        .unwrap();
+        let shim_s = shim.to_string_lossy().into_owned();
+        let got = node_cli_from_shim(&shim_s).expect("js entry resolved");
+        assert_eq!(PathBuf::from(&got), cli, "must extract the node_modules cli.js, not PATHEXT .JS");
+        let (prog, lead) = resolve_pi_invocation(&shim_s);
+        assert_eq!(lead, vec![got], "lead arg is the resolved cli.js");
+        assert!(prog.to_lowercase().contains("node"), "program is node, got {prog}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     // ---- agent_shim_dir: exact error strings + 4 verbs ----
     #[test]
     fn agent_shim_dir_writes_exact_block_strings() {
@@ -584,19 +722,48 @@ mod tests {
         if let Some(p) = proc::which_git() {
             if p.is_absolute() {
                 let gitsh = std::fs::read_to_string(d.join("git")).unwrap();
-                // POSIX git shim interpolates the verb via $1 and blocks exactly 4 verbs.
+                // POSIX git shim interpolates the verb via $1 and blocks the 4 VC verbs.
                 assert!(gitsh.contains("push|pull|merge|rebase)"));
                 assert!(gitsh.contains(
                     "blocked by Solomon: the runner owns version control (no git $1 in the agent)"
                 ));
+                // ...and the branch-switching verbs (the 2026-06-24 `checkout -b` escape vector).
+                assert!(gitsh.contains(
+                    "switch) echo \"blocked by Solomon: the runner owns branches (no git switch in the agent)\""
+                ));
+                assert!(gitsh.contains(
+                    "-b|-B) echo \"blocked by Solomon: the runner owns branches (no git checkout -b in the agent)\""
+                ));
+                assert!(gitsh.contains(
+                    "blocked by Solomon: the runner owns branches \
+(use git checkout -- <file> to discard, no branch switch in the agent)"
+                ));
+                assert!(gitsh.contains(
+                    "blocked by Solomon: the runner owns branches (no git branch <name> in the agent)"
+                ));
+                // File-restore / list forms PASS THROUGH: the empty/`.`/`-*` $2 arms exec real git.
+                assert!(gitsh.contains("\"\"|.|-*) exec")); // checkout -- <file>, checkout .
+                assert!(gitsh.contains("\"\"|-*) exec")); //   branch (list), branch -a/-d/...
+
                 let gitcmd = std::fs::read_to_string(d.join("git.cmd")).unwrap();
-                // Windows git.cmd: /I checks for each of the 4 verbs; message does NOT name the verb.
+                // Windows git.cmd: /I checks for each of the 4 VC verbs -> :blk (msg does NOT name verb).
                 for v in ["push", "pull", "merge", "rebase"] {
                     assert!(gitcmd.contains(&format!("if /I \"%~1\"==\"{v}\" goto blk")));
                 }
-                // Source (_agent_shim_dir ~1036) emits the message with the cmd stderr redirect:
-                // `echo blocked by Solomon: the runner owns version control 1>&2\r\n`.
+                // Source emits the VC message with the cmd stderr redirect.
                 assert!(gitcmd.contains("blocked by Solomon: the runner owns version control 1>&2\r\n"));
+                // Branch-switching verbs dispatch to :blkbr (switch directly; checkout/branch via sub-labels).
+                assert!(gitcmd.contains("if /I \"%~1\"==\"switch\" goto blkbr"));
+                assert!(gitcmd.contains("if /I \"%~1\"==\"checkout\" goto chk"));
+                assert!(gitcmd.contains("if /I \"%~1\"==\"branch\" goto br"));
+                assert!(gitcmd.contains("if /I \"%~2\"==\"-b\" goto blkbr"));
+                assert!(gitcmd.contains("if /I \"%~2\"==\"-B\" goto blkbr"));
+                // File-restore / list forms forward to :run (real git): empty, `.`, or a `-`-led flag.
+                assert!(gitcmd.contains("if \"%~2\"==\".\" goto run"));
+                assert!(gitcmd.contains("if \"%a2:~0,1%\"==\"-\" goto run"));
+                assert!(gitcmd.contains("if \"%b2:~0,1%\"==\"-\" goto run"));
+                assert!(gitcmd.contains("blocked by Solomon: the runner owns branches 1>&2\r\n"));
+                // Windows messages never interpolate a POSIX `$1`.
                 assert!(!gitcmd.contains("$1"));
             }
         }

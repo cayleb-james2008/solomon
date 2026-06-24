@@ -507,11 +507,17 @@ fn build_vision_task(capture_result: &Value, iteration_summary: &str, _pages_con
 fn run_vision_agent(ctx: &Ctx, task: &str, vision_model: &str) -> Option<String> {
     let pi = which::which("pi").ok()?; // pi = shutil.which("pi"); if not pi: return None
     let pi = pi.to_string_lossy().to_string();
+    // Windows: bypass the npm `pi.CMD` batch shim (Rust refuses multi-line args to a .cmd — see
+    // pi::run_pi's deviation note) by invoking the underlying `node <cli.js>` instead. The vision task
+    // is multi-line (per-page errors + a11y trees), so without this the vision agent's spawn fails
+    // instantly and the review is falsely reported "no output / SKIPPED".
+    let (program, lead) = crate::improver::pi::resolve_pi_invocation(&pi);
     let vision_ext = vision_ext(ctx);
     let visual_md = visual_review_md(ctx);
 
-    let args: Vec<String> = vec![
-        pi,
+    let mut args: Vec<String> = vec![program];
+    args.extend(lead);
+    args.extend::<Vec<String>>(vec![
         "--print".into(),
         "--mode".into(),
         "json".into(),
@@ -525,7 +531,7 @@ fn run_vision_agent(ctx: &Ctx, task: &str, vision_model: &str) -> Option<String>
         visual_md.to_string_lossy().into_owned(),
         "--no-tools".into(),
         task.into(),
-    ];
+    ]);
 
     // env = dict(os.environ) + RSI_PROVIDER/RSI_VISION_MODEL; pop PYTHONPATH/PYTHONHOME.
     for timeout in [120u64, 180u64] {

@@ -452,6 +452,19 @@ set a goal in Config so the loop has an objective (it will not fabricate work)."
         return;
     }
 
+    // OBSERVABILITY: a nonzero exit with no stdout that ISN'T a recognized load-failure (e.g. a refused
+    // batch spawn -> rc=-1 "batch file arguments are invalid", or any exec failure) used to fall
+    // silently through to the "made no changes" no-op below, hiding the real cause for hours. Surface
+    // the captured stderr (redacted) so the operator sees WHY pi produced nothing. Additive log only —
+    // control flow is unchanged; the noop drop still runs.
+    if p.code != 0 && p.stdout.trim().is_empty() && !load_fail {
+        let why = tail_chars(&ctx.redact(p.stderr.trim()), 300);
+        ctx.log(&format!(
+            "Pi exited rc={} with no output (likely a spawn/exec failure, not a model no-op): {why}",
+            p.code
+        ));
+    }
+
     if !gitops::tree_dirty(ctx) && gitops::head_sha(ctx) == base {
         let agent_untracked = gitops::untracked_non_ignored_files(ctx);
         if agent_untracked.is_empty() {

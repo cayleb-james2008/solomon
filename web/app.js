@@ -173,7 +173,12 @@ function loopsPanel(body) {
 function activityPanel(body, spec) {
   const head = h("div", "act-head");
   const sel = h("select");
-  const refreshLog = async () => { try { const x = await call("read_log", spec.repo); const txt = (x && x.text) || (typeof x === "string" ? x : (x && x.log) || ""); pre.textContent = txt || "(no log yet)"; const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40; if (atBottom) pre.scrollTop = pre.scrollHeight; } catch { pre.textContent = "(log unavailable)"; } };
+  let firstLoad = true;
+  // A live log must OPEN on the latest line. Capture the bottom-pinned state BEFORE replacing text
+  // (setting textContent resets scrollTop). Force a jump to the bottom on the first load and on a
+  // repo switch (force=true); otherwise only follow the tail when the user was already at the bottom,
+  // so a periodic refresh never yanks them out of scrollback they're reading.
+  const refreshLog = async (force = false) => { try { const x = await call("read_log", spec.repo); const txt = (x && x.text) || (typeof x === "string" ? x : (x && x.log) || ""); const wasAtBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40; pre.textContent = txt || "(no log yet)"; if (force || firstLoad || wasAtBottom) pre.scrollTop = pre.scrollHeight; firstLoad = false; } catch { pre.textContent = "(log unavailable)"; } };
   const pre = h("div", "log", "(loading…)");
   function fillRepos() {
     sel.innerHTML = ""; state.repos.forEach(r => { const o = h("option"); o.value = r.name; o.textContent = r.name; if (r.name === spec.repo) o.selected = true; sel.appendChild(o); });
@@ -181,7 +186,7 @@ function activityPanel(body, spec) {
     // so it stays in sync with what the <select> actually displays (a stale name -> permanently blank log).
     if (state.repos.length && !state.repos.some(r => r.name === spec.repo)) { spec.repo = state.repos[0].name; sel.value = spec.repo; saveLayout(); }
   }
-  sel.onchange = () => { spec.repo = sel.value; saveLayout(); refreshLog(); };
+  sel.onchange = () => { spec.repo = sel.value; saveLayout(); refreshLog(true); };
   head.append(h("span", "muted", "Repo"), sel);
   body.append(head, pre);
   fillRepos(); refreshLog();

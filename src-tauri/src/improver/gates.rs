@@ -411,11 +411,20 @@ pub fn anti_gaming_reason(c: &Ctx, base_tests: &Value, tests: &Value, diff_text:
         // collected must not drop either (deleting real tests + adding one trivial one holds 'passed'
         // steady while coverage shrinks). Python: `base_c, c = ...get("collected")` then
         // `if base_c and c is not None and c < base_c`.
+        // DEVIATION from the Python port (deliberate bug fix, not a simplification): the rail also
+        // requires `passed` to have held STEADY. `collected` falls back to passed+failed+errors+skipped
+        // when there's no explicit "collected N items" line, so RESOLVING failures/errors legitimately
+        // shrinks the sum even though no test was removed — and the documented gaming pattern this rail
+        // targets is "...holds 'passed' steady while coverage shrinks". If `passed` INCREASED the agent
+        // made more tests pass (a real improvement), so a collected-sum drop is the fixed failures/errors
+        // leaving the sum, not deleted tests. Without this guard, fixing a lint/error gate (e.g. ruff's
+        // "Found N errors" parsed as errors=N on the red base) is falsely reverted as gamed. Rail 1
+        // above already returns on `t_passed < b_passed`, so here `t_passed <= b_passed` ⇒ exactly steady.
         let base_c = base_tests.get("collected");
         let cur_c = tests.get("collected");
         let base_c_truthy = value_truthy(base_c);
         let cur_c_not_none = !matches!(cur_c, None | Some(Value::Null));
-        if base_c_truthy && cur_c_not_none {
+        if base_c_truthy && cur_c_not_none && t_passed <= b_passed {
             let base_cv = base_c.and_then(Value::as_i64).unwrap_or(0);
             let cur_cv = cur_c.and_then(Value::as_i64).unwrap_or(0);
             if cur_cv < base_cv {
@@ -1048,6 +1057,18 @@ mod tests {
         // passed held steady (10) but collected dropped 12->10
         let r = anti_gaming_reason(&c, &bt(10, 12), &full(10, 0, 0, 0, 10), "");
         assert_eq!(r.as_deref(), Some("collected count fell 12→10 (tests removed)"));
+    }
+
+    #[test]
+    fn anti_gaming_collected_fell_not_gamed_when_passed_rose() {
+        // Regression: fixing an error/lint gate makes `passed` RISE while the collected fallback sum
+        // (passed+failed+errors+skipped) FALLS as the failures/errors leave it. That is a genuine fix,
+        // not coverage shrink — the rail must NOT revert it. (maki: ruff "Found 2 errors" parsed as
+        // errors=2 on the red base → collected 696; after the fix 694 passed/0 errors → collected 694.)
+        let c = ctx();
+        let base = json!({"passed": 693, "failed": 1, "errors": 2, "skipped": 0, "collected": 696});
+        let after = json!({"passed": 694, "failed": 0, "errors": 0, "skipped": 0, "collected": 694});
+        assert_eq!(anti_gaming_reason(&c, &base, &after, ""), None);
     }
 
     #[test]
