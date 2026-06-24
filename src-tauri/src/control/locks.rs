@@ -121,10 +121,23 @@ fn lock_is_live_decide(lock_run_id: &Option<String>, hb: Option<&Value>, interva
         // not isinstance(hb, dict) -> True (lock + live PID, no heartbeat yet -> just-started)
         _ => return true,
     };
-    let hb_run_id = hb.get("run_id").and_then(Value::as_str);
-    // `if run_id and hb.get("run_id") and hb.get("run_id") != run_id`: both present AND differ.
-    if let (Some(lr), Some(hr)) = (lock_run_id.as_deref(), hb_run_id) {
-        if !lr.is_empty() && !hr.is_empty() && hr != lr {
+    // `if run_id and hb.get("run_id") and hb.get("run_id") != run_id`: lock run_id truthy AND the
+    // heartbeat run_id truthy AND they differ -> orphaned by a newer runner. Compare the RAW
+    // heartbeat Value (not as_str): Python compares values, so a truthy NON-string run_id from a
+    // corrupt/externally-written heartbeat (e.g. a number) is cross-type-unequal to the lock's
+    // string and must also orphan — the old as_str() narrowing silently skipped that, keeping a
+    // dead lock wrongly LIVE and blocking recovery.
+    if let Some(lr) = lock_run_id.as_deref().filter(|s| !s.is_empty()) {
+        let orphaned = match hb.get("run_id") {
+            None => false,
+            Some(Value::String(hr)) => !hr.is_empty() && hr != lr,
+            Some(Value::Null) | Some(Value::Bool(false)) => false,
+            Some(Value::Number(n)) => n.as_f64() != Some(0.0),
+            Some(Value::Bool(true)) => true,
+            Some(Value::Array(a)) => !a.is_empty(),
+            Some(Value::Object(o)) => !o.is_empty(),
+        };
+        if orphaned {
             return false; // a newer runner owns the heartbeat; this lock is orphaned
         }
     }
@@ -431,6 +444,12 @@ mod tests {
         assert!(lock_is_live_decide(&Some("tokA".into()), Some(&hb), 120));
         // empty/null hb (non-dict) treated as just-started -> True
         assert!(lock_is_live_decide(&Some("tokA".into()), Some(&Value::Null), 120));
+        // a truthy NON-string run_id (corrupt heartbeat) differing from the lock's string -> orphaned -> False
+        let hb = json!({"run_id": 42, "status": "running", "updated_at": ts_ago(1)});
+        assert!(!lock_is_live_decide(&Some("tokA".into()), Some(&hb), 120));
+        // a FALSY non-string run_id (0) is `hb.get("run_id")`-falsy in Python -> not orphaned -> True
+        let hb = json!({"run_id": 0, "status": "running", "updated_at": ts_ago(1)});
+        assert!(lock_is_live_decide(&Some("tokA".into()), Some(&hb), 120));
     }
 
     #[test]

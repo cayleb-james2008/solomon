@@ -1438,7 +1438,15 @@ fn copy_tree_filtered(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
         let from = entry.path();
         let to = dst.join(&name);
-        if from.is_dir() {
+        // entry.file_type() does NOT follow symlinks, so a directory SYMLINK reports is_dir()==false
+        // and is never recursed into. This prevents a symlink cycle (e.g. `loop -> ..`) in a managed
+        // repo from recursing forever into an uncatchable stack-overflow ABORT that would take down
+        // the whole orchestrator (violating this module's panic-free contract — a stack overflow is
+        // not a Result::Err the caller's map_err can absorb). `from.is_dir()` followed the link and
+        // looped. Real dirs still recurse; files (and symlinked files) go through fs::copy, which
+        // follows a file symlink to its target content and harmlessly no-ops on a dir symlink.
+        let is_real_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_real_dir {
             copy_tree_filtered(&from, &to)?;
         } else {
             let _ = std::fs::copy(&from, &to);
@@ -1730,6 +1738,46 @@ mod tests {
     fn parse_findings_no_block_is_empty() {
         assert_eq!(parse_findings("no markers | here | at all"), json!([]));
         assert_eq!(parse_findings(""), json!([]));
+    }
+
+    #[test]
+    fn copy_tree_filtered_skips_ignored_and_survives_symlink_cycle() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "solomon_copytree_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let src = base.join("src");
+        let dst = base.join("dst");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub").join("a.txt"), b"hi").unwrap();
+        std::fs::create_dir_all(src.join(".git")).unwrap(); // in the FIXED ignore set
+        std::fs::write(src.join(".git").join("config"), b"x").unwrap();
+
+        // A directory-symlink cycle (loop -> its own parent). Creating a dir symlink needs privilege
+        // (Windows: SeCreateSymbolicLink / developer mode); if it fails, skip the cycle assertion —
+        // the copy/ignore checks below still run. WITHOUT the file_type() fix this symlink makes
+        // copy_tree_filtered recurse forever and abort the test process via stack overflow.
+        let cycle = src.join("loop");
+        #[cfg(windows)]
+        let made_link = std::os::windows::fs::symlink_dir(&src, &cycle).is_ok();
+        #[cfg(not(windows))]
+        let made_link = std::os::unix::fs::symlink(&src, &cycle).is_ok();
+
+        copy_tree_filtered(&src, &dst).expect("copy must succeed, never overflow on a symlink cycle");
+
+        assert!(dst.join("sub").join("a.txt").exists(), "real file copied");
+        assert!(!dst.join(".git").exists(), "ignored dir skipped");
+        if made_link {
+            assert!(
+                !dst.join("loop").join("sub").exists(),
+                "a directory symlink must NOT be recursed into"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

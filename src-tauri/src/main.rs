@@ -172,6 +172,12 @@ fn serve_health(port: u16) -> i32 {
             Ok(s) => s,
             Err(_) => continue,
         };
+        // Bound the read so one silent/partial client can't pin this single-threaded accept loop
+        // forever (which would wedge the whole health endpoint for every other poller). On timeout
+        // read() returns Err -> unwrap_or(0) -> 0 bytes -> the 404 path -> connection dropped -> loop
+        // continues. ponytail: a read timeout fixes the wedge; per-connection threads (full
+        // ThreadingHTTPServer parity) only matter if concurrent health polls ever become a need.
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
         // Read just the request line (the method + path); a single small read is enough for GET headers.
         let mut buf = [0u8; 1024];
         let n = stream.read(&mut buf).unwrap_or(0);
