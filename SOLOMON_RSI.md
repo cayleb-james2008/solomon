@@ -493,7 +493,38 @@ preserved; the polish is additive CSS over the same classes.
 
 ---
 
-## One-click updater (separate exe)
+## Per-repo API key (`api_key`)
+
+A repo may carry an `api_key` field in repos.json that overrides the global
+provider key (in `Solomon/.env`) for THAT repo's iterations only. This lets each
+repo use a different OpenRouter account/key (or a different Ollama key) without
+sharing one global key.
+
+```json
+{"name": "maki", "provider": "openrouter", "model": "openrouter/owl-alpha",
+ "api_key": "sk-or-v1-..."}
+```
+
+- **Loading:** `Ctx::load_env()` loads the global `.env` keys first (existing
+  behavior), then `Ctx::apply_api_key()` overrides the active provider's env var
+  (`OPENROUTER_API_KEY` / `OLLAMA_API_KEY`) with the per-repo value. Each repo's
+  improver is a separate child process, so the override is isolated to that repo.
+- **Mid-loop refresh:** `refresh_config_from_registry()` re-applies the per-repo
+  key each iteration (after `apply_phase_config`, so a per-phase provider override
+  lands the key in the right env var). A dashboard edit to the per-repo key takes
+  effect without a stop+restart.
+- **Preflight:** the existing `required_key()` env-var check passes when EITHER
+  the global `.env` key OR the per-repo key is set.
+- **Redaction:** `Ctx::redact()` already scrubs the literal `OPENROUTER_API_KEY` /
+  `OLLAMA_API_KEY` env values from agent text; since `apply_api_key` sets the env
+  var to the per-repo key, the per-repo key is scrubbed too.
+- **Dashboard:** `get_state` surfaces `api_key_set: bool` per repo (never the
+  value). The Loop Controls panel has a per-repo "API key (per-repo)" password
+  input; the placeholder reflects set/unset state. `set_repo_config` accepts
+  `api_key` as its 12th positional arg (null = unchanged, "" = clear, string = set).
+
+---
+
 
 `updater.py` + `updater.spec` build a standalone **`SolomonUpdater.exe`** (console) that
 is the "update + open" entry point: double-click it and it (1) finds the solomon source

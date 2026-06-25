@@ -291,6 +291,7 @@ fn repo_state(r: &Value, gh_ready: bool) -> Value {
         "goal": safe(|| Value::String(registry::project_goal(r)), json!("")),
         "interval": safe(|| json!(registry::project_interval(r)), json!(120)),
         "max_iterations": safe(|| json!(registry::project_max_iterations(r)), json!(0)),
+        "api_key_set": safe(|| Value::Bool(!registry::project_api_key(r).is_empty()), Value::Bool(false)),
         "phases": phases_or_empty(r),
         "is_git": json_bool(r.get("is_git")),
         "has_remote": json_bool(r.get("has_remote")),
@@ -491,10 +492,11 @@ fn arg_i64_default(args: &[Value], i: usize) -> i64 {
 }
 
 /// app.set_repo_config: pass through every Some(...) keyword. `phases` is a JSON value (object or null).
+/// `api_key` (positional 11) is an optional per-repo OpenRouter/Ollama key overriding the global .env.
 fn set_repo_config(args: &[Value]) -> Value {
     let name = arg_str(args, 0);
     // Positional order mirrors app.py: name, provider, model, ship, gate, pr_target_branch, interval,
-    // max_iterations, reasoning, goal, phases.
+    // max_iterations, reasoning, goal, phases, api_key.
     let provider = arg_opt_str(args, 1);
     let model = arg_opt_str(args, 2);
     let ship = arg_opt_str(args, 3);
@@ -506,6 +508,11 @@ fn set_repo_config(args: &[Value]) -> Value {
     let goal = arg_opt_str(args, 9);
     let phases = match args.get(10) {
         Some(v) if !v.is_null() => Some(v.clone()),
+        _ => None,
+    };
+    // api_key: null/absent -> None (unchanged); a string (incl. "" to clear) -> Some.
+    let api_key = match args.get(11) {
+        Some(Value::String(s)) => Some(s.as_str()),
         _ => None,
     };
     registry::set_repo_config(
@@ -520,6 +527,7 @@ fn set_repo_config(args: &[Value]) -> Value {
         reasoning.as_deref(),
         goal.as_deref(),
         phases.as_ref(),
+        api_key,
     )
 }
 
@@ -550,6 +558,7 @@ fn add_project(args: &[Value]) -> Value {
                 &name,
                 None, None, None, None, None, None, None, None,
                 Some(trimmed),
+                None,
                 None,
             );
         } else {

@@ -320,6 +320,14 @@ pub fn project_reasoning(repo: &Value) -> String {
     str_or(repo, "reasoning", "xhigh")
 }
 
+/// control.project_api_key: a per-repo API key (overrides the global .env key for this repo's
+/// iterations), or "" when unset. Stored under the repo's `api_key` field in repos.json. Never
+/// logged verbatim by callers (Ctx::redact scrubs the active key env value); get_state surfaces
+/// only a bool `api_key_set`.
+pub fn project_api_key(repo: &Value) -> String {
+    str_or(repo, "api_key", "")
+}
+
 /// control.project_goal: the north-star goal, stripped, or "" (unset).
 pub fn project_goal(repo: &Value) -> String {
     let v = get(repo, "goal");
@@ -346,7 +354,9 @@ pub fn project_sandbox(repo: &Value) -> Value {
 /// control.set_repo_config: upsert the repos.json entry for `name`, setting any passed (Some) keys.
 /// Read-modify-write the whole list; preserve untouched keys; atomic write. Creates the entry
 /// (carrying its discovered path) when absent. `phases` Some(obj) full-replaces the per-phase map,
-/// pruning empty per-phase dicts; an empty result removes the `phases` key entirely.
+/// pruning empty per-phase dicts; an empty result removes the `phases` key entirely. `api_key`
+/// Some("") clears the per-repo key (writes empty, which `project_api_key` treats as unset);
+/// Some(non-empty) sets it; None leaves it untouched.
 #[allow(clippy::too_many_arguments)]
 pub fn set_repo_config(
     name: &str,
@@ -360,6 +370,7 @@ pub fn set_repo_config(
     reasoning: Option<&str>,
     goal: Option<&str>,
     phases: Option<&Value>,
+    api_key: Option<&str>,
 ) -> Value {
     if name.is_empty() {
         return json!({"ok": false, "error": "name required"});
@@ -439,6 +450,11 @@ pub fn set_repo_config(
             } else {
                 entry.insert("phases".to_string(), Value::Object(pruned));
             }
+        }
+        if let Some(k) = api_key {
+            // Some("") clears the per-repo key (treat empty as unset, matching project_api_key's
+            // truthiness check); Some(non-empty) sets it. Stored plaintext like the global .env keys.
+            entry.insert("api_key".to_string(), Value::String(k.to_string()));
         }
     }
 
@@ -925,6 +941,16 @@ mod tests {
         assert_eq!(project_reasoning(&json!({"reasoning": "low"})), "low");
     }
 
+    // ---- project_api_key ----
+    #[test]
+    fn project_api_key_vectors() {
+        assert_eq!(project_api_key(&json!({})), "");
+        assert_eq!(project_api_key(&json!({"api_key": ""})), "");
+        assert_eq!(project_api_key(&json!({"api_key": "sk-or-v1-xyz"})), "sk-or-v1-xyz");
+        // non-string truthy values fall through to "" (str_or only accepts truthy strings)
+        assert_eq!(project_api_key(&json!({"api_key": 123})), "");
+    }
+
     // ---- project_goal ----
     #[test]
     fn project_goal_vectors() {
@@ -1108,5 +1134,95 @@ mod tests {
             expandvars("%DEFINITELY_UNSET_VAR_XYZ%"),
             "%DEFINITELY_UNSET_VAR_XYZ%"
         );
+    }
+
+    // ---- set_repo_config: per-repo api_key round-trip (writes the real repos.json; serialized) ----
+    // The crate's other file-touching suites (keys::EnvGuard, api::StateGuard) backup+restore the
+    // real operator file under a process-wide mutex; mirror that for repos.json so the test is
+    // hermetic and serializes against any future repos.json-writing test.
+    static REPOS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ReposGuard {
+        saved: Option<Vec<u8>>,
+        _g: std::sync::MutexGuard<'static, ()>,
+    }
+    impl ReposGuard {
+        fn capture() -> Self {
+            let g = REPOS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let p = paths::repos_json();
+            let saved = std::fs::read(&p).ok();
+            let _ = std::fs::remove_file(&p);
+            ReposGuard { saved, _g: g }
+        }
+        fn read(&self) -> Vec<Value> {
+            read_repos_json()
+        }
+    }
+    impl Drop for ReposGuard {
+        fn drop(&mut self) {
+            let p = paths::repos_json();
+            match &self.saved {
+                Some(b) => { let _ = std::fs::write(&p, b); }
+                None => { let _ = std::fs::remove_file(&p); }
+            }
+        }
+    }
+
+    #[test]
+    fn set_repo_config_api_key_round_trip() {
+        let g = ReposGuard::capture();
+        // set the per-repo key
+        let r = set_repo_config(
+            "testrepo_ak", None, None, None, None, None, None, None, None, None, None,
+            Some("sk-or-v1-perrepo"),
+        );
+        assert_eq!(r, json!({"ok": true}));
+        let rows = g.read();
+        let row = rows.iter().find(|r| r.get("name").and_then(Value::as_str) == Some("testrepo_ak"))
+            .expect("entry written");
+        assert_eq!(row.get("api_key").and_then(Value::as_str), Some("sk-or-v1-perrepo"));
+        assert_eq!(project_api_key(row), "sk-or-v1-perrepo");
+        // clear it (Some("") writes empty -> project_api_key treats as unset)
+        let _ = set_repo_config(
+            "testrepo_ak", None, None, None, None, None, None, None, None, None, None,
+            Some(""),
+        );
+        let rows = g.read();
+        let row = rows.iter().find(|r| r.get("name").and_then(Value::as_str) == Some("testrepo_ak"))
+            .expect("entry present");
+        assert_eq!(project_api_key(row), "", "empty api_key reads as unset");
+        // None leaves it untouched (re-set, then None-call must not clear)
+        let _ = set_repo_config(
+            "testrepo_ak", None, None, None, None, None, None, None, None, None, None,
+            Some("sk-or-v1-keep"),
+        );
+        let _ = set_repo_config(
+            "testrepo_ak", None, None, None, None, None, None, None, None, None, None,
+            None,
+        );
+        let rows = g.read();
+        let row = rows.iter().find(|r| r.get("name").and_then(Value::as_str) == Some("testrepo_ak"))
+            .expect("entry present");
+        assert_eq!(project_api_key(row), "sk-or-v1-keep", "None api_key leaves it untouched");
+    }
+
+    #[test]
+    fn set_repo_config_preserves_existing_api_key_when_not_passed() {
+        let g = ReposGuard::capture();
+        // seed with an api_key
+        let _ = set_repo_config(
+            "testrepo_keep", None, None, None, None, None, None, None, None, None, None,
+            Some("sk-or-v1-orig"),
+        );
+        // a call that does NOT pass api_key (None) must preserve the existing key
+        let _ = set_repo_config(
+            "testrepo_keep", Some("openrouter"), None, None, None, None, None, None, None, None, None,
+            None,
+        );
+        let rows = g.read();
+        let row = rows.iter().find(|r| r.get("name").and_then(Value::as_str) == Some("testrepo_keep"))
+            .expect("entry present");
+        assert_eq!(row.get("provider").and_then(Value::as_str), Some("openrouter"));
+        assert_eq!(project_api_key(row), "sk-or-v1-orig", "api_key preserved when not passed");
     }
 }
