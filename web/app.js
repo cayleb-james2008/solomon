@@ -170,26 +170,89 @@ function loopsPanel(body) {
 }
 
 /* ---------- panel: activity / log ---------- */
+// Richer activity surface: live metrics (iterations / shipped / reverted / success rate) + a tests
+// sparkline + an iteration-timeline of status nodes ABOVE the tailing log. All data flows from the
+// EXISTING bridge methods (metrics, read_history, read_log) — no new backend.
+const STATUS_COLOR = { shipped: "--ok", reverted: "--err", noop: "--ink-3", blocked: "--warn", error: "--err", stopped: "--ink-3" };
+const STATUS_GLYPH = { shipped: "✓", reverted: "↺", noop: "·", blocked: "!", error: "⚠", stopped: "○" };
+function sparkline(series) {
+  if (!series || !series.length) return '<svg class="spark" viewBox="0 0 120 28" aria-hidden="true"><text x="60" y="18" text-anchor="middle" class="spark-empty">no tests yet</text></svg>';
+  const w = 120, h = 28, pad = 3;
+  const vals = series.map(s => Number(s.passed || 0) + Number(s.failed || 0));
+  const max = Math.max(1, ...vals);
+  const pts = series.map((s, i) => {
+    const x = pad + (i / Math.max(1, series.length - 1)) * (w - pad * 2);
+    const y = h - pad - (Number(s.passed || 0) / max) * (h - pad * 2);
+    return [x, y, Number(s.failed || 0)];
+  });
+  // Single-point degenerate case: a lone `M` renders no visible line. Draw a dot (passed) + bar (failed)
+  // so one data point isn't an invisible empty graph.
+  if (pts.length === 1) {
+    const [x, y, f] = pts[0];
+    const bh = (f / max) * (h - pad * 2);
+    return `<svg class="spark" viewBox="0 0 ${w} ${h}" aria-hidden="true"><rect x="${(x - 1.2).toFixed(1)}" y="${(h - pad - bh).toFixed(1)}" width="2.4" height="${bh.toFixed(1)}" class="spark-bar" rx="0.6"/><circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.4" class="spark-line" fill="var(--clay)" stroke="none"/></svg>`;
+  }
+  const line = pts.map((p, i) => (i === 0 ? "M" : "L") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
+  const area = line + ` L${pts[pts.length - 1][0].toFixed(1)} ${h - pad} L${pts[0][0].toFixed(1)} ${h - pad} Z`;
+  const bars = pts.map(p => `<rect x="${(p[0] - 1.2).toFixed(1)}" y="${(h - pad - (p[2] / max) * (h - pad * 2)).toFixed(1)}" width="2.4" height="${((p[2] / max) * (h - pad * 2)).toFixed(1)}" class="spark-bar" rx="0.6"/>`).join("");
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" aria-hidden="true"><path d="${area}" class="spark-area"/><path d="${line}" class="spark-line"/><g>${bars}</g></svg>`;
+}
+function timelineNodes(hist) {
+  if (!hist || !hist.length) return '<div class="tl-empty">no iterations yet</div>';
+  const last = hist.slice(-24);
+  return '<div class="tl">' + last.map(rec => {
+    const st = rec.status || "noop";
+    const col = STATUS_COLOR[st] || "--ink-3";
+    const g = STATUS_GLYPH[st] || "·";
+    const i = rec.iteration ?? "?";
+    const ts = rec.ts ? ago(rec.ts) : "";
+    const title = `iter ${i} · ${st}${ts ? " · " + ts : ""}`;
+    return `<span class="tl-node ${st}" style="--node:var(${col})" title="${esc(title)}">${esc(g)}</span>`;
+  }).join("") + '</div>';
+}
+function metricsRow(m) {
+  if (!m || m.iterations == null) return '<div class="metrics-row muted">no metrics yet</div>';
+  const sr = m.success_rate == null ? "—" : (Math.round(Number(m.success_rate) * 100) + "%");
+  return '<div class="metrics-row">'
+    + `<div class="mstat"><span class="mstat-val">${esc(m.iterations)}</span><span class="mstat-lbl">iters</span></div>`
+    + `<div class="mstat ok"><span class="mstat-val">${esc(m.shipped || 0)}</span><span class="mstat-lbl">shipped</span></div>`
+    + `<div class="mstat err"><span class="mstat-val">${esc(m.reverted || 0)}</span><span class="mstat-lbl">reverted</span></div>`
+    + `<div class="mstat"><span class="mstat-val sr">${esc(sr)}</span><span class="mstat-lbl">success</span></div>`
+    + '</div>';
+}
+
 function activityPanel(body, spec) {
   const head = h("div", "act-head");
   const sel = h("select");
   let firstLoad = true;
+  // metrics + history widgets (rebuilt only when changed; cheap DOM swap)
+  const overview = h("div", "act-overview", '<div class="metrics-row muted">no metrics yet</div>');
+  const tlWrap = h("div", "act-tl", '<div class="tl-empty">no iterations yet</div>');
+  const logWrap = h("div", "act-logwrap");
+  const pre = h("div", "log", "(loading…)");
+  logWrap.append(pre);
+  body.append(head, overview, tlWrap, logWrap);
+
   // A live log must OPEN on the latest line. Capture the bottom-pinned state BEFORE replacing text
   // (setting textContent resets scrollTop). Force a jump to the bottom on the first load and on a
   // repo switch (force=true); otherwise only follow the tail when the user was already at the bottom,
   // so a periodic refresh never yanks them out of scrollback they're reading.
   const refreshLog = async (force = false) => { try { const x = await call("read_log", spec.repo); const txt = (x && x.text) || (typeof x === "string" ? x : (x && x.log) || ""); const wasAtBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40; pre.textContent = txt || "(no log yet)"; if (force || firstLoad || wasAtBottom) pre.scrollTop = pre.scrollHeight; firstLoad = false; } catch { pre.textContent = "(log unavailable)"; } };
-  const pre = h("div", "log", "(loading…)");
+  // metrics + history: debounce-ish — rebuild the widgets only when the serialized payload changes,
+  // so a 4s tick doesn't thrash the DOM (and flash) when nothing moved.
+  let metricsSig = "", histSig = "";
+  const refreshMetrics = async () => { try { const m = await call("metrics", spec.repo); const sig = JSON.stringify(m); if (sig !== metricsSig) { metricsSig = sig; overview.innerHTML = metricsRow(m) + sparkline(m && m.tests_series); } } catch {} };
+  const refreshHistory = async () => { try { const hist = await call("read_history", spec.repo, 40); const sig = JSON.stringify(hist); if (sig !== histSig) { histSig = sig; tlWrap.innerHTML = timelineNodes(hist); } } catch {} };
+
   function fillRepos() {
     sel.innerHTML = ""; state.repos.forEach(r => { const o = h("option"); o.value = r.name; o.textContent = r.name; if (r.name === spec.repo) o.selected = true; sel.appendChild(o); });
     // reset spec.repo to a LIVE repo when it is unset OR names a repo that has been removed/renamed,
     // so it stays in sync with what the <select> actually displays (a stale name -> permanently blank log).
     if (state.repos.length && !state.repos.some(r => r.name === spec.repo)) { spec.repo = state.repos[0].name; sel.value = spec.repo; saveLayout(); }
   }
-  sel.onchange = () => { spec.repo = sel.value; saveLayout(); refreshLog(true); };
+  sel.onchange = () => { spec.repo = sel.value; saveLayout(); firstLoad = true; metricsSig = ""; histSig = ""; refreshLog(true); refreshMetrics(); refreshHistory(); };
   head.append(h("span", "muted", "Repo"), sel);
-  body.append(head, pre);
-  fillRepos(); refreshLog();
+  fillRepos(); refreshLog(); refreshMetrics(); refreshHistory();
   // Rebuild the <select> only when the repo set changes AND the dropdown isn't focused — an
   // unconditional 4s rebuild clobbers an open/keyboard-navigated dropdown. (name-set cache mirrors
   // the loops panel's update(); the activeElement focus-guard mirrors loopRow's setSel.) refreshLog
@@ -199,6 +262,8 @@ function activityPanel(body, spec) {
     const n = state.repos.map(r => r.name).join();
     if (n !== names && document.activeElement !== sel) { names = n; fillRepos(); }
     refreshLog();
+    refreshMetrics();
+    refreshHistory();
   } };
 }
 
@@ -404,6 +469,23 @@ const mock = (() => {
     get_layout: () => lay, set_layout: (l) => { lay = l; return { ok: true }; },
     current_sha: () => ({ sha: "efd7ba2" }),
     read_log: (n) => ({ text: `2026-06-22T06:44Z iteration 3: branch rsi/iter — Pi working (${n})\n2026-06-22T06:45Z gate: pytest…\n2026-06-22T06:46Z Pi made one improvement; opening PR` }),
+    // mock metrics + history so ?mock=1 previews the rich activity panel (shape byte-identical to the
+    // real backend: control.metrics / control.read_history).
+    metrics: (n) => {
+      const r = (n === "maki") ? { iterations: 142, shipped: 96, reverted: 31, success_rate: 0.736 }
+        : (n === "asmodeus") ? { iterations: 88, shipped: 60, reverted: 21, success_rate: 0.706 }
+        : { iterations: 7, shipped: 5, reverted: 1, success_rate: 0.833 };
+      return { ...r, merged: r.shipped, noop: 3, blocked: 0, error: 1, stopped: 0,
+        tests_series: Array.from({ length: 8 }, (_, i) => ({ ts: `t${i}`, passed: 4 + i, failed: i === 3 ? 2 : 0 })) };
+    },
+    read_history: (n, limit = 40) => {
+      const seq = ["shipped", "shipped", "reverted", "shipped", "noop", "shipped", "blocked", "shipped", "error", "shipped"];
+      const out = [];
+      for (let i = 1; i <= Math.min(limit, 12); i++) {
+        out.push({ iteration: i, status: seq[(i - 1) % seq.length], ts: new Date(Date.now() - (12 - i) * 3600 * 1000).toISOString() });
+      }
+      return out;
+    },
     set_repo_config: () => ({ ok: true }), start: () => ({ ok: true }), stop: () => ({ ok: true }),
     merge: () => ({ ok: true }), close: () => ({ ok: true }), set_key: () => ({ ok: true }),
     github_login_start: () => ({ ok: true }), add_project: () => ({ ok: true, name: "newrepo" }), set_auto_push: () => ({ ok: true }),
