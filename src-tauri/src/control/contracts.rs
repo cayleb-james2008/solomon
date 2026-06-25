@@ -306,6 +306,7 @@ pub fn ensure_contracts(repo: &Value) -> Value {
                 None,
                 None,
                 None,
+                None,
             );
             if r.get("ok").and_then(Value::as_bool).unwrap_or(false) {
                 out.insert("gate_set".to_string(), Value::String(det));

@@ -549,8 +549,10 @@ pub fn phase_run_pi(
 }
 
 // re-export the timeout constants verbatim from the source so callers don't re-derive them.
-/// run_pi default timeout (implement). run_improver: `def run_pi(task, timeout=1800, ...)`.
-pub const TIMEOUT_IMPLEMENT: i64 = 1800;
+/// run_pi default timeout (implement). Raised from 1800s (30 min) to 3600s (60 min) so slower
+/// OpenRouter models (owl-alpha, nemotron free tier) have enough time to complete a real coding
+/// task. The prior 30-min ceiling timed out every free-tier model before it could finish.
+pub const TIMEOUT_IMPLEMENT: i64 = 3600;
 /// beautify pass timeout. run_improver: `run_pi(..., timeout=900)` (skips the gate).
 pub const TIMEOUT_BEAUTIFY: i64 = 900;
 /// decompose/review/ideate/provision one-off timeout. run_improver: `timeout=600`.
@@ -660,7 +662,7 @@ mod tests {
     // ---- timeout constant parity with the source ----
     #[test]
     fn timeout_constants_match_source() {
-        assert_eq!(TIMEOUT_IMPLEMENT, 1800);
+        assert_eq!(TIMEOUT_IMPLEMENT, 3600);
         assert_eq!(TIMEOUT_BEAUTIFY, 900);
         assert_eq!(TIMEOUT_PHASE_600, 600);
         assert_eq!(TIMEOUT_PHASE_400, 400);

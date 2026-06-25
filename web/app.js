@@ -72,7 +72,8 @@ function setConfig(name, c) {
   return act("set_repo_config", name,
     c.provider ?? null, c.model ?? null, c.ship ?? null, null /*gate*/,
     c.pr_target_branch ?? null, null /*interval*/, null /*max_iterations*/,
-    c.reasoning ?? null, null /*goal*/, null /*phases*/);
+    c.reasoning ?? null, null /*goal*/, null /*phases*/,
+    c.api_key ?? null);
 }
 
 /* ---------- selector builders ---------- */
@@ -116,8 +117,22 @@ function loopRow(r) {
   const fShip = selectField("Ship mode", r.ship, SHIP, v => commit({ ship: v }));
   const fBranch = inputField("Target branch", r.pr_target_branch, v => commit({ pr_target_branch: v }));
   const fReason = selectField("Reasoning", r.reasoning || "high", REASON.map(x => [x, x]), v => commit({ reasoning: v }));
+  // Per-repo API key (overrides the global .env key for this repo's iterations). Password input;
+  // placeholder reflects whether a per-repo key is set (the value is never sent back by the backend).
+  const fKey = h("div", "field wide");
+  fKey.appendChild(h("label", null, "API key (per-repo)"));
+  const keyInp = h("input");
+  keyInp.type = "password";
+  keyInp.setAttribute("autocomplete", "off");
+  keyInp.setAttribute("aria-label", `${r.name} per-repo API key`);
+  let keyBaseline = "";
+  keyInp.onfocus = () => { keyBaseline = keyInp.value; };
+  const commitKey = () => { if (keyInp.value !== keyBaseline) commit({ api_key: keyInp.value.trim() }); };
+  keyInp.onblur = commitKey;
+  keyInp.onkeydown = e => { if (e.key === "Enter") keyInp.blur(); };
+  fKey.appendChild(keyInp);
   fModel.classList.add("wide");
-  grid.append(fProv, fModel, fShip, fBranch, fReason);
+  grid.append(fProv, fModel, fShip, fBranch, fReason, fKey);
   row.append(top, grid);
 
   async function commit(c) {
@@ -150,6 +165,11 @@ function loopRow(r) {
     const setInp = (f, v) => { if (f._inp && document.activeElement !== f._inp) f._inp.value = v || ""; };
     setSel(fProv, cur.provider); setInp(fModel, cur.model); setSel(fShip, cur.ship);
     setInp(fBranch, cur.pr_target_branch); setSel(fReason, cur.reasoning || "high");
+    // per-repo key: never display a value (backend doesn't return it); reflect set-state in the placeholder.
+    if (document.activeElement !== keyInp) {
+      keyInp.value = "";
+      keyInp.placeholder = cur.api_key_set ? "•••••• (per-repo key set — type to replace)" : "uses global key (type to set per-repo)";
+    }
   }
   return { el: row, update };
 }
@@ -458,10 +478,10 @@ function start() { if (booted) return; booted = true; boot(); }
 /* ---------- mock data (browser preview: index.html?mock=1) ---------- */
 const mock = (() => {
   const repos = [
-    { name: "maki", provider: "ollama-cloud", model: "kimi-k2.7-code", ship: "auto-merge", pr_target_branch: "main", reasoning: "xhigh", running: true, heartbeat: { status: "iterating", phase: "implement", updated_at: new Date(Date.now() - 40000).toISOString() }, prs: [{ number: 142, title: "harden KCC convert pipeline", state: "open" }] },
-    { name: "sover", provider: "ollama-cloud", model: "kimi-k2.7-code", ship: "auto-merge", pr_target_branch: "main", reasoning: "xhigh", running: false, heartbeat: { status: "stopped" }, prs: [] },
-    { name: "asmodeus", provider: "ollama-cloud", model: "glm-5.2", ship: "auto-merge", pr_target_branch: "master", reasoning: "high", running: true, heartbeat: { status: "sleeping", phase: "reflect", updated_at: new Date(Date.now() - 9000).toISOString() }, prs: [{ number: 88, title: "advance funnel candidate v54", state: "open" }] },
-    { name: "dotz", provider: "ollama-cloud", model: "kimi-k2.7-code", ship: "auto-merge", pr_target_branch: "master", reasoning: "xhigh", running: false, heartbeat: { status: "idle" }, prs: [] },
+    { name: "maki", provider: "ollama-cloud", model: "kimi-k2.7-code", ship: "auto-merge", pr_target_branch: "main", reasoning: "xhigh", running: true, api_key_set: false, heartbeat: { status: "iterating", phase: "implement", updated_at: new Date(Date.now() - 40000).toISOString() }, prs: [{ number: 142, title: "harden KCC convert pipeline", state: "open" }] },
+    { name: "sover", provider: "ollama-cloud", model: "kimi-k2.7-code", ship: "auto-merge", pr_target_branch: "main", reasoning: "xhigh", running: false, api_key_set: false, heartbeat: { status: "stopped" }, prs: [] },
+    { name: "asmodeus", provider: "ollama-cloud", model: "glm-5.2", ship: "auto-merge", pr_target_branch: "master", reasoning: "high", running: true, api_key_set: true, heartbeat: { status: "sleeping", phase: "reflect", updated_at: new Date(Date.now() - 9000).toISOString() }, prs: [{ number: 88, title: "advance funnel candidate v54", state: "open" }] },
+    { name: "dotz", provider: "ollama-cloud", model: "kimi-k2.7-code", ship: "auto-merge", pr_target_branch: "master", reasoning: "xhigh", running: false, api_key_set: false, heartbeat: { status: "idle" }, prs: [] },
   ];
   let lay = null;
   return {

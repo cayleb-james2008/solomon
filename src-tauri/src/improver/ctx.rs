@@ -21,8 +21,10 @@ use chrono::Utc;
 // static tables / constants (run_improver.py module level)
 // --------------------------------------------------------------------------- #
 
-/// run_improver.GATE_TIMEOUT — seconds before a hung gate is force-failed.
-pub const GATE_TIMEOUT: i64 = 900;
+/// run_improver.GATE_TIMEOUT — seconds before a hung gate is force-failed. Raised to 3600s (60 min)
+/// to match the implement timeout, so a cold `cargo test` on a large Rust workspace has the full hour
+/// to compile + run rather than falsely RED-ing a good change at the 30-min mark.
+pub const GATE_TIMEOUT: i64 = 3600;
 /// run_improver._ESCALATE_TO_FALLBACK — cumulative failures before switching to the fallback model.
 pub const ESCALATE_TO_FALLBACK: i64 = 2;
 /// run_improver.DECOMPOSE_ENABLED — rung-2 goal decomposition (opt-in; off => the final rung defers).
@@ -192,6 +194,10 @@ pub struct Ctx {
     pub pi_provider: String,
     pub pi_model: String,
     pub pi_ext: PathBuf,
+    /// Per-repo API key (from repos.json `api_key`), overriding the global .env key for this repo's
+    /// iterations. Empty when unset -> the global .env key (if any) is used. Applied to the process
+    /// env in load_env() so run_pi/redact/required_key all read it through the existing env-var channel.
+    pub api_key: String,
 
     // ---- HERE/*.md contracts the later phases need ----
     pub beautify_md: PathBuf,
@@ -333,6 +339,7 @@ impl Ctx {
             pi_provider,
             pi_model,
             pi_ext,
+            api_key: String::new(),
 
             // run config defaults (run_improver module level)
             run_id,
@@ -411,6 +418,8 @@ impl Ctx {
         self.pi_ext = self.here.join(prov.ext);
         // PI_MODEL = row.get("model") or prov["default_model"]
         self.pi_model = str_or_truthy(row.get("model"), prov.default_model);
+        // API_KEY = row.get("api_key") or ""  (per-repo key; "" -> use the global .env key)
+        self.api_key = str_or_truthy(row.get("api_key"), "");
         // GATE_CMD = (row.get("gate") or "").strip()
         self.gate_cmd = str_or_truthy(row.get("gate"), "").trim().to_string();
         // REASONING = row.get("reasoning") or "xhigh"
@@ -452,6 +461,10 @@ impl Ctx {
 
         // _apply_phase_config(row)
         self.apply_phase_config(Some(&row));
+
+        // Re-apply the per-repo API-key override AFTER phase config (a per-phase provider override may
+        // have swapped pi_provider, changing which env var the key should land in).
+        self.apply_api_key();
     }
 
     /// run_improver._apply_phase_config (~223-257): override the active provider/model/reasoning with
@@ -654,6 +667,9 @@ impl Ctx {
 
     /// run_improver._load_env (~568-584): load provider API keys (+ OLLAMA_BASE_URL) from
     /// Solomon/.env into the process env. Dependency-free parser; existing environment values win.
+    /// Then apply the per-repo `api_key` override (if set) so this repo's iterations use its own key
+    /// instead of the global one. Called once at startup; the per-repo override is re-applied each
+    /// iteration by `refresh_config_from_registry` -> `apply_api_key`.
     pub fn load_env(&self) {
         let p = self.control.join(".env");
         let content = match std::fs::read_to_string(&p) {
@@ -677,6 +693,26 @@ impl Ctx {
                 std::env::set_var(k, v);
             }
         }
+        // Per-repo override on top of the globals.
+        self.apply_api_key();
+    }
+
+    /// Apply this repo's per-repo `api_key` to the process env, overriding the global .env value for
+    /// the active provider's env var. A no-op when `api_key` is empty (the global key, if any, is
+    /// left in place). Idempotent; called from load_env() and refresh_config_from_registry() so a
+    /// dashboard edit to the per-repo key takes effect mid-loop without a stop+restart. Each repo's
+    /// improver is a separate process, so this override is isolated to that repo's iterations.
+    pub fn apply_api_key(&self) {
+        if self.api_key.is_empty() {
+            return;
+        }
+        // Map the active provider to its env-var name (mirror required_key, but as a set, not a read).
+        let var = if self.pi_provider == "openrouter" {
+            "OPENROUTER_API_KEY"
+        } else {
+            "OLLAMA_API_KEY"
+        };
+        std::env::set_var(var, &self.api_key);
     }
 
     /// run_improver._required_key (~587-589): the env-var name of the API key the active provider needs.
@@ -1160,5 +1196,87 @@ mod tests {
         assert_eq!(c.redact(kv), "API_KEY=[REDACTED]");
         // empty passes through
         assert_eq!(c.redact(""), "");
+    }
+
+    // ---- apply_api_key: per-repo key overrides the provider env var ----
+    // Mutates the process env (OPENROUTER_API_KEY / OLLAMA_API_KEY); serialize via a mutex and
+    // save/restore the touched vars so the suite is hermetic.
+    static APIKEY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvVarGuard {
+        keys: Vec<&'static str>,
+        saved: Vec<Option<String>>,
+        _g: std::sync::MutexGuard<'static, ()>,
+    }
+    impl EnvVarGuard {
+        fn capture(keys: Vec<&'static str>) -> Self {
+            let g = APIKEY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let saved = keys.iter().map(|k| std::env::var(k).ok()).collect();
+            for k in &keys { std::env::remove_var(k); }
+            EnvVarGuard { keys, saved, _g: g }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.keys.iter().zip(self.saved.iter()) {
+                match v {
+                    Some(s) => std::env::set_var(k, s),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn apply_api_key_openrouter_overrides_env() {
+        let _g = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY", "OLLAMA_API_KEY"]);
+        // seed a "global" key
+        std::env::set_var("OPENROUTER_API_KEY", "sk-global");
+        let mut c = Ctx::configure("C:/x/repo", "repo", "openrouter", None);
+        assert_eq!(c.pi_provider, "openrouter");
+        // no per-repo key -> global stays
+        c.api_key = String::new();
+        c.apply_api_key();
+        assert_eq!(std::env::var("OPENROUTER_API_KEY").unwrap(), "sk-global");
+        // per-repo key overrides the global
+        c.api_key = "sk-perrepo".to_string();
+        c.apply_api_key();
+        assert_eq!(std::env::var("OPENROUTER_API_KEY").unwrap(), "sk-perrepo");
+    }
+
+    #[test]
+    fn apply_api_key_ollama_cloud_writes_ollama_var() {
+        let _g = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY", "OLLAMA_API_KEY"]);
+        std::env::remove_var("OLLAMA_API_KEY");
+        let mut c = Ctx::configure("C:/x/repo", "repo", "ollama-cloud", None);
+        assert_eq!(c.pi_provider, "maki-cloud");
+        c.api_key = "sk-ollama-perrepo".to_string();
+        c.apply_api_key();
+        assert_eq!(std::env::var("OLLAMA_API_KEY").unwrap(), "sk-ollama-perrepo");
+        // openrouter var untouched
+        assert!(std::env::var("OPENROUTER_API_KEY").is_err());
+    }
+
+    #[test]
+    fn apply_api_key_empty_is_noop() {
+        let _g = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY", "OLLAMA_API_KEY"]);
+        std::env::set_var("OPENROUTER_API_KEY", "sk-global");
+        let mut c = Ctx::configure("C:/x/repo", "repo", "openrouter", None);
+        c.api_key = String::new();
+        c.apply_api_key();
+        assert_eq!(std::env::var("OPENROUTER_API_KEY").unwrap(), "sk-global");
+    }
+
+    #[test]
+    fn redact_scrubs_per_repo_key_value() {
+        // The per-repo key, once applied to the env var, is redacted from agent text by the existing
+        // exact-value pass (Ctx::redact reads OPENROUTER_API_KEY / OLLAMA_API_KEY from env).
+        let _g = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY", "OLLAMA_API_KEY"]);
+        let mut c = Ctx::configure("C:/x/repo", "repo", "openrouter", None);
+        c.api_key = "sk-or-v1-uniquerandperrepo".to_string();
+        c.apply_api_key();
+        let text = "here is my key sk-or-v1-uniquerandperrepo for you";
+        assert!(c.redact(text).contains("[REDACTED]"), "per-repo key value must be redacted");
+        assert!(!c.redact(text).contains("sk-or-v1-uniquerandperrepo"));
     }
 }

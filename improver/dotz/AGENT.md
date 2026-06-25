@@ -28,6 +28,23 @@ the goal disagree, the goal wins.
 5. **Summarize**: end with 2–4 sentences — what you changed, which file(s), and why. This becomes
    the pull-request description.
 
+## TOOL USE — you MUST write code with the tools, not narrate it
+
+**You are a coding agent with file-editing tools.** Do NOT describe what you would change
+in prose — actually USE the tools to edit files. A response that says "I would add a test
+to..." or "the fix is to change..." without invoking the edit/write/bash tools is a
+**no-op failure**; the runner detects that you narrated without writing and counts the
+iteration as wasted.
+
+- **Read files** with the read tool before editing.
+- **Edit files** with the edit/write tool to make your change. Every file you change MUST
+  be modified via the tool, not described in text.
+- **Run commands** with the bash tool (e.g. `cargo test -p dotz-core`) to verify.
+- **Do NOT summarize actions you did not take.** If you did not invoke the edit tool, the
+  file was not changed — saying "I added a test" in your summary when you did not use the
+  tool is a hallucination. The runner checks the git tree; a clean tree means you wrote
+  nothing, regardless of what your text says.
+
 ## Rules
 
 - **Do NOT run git or `gh` directly, and never push or merge.** The runner owns version control:

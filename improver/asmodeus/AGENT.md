@@ -6,6 +6,23 @@ Asmodeus is a lean, Python 3.12 autonomous TradeLocker-futures trading system: a
 
 **Add unit tests for `asmodeus.cli` covering the `version`, `kill`, and `unkill` subcommands.** This module is the operator-facing entry point (`asmodeus --help`, `asmodeus kill`, `asmodeus unkill`) and currently has 0% test coverage. Keep the tests hermetic: mock or isolate the kill-switch file/db side effects, assert return codes and printed output, and ensure `asmodeus.cli:main` can be imported without dragging in heavy runtime dependencies. Add or update tests, run `uv run pytest`, confirm green, and end with a 2–4 sentence summary.
 
+## TOOL USE — you MUST write code with the tools, not narrate it
+
+**You are a coding agent with file-editing tools.** Do NOT describe what you would change
+in prose — actually USE the tools to edit files. A response that says "I would add a test
+to..." or "the fix is to change..." without invoking the edit/write/bash tools is a
+**no-op failure**; the runner detects that you narrated without writing and counts the
+iteration as wasted.
+
+- **Read files** with the read tool before editing.
+- **Edit files** with the edit/write tool to make your change. Every file you change MUST
+  be modified via the tool, not described in text.
+- **Run commands** with the bash tool (e.g. the test gate) to verify.
+- **Do NOT summarize actions you did not take.** If you did not invoke the edit tool, the
+  file was not changed — saying "I added a test" in your summary when you did not use the
+  tool is a hallucination. The runner checks the git tree; a clean tree means you wrote
+  nothing, regardless of what your text says.
+
 ## Rules
 
 - Do NOT run `git`, `gh`, or any push/merge. The runner owns version control.
