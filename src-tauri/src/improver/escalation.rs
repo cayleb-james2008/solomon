@@ -249,7 +249,7 @@ fn edit_mandate_re() -> &'static regex::Regex {
 }
 
 /// run_improver._deviated_from_named_files (~360-373): True when the item explicitly mandates editing
-/// >=1 file but the committed diff touched NONE of them (matched by path SUFFIX so a named
+/// one or more files but the committed diff touched none of them (matched by path SUFFIX so a named
 /// `scripts/scheduler.py` isn't satisfied by a decoy `docs/scheduler.py`). Conservative: fires ONLY on
 /// an explicit edit mandate — when no file is mandated, returns False (the agent's self-reported
 /// ITEM-STATUS stands).
@@ -281,7 +281,12 @@ pub fn deviated_from_named_files(_ctx: &Ctx, goal: &str, changed_files: &str) ->
 /// Returns True (writing STOP + an error heartbeat) when [`DIRTY_BASE_PERSISTENT_LIMIT`] is reached —
 /// the caller must NOT spin again. A dirty NON-base branch (rsi/* — cleared by the forced preflight)
 /// does NOT count; a clean iteration RESETS the counter.
-pub fn note_dirty_base_bail(ctx: &mut Ctx, dirty: bool, cur_branch: &str, base_branch: &str) -> bool {
+pub fn note_dirty_base_bail(
+    ctx: &mut Ctx,
+    dirty: bool,
+    cur_branch: &str,
+    base_branch: &str,
+) -> bool {
     // only a dirty BASE branch counts
     if !(dirty && cur_branch == base_branch) {
         ctx.dirty_base_bail_count = 0;
@@ -543,8 +548,21 @@ concrete approach and actually edit files to implement THIS item",
     );
 }
 
-/// run_improver._note_deviation (~1841-1846): the agent shipped a real change to something OTHER than
-/// the named item — escalate with the templated deviation corrective note.
+/// Implement timeouts usually mean the item needs a smaller shippable slice. Count them in the same
+/// escalation ladder as noops/reverts so the runner adapts instead of retrying forever.
+pub fn note_timeout(ctx: &mut Ctx, goal: &str, limit: i64) {
+    register_failure(
+        ctx,
+        goal,
+        "timeout",
+        "the previous attempt exceeded the implement timeout -- scope this item down to the \
+largest coherent slice that can be edited, tested, and shipped in one cycle",
+        limit,
+    );
+}
+
+/// The agent shipped a real change to something OTHER than the named item. Escalate with the
+/// templated deviation corrective note.
 pub fn note_deviation(ctx: &mut Ctx, goal: &str, limit: i64) {
     register_failure(
         ctx,
@@ -710,7 +728,10 @@ mod tests {
     // ---- norm_path ----
     #[test]
     fn norm_path_strips_and_lowercases() {
-        assert_eq!(norm_path("  ./Scripts/Scheduler.PY  "), "scripts/scheduler.py");
+        assert_eq!(
+            norm_path("  ./Scripts/Scheduler.PY  "),
+            "scripts/scheduler.py"
+        );
         assert_eq!(norm_path("..\\a\\B.rs"), "a/b.rs");
         assert_eq!(norm_path("/x/y.json"), "x/y.json");
         assert_eq!(norm_path(""), "");
@@ -732,7 +753,11 @@ mod tests {
         let c = ctx();
         let goal = "edit `scripts/scheduler.py` to add a flag";
         // diff touched something else -> deviation
-        assert!(deviated_from_named_files(&c, goal, "docs/other.md\nsrc/main.rs"));
+        assert!(deviated_from_named_files(
+            &c,
+            goal,
+            "docs/other.md\nsrc/main.rs"
+        ));
         // suffix match: touching scripts/scheduler.py -> NOT a deviation
         assert!(!deviated_from_named_files(&c, goal, "scripts/scheduler.py"));
         // decoy suffix: docs/scheduler.py must NOT satisfy scripts/scheduler.py
@@ -743,7 +768,11 @@ mod tests {
     fn deviated_false_when_no_mandate() {
         let c = ctx();
         // no explicit edit-verb-then-backtick mandate -> never a deviation
-        assert!(!deviated_from_named_files(&c, "improve the dashboard layout", "anything.py"));
+        assert!(!deviated_from_named_files(
+            &c,
+            "improve the dashboard layout",
+            "anything.py"
+        ));
     }
 
     // ---- build_task: feedback consumption + exact strings ----
@@ -769,7 +798,9 @@ mod tests {
         assert!(chore.contains("a pytest test for it"));
         assert!(chore.contains(".venv/Scripts/python -m pytest"));
         assert!(chore.contains("doing more than this one item is a regression."));
-        assert!(chore.contains("Implement exactly ONE improvement in this repository: \"fix bug\"."));
+        assert!(
+            chore.contains("Implement exactly ONE improvement in this repository: \"fix bug\".")
+        );
         assert!(chore.contains("ITEM-STATUS: done"));
         // a non-chore tier -> uppercased tier + ambition phrasing
         let feat = build_task(&mut c, "big feature", "feature");
@@ -873,7 +904,7 @@ mod tests {
     #[test]
     fn apply_fallback_model_switches_only_when_escalated() {
         let mut c = ctx(); // ollama-cloud -> fallback kimi-k2.7-code, model glm-5.2
-        // not escalated -> no change
+                           // not escalated -> no change
         apply_fallback_model(&mut c, "g");
         assert_eq!(c.pi_model, "glm-5.2");
         // escalated -> switch
@@ -912,6 +943,18 @@ concrete approach and actually edit files to implement THIS item"
             c.last_gate_feedback,
             "the previous attempt changed something OTHER than this item — implement THIS \
 specific backlog item, not an unrelated change"
+        );
+    }
+
+    #[test]
+    fn note_timeout_uses_scope_down_reason_and_counts_failure() {
+        let mut c = ctx();
+        note_timeout(&mut c, "g", 3);
+        assert_eq!(c.fail_counts.get("g"), Some(&1));
+        assert_eq!(
+            c.last_gate_feedback,
+            "the previous attempt exceeded the implement timeout -- scope this item down to the \
+largest coherent slice that can be edited, tested, and shipped in one cycle"
         );
     }
 

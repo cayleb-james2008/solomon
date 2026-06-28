@@ -27,8 +27,8 @@ use crate::improver::ctx::{self, Ctx};
 use crate::improver::{backlog, escalation, gates, gitops, phases, pi, ship, visual};
 
 use regex::Regex;
-use std::sync::OnceLock;
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 /// The `limit` argument the source's `_note_noop`/`_note_deviation`/`_note_revert` default to (3).
 const NOTE_LIMIT: i64 = 3;
@@ -69,13 +69,16 @@ pub fn one_iteration(ctx: &mut Ctx) {
         let refuse_untracked = !untracked.is_empty()
             && gitops::untracked_recovery_action(ctx, &untracked, Some(&artifact_pats)) == "refuse";
         if (gitops::tree_dirty(ctx) || refuse_untracked) && gitops::auto_stash_base(ctx, &branch) {
-            ctx.log("auto-recover: base tree was dirty/untracked — stashed (recoverable) and resuming");
+            ctx.log(
+                "auto-recover: base tree was dirty/untracked — stashed (recoverable) and resuming",
+            );
         }
     }
 
     if gitops::dirty_blocks_iteration(ctx, gitops::tree_dirty(ctx), &cur_branch, &base_branch) {
         // After N consecutive dirty-base bails, self-stop (write STOP + an error heartbeat).
-        if escalation::note_dirty_base_bail(ctx, gitops::tree_dirty(ctx), &cur_branch, &base_branch) {
+        if escalation::note_dirty_base_bail(ctx, gitops::tree_dirty(ctx), &cur_branch, &base_branch)
+        {
             ctx.log(&format!(
                 "SELF-STOP: dirty base '{base_branch}' persisted for {} \
 consecutive preflight bails — writing STOP + error heartbeat (operator action required)",
@@ -88,10 +91,12 @@ consecutive preflight bails — writing STOP + error heartbeat (operator action 
             "phase": "preflight",
             "last_summary": format!(
                 "Working tree is dirty on the base branch '{base_branch}' — commit or stash your \
-changes; the loop won't clobber base-branch work."
+        changes; the loop won't clobber base-branch work."
             ),
         }));
-        ctx.log(&format!("SKIP iteration: working tree dirty on base branch '{base_branch}'"));
+        ctx.log(&format!(
+            "SKIP iteration: working tree dirty on base branch '{base_branch}'"
+        ));
         return;
     }
     // a clean iteration resets the persistent-dirty-base counter
@@ -106,7 +111,9 @@ changes; the loop won't clobber base-branch work."
             "phase": "preflight",
             "last_summary": format!("Could not checkout {base_branch}: {detail}"),
         }));
-        ctx.log(&format!("checkout {base_branch} failed — skipping iteration"));
+        ctx.log(&format!(
+            "checkout {base_branch} failed — skipping iteration"
+        ));
         return;
     }
     ctx.git(&["reset", "--hard"], 120); // drop tracked changes from a dead run
@@ -166,7 +173,11 @@ iterating on local {base_branch}"
         } else {
             // REFUSE to adopt a base that moved without a gated iteration (un-pushed base commits).
             let ahead = ctx.git(
-                &["rev-list", "--count", &format!("origin/{base_branch}..{base_branch}")],
+                &[
+                    "rev-list",
+                    "--count",
+                    &format!("origin/{base_branch}..{base_branch}"),
+                ],
                 120,
             );
             let n_ahead: i64 = if ahead.code == 0 {
@@ -179,7 +190,14 @@ iterating on local {base_branch}"
             let mut skip_origin_reset = false;
             if n_ahead > 0 {
                 let shas = ctx
-                    .git(&["log", &format!("origin/{base_branch}..{base_branch}"), "--oneline"], 120)
+                    .git(
+                        &[
+                            "log",
+                            &format!("origin/{base_branch}..{base_branch}"),
+                            "--oneline",
+                        ],
+                        120,
+                    )
                     .stdout
                     .trim()
                     .to_string();
@@ -332,7 +350,8 @@ Have the gate print a pytest-style 'N passed' or unittest 'Ran N tests' summary.
         task = solomon_task(ctx);
         system_md = Some(ctx.solomon_md.clone());
     } else if ctx.beautify {
-        goal = "Beautify this repository (README/banner/badges/Mermaid/About, docs only)".to_string();
+        goal =
+            "Beautify this repository (README/banner/badges/Mermaid/About, docs only)".to_string();
         task = "Beautify this repository per beautify.md — rewrite the README to modern OSS \
 standards (centered banner, shields.io badges, a Mermaid architecture diagram, full sections), \
 create assets/banner.svg, set the GitHub About (description + topics), and add LICENSE/CONTRIBUTING \
@@ -347,9 +366,8 @@ Then stop."
         }
         // IDEATE phase.
         ideate_phase(ctx);
-        let (g, tier) = backlog::top_backlog_item(ctx).unwrap_or_else(|| {
-            ("model-chosen improvement".to_string(), "chore".to_string())
-        });
+        let (g, tier) = backlog::top_backlog_item(ctx)
+            .unwrap_or_else(|| ("model-chosen improvement".to_string(), "chore".to_string()));
         // EMPTY-GOAL GUARD.
         if backlog::needs_goal_skip(ctx, &g) {
             ctx.heartbeat(json!({
@@ -357,7 +375,7 @@ Then stop."
                 "phase": "preflight",
                 "reason": "needs_goal",
                 "last_summary": "This repo has no north-star GOAL set and no actionable backlog — \
-set a goal in Config so the loop has an objective (it will not fabricate work).",
+            set a goal in Config so the loop has an objective (it will not fabricate work).",
             }));
             ctx.log(
                 "SKIP iteration: no north-star GOAL and no actionable backlog item — needs_goal \
@@ -395,7 +413,11 @@ set a goal in Config so the loop has an objective (it will not fabricate work)."
     ctx.log(&format!(
         "iteration {n}: branch {branch} — Pi ({}) working{}",
         ctx.pi_model,
-        if ctx.beautify { " (beautify, docs-only)" } else { "" }
+        if ctx.beautify {
+            " (beautify, docs-only)"
+        } else {
+            ""
+        }
     ));
 
     let implement_timeout = if ctx.beautify {
@@ -412,6 +434,7 @@ set a goal in Config so the loop has an objective (it will not fabricate work)."
     // the gate/ship path). Any other nonzero+empty is the generic Exception path (handled below).
     if p.code == 124 {
         ctx.log("Pi session timed out");
+        escalation::note_timeout(ctx, &goal, NOTE_LIMIT);
         gitops::drop_branch(ctx, &branch, "noop", "Pi session timed out.", "sleeping");
         return;
     }
@@ -445,7 +468,9 @@ set a goal in Config so the loop has an objective (it will not fabricate work)."
             ctx,
             &branch,
             "preflight",
-            &format!("Pi agent is UNRUNNABLE (extension/startup load error — not a model no-op): {why}"),
+            &format!(
+                "Pi agent is UNRUNNABLE (extension/startup load error — not a model no-op): {why}"
+            ),
             "error",
         );
         ctx.heartbeat(json!({"reason": "agent_unrunnable"})); // distinguishing diagnostic
@@ -497,9 +522,16 @@ hallucinated its file edits; counting as a no-op",
         let (green, t, tail) = gates::run_gate(ctx);
         tests = t;
         ctx.heartbeat(json!({"tests": tests}));
-        ctx.log(&format!("gate: {} {}", if green { "GREEN" } else { "RED" }, py_dict_str(&tests)));
+        ctx.log(&format!(
+            "gate: {} {}",
+            if green { "GREEN" } else { "RED" },
+            py_dict_str(&tests)
+        ));
         if !green {
-            ctx.log(&format!("gate tail: {}", ctx.redact(&tail_chars(&tail, 400))));
+            ctx.log(&format!(
+                "gate tail: {}",
+                ctx.redact(&tail_chars(&tail, 400))
+            ));
             let failed = tests.get("failed").and_then(Value::as_i64).unwrap_or(0);
             escalation::note_revert(
                 ctx,
@@ -560,7 +592,9 @@ skip, xfail, delete, or weaken any test"
                 .and_then(Value::as_str)
                 .map(|s| char_slice(s, 300))
                 .unwrap_or_default();
-            ctx.log(&format!("cross-repo gate RED on dep '{failed}' — reverting: {ftail}"));
+            ctx.log(&format!(
+                "cross-repo gate RED on dep '{failed}' — reverting: {ftail}"
+            ));
             gitops::drop_branch(
                 ctx,
                 &branch,
@@ -626,7 +660,7 @@ skip, xfail, delete, or weaken any test"
             "phase": "commit",
             "last_summary": format!(
                 "git add failed — the agent's change could not be staged ({err}). If an untracked \
-Windows reserved-name file (e.g. `nul`) is in the tree, add it to .git/info/exclude."
+        Windows reserved-name file (e.g. `nul`) is in the tree, add it to .git/info/exclude."
             ),
         }));
         ctx.record_history("error", Some(&branch), &summary, None);
@@ -639,12 +673,20 @@ Windows reserved-name file (e.g. `nul`) is in the tree, add it to .git/info/excl
             ship::pr_title(ctx, if item_deviated { "" } else { &goal }, &summary)
         };
         let prefix = if ctx.beautify { "docs" } else { "rsi" };
-        ctx.git(&["commit", "-m", &format!("{prefix}: {title}\n\n{summary}")], 120);
+        ctx.git(
+            &["commit", "-m", &format!("{prefix}: {title}\n\n{summary}")],
+            120,
+        );
     }
-    let rl = ctx.git(&["rev-list", "--count", &format!("{base_branch}..HEAD")], 120);
+    let rl = ctx.git(
+        &["rev-list", "--count", &format!("{base_branch}..HEAD")],
+        120,
+    );
     if rl.code != 0 {
         let detail: String = rl.stderr.trim().chars().take(160).collect();
-        ctx.log(&format!("rev-list failed: {detail} — keeping {branch} for inspection"));
+        ctx.log(&format!(
+            "rev-list failed: {detail} — keeping {branch} for inspection"
+        ));
         ctx.git(&["checkout", &base_branch], 120);
         ctx.heartbeat(json!({
             "status": "error",
@@ -664,7 +706,15 @@ Windows reserved-name file (e.g. `nul`) is in the tree, add it to .git/info/excl
     // Catch a DEVIATING agent that reports ITEM-STATUS: done while shipping UNRELATED work.
     if !ctx.beautify && !ctx.solomon && !item_deviated {
         let changed = ctx
-            .git(&["diff", "--name-only", "--no-renames", &format!("{base_branch}..{branch}")], 120)
+            .git(
+                &[
+                    "diff",
+                    "--name-only",
+                    "--no-renames",
+                    &format!("{base_branch}..{branch}"),
+                ],
+                120,
+            )
             .stdout;
         if escalation::deviated_from_named_files(ctx, &goal, &changed) {
             ctx.log(&format!(
@@ -674,7 +724,9 @@ unrelated work; not ticking '{}'",
             ));
             item_deviated = true;
         } else if gates::item_demands_tests(&goal) {
-            let full_diff = ctx.git(&["diff", &format!("{base_branch}..{branch}")], 120).stdout;
+            let full_diff = ctx
+                .git(&["diff", &format!("{base_branch}..{branch}")], 120)
+                .stdout;
             if gates::added_test_defs(&full_diff).is_empty() {
                 ctx.log(&format!(
                     "DEVIATION: item asks to add tests but the committed diff added no test definition — \
@@ -688,7 +740,9 @@ not ticking '{}'",
 
     // LEAK GUARD (PUBLIC repos only).
     if gitops::repo_is_public(ctx, &ctx.name.clone()) {
-        let full_diff = ctx.git(&["diff", &format!("{base_branch}..{branch}")], 120).stdout;
+        let full_diff = ctx
+            .git(&["diff", &format!("{base_branch}..{branch}")], 120)
+            .stdout;
         let leak = gates::leak_in_diff(ctx, &full_diff);
         if !leak.is_empty() {
             ctx.log(&format!(
@@ -709,10 +763,12 @@ data or a secret to the PUBLIC repo; fix the change to exclude it."
     }
 
     // Adversarial REVIEW / JUDGE phase (the SECOND gate).
-    if ctx.review_enabled && !ctx.beautify && !ctx.solomon {
-        if phases::run_review_phase(ctx, &branch, &goal, &summary) == "reject" {
-            return; // branch already reverted inside run_review_phase
-        }
+    if ctx.review_enabled
+        && !ctx.beautify
+        && !ctx.solomon
+        && phases::run_review_phase(ctx, &branch, &goal, &summary) == "reject"
+    {
+        return; // branch already reverted inside run_review_phase
     }
 
     // Visual E2E review (best-effort; may HARD-gate when visual_gate is on).
@@ -765,7 +821,9 @@ data or a secret to the PUBLIC repo; fix the change to exclude it."
             // Visual review HARD gate.
             if gates::visual_gate_enabled(ctx, &ctx.name.clone()) {
                 if let Some(vreason) = gates::visual_gate_reason(&vr) {
-                    ctx.log(&format!("visual gate RED (visual_gate=on): {vreason} — reverting"));
+                    ctx.log(&format!(
+                        "visual gate RED (visual_gate=on): {vreason} — reverting"
+                    ));
                     gitops::drop_branch(
                         ctx,
                         &branch,
@@ -841,7 +899,12 @@ data or a secret to the PUBLIC repo; fix the change to exclude it."
         "last_summary": summary,
     }));
     let ship_mode = ctx.ship.clone();
-    ctx.record_history(&ship::ship_outcome(&pr, &ship_mode), Some(&branch), &summary, None);
+    ctx.record_history(
+        &ship::ship_outcome(&pr, &ship_mode),
+        Some(&branch),
+        &summary,
+        None,
+    );
 }
 
 // --------------------------------------------------------------------------- #
@@ -879,7 +942,12 @@ fn ideate_phase(ctx: &mut Ctx) {
 /// value the in-loop caller reads — is byte-identical.
 fn ideate(ctx: &mut Ctx) -> i64 {
     let task = ideate_task(ctx);
-    let p = pi::run_pi(ctx, &task, pi::TIMEOUT_PHASE_600, Some(&ctx.ideate_md.clone()));
+    let p = pi::run_pi(
+        ctx,
+        &task,
+        pi::TIMEOUT_PHASE_600,
+        Some(&ctx.ideate_md.clone()),
+    );
     // A timeout returns rc=124 with (usually) empty stdout — final_text is "" -> no ideas -> rc 5,
     // the same observable outcome as the Python `except TimeoutExpired -> return 5` branch.
     let raw = pi::final_text(&p.stdout);
@@ -937,7 +1005,11 @@ fn ideate(ctx: &mut Ctx) -> i64 {
         .collect();
     // prepend above the existing menu, after a header line if present.
     let lines: Vec<&str> = existing.lines().collect();
-    let head = if lines.first().map(|l| l.trim_start().starts_with('#')).unwrap_or(false) {
+    let head = if lines
+        .first()
+        .map(|l| l.trim_start().starts_with('#'))
+        .unwrap_or(false)
+    {
         1
     } else {
         0
@@ -992,7 +1064,11 @@ per ideate.md. Output ONLY the idea lines.{research_line}{goal_line}"
 /// run_improver._ideate_research_enabled (~3157-3165): True iff THIS repo set `ideate_research:
 /// true` in repos.json (read fresh). False when absent.
 fn ideate_research_enabled(ctx: &Ctx, name: &str) -> bool {
-    value_truthy(gitops::repo_row(ctx, name).get("ideate_research").unwrap_or(&Value::Null))
+    value_truthy(
+        gitops::repo_row(ctx, name)
+            .get("ideate_research")
+            .unwrap_or(&Value::Null),
+    )
 }
 
 /// run_improver._parse_ideas (~3124-3154): parse the ideate lane's idea lines into
@@ -1030,7 +1106,11 @@ fn parse_ideas(text: &str) -> Vec<(i64, String, String)> {
                     },
                     _ => 3,
                 };
-                let tier = caps.get(1).map(|m| m.as_str()).unwrap_or("feature").to_lowercase();
+                let tier = caps
+                    .get(1)
+                    .map(|m| m.as_str())
+                    .unwrap_or("feature")
+                    .to_lowercase();
                 // m.group(3).strip().rstrip("`").strip()
                 let idea = idea_raw.trim().trim_end_matches('`').trim().to_string();
                 tiered.push((lev, tier, idea));
@@ -1053,7 +1133,7 @@ fn parse_ideas(text: &str) -> Vec<(i64, String, String)> {
     }
     let mut ideas = if !tiered.is_empty() { tiered } else { plain };
     // ideas.sort(key=lambda t: -t[0]) — stable descending by leverage (Python sort is stable).
-    ideas.sort_by(|a, b| b.0.cmp(&a.0));
+    ideas.sort_by_key(|idea| std::cmp::Reverse(idea.0));
     ideas
 }
 
@@ -1094,7 +1174,12 @@ fn recent_history_summaries(ctx: &Ctx, limit: usize) -> Vec<String> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let s = rec.get("summary").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let s = rec
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
         if !s.is_empty() {
             out.push(s);
         }
@@ -1346,8 +1431,8 @@ mod tests {
         // them without changing any assertion.
         let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
         let mut c = Ctx::configure("C:/nonexistent/repo", "testrepo", "ollama-cloud", None);
-        c.runtime = std::env::temp_dir()
-            .join(format!("solomon_iter_test_{}_{}", std::process::id(), uniq));
+        c.runtime =
+            std::env::temp_dir().join(format!("solomon_iter_test_{}_{}", std::process::id(), uniq));
         c.backlog = c.runtime.join("backlog.md");
         c.lessons = c.runtime.join("LESSONS.md");
         c
@@ -1430,8 +1515,16 @@ The following:";
     #[test]
     fn is_novel_jaccard_and_containment() {
         let corpus = vec!["prefer the standard library over custom code".to_string()];
-        assert!(!is_novel("prefer standard library over custom code", &corpus, 0.6));
-        assert!(is_novel("document the licensing terms clearly", &corpus, 0.6));
+        assert!(!is_novel(
+            "prefer standard library over custom code",
+            &corpus,
+            0.6
+        ));
+        assert!(is_novel(
+            "document the licensing terms clearly",
+            &corpus,
+            0.6
+        ));
         // empty token idea (all stopwords) -> always novel
         assert!(is_novel("the a an it", &corpus, 0.6));
     }
