@@ -548,6 +548,21 @@ concrete approach and actually edit files to implement THIS item",
     );
 }
 
+/// The agent claimed it edited files but the tree stayed clean. Feed a sharper corrective note back
+/// than the generic no-change case so the next attempt stops narrating possible edits and either
+/// writes a real diff or honestly deviates.
+pub fn note_narrated_noop(ctx: &mut Ctx, goal: &str, limit: i64) {
+    register_failure(
+        ctx,
+        goal,
+        "noop",
+        "the previous attempt narrated file edits but left the tree clean -- do not describe \
+planned edits; actually modify files for THIS item, or explicitly report ITEM-STATUS: deviated \
+if there is no safe change",
+        limit,
+    );
+}
+
 /// Implement timeouts usually mean the item needs a smaller shippable slice. Count them in the same
 /// escalation ladder as noops/reverts so the runner adapts instead of retrying forever.
 pub fn note_timeout(ctx: &mut Ctx, goal: &str, limit: i64) {
@@ -943,6 +958,19 @@ concrete approach and actually edit files to implement THIS item"
             c.last_gate_feedback,
             "the previous attempt changed something OTHER than this item — implement THIS \
 specific backlog item, not an unrelated change"
+        );
+    }
+
+    #[test]
+    fn note_narrated_noop_uses_specific_feedback_and_counts_failure() {
+        let mut c = ctx();
+        note_narrated_noop(&mut c, "g", 3);
+        assert_eq!(c.fail_counts.get("g"), Some(&1));
+        assert_eq!(
+            c.last_gate_feedback,
+            "the previous attempt narrated file edits but left the tree clean -- do not describe \
+planned edits; actually modify files for THIS item, or explicitly report ITEM-STATUS: deviated \
+if there is no safe change"
         );
     }
 
