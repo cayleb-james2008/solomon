@@ -16,9 +16,13 @@
 use crate::control::proc::{self, RunOut};
 use crate::improver::ctx::Ctx;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -358,6 +362,29 @@ pub fn run_pi(ctx: &mut Ctx, task: &str, timeout: i64, system_md: Option<&Path>)
         }
     };
     let pid = child.id();
+    let started_at = crate::improver::ctx::now();
+    let started_instant = std::time::Instant::now();
+    ctx.heartbeat(json!({
+        "pi": pi_heartbeat(PiHeartbeat {
+            pid,
+            started_at: &started_at,
+            elapsed_s: 0,
+            timeout_s: timeout,
+            provider: &ctx.pi_provider,
+            model: &ctx.pi_model,
+            status: "running",
+            exit_code: None,
+        })
+    }));
+    let pump = start_pi_heartbeat_pump(
+        ctx.heartbeat_path.clone(),
+        pid,
+        started_at.clone(),
+        started_instant,
+        timeout,
+        ctx.pi_provider.clone(),
+        ctx.pi_model.clone(),
+    );
 
     // ---- communicate(timeout) ---------------------------------------------- #
     // Drain BOTH pipes on dedicated threads CONCURRENTLY with the wait. Reading stdout only AFTER
@@ -389,8 +416,23 @@ pub fn run_pi(ctx: &mut Ctx, task: &str, timeout: i64, system_md: Option<&Path>)
     match child.wait_timeout(dur) {
         Ok(Some(status)) => {
             // Normal exit: the write ends are closed, so the readers finish; join for full output.
+            pump.stop();
+            let code = status.code().unwrap_or(-1);
+            let elapsed_s = elapsed_secs(started_instant);
+            ctx.heartbeat(json!({
+                "pi": pi_heartbeat(PiHeartbeat {
+                    pid,
+                    started_at: &started_at,
+                    elapsed_s,
+                    timeout_s: timeout,
+                    provider: &ctx.pi_provider,
+                    model: &ctx.pi_model,
+                    status: "exited",
+                    exit_code: Some(code),
+                })
+            }));
             RunOut {
-                code: status.code().unwrap_or(-1),
+                code,
                 stdout: join(out_h),
                 stderr: join(err_h),
             }
@@ -407,16 +449,27 @@ pub fn run_pi(ctx: &mut Ctx, task: &str, timeout: i64, system_md: Option<&Path>)
             let err = join(err_h);
             // raise subprocess.TimeoutExpired(args, timeout, output=out, stderr=err) — surfaced as a
             // rc=124 failed RunOut carrying the partial streams + the timed-out marker (see fn doc).
-            let argv0 = args
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "pi".to_string());
+            let argv0 = args.first().cloned().unwrap_or_else(|| "pi".to_string());
             let marker = format!("{argv0} timed out after {timeout}s");
             let stderr = if err.is_empty() {
                 marker
             } else {
                 format!("{err}\n{marker}")
             };
+            pump.stop();
+            let elapsed_s = elapsed_secs(started_instant);
+            ctx.heartbeat(json!({
+                "pi": pi_heartbeat(PiHeartbeat {
+                    pid,
+                    started_at: &started_at,
+                    elapsed_s,
+                    timeout_s: timeout,
+                    provider: &ctx.pi_provider,
+                    model: &ctx.pi_model,
+                    status: "timed_out",
+                    exit_code: Some(124),
+                })
+            }));
             RunOut {
                 code: 124,
                 stdout: out,
@@ -428,6 +481,20 @@ pub fn run_pi(ctx: &mut Ctx, task: &str, timeout: i64, system_md: Option<&Path>)
             let _ = child.kill();
             drop(out_h);
             drop(err_h);
+            pump.stop();
+            let elapsed_s = elapsed_secs(started_instant);
+            ctx.heartbeat(json!({
+                "pi": pi_heartbeat(PiHeartbeat {
+                    pid,
+                    started_at: &started_at,
+                    elapsed_s,
+                    timeout_s: timeout,
+                    provider: &ctx.pi_provider,
+                    model: &ctx.pi_model,
+                    status: "wait_error",
+                    exit_code: Some(-1),
+                })
+            }));
             RunOut {
                 code: -1,
                 stdout: String::new(),
@@ -435,6 +502,107 @@ pub fn run_pi(ctx: &mut Ctx, task: &str, timeout: i64, system_md: Option<&Path>)
             }
         }
     }
+}
+
+struct PiHeartbeat<'a> {
+    pid: u32,
+    started_at: &'a str,
+    elapsed_s: i64,
+    timeout_s: i64,
+    provider: &'a str,
+    model: &'a str,
+    status: &'a str,
+    exit_code: Option<i32>,
+}
+
+fn pi_heartbeat(hb: PiHeartbeat<'_>) -> Value {
+    json!({
+        "pid": hb.pid,
+        "started_at": hb.started_at,
+        "elapsed_s": hb.elapsed_s,
+        "timeout_s": hb.timeout_s,
+        "provider": hb.provider,
+        "model": hb.model,
+        "status": hb.status,
+        "exit_code": hb.exit_code,
+    })
+}
+
+struct PiHeartbeatPump {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PiHeartbeatPump {
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn start_pi_heartbeat_pump(
+    heartbeat_path: PathBuf,
+    pid: u32,
+    started_at: String,
+    started_instant: std::time::Instant,
+    timeout_s: i64,
+    provider: String,
+    model: String,
+) -> PiHeartbeatPump {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let handle = std::thread::spawn(move || {
+        while !stop_thread.load(Ordering::Relaxed) {
+            for _ in 0..30 {
+                if stop_thread.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            if stop_thread.load(Ordering::Relaxed) {
+                return;
+            }
+            update_pi_heartbeat_file(
+                &heartbeat_path,
+                pi_heartbeat(PiHeartbeat {
+                    pid,
+                    started_at: &started_at,
+                    elapsed_s: elapsed_secs(started_instant),
+                    timeout_s,
+                    provider: &provider,
+                    model: &model,
+                    status: "running",
+                    exit_code: None,
+                }),
+            );
+        }
+    });
+    PiHeartbeatPump {
+        stop,
+        handle: Some(handle),
+    }
+}
+
+fn update_pi_heartbeat_file(path: &Path, pi: Value) {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|_| "{}".to_string());
+    let mut root = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({}));
+    if let Value::Object(obj) = &mut root {
+        obj.insert("pi".to_string(), pi);
+        obj.insert("updated_at".to_string(), json!(crate::improver::ctx::now()));
+    }
+    let next = serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string());
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    if std::fs::write(&tmp, next.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+fn elapsed_secs(started_at: std::time::Instant) -> i64 {
+    started_at.elapsed().as_secs().min(i64::MAX as u64) as i64
 }
 
 /// hidden_subprocess_kwargs(new_group=True): CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP on Windows
@@ -629,9 +797,8 @@ mod tests {
             "messages": [{"role": "assistant", "content": [{"type": "text", "text": ""}]}]
         }))
         .unwrap();
-        let stdout = format!(
-            "\n   \nnot json at all\n{good}\n{{ truncated\n{user}\n{empty_assistant}\n"
-        );
+        let stdout =
+            format!("\n   \nnot json at all\n{good}\n{{ truncated\n{user}\n{empty_assistant}\n");
         // good is kept; user role ignored; empty-text assistant does NOT clobber.
         assert_eq!(final_text(&stdout), "keep me");
     }
@@ -657,6 +824,28 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(final_text(&line), "tail");
+    }
+
+    #[test]
+    fn pi_heartbeat_payload_exposes_live_child_state() {
+        let payload = pi_heartbeat(PiHeartbeat {
+            pid: 4242,
+            started_at: "2026-06-28T04:00:00Z",
+            elapsed_s: 31,
+            timeout_s: 3600,
+            provider: "openrouter",
+            model: "openrouter/owl-alpha",
+            status: "running",
+            exit_code: None,
+        });
+        assert_eq!(payload["pid"], 4242);
+        assert_eq!(payload["started_at"], "2026-06-28T04:00:00Z");
+        assert_eq!(payload["elapsed_s"], 31);
+        assert_eq!(payload["timeout_s"], 3600);
+        assert_eq!(payload["provider"], "openrouter");
+        assert_eq!(payload["model"], "openrouter/owl-alpha");
+        assert_eq!(payload["status"], "running");
+        assert!(payload["exit_code"].is_null());
     }
 
     // ---- timeout constant parity with the source ----
@@ -694,10 +883,17 @@ mod tests {
         .unwrap();
         let shim_s = shim.to_string_lossy().into_owned();
         let got = node_cli_from_shim(&shim_s).expect("js entry resolved");
-        assert_eq!(PathBuf::from(&got), cli, "must extract the node_modules cli.js, not PATHEXT .JS");
+        assert_eq!(
+            PathBuf::from(&got),
+            cli,
+            "must extract the node_modules cli.js, not PATHEXT .JS"
+        );
         let (prog, lead) = resolve_pi_invocation(&shim_s);
         assert_eq!(lead, vec![got], "lead arg is the resolved cli.js");
-        assert!(prog.to_lowercase().contains("node"), "program is node, got {prog}");
+        assert!(
+            prog.to_lowercase().contains("node"),
+            "program is node, got {prog}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -705,7 +901,8 @@ mod tests {
     #[test]
     fn agent_shim_dir_writes_exact_block_strings() {
         let mut c = Ctx::configure("C:/nonexistent/repo", "shimtest", "ollama-cloud", None);
-        c.runtime = std::env::temp_dir().join(format!("solomon_pi_shimtest_{}", std::process::id()));
+        c.runtime =
+            std::env::temp_dir().join(format!("solomon_pi_shimtest_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&c.runtime);
 
         let d = agent_shim_dir(&c).expect("shim dir created");
@@ -753,7 +950,9 @@ mod tests {
                     assert!(gitcmd.contains(&format!("if /I \"%~1\"==\"{v}\" goto blk")));
                 }
                 // Source emits the VC message with the cmd stderr redirect.
-                assert!(gitcmd.contains("blocked by Solomon: the runner owns version control 1>&2\r\n"));
+                assert!(
+                    gitcmd.contains("blocked by Solomon: the runner owns version control 1>&2\r\n")
+                );
                 // Branch-switching verbs dispatch to :blkbr (switch directly; checkout/branch via sub-labels).
                 assert!(gitcmd.contains("if /I \"%~1\"==\"switch\" goto blkbr"));
                 assert!(gitcmd.contains("if /I \"%~1\"==\"checkout\" goto chk"));
@@ -776,7 +975,8 @@ mod tests {
     #[test]
     fn phase_run_pi_restores_phase_config() {
         let mut c = Ctx::configure("C:/nonexistent/repo", "phasetest", "ollama-cloud", None);
-        c.runtime = std::env::temp_dir().join(format!("solomon_pi_phasetest_{}", std::process::id()));
+        c.runtime =
+            std::env::temp_dir().join(format!("solomon_pi_phasetest_{}", std::process::id()));
         c.phase = "implement".to_string();
         c.pi_model = "glm-5.2".to_string();
         c.reasoning = "xhigh".to_string();
