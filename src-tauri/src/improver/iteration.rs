@@ -493,7 +493,8 @@ Then stop."
     if !gitops::tree_dirty(ctx) && gitops::head_sha(ctx) == base {
         let agent_untracked = gitops::untracked_non_ignored_files(ctx);
         if agent_untracked.is_empty() {
-            if gates::narrated_without_writing(&summary) {
+            let narrated_noop = gates::narrated_without_writing(&summary);
+            if narrated_noop {
                 ctx.log(
                     "WARNING: Pi narrated a change but wrote nothing to a clean tree — the model likely \
 hallucinated its file edits; counting as a no-op",
@@ -502,7 +503,11 @@ hallucinated its file edits; counting as a no-op",
             } else {
                 ctx.log("Pi made no changes — dropping branch");
             }
-            escalation::note_noop(ctx, &goal, NOTE_LIMIT);
+            if narrated_noop {
+                escalation::note_narrated_noop(ctx, &goal, NOTE_LIMIT);
+            } else {
+                escalation::note_noop(ctx, &goal, NOTE_LIMIT);
+            }
             gitops::drop_branch(ctx, &branch, "noop", &summary, "sleeping");
             return;
         }
