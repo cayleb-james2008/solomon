@@ -118,13 +118,32 @@ stay green. This corrective note is ONE-TIME.\n",
         ctx.last_gate_feedback = String::new(); // consumed — inject exactly once
     }
 
+    let placeholder_goal = goal.trim().eq_ignore_ascii_case("model-chosen improvement");
+    let item_intro = if placeholder_goal {
+        "No concrete backlog item is queued. Choose exactly ONE small, real bug, reliability gap, \
+missing test, or cleanup that advances the north-star goal. Before editing, name the concrete \
+target in your own notes, then implement only that target. If you cannot find a safe target \
+after a short scan, end with ITEM-STATUS: deviated and do not invent a change."
+            .to_string()
+    } else {
+        format!("Implement exactly ONE improvement in this repository: \"{goal}\".")
+    };
+    let status_instr = if placeholder_goal {
+        "End with a 2-4 sentence summary of what you changed, then a FINAL line that is exactly \
+`ITEM-STATUS: done` if you implemented a concrete change, or `ITEM-STATUS: deviated` if you \
+found no safe change."
+            .to_string()
+    } else {
+        "End with a 2-4 sentence summary of what you changed, then a FINAL line that is exactly \
+`ITEM-STATUS: done` if you implemented (or it was already fully done) the named item above, or \
+`ITEM-STATUS: deviated` if you instead changed something else."
+            .to_string()
+    };
+
     format!(
-        "{north_star}Implement exactly ONE improvement in this repository: \"{goal}\". {sizing} {gate_instr} \
+        "{north_star}{item_intro} {sizing} {gate_instr} \
 Do NOT run git or gh — the runner commits and opens the pull request. If that item is already done or \
-unclear, instead fix one clear small bug or cleanup you find. End with a 2-4 sentence summary \
-of what you changed, then a FINAL line that is exactly `ITEM-STATUS: done` if you implemented \
-(or it was already fully done) the named item above, or `ITEM-STATUS: deviated` if you instead \
-changed something else.{feedback_block}"
+unclear, instead fix one clear small bug or cleanup you find. {status_instr}{feedback_block}"
     )
 }
 
@@ -832,6 +851,19 @@ mod tests {
         assert!(t.contains("Then run the project's test gate (`npm test`) yourself"));
         assert!(t.contains("a test for it")); // not "a pytest test for it"
         assert!(!t.contains("a pytest test for it"));
+    }
+
+    #[test]
+    fn build_task_placeholder_goal_requires_concrete_target() {
+        let mut c = ctx();
+        c.goal = "make the app more reliable".to_string();
+        let t = build_task(&mut c, "model-chosen improvement", "chore");
+        assert!(t.contains("No concrete backlog item is queued."));
+        assert!(t.contains("Choose exactly ONE small, real bug, reliability gap"));
+        assert!(t.contains("found no safe change"));
+        assert!(!t.contains(
+            "Implement exactly ONE improvement in this repository: \"model-chosen improvement\"."
+        ));
     }
 
     #[test]
