@@ -34,6 +34,12 @@ use std::path::Path;
 /// monitor.STALL_SWEEPS — consecutive error/preflight sweeps (incl. this one) that mark a lane STALLED.
 const STALL_SWEEPS: usize = 3;
 
+/// HEALTH_K — the iteration window the degraded-health classifier inspects. A lane whose last
+/// `HEALTH_K` iterations all failed to ship AND were every one a timeout or a gate-RED is
+/// `degraded:<reason>`, not `healthy` — even when its PID is alive. Pure observability: the
+/// watchdog line surfaces the per-lane reason; it never auto-restarts or auto-merges on it.
+const HEALTH_K: usize = 3;
+
 /// monitor.DISABLED — global kill-switch path: HERE/runtime/_watchdog.disabled.
 fn disabled_path() -> std::path::PathBuf {
     paths::here().join("runtime").join("_watchdog.disabled")
@@ -144,6 +150,73 @@ pub fn should_restart(running: bool, hb: &Value, paused: bool, stop_pending: boo
         return false; // the revert-failure HALT — operator cleanup, not a restart
     }
     true
+}
+
+/// DEGRADED HEALTH CLASSIFIER — deepens the watchdog's health signal beyond process-liveness.
+///
+/// A RUNNING lane (PID alive) is `degraded:<reason>` when its last `k` iterations all failed
+/// to ship AND every one was a timeout or a gate-RED. `None` means healthy/unknown. Pure (no IO)
+/// so the healthy-vs-degraded predicate is unit-tested over synthetic history slices.
+///
+/// Each history record (from `runtime/<lane>/history.jsonl`, oldest→newest) is classified:
+///   - **TIMEOUT** — `status == "noop"` and `summary` contains "timed out" (the runner records a
+///     pi timeout — `pi.status == "timed_out"`, `pi.exit_code == 124` — as a noop with summary
+///     `"Pi session timed out."`).
+///   - **GATE-RED** — `status == "reverted"` and `tests.green == false` (the test gate failed).
+///   - **SHIP** — `status == "shipped"` (a successful merge/push).
+/// Any other outcome (a ship, a non-timeout noop, a non-gate revert, an error, a blocked) or fewer
+/// than `k` records breaks the streak → healthy (no false degradation from a single flake).
+///
+/// Pure observability — the caller MUST NOT auto-restart or auto-merge on this signal (ship=pr
+/// stays manual). This is the systemic fix for "stale heartbeat/escalation state" + "lanes
+/// thrashing without a real fix" being silently reported as `all healthy`.
+pub fn lane_health(running: bool, history: &[Value], k: usize) -> Option<String> {
+    if !running || k == 0 {
+        return None;
+    }
+    // history is oldest→newest; take the last k. Fewer than k records → unknown, not degraded.
+    if history.len() < k {
+        return None;
+    }
+    let last_k = &history[history.len() - k..];
+    let mut timeouts = 0usize;
+    let mut gate_reds = 0usize;
+    for rec in last_k {
+        let status = rec.get("status").and_then(Value::as_str).unwrap_or("");
+        match status {
+            "noop" => {
+                let summary = rec.get("summary").and_then(Value::as_str).unwrap_or("");
+                if summary.to_lowercase().contains("timed out") {
+                    timeouts += 1;
+                } else {
+                    return None; // a non-timeout noop (model no-op, beautify) breaks the streak
+                }
+            }
+            "reverted" => {
+                let green = rec
+                    .get("tests")
+                    .and_then(|t| t.get("green"))
+                    .and_then(Value::as_bool);
+                if green == Some(false) {
+                    gate_reds += 1;
+                } else {
+                    return None; // a non-gate-RED revert (anti-gaming, eval, leak-guard) breaks the streak
+                }
+            }
+            _ => return None, // shipped/error/blocked/stopped/unknown breaks the streak
+        }
+    }
+    if timeouts == 0 && gate_reds == 0 {
+        return None;
+    }
+    let reason = if gate_reds == 0 {
+        format!("degraded:{k}x timed_out")
+    } else if timeouts == 0 {
+        format!("degraded:{k}x gate-RED")
+    } else {
+        format!("degraded:{k}x ({timeouts}x timed_out, {gate_reds}x gate-RED)")
+    };
+    Some(reason)
 }
 
 /// monitor._auto_push: read `.solomon.json`'s `auto_push` (default True; True on missing/corrupt).
@@ -341,6 +414,19 @@ fn sweep_repo(r: &Value, auto_push_flag: bool) -> (Vec<String>, Value) {
                     &json!({"category": "running_stalled", "evidence": evidence}),
                 );
             }
+        }
+    }
+
+    // DEGRADED HEALTH CLASSIFIER: a lane whose PID is alive but whose last HEALTH_K iterations
+    // all failed to ship AND were every one a timeout or a gate-RED is degraded, not healthy.
+    // Pure observability — emits a per-lane reason in the watchdog line instead of the blanket
+    // "all healthy"; does NOT auto-restart or auto-merge (ship=pr stays manual). This is the fix for
+    // "stale heartbeat/escalation state" + "lanes thrashing without a real fix" being silently
+    // reported as healthy.
+    if running2 {
+        let hist_k = control::heartbeat::read_history(r, HEALTH_K);
+        if let Some(reason) = lane_health(true, &hist_k, HEALTH_K) {
+            actions.push(format!("{name} {reason}"));
         }
     }
 
@@ -605,5 +691,142 @@ mod tests {
         assert_eq!(recent_snapshots_from(&log, name, 50, Some(600.0)).len(), 2);
 
         let _ = std::fs::remove_file(&log);
+    }
+
+    // -------- lane_health degraded classifier (pure predicate) --------
+    // Exercises the healthy-vs-degraded decision over synthetic history slices — no IO.
+    fn hist_rec(status: &str, green: Option<bool>, summary: &str) -> Value {
+        let mut rec = json!({"status": status, "summary": summary});
+        if let Some(g) = green {
+            rec["tests"] = json!({"green": g});
+        }
+        rec
+    }
+
+    #[test]
+    fn lane_health_all_timeouts_is_degraded() {
+        // 3 consecutive pi timeouts (noop + "timed out" summary) → degraded:3x timed_out
+        let h = vec![
+            hist_rec("noop", None, "Pi session timed out."),
+            hist_rec("noop", None, "Pi session timed out."),
+            hist_rec("noop", None, "Pi session timed out."),
+        ];
+        assert_eq!(
+            lane_health(true, &h, 3),
+            Some("degraded:3x timed_out".to_string())
+        );
+    }
+
+    #[test]
+    fn lane_health_all_gate_red_is_degraded() {
+        // 3 consecutive gate-RED reverts → degraded:3x gate-RED
+        let h = vec![
+            hist_rec("reverted", Some(false), "Reverted — tests failed (2 failed)."),
+            hist_rec("reverted", Some(false), "Reverted — tests failed (1 failed)."),
+            hist_rec("reverted", Some(false), "Reverted — tests failed (3 failed)."),
+        ];
+        assert_eq!(
+            lane_health(true, &h, 3),
+            Some("degraded:3x gate-RED".to_string())
+        );
+    }
+
+    #[test]
+    fn lane_health_mixed_timeout_and_gate_red_is_degraded() {
+        let h = vec![
+            hist_rec("noop", None, "Pi session timed out."),
+            hist_rec("reverted", Some(false), "Reverted — tests failed (1 failed)."),
+            hist_rec("noop", None, "Pi session timed out."),
+        ];
+        assert_eq!(
+            lane_health(true, &h, 3),
+            Some("degraded:3x (2x timed_out, 1x gate-RED)".to_string())
+        );
+    }
+
+    #[test]
+    fn lane_health_ship_in_window_is_healthy() {
+        // A ship in the last K breaks the streak — even with 2 timeouts before it.
+        let h = vec![
+            hist_rec("noop", None, "Pi session timed out."),
+            hist_rec("noop", None, "Pi session timed out."),
+            hist_rec("shipped", Some(true), "Green. All tests pass."),
+        ];
+        assert_eq!(lane_health(true, &h, 3), None);
+    }
+
+    #[test]
+    fn lane_health_non_timeout_noop_is_healthy() {
+        // A noop that is NOT a timeout (model no-op, beautify) does not count as degradation.
+        let h = vec![
+            hist_rec("noop", None, "Pi session timed out."),
+            hist_rec("noop", None, "(no summary returned)"),
+            hist_rec("noop", None, "Pi session timed out."),
+        ];
+        assert_eq!(lane_health(true, &h, 3), None);
+    }
+
+    #[test]
+    fn lane_health_non_gate_red_revert_is_healthy() {
+        // A revert with tests.green == true (leak-guard, anti-gaming, eval gate) is not gate-RED.
+        let h = vec![
+            hist_rec("reverted", Some(false), "Reverted — tests failed (1 failed)."),
+            hist_rec("reverted", Some(true), "Reverted — leak guard: secret detected."),
+            hist_rec("reverted", Some(false), "Reverted — tests failed (2 failed)."),
+        ];
+        assert_eq!(lane_health(true, &h, 3), None);
+    }
+
+    #[test]
+    fn lane_health_error_or_blocked_breaks_streak() {
+        // error / blocked / stopped are not timeout/gate-RED — they break the streak.
+        for bad in ["error", "blocked", "stopped"] {
+            let h = vec![
+                hist_rec("noop", None, "Pi session timed out."),
+                hist_rec(bad, None, "something"),
+                hist_rec("noop", None, "Pi session timed out."),
+            ];
+            assert_eq!(lane_health(true, &h, 3), None, "status={bad} should be healthy");
+        }
+    }
+
+    #[test]
+    fn lane_health_not_running_is_healthy() {
+        // A dead lane is the should_restart/recover path, not a degraded-health signal.
+        let h = vec![
+            hist_rec("noop", None, "Pi session timed out."),
+            hist_rec("noop", None, "Pi session timed out."),
+            hist_rec("noop", None, "Pi session timed out."),
+        ];
+        assert_eq!(lane_health(false, &h, 3), None);
+    }
+
+    #[test]
+    fn lane_health_insufficient_history_is_healthy() {
+        // Fewer than K records → unknown, not degraded (no false alarm on a fresh lane).
+        let h = vec![hist_rec("noop", None, "Pi session timed out.")];
+        assert_eq!(lane_health(true, &h, 3), None);
+    }
+
+    #[test]
+    fn lane_health_k_zero_is_healthy() {
+        let h = vec![hist_rec("noop", None, "Pi session timed out.")];
+        assert_eq!(lane_health(true, &h, 0), None);
+    }
+
+    #[test]
+    fn lane_health_takes_last_k() {
+        // 5 records: 2 ships, then 3 timeouts. The last 3 are all timeouts → degraded.
+        let h = vec![
+            hist_rec("shipped", Some(true), "Green."),
+            hist_rec("shipped", Some(true), "Green."),
+            hist_rec("noop", None, "Pi session timed out."),
+            hist_rec("noop", None, "Pi session timed out."),
+            hist_rec("noop", None, "Pi session timed out."),
+        ];
+        assert_eq!(
+            lane_health(true, &h, 3),
+            Some("degraded:3x timed_out".to_string())
+        );
     }
 }
