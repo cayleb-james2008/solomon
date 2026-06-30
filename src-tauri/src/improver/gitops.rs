@@ -11,6 +11,7 @@
 //! reproducing Python's start-anchored semantics exactly.
 
 use crate::improver::ctx::{self, Ctx};
+use crate::improver::escalation;
 use regex::Regex;
 use serde_json::{json, Value};
 use std::sync::OnceLock;
@@ -300,6 +301,16 @@ fn log_ro(ctx: &Ctx, msg: &str) {
 /// silently keeps branching off poisoned state. `status` defaults to "sleeping" in Python; callers
 /// pass it explicitly here.
 pub fn drop_branch(ctx: &mut Ctx, branch: &str, phase: &str, summary: &str, status: &str) {
+    // Anti-thrash: track consecutive reverts of the same goal. When N consecutive reverts of the
+    // SAME goal hit, force a different goal next iteration (defer + corrective note + surface
+    // stuck_goal in the heartbeat) instead of silently retrying the reverted change. This covers
+    // ALL revert paths (gate-red, anti-gaming, cross-repo, eval, leak guard, visual, review reject)
+    // since they all go through drop_branch with phase="reverted".
+    if phase == "reverted" {
+        if let Some(goal) = ctx.hb.get("goal").and_then(Value::as_str).map(|s| s.to_string()) {
+            escalation::note_consecutive_revert(ctx, &goal);
+        }
+    }
     if abort_branch(ctx, branch) {
         ctx.heartbeat(json!({"status": status, "phase": phase, "last_summary": summary}));
         ctx.record_history(phase, Some(branch), summary, None);
