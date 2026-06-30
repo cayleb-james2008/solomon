@@ -588,3 +588,189 @@ fn release_lock(ctx: &Ctx) {
         let _ = std::fs::remove_file(&ctx.lock_path);
     }
 }
+
+// --------------------------------------------------------------------------- //
+// tests
+// --------------------------------------------------------------------------- //
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: build argv from string slices.
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_args_defaults_when_only_repo_given() {
+        let a = parse_args(&argv(&["--repo", "/srv/repos/foo"])).expect("ok");
+        assert_eq!(a.repo.as_deref(), Some("/srv/repos/foo"));
+        assert_eq!(a.provider, "ollama-cloud");
+        assert_eq!(a.ship, "pr");
+        assert_eq!(a.gate, "");
+        assert_eq!(a.pr_target_branch, "");
+        assert_eq!(a.max_iterations, 0);
+        assert_eq!(a.reasoning, "");
+        assert_eq!(a.goal, "");
+        assert!(!a.once);
+        assert_eq!(a.interval, 120);
+        assert!(!a.smoke);
+        assert!(!a.beautify);
+        assert!(!a.provision);
+        assert!(!a.ideate);
+        assert!(!a.solomon);
+        assert!(a.name.is_none());
+        assert!(a.model.is_none());
+    }
+
+    #[test]
+    fn parse_args_missing_repo_exits_2() {
+        let code = parse_args(&argv(&[])).err().unwrap();
+        assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn parse_args_value_flags_space_form() {
+        let a = parse_args(&argv(&[
+            "--repo", "r",
+            "--name", "n",
+            "--provider", "openrouter",
+            "--model", "qwen",
+            "--ship", "push",
+            "--gate", "cargo test",
+            "--pr-target-branch", "trunk",
+            "--max-iterations", "7",
+            "--reasoning", "high",
+            "--goal", "fix bug",
+            "--interval", "30",
+        ]))
+        .expect("ok");
+        assert_eq!(a.repo.as_deref(), Some("r"));
+        assert_eq!(a.name.as_deref(), Some("n"));
+        assert_eq!(a.provider, "openrouter");
+        assert_eq!(a.model.as_deref(), Some("qwen"));
+        assert_eq!(a.ship, "push");
+        assert_eq!(a.gate, "cargo test");
+        assert_eq!(a.pr_target_branch, "trunk");
+        assert_eq!(a.max_iterations, 7);
+        assert_eq!(a.reasoning, "high");
+        assert_eq!(a.goal, "fix bug");
+        assert_eq!(a.interval, 30);
+    }
+
+    #[test]
+    fn parse_args_inline_equals_form() {
+        let a = parse_args(&argv(&[
+            "--repo=r",
+            "--provider=openrouter",
+            "--ship=auto-merge",
+            "--reasoning=off",
+            "--max-iterations=3",
+            "--interval=5",
+        ]))
+        .expect("ok");
+        assert_eq!(a.repo.as_deref(), Some("r"));
+        assert_eq!(a.provider, "openrouter");
+        assert_eq!(a.ship, "auto-merge");
+        assert_eq!(a.reasoning, "off");
+        assert_eq!(a.max_iterations, 3);
+        assert_eq!(a.interval, 5);
+    }
+
+    #[test]
+    fn parse_args_store_true_flags() {
+        let a = parse_args(&argv(&[
+            "--repo", "r",
+            "--once", "--smoke", "--beautify", "--provision", "--ideate", "--solomon",
+        ]))
+        .expect("ok");
+        assert!(a.once);
+        assert!(a.smoke);
+        assert!(a.beautify);
+        assert!(a.provision);
+        assert!(a.ideate);
+        assert!(a.solomon);
+    }
+
+    #[test]
+    fn parse_args_bad_provider_choice_exits_2() {
+        let code = parse_args(&argv(&["--repo", "r", "--provider", "claude"])).err().unwrap();
+        assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn parse_args_bad_ship_choice_exits_2() {
+        let code = parse_args(&argv(&["--repo", "r", "--ship", "teleport"])).err().unwrap();
+        assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn parse_args_bad_reasoning_choice_exits_2() {
+        let code = parse_args(&argv(&["--repo", "r", "--reasoning", "ultra"])).err().unwrap();
+        assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn parse_args_empty_reasoning_is_valid_choice() {
+        // "" is in REASONING_CHOICES (matches Python's default-of-""-is-allowed edge)
+        let a = parse_args(&argv(&["--repo", "r", "--reasoning", ""])).expect("ok");
+        assert_eq!(a.reasoning, "");
+    }
+
+    #[test]
+    fn parse_args_non_int_max_iterations_exits_2() {
+        let code = parse_args(&argv(&["--repo", "r", "--max-iterations", "abc"])).err().unwrap();
+        assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn parse_args_non_int_interval_exits_2() {
+        let code = parse_args(&argv(&["--repo", "r", "--interval", "x"])).err().unwrap();
+        assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn parse_args_max_iterations_trims_whitespace() {
+        let a = parse_args(&argv(&["--repo", "r", "--max-iterations", " 42 "])).expect("ok");
+        assert_eq!(a.max_iterations, 42);
+    }
+
+    #[test]
+    fn parse_args_unknown_flag_exits_2() {
+        let code = parse_args(&argv(&["--repo", "r", "--bogus"])).err().unwrap();
+        assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn parse_args_missing_value_at_end_exits_2() {
+        // --provider with no following value
+        let code = parse_args(&argv(&["--repo", "r", "--provider"])).err().unwrap();
+        assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn parse_args_negative_max_iterations_ok() {
+        let a = parse_args(&argv(&["--repo", "r", "--max-iterations", "-1"])).expect("ok");
+        assert_eq!(a.max_iterations, -1);
+    }
+
+    #[test]
+    fn parse_args_repo_required_even_with_other_flags() {
+        // other valid flags but no --repo
+        let code = parse_args(&argv(&["--ship", "pr", "--interval", "10"])).err().unwrap();
+        assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn path_name_returns_final_component() {
+        assert_eq!(path_name("/srv/repos/foo"), "foo");
+        assert_eq!(path_name("foo"), "foo");
+        assert_eq!(path_name("/srv/repos/foo/"), "foo");
+    }
+
+    #[test]
+    fn path_name_falls_back_to_input_on_root() {
+        // Path::file_name is None for "/" — falls back to the input string
+        assert_eq!(path_name("/"), "/");
+    }
+}
