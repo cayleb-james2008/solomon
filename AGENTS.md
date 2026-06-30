@@ -3,8 +3,11 @@
 Solomon is the **RSI orchestrator/supervisor**: it provisions, schedules, gates, ships, and
 recovers improvements for the repos it manages (see `repos.json`), driving each via a per-repo
 pi agent under a written contract (`improver/<name>/AGENT.md` + `backlog.md`). It does not write
-managed-project code itself, and it is not improved by its own loop. The canonical loop spec and
-the 7 invariants live in **`SOLOMON_RSI.md`** — read it before touching the harness.
+managed-project code itself (see the keystone invariant below) — but it IS improved by its own
+loop: `repos.json` carries a `solomon` entry pointed at this repo, run under the same pi-agent
+pattern as the other lanes (`improver/solomon/AGENT.md` + `backlog.md`), shipping via gated PRs
+to `main` like every other lane. The canonical loop spec and the 7 invariants live in
+**`SOLOMON_RSI.md`** — read it before touching the harness.
 
 ## Distribution
 
