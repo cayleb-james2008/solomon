@@ -312,6 +312,17 @@ set this repo's PR-target branch to a real branch in Config."
         return 2;
     }
 
+    // provider/api_key shape mismatch (the 2026-06-27/28 owl-alpha-instead-of-glm-5.2 class of bug):
+    // refuse to run rather than silently authenticating against a provider repos.json doesn't claim.
+    if let Some(reason) = ctx.key_shape_mismatch() {
+        ctx.heartbeat(json!({
+            "status": "error",
+            "last_summary": reason,
+        }));
+        println!("ERROR: {reason}");
+        return 2;
+    }
+
     // pi must be on PATH (else implement crash-loops every iteration)
     if which_pi_missing() {
         ctx.heartbeat(json!({
