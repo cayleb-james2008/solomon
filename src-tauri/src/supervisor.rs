@@ -180,10 +180,10 @@ fn push_base_if_ahead(repo: &Value) -> Value {
 /// solomon.diagnose: deterministic, file-only health classification (no git shell-out — cheap on
 /// every poll). Returns {name, healthy, category, evidence, recommended:[...], auto_safe, running}.
 ///
-/// The 14-category cascade ORDER is load-bearing:
+/// The 15-category cascade ORDER is load-bearing:
 ///   ok / needs_goal / no_key / gh_not_ready / revert_failed / dirty_tree / base_out_of_band /
 ///   untracked_refusal / stale_lock / stop_lingering / stuck / gate_red_streak / ci_red_streak /
-///   noop_streak / unknown_error.
+///   noop_streak / provider_key_mismatch / unknown_error.
 pub fn diagnose(repo: &Value) -> Value {
     let name = paths::repo_name(repo);
     let hb = heartbeat::read_heartbeat(repo).unwrap_or_else(|| json!({}));
@@ -343,6 +343,20 @@ pub fn diagnose(repo: &Value) -> Value {
                 .into(),
         ];
         safe = false;
+    } else if status == Some("error") && summary.contains("looks like an OpenRouter key") {
+        // The improver's key_shape_mismatch guard (ctx.rs) refuses to run when a per-repo api_key
+        // shape doesn't match the configured provider — the exact silent-provider-drift class of
+        // bug (owl-alpha-instead-of-glm-5.2). Recognize it here so the dashboard and escalation
+        // point the operator at repos.json instead of the generic "review the log" fallback.
+        cat = "provider_key_mismatch".into();
+        ev = trunc(summary, 200);
+        rec = vec![
+            "fix repos.json: the per-repo api_key shape doesn't match the configured provider — \
+             set provider to \"openrouter\" (if the key is sk-or-v1-...), or clear the per-repo \
+             api_key and use the global .env key for the intended provider"
+                .into(),
+        ];
+        safe = false;
     } else if status == Some("error") {
         cat = "unknown_error".into();
         ev = trunc_or(summary, 200, "unclassified loop error");
@@ -435,6 +449,12 @@ fn suggested_steps(repo: &Value, cat: &str) -> Vec<String> {
             "Open Solomon → this repo → Ideate to refill the backlog with fresh items,".into(),
             "or edit improver/<name>/backlog.md to add/simplify items,".into(),
             "or raise the repo's model in Config (the current one keeps failing to implement)".into(),
+        ],
+        "provider_key_mismatch" => vec![
+            "Open Solomon → this repo → Config: the per-repo API key shape doesn't match the".into(),
+            "configured provider. Either set provider back to \"openrouter\" (if the key is".into(),
+            "sk-or-v1-...), or clear the per-repo api_key and use the global .env key for the".into(),
+            "intended provider.".into(),
         ],
         _ => vec![cd, "git status".into()],
     }
@@ -1044,6 +1064,39 @@ mod tests {
         assert_eq!(d["category"], "noop_streak");
         assert_eq!(d["auto_safe"], false);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnose_provider_key_mismatch_recognized() {
+        // The exact heartbeat the improver's key_shape_mismatch guard writes when a per-repo api_key
+        // shape doesn't match the configured provider — the silent-provider-drift class of bug.
+        let (dir, repo) = tmp_repo("keymismatch");
+        write_hb(
+            &dir,
+            &json!({
+                "status": "error",
+                "last_summary": "repos.json api_key for 'asmodeus' looks like an OpenRouter key (sk-or-v1-...) but provider is 'ollama-cloud' (resolved pi_provider 'maki-cloud') — this is the exact mismatch that silently ran a prior iteration on openrouter/owl-alpha instead of the configured model. Fix repos.json: either set provider back to \"openrouter\", or clear/replace api_key with a key that matches the intended provider."
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], "provider_key_mismatch");
+        assert_eq!(d["auto_safe"], false);
+        assert_eq!(d["healthy"], false);
+        // recommended must point at repos.json, NOT the generic "review the log" fallback.
+        let rec = d["recommended"].as_array().unwrap();
+        assert!(rec[0].as_str().unwrap().contains("repos.json"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provider_key_mismatch_suggested_steps_point_at_config() {
+        let repo = json!({"name": "x", "path": "C:/p/x", "pr_target_branch": "main"});
+        let steps = suggested_steps(&repo, "provider_key_mismatch");
+        // The steps must NOT be the generic "cd ...; git status" fallback.
+        assert!(!steps.iter().any(|s| s == "git status"));
+        assert!(steps[0].contains("Config"));
+        assert!(steps.iter().any(|s| s.contains("openrouter")));
+        assert!(steps.iter().any(|s| s.contains("api_key")));
     }
 
     #[test]
