@@ -1229,6 +1229,18 @@ mod tests {
         assert_eq!(leak_in_diff(&c, "-DB_PASSWORD=hunter2hunter2"), "");
     }
 
+    #[test]
+    fn leak_in_diff_parts_built_test_key_is_not_flagged() {
+        // Test fixtures assemble OpenRouter-shaped keys at runtime from parts (format!("{}-or-v1-{}",
+        // "sk", suffix)) so the literal `sk-[A-Za-z0-9_-]{20,}` token never appears in source. The
+        // leak guard must NOT trip on such a constructed line — otherwise a legitimate
+        // key_shape_mismatch() hardening change gets reverted (2026-06-30 incident).
+        let c = ctx();
+        let diff = "+        c.api_key = format!(\"{}-or-v1-{}\", \"sk\", \"7810c0c208a9b368710342d765c2c4d79c19581176509191ef335157d1467c20\");\n+        let k = format!(\"{}-or-v1-{}\", \"sk\", \"uniquerandperrepo\");\n+ok\n";
+        assert_eq!(leak_in_diff(&c, diff), "",
+            "parts-built key construction must not trip the leak guard");
+    }
+
     // ---- narrated_without_writing ----
     #[test]
     fn narrated_without_writing_cases() {
