@@ -45,6 +45,10 @@ pub fn smoke(ctx: &mut Ctx) -> i32 {
         println!("SMOKE: FAIL — {key} not set (put it in Solomon/.env)");
         return 1;
     }
+    if let Some(reason) = ctx.key_shape_mismatch() {
+        println!("SMOKE: FAIL — {reason}");
+        return 1;
+    }
     // args = [pi, --print, --mode json, -ne, --provider PI_PROVIDER, --model PI_MODEL, -e PI_EXT,
     //         --no-tools, --system-prompt "Connectivity smoke test. ...", "READY?"]
     let pi_exe = ctx.pi_exe();

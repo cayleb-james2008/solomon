@@ -724,6 +724,37 @@ impl Ctx {
         }
     }
 
+    /// Loud guard against the silent-fallback class of bug that put `openrouter/owl-alpha` in
+    /// production against the operator's glm-5.2-only intent: repos.json's `provider` and `api_key`
+    /// fields are independent (set_repo_config writes either one without touching the other), so a
+    /// dashboard/manual edit can flip `provider` back to "ollama-cloud" while leaving a stale
+    /// OpenRouter-shaped key (`sk-or-v1-...`) in `api_key` — or vice versa. Either combination means
+    /// the model actually served is NOT the one repos.json's `provider`/`model` claim, because the
+    /// wrong-shaped key either gets rejected by the wrong endpoint or, worse, silently authenticates
+    /// against a DIFFERENT provider than the one named in config. Returns `Some(reason)` describing
+    /// the mismatch (never panics, never guesses a fix), or `None` when the key (if any) is consistent
+    /// with `pi_provider`. Only fires when `api_key` is actually set; an empty per-repo key (falling
+    /// through to the global `.env` key) is not this class of bug.
+    pub fn key_shape_mismatch(&self) -> Option<String> {
+        if self.api_key.is_empty() {
+            return None;
+        }
+        // The only key shape we can identify with confidence: OpenRouter keys are always prefixed
+        // "sk-or-v1-" (per OpenRouter's own key format). Ollama Cloud keys never use that prefix.
+        let looks_openrouter = self.api_key.starts_with("sk-or-v1-");
+        if looks_openrouter && self.pi_provider != "openrouter" {
+            return Some(format!(
+                "repos.json api_key for '{}' looks like an OpenRouter key (sk-or-v1-...) but \
+                 provider is '{}' (resolved pi_provider '{}') — this is the exact mismatch that \
+                 silently ran a prior iteration on openrouter/owl-alpha instead of the configured \
+                 model. Fix repos.json: either set provider back to \"openrouter\", or clear/replace \
+                 api_key with a key that matches the intended provider.",
+                self.name, self.provider_name, self.pi_provider
+            ));
+        }
+        None
+    }
+
     // ---- exe discovery ---------------------------------------------------- #
 
     /// run_improver.pi_exe (~602-603): `_which("pi")`.
@@ -1265,6 +1296,43 @@ mod tests {
         c.api_key = String::new();
         c.apply_api_key();
         assert_eq!(std::env::var("OPENROUTER_API_KEY").unwrap(), "sk-global");
+    }
+
+    // ---- key_shape_mismatch: the owl-alpha-class silent-provider-divergence guard ----
+    #[test]
+    fn key_shape_mismatch_flags_openrouter_key_on_ollama_cloud_provider() {
+        // This is exactly the repos.json state that produced the 2026-06-27/28 incident: provider
+        // reverted to ollama-cloud, but api_key left as a stale OpenRouter-shaped key.
+        let mut c = Ctx::configure("C:/x/repo", "asmodeus", "ollama-cloud", None);
+        assert_eq!(c.pi_provider, "maki-cloud");
+        c.api_key = "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"
+            .to_string();
+        let reason = c.key_shape_mismatch().expect("mismatch must be flagged");
+        assert!(reason.contains("asmodeus"));
+        assert!(reason.contains("ollama-cloud"));
+        assert!(reason.contains("owl-alpha"), "must name the prior incident for operator context");
+    }
+
+    #[test]
+    fn key_shape_mismatch_silent_when_key_matches_openrouter_provider() {
+        let mut c = Ctx::configure("C:/x/repo", "repo", "openrouter", None);
+        assert_eq!(c.pi_provider, "openrouter");
+        c.api_key = "sk-or-v1-abcdefghijklmnopqrstuvwxyz0123456789".to_string();
+        assert!(c.key_shape_mismatch().is_none());
+    }
+
+    #[test]
+    fn key_shape_mismatch_silent_when_no_per_repo_key_set() {
+        let c = Ctx::configure("C:/x/repo", "repo", "ollama-cloud", None);
+        // api_key defaults to "" — falls through to the global .env key, not this class of bug.
+        assert!(c.key_shape_mismatch().is_none());
+    }
+
+    #[test]
+    fn key_shape_mismatch_silent_for_non_openrouter_shaped_key_on_ollama_cloud() {
+        let mut c = Ctx::configure("C:/x/repo", "repo", "ollama-cloud", None);
+        c.api_key = "some-ollama-cloud-key-12345".to_string();
+        assert!(c.key_shape_mismatch().is_none());
     }
 
     #[test]
