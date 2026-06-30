@@ -1078,4 +1078,24 @@ mod tests {
         assert_eq!(s.len(), 12);
         assert!(s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
+
+    // ---- README quickstart exists at the repo root ----
+    // The repo root is the parent of the crate dir (CARGO_MANIFEST_DIR = .../src-tauri). The README
+    // is operator-facing docs; this guards against the quickstart section being dropped silently.
+    #[test]
+    fn readme_has_quickstart_section() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let readme = crate_dir.parent().unwrap().join("README.md");
+        let body = std::fs::read_to_string(&readme)
+            .unwrap_or_else(|_| panic!("README.md missing at {}", readme.display()));
+        assert!(
+            body.contains("## Quickstart"),
+            "README.md has no Quickstart heading"
+        );
+        // The quickstart must point at the real test gate (the gate every PR passes).
+        assert!(
+            body.contains("cargo test"),
+            "README Quickstart does not reference the cargo test gate"
+        );
+    }
 }
