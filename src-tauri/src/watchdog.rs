@@ -192,6 +192,317 @@ fn base_is_clean(path: &str) -> bool {
     r.code == 0 && r.stdout.trim().is_empty()
 }
 
+// --------------------------------------------------------------------------- //
+// LIVE-EXE STALENESS: auto-rebuild a lane's LIVE production exe when it is behind
+// origin/<default-branch>. Verified gap 2026-06-30: `sover.exe --live` (built from a commit now
+// several PRs behind) keeps running stale render code because sover's self-updater
+// (`POST /sover/update/apply`) is ON-DEMAND only — nothing auto-triggers it (asmodeus solved this
+// with `ASMODEUS_AUTO_UPDATE=1` — rebuild+restart only when the book is FLAT; sover had no
+// equivalent). The watchdog now fills that gap: per repos.json lane with a known live exe, it
+// compares the running exe's embedded git_sha against `git rev-list origin/<default-branch>` and,
+// when BEHIND, triggers a rebuild-relaunch ONLY through the app's OWN sanctioned updater path with
+// hard safety gates. NEVER kill+`cargo build` a live exe directly from the watchdog (collides with
+// the lane's own checkout; on Windows the running exe is file-locked).
+//
+// `live` config (optional repos.json field, per lane):
+//   { "url": "http://127.0.0.1:8000",          // base URL of the running app (http only)
+//     "health_path": "/health"                 // GET path returning JSON w/ `git_sha` (+ optional
+//                                            //   `safe_to_rebuild`); default "/health"
+//     "update_path": "/sover/update/apply",    // POST path of the app's OWN sanctioned updater;
+//                                            //   default "/sover/update/apply"
+//     "kind": "generic"|"trading"|"posting" } // default "generic"; trading/posting require an
+//                                            //   explicit safe signal (book flat / outside posting
+//                                            //   windows) before a rebuild is allowed.
+// Absent / not an object / no truthy url -> this lane has no known live exe -> no-op.
+// --------------------------------------------------------------------------- //
+
+/// Pure behind/clean/safe predicate for the live-exe auto-rebuild gate. No IO — fully unit-tested.
+/// ALL gates must hold (a single false short-circuits to "do not rebuild"):
+///   - `behind`         — the live exe's embedded git_sha is NOT at origin/<default-branch> (stale).
+///   - `tree_clean`     — the lane checkout has no uncommitted changes on the default branch.
+///   - `on_default`     — HEAD is the default branch (never rebuild mid-RSI branch).
+///   - `mid_iteration`   — a live RSI iteration is running on this checkout (MUST be false).
+///   - `safe_window`    — trading: book is FLAT; posting: outside configured posting windows;
+///                        generic: always true. Rebuilding a live trading exe mid-position or a
+///                        poster mid-post-window risks real money / real posts.
+pub fn should_auto_rebuild_live(
+    behind: bool,
+    tree_clean: bool,
+    on_default: bool,
+    mid_iteration: bool,
+    safe_window: bool,
+) -> bool {
+    behind && tree_clean && on_default && !mid_iteration && safe_window
+}
+
+/// The lane's `live` config object, or None when absent / not an object / no truthy url.
+fn live_config(r: &Value) -> Option<Value> {
+    let lc = r.get("live")?;
+    if !lc.is_object() {
+        return None;
+    }
+    let url = lc.get("url").and_then(Value::as_str).unwrap_or("");
+    if url.is_empty() {
+        return None;
+    }
+    Some(lc.clone())
+}
+
+/// `git -C <path> rev-list --count <sha>..origin/<default-branch>`: how many commits origin is
+/// ahead of the live exe's build sha (0 = up to date; N = behind). None on any error (spawn fails,
+/// sha unknown, no origin ref) — the caller treats None as "cannot prove staleness" and does NOT
+/// rebuild (conservative: never rebuild when uncertain), but still surfaces it as observable.
+fn live_behind_count(path: &str, sha: &str, default_branch: &str) -> Option<u64> {
+    if path.is_empty() || sha.is_empty() || default_branch.is_empty() {
+        return None;
+    }
+    let range = format!("{sha}..origin/{default_branch}");
+    let r = control::proc::run(
+        &["git", "-C", path, "rev-list", "--count", &range],
+        None,
+        None,
+    )
+    .ok()?;
+    if r.code != 0 {
+        return None; // sha not in history / no origin ref -> cannot prove staleness
+    }
+    r.stdout.trim().parse::<u64>().ok()
+}
+
+/// True iff HEAD is on `default_branch` (`git rev-parse --abbrev-ref HEAD` == default_branch).
+/// False on any error / empty path (the rebuild gate treats false as "not safe to rebuild").
+fn on_default_branch(path: &str, default_branch: &str) -> bool {
+    if path.is_empty() || default_branch.is_empty() {
+        return false;
+    }
+    match control::proc::run(
+        &["git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"],
+        None,
+        None,
+    ) {
+        Ok(o) => o.code == 0 && o.stdout.trim() == default_branch,
+        Err(_) => false,
+    }
+}
+
+/// `runtime/<name>/live_rebuilt.json` — the watchdog's record of the last successful sanctioned
+/// rebuild (so `live_last_rebuilt` is observable across sweeps). {"ts": "..."}.
+fn last_rebuilt_path(r: &Value) -> Option<std::path::PathBuf> {
+    paths::runtime_dir(r).map(|d| d.join("live_rebuilt.json"))
+}
+
+fn read_last_rebuilt(r: &Value) -> Option<String> {
+    let p = last_rebuilt_path(r)?;
+    let data = std::fs::read_to_string(&p).ok()?;
+    let v: Value = serde_json::from_str(&data).ok()?;
+    v.get("ts").and_then(Value::as_str).map(str::to_string)
+}
+
+fn write_last_rebuilt(r: &Value, ts: &str) {
+    if let Some(p) = last_rebuilt_path(r) {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&p, json!({"ts": ts}).to_string());
+    }
+}
+
+/// Parse a `http://host[:port][/path]` URL into (host, port, path). `https://` is NOT supported
+/// (live production apps on localhost are plain http; stdlib TcpStream has no TLS — and we never
+/// want a watchdog rebuild gated on a TLS dep). None for non-http / unparseable URLs.
+fn parse_http_url(url: &str) -> Option<(String, u16, String)> {
+    let rest = url.strip_prefix("http://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match authority.rfind(':') {
+        Some(i) => (&authority[..i], authority[i + 1..].parse::<u16>().ok()?),
+        None => (authority, 80),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_string(), port, path.to_string()))
+}
+
+/// Split a raw HTTP response into its body (bytes after the blank `\r\n\r\n` separator). Empty
+/// when no separator is found (malformed response) — the caller's JSON parse then yields None.
+fn split_http_body(buf: &[u8]) -> Vec<u8> {
+    for i in 0..buf.len().saturating_sub(3) {
+        if buf[i..i + 4] == *b"\r\n\r\n" {
+            return buf[i + 4..].to_vec();
+        }
+    }
+    Vec::new()
+}
+
+/// GET `<url><health_path>`, parse the JSON body, return it. None on any connect/parse error (the
+/// live exe is down or not instrumented). Bounded by a 5s read timeout so a silent app can't stall
+/// the watchdog sweep.
+fn http_get_json(url: &str, health_path: &str) -> Option<Value> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::net::ToSocketAddrs;
+    use std::time::Duration;
+    let (host, port, _base) = parse_http_url(url)?;
+    let addr = (host.as_str(), port).to_socket_addrs().ok()?.next()?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    let req = format!(
+        "GET {health_path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).ok()?;
+    let body = split_http_body(&buf);
+    serde_json::from_slice(&body).ok()
+}
+
+/// POST `<url><update_path>` (the app's OWN sanctioned updater — Content-Length: 0). Returns true iff
+/// the app answered with a 2xx status (it has accepted and will rebuild+relaunch itself). False on
+/// any connect/IO error so the watchdog never silently assumes a rebuild happened.
+fn http_post(url: &str, update_path: &str) -> bool {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::net::ToSocketAddrs;
+    use std::time::Duration;
+    let (host, port, _base) = match parse_http_url(url) {
+        Some(x) => x,
+        None => return false,
+    };
+    let addr = match (host.as_str(), port).to_socket_addrs().ok().and_then(|mut i| i.next()) {
+        Some(a) => a,
+        None => return false,
+    };
+    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    let req = format!(
+        "POST {update_path} HTTP/1.0\r\nHost: {host}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf);
+    let text = String::from_utf8_lossy(&buf);
+    text.lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok())
+        .map(|c| (200..300).contains(&c))
+        .unwrap_or(false)
+}
+
+/// Per-lane LIVE production-exe staleness check + sanctioned auto-rebuild trigger. Called from
+/// sweep_repo AFTER the base snap is built; mutates `snap` to surface `live_behind` /
+/// `live_last_rebuilt` / `live_url` (so staleness is OBSERVABLE instead of silent) and, when ALL
+/// safety gates hold, POSTs to the app's own sanctioned updater (`live.update_path`).
+fn live_exe_sweep(r: &Value, snap: &mut Value, actions: &mut Vec<String>) {
+    let Some(lc) = live_config(r) else { return; };
+    let name = r.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let url = lc.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+    let health_path = lc
+        .get("health_path")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("/health")
+        .to_string();
+    let update_path = lc
+        .get("update_path")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("/sover/update/apply")
+        .to_string();
+    let kind = lc
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("generic")
+        .to_string();
+    let path = paths::repo_path(r);
+    let default_branch = control::registry::project_pr_target_branch(r);
+
+    // Fetch the live exe's self-reported health (embedded git_sha + optional safe_to_rebuild).
+    let health = http_get_json(&url, &health_path);
+    let sha = health
+        .as_ref()
+        .and_then(|h| h.get("git_sha").and_then(Value::as_str))
+        .map(str::to_string);
+    let behind_count = sha.as_ref().and_then(|s| live_behind_count(&path, s, &default_branch));
+    let last_rebuilt = read_last_rebuilt(r);
+
+    // Surface FIRST — staleness must be OBSERVABLE even when we cannot/should not rebuild.
+    if let Some(obj) = snap.as_object_mut() {
+        obj.insert("live_url".to_string(), json!(url));
+        obj.insert(
+            "live_behind".to_string(),
+            match &behind_count {
+                Some(n) => json!(n),
+                None => Value::Null,
+            },
+        );
+        obj.insert(
+            "live_last_rebuilt".to_string(),
+            match &last_rebuilt {
+                Some(s) => json!(s),
+                None => Value::Null,
+            },
+        );
+    }
+
+    let behind = behind_count.map(|n| n > 0).unwrap_or(false);
+    if !behind {
+        return; // up to date (or unprovable) — nothing to rebuild
+    }
+    let n = behind_count.unwrap_or(0);
+    let tree_clean = base_is_clean(&path);
+    let on_default = on_default_branch(&path, &default_branch);
+    let mid_iteration = control::locks::is_running(r);
+    // safe_window: the app self-reports via health["safe_to_rebuild"] when it can; otherwise a
+    // generic lane is always safe, while a trading/posting lane WITHOUT an explicit safe signal is
+    // treated as NOT safe (never rebuild a live trading exe without a "book flat" signal).
+    let safe_window = match health.as_ref().and_then(|h| h.get("safe_to_rebuild")) {
+        Some(Value::Bool(b)) => *b,
+        _ => kind == "generic",
+    };
+
+    if should_auto_rebuild_live(behind, tree_clean, on_default, mid_iteration, safe_window) {
+        if http_post(&url, &update_path) {
+            let ts = now();
+            write_last_rebuilt(r, &ts);
+            if let Some(obj) = snap.as_object_mut() {
+                obj.insert("live_last_rebuilt".to_string(), json!(ts));
+            }
+            actions.push(format!(
+                "{name} live-exe auto-rebuild: {n} commits behind origin/{default_branch}, triggered sanctioned updater {url}{update_path}"
+            ));
+        } else {
+            actions.push(format!(
+                "{name} live-exe auto-rebuild: {n} behind but sanctioned updater {url}{update_path} did not respond 2xx"
+            ));
+        }
+    } else {
+        // Stale but not safe to rebuild right now — surface WHY so the operator can act, instead
+        // of letting the staleness stay silent (the exact failure mode this gate exists to fix).
+        let reason = if mid_iteration {
+            "mid RSI iteration"
+        } else if !tree_clean {
+            "checkout dirty"
+        } else if !on_default {
+            "not on default branch"
+        } else {
+            "unsafe window (trading book open / posting window active)"
+        };
+        actions.push(format!(
+            "{name} live-exe STALE: {n} commits behind origin/{default_branch} — not rebuilt ({reason})"
+        ));
+    }
+}
+
 /// monitor._sweep_repo: process ONE repo for sweep(); returns (actions, snap). The caller runs this
 /// inside a blanket try/except so one bad repo can never abort the whole sweep — the module's
 /// documented 'a watchdog must never die on one bad repo' contract.
@@ -289,7 +600,7 @@ fn sweep_repo(r: &Value, auto_push_flag: bool) -> (Vec<String>, Value) {
         .unwrap_or(Value::Null);
 
     let running2 = control::locks::is_running(r);
-    let snap = json!({
+    let mut snap = json!({
         "ts": now(),
         "repo": name,
         "running": running2,
@@ -301,6 +612,16 @@ fn sweep_repo(r: &Value, auto_push_flag: bool) -> (Vec<String>, Value) {
         "last_status": last.get("status").cloned().unwrap_or(Value::Null),
         "diagnosis": diag,
     });
+
+    // LIVE-EXE STALENESS: if this lane runs a LIVE production exe (e.g. `sover.exe --live`, an
+    // `asmodeus.exe`), compare its embedded git_sha against origin/<default-branch> and, when behind
+    // AND all safety gates hold, trigger the app's OWN sanctioned updater path (a POST to
+    // `live.update_path`). NEVER kill+cargo-build a live exe directly — that collides with the
+    // lane's own checkout and, on Windows, the running exe is file-locked. Surface `live_behind` /
+    // `live_last_rebuilt` so the staleness is OBSERVABLE instead of silent (the systemic fix for
+    // "production apps silently running stale code" — the self-updater is on-demand only, nothing
+    // auto-triggers it, so a live exe built from a commit N PRs behind keeps running stale code).
+    live_exe_sweep(r, &mut snap, &mut actions);
 
     // STALL DETECTOR: a lane that is STILL RUNNING but has repeated the SAME preflight refusal
     // (status=error, phase=preflight) every sweep is wedged. Compare across RECENT sweeps: if this
@@ -605,5 +926,119 @@ mod tests {
         assert_eq!(recent_snapshots_from(&log, name, 50, Some(600.0)).len(), 2);
 
         let _ = std::fs::remove_file(&log);
+    }
+
+    // -------- should_auto_rebuild_live: behind/clean/safe predicate (pure) --------
+    // The systemic fix for "production apps silently running stale code": the watchdog may rebuild a
+    // lane's LIVE production exe ONLY when EVERY safety gate holds. A single false -> no rebuild.
+    #[test]
+    fn should_auto_rebuild_live_all_gates_hold() {
+        // behind + clean tree + on default branch + not mid-iteration + safe window -> rebuild.
+        assert!(should_auto_rebuild_live(true, true, true, false, true));
+    }
+
+    #[test]
+    fn should_auto_rebuild_live_any_single_gate_failing_blocks() {
+        // Each gate alone must block the rebuild.
+        assert!(!should_auto_rebuild_live(false, true, true, false, true)); // up to date
+        assert!(!should_auto_rebuild_live(true, false, true, false, true)); // dirty checkout
+        assert!(!should_auto_rebuild_live(true, true, false, false, true)); // not on default branch
+        assert!(!should_auto_rebuild_live(true, true, true, true, true)); // mid RSI iteration
+        assert!(!should_auto_rebuild_live(true, true, true, false, false)); // unsafe window (book/post)
+    }
+
+    #[test]
+    fn should_auto_rebuild_live_trading_never_rebuilt_without_safe_signal() {
+        // A trading/posting exe with no explicit safe_to_rebuild (safe_window=false) is NEVER rebuilt,
+        // even when every other gate holds — real money / real posts are on the line.
+        assert!(!should_auto_rebuild_live(true, true, true, false, false));
+        // ... but with the safe signal (book flat / outside posting window) it rebuilds.
+        assert!(should_auto_rebuild_live(true, true, true, false, true));
+    }
+
+    // -------- live_config: a lane is a live-exe lane iff repo["live"] is an object w/ url --------
+    #[test]
+    fn live_config_requires_object_with_url() {
+        assert!(live_config(&json!({})).is_none());
+        assert!(live_config(&json!({"live": {}})).is_none()); // object but no url
+        assert!(live_config(&json!({"live": {"url": ""}})).is_none()); // empty url
+        assert!(live_config(&json!({"live": "http://x"})).is_none()); // not an object
+        assert!(live_config(&json!({"live": null})).is_none());
+        assert!(live_config(&json!({"live": {"url": "http://127.0.0.1:8000"}})).is_some());
+        assert!(live_config(
+            &json!({"live": {"url": "http://127.0.0.1:8000", "kind": "trading", "update_path": "/sover/update/apply"}})
+        )
+        .is_some());
+    }
+
+    // -------- parse_http_url / split_http_body: stdlib HTTP plumbing (pure) --------
+    #[test]
+    fn parse_http_url_vectors() {
+        assert_eq!(
+            parse_http_url("http://127.0.0.1:8000/health"),
+            Some(("127.0.0.1".to_string(), 8000, "/health".to_string()))
+        );
+        assert_eq!(
+            parse_http_url("http://127.0.0.1:8000"),
+            Some(("127.0.0.1".to_string(), 8000, "/".to_string()))
+        );
+        assert_eq!(
+            parse_http_url("http://localhost:8080/sover/update/apply"),
+            Some(("localhost".to_string(), 8080, "/sover/update/apply".to_string()))
+        );
+        assert_eq!(
+            parse_http_url("http://127.0.0.1/health"),
+            Some(("127.0.0.1".to_string(), 80, "/health".to_string()))
+        );
+        assert_eq!(parse_http_url("https://127.0.0.1:8000"), None); // https unsupported (no TLS dep)
+        assert_eq!(parse_http_url("not a url"), None);
+        assert_eq!(parse_http_url("http://"), None); // empty authority
+    }
+
+    #[test]
+    fn split_http_body_finds_header_body_boundary() {
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"git_sha\":\"abc\"}";
+        assert_eq!(split_http_body(resp), br#"{"git_sha":"abc"}"#.to_vec());
+        // no body separator -> empty (caller's JSON parse yields None).
+        assert_eq!(split_http_body(b"no headers here"), Vec::<u8>::new());
+    }
+
+    // -------- read/write_last_rebuilt: the observable "last rebuilt" timestamp --------
+    #[test]
+    fn last_rebuilt_round_trip() {
+        let repo = json!({"name": "wd_test_live_rebuilt_unique"});
+        let rt = paths::runtime_dir(&repo).unwrap();
+        let _ = std::fs::create_dir_all(&rt);
+        let p = rt.join("live_rebuilt.json");
+        let _ = std::fs::remove_file(&p);
+        // absent -> None
+        assert_eq!(read_last_rebuilt(&repo), None);
+        write_last_rebuilt(&repo, "2026-06-30T21:40:00Z");
+        assert_eq!(read_last_rebuilt(&repo), Some("2026-06-30T21:40:00Z".to_string()));
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(&rt);
+    }
+
+    // -------- live_exe_sweep surfaces staleness WITHOUT rebuilding when unsafe --------
+    // Drives the real live_exe_sweep against a live config whose URL is unreachable (http_get_json
+    // returns None) — the lane's `live_behind` surfaces as null and no rebuild is attempted, but the
+    // snap gains the observable live_* fields. Confirms the surfacing path never panics and never
+    // rebuilds without a proven-behind + safe signal.
+    #[test]
+    fn live_exe_sweep_surfaces_nulls_when_exe_unreachable_and_does_not_rebuild() {
+        let repo = json!({
+            "name": "wd_test_live_sweep_unique",
+            "path": "",
+            "live": {"url": "http://127.0.0.1:1", "kind": "generic"}
+        });
+        let mut snap = json!({"ts": now(), "repo": "wd_test_live_sweep_unique", "running": false});
+        let mut actions: Vec<String> = Vec::new();
+        live_exe_sweep(&repo, &mut snap, &mut actions);
+        // The live_* fields are surfaced regardless of reachability.
+        assert_eq!(snap.get("live_url").and_then(Value::as_str), Some("http://127.0.0.1:1"));
+        assert!(snap.get("live_behind").is_some()); // present (null — exe unreachable)
+        assert!(snap.get("live_last_rebuilt").is_some()); // present (null)
+        // Unreachable exe -> no proven-behind -> no rebuild action.
+        assert!(actions.is_empty(), "no rebuild should be attempted when the exe is unreachable: {actions:?}");
     }
 }
