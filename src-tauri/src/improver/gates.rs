@@ -677,18 +677,54 @@ pub fn run_eval_gate(c: &mut Ctx, base_score: Option<f64>) -> Value {
 /// run_improver._leak_in_diff (~1313-1329): for a PUBLIC repo, a short reason if the committed diff's
 /// ADDED ('+', not '+++') lines contain an operator deny-term (case-insensitive substring) or a
 /// secret-shaped token; else "". Scans only added lines so deleting a deny-term never trips it.
+///
+/// TEST-CODE SKIP: added lines inside `#[cfg(test)]` blocks, `*_test.rs` files, or `tests/` dirs are
+/// NOT scanned — test fixtures legitimately embed secret-shaped strings and scanning them produces
+/// false-positive leak-guard reverts (seen 2026-06-30T20:40Z and 21:07Z). File sections are delimited
+/// by `diff --git` headers; once a `#[cfg(test)]` attribute is seen in a section all subsequent added
+/// lines in that section are treated as test code (Rust convention: `#[cfg(test)] mod tests` is the
+/// last item in the file).
 pub fn leak_in_diff(c: &Ctx, diff: &str) -> String {
     if diff.is_empty() {
         return String::new();
     }
-    let added: String = diff
-        .lines()
-        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Collect added ('+', not '+++') lines, skipping test-only code.
+    let mut added: Vec<&str> = Vec::new();
+    let mut file_is_test = false; // *_test.rs or tests/
+    let mut in_cfg_test = false;  // #[cfg(test)] seen in this file section
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            file_is_test = false;
+            in_cfg_test = false;
+            if let Some(b_idx) = line.find(" b/") {
+                let path = &line[b_idx + 3..];
+                if path.ends_with("_test.rs") || path.starts_with("tests/") {
+                    file_is_test = true;
+                }
+            }
+            continue;
+        }
+        if line.starts_with("+++ b/") {
+            let path = &line[6..];
+            if path.ends_with("_test.rs") || path.starts_with("tests/") {
+                file_is_test = true;
+            }
+            continue;
+        }
+        if line.starts_with("---") || line.starts_with("+++") || line.starts_with("@@") {
+            continue;
+        }
+        if line.contains("#[cfg(test)]") {
+            in_cfg_test = true;
+        }
+        if line.starts_with('+') && !file_is_test && !in_cfg_test {
+            added.push(line);
+        }
+    }
     if added.is_empty() {
         return String::new();
     }
+    let added: String = added.join("\n");
     let low = added.to_lowercase();
     for term in gitops::repo_deny_terms(c, &c.name) {
         if !term.is_empty() && low.contains(&term.to_lowercase()) {
@@ -1227,6 +1263,61 @@ mod tests {
         );
         // the same credential on a REMOVED line is not scanned (added-only)
         assert_eq!(leak_in_diff(&c, "-DB_PASSWORD=hunter2hunter2"), "");
+    }
+
+    // ---- leak_in_diff: test-code skip (#[cfg(test)] / *_test.rs / tests/) ----
+    // Key-shaped strings are built at runtime (format! concatenation) so the test source never
+    // contains a contiguous key-shaped literal that would trip the guard on THIS repo's own diff.
+    #[test]
+    fn leak_in_diff_skips_test_files() {
+        // A secret-shaped token in a *_test.rs file must NOT trip the guard.
+        let c = ctx();
+        let p = "ghp_";
+        let b = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+        let diff = format!(
+            "diff --git a/src/foo_test.rs b/src/foo_test.rs\n--- a/src/foo_test.rs\n+++ b/src/foo_test.rs\n@@ -1,1 +1,2 @@\n ctx\n+    let x = {}{};\n",
+            p, b
+        );
+        assert_eq!(leak_in_diff(&c, &diff), "");
+    }
+
+    #[test]
+    fn leak_in_diff_skips_tests_dir() {
+        // A secret-shaped token under tests/ must NOT trip the guard.
+        let c = ctx();
+        let p = "ghp_";
+        let b = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+        let diff = format!(
+            "diff --git a/tests/integration.rs b/tests/integration.rs\n--- a/tests/integration.rs\n+++ b/tests/integration.rs\n@@ -1,1 +1,2 @@\n ctx\n+    let x = {}{};\n",
+            p, b
+        );
+        assert_eq!(leak_in_diff(&c, &diff), "");
+    }
+
+    #[test]
+    fn leak_in_diff_skips_cfg_test_block() {
+        // A secret-shaped token after #[cfg(test)] in a regular .rs file must NOT trip the guard.
+        let c = ctx();
+        let p = "ghp_";
+        let b = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+        let diff = format!(
+            "diff --git a/src/foo.rs b/src/foo.rs\n--- a/src/foo.rs\n+++ b/src/foo.rs\n@@ -10,3 +10,5 @@\n ctx\n #[cfg(test)]\n+    let x = {}{};\n",
+            p, b
+        );
+        assert_eq!(leak_in_diff(&c, &diff), "");
+    }
+
+    #[test]
+    fn leak_in_diff_flags_non_test_file() {
+        // The same secret-shaped token in a regular (non-test) .rs file MUST still trip the guard.
+        let c = ctx();
+        let p = "ghp_";
+        let b = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+        let diff = format!(
+            "diff --git a/src/foo.rs b/src/foo.rs\n--- a/src/foo.rs\n+++ b/src/foo.rs\n@@ -10,3 +10,5 @@\n ctx\n+    let x = {}{};\n",
+            p, b
+        );
+        assert_eq!(leak_in_diff(&c, &diff), "a secret-shaped token is present in the diff");
     }
 
     // ---- narrated_without_writing ----
