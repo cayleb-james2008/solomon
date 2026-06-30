@@ -90,7 +90,18 @@ async fn apply_update(app: &tauri::AppHandle) -> Value {
 /// app.py's `__main__` block: --state pretty-prints get_state; --start/--stop take a name; --supervise
 /// runs the unattended sweep (one repo or all); --serve-health runs a 127.0.0.1 health endpoint.
 fn run_headless(args: &[String]) -> i32 {
-    let sub = args[0].trim_start_matches("--");
+    // A missing/unknown subcommand is a usage error, not silent success. Exit 2 (argparse's
+    // SystemExit code for missing required args — the same improver::run::parse_args uses) so a
+    // scripted `solomon start && ...` does not falsely report OK, and a short argv cannot panic on
+    // `args[0]` (main() only routes the 5 known subcommands here, but the function must not lie /
+    // crash if called with fewer).
+    let sub = match args.first() {
+        Some(a) => a.trim_start_matches("--"),
+        None => {
+            usage();
+            return 2;
+        }
+    };
     let name_arg = args.get(1).cloned();
     match sub {
         // print(json.dumps(api.get_state(), indent=2))
@@ -104,7 +115,9 @@ fn run_headless(args: &[String]) -> i32 {
                 1
             }
         },
-        // print(json.dumps(api.start(arg))) — app.py requires a name (`--start and arg`).
+        // print(json.dumps(api.start(arg))) — app.py requires a name (`--start and arg`). A missing
+        // name is a usage error (exit 2), not exit-success — otherwise `solomon start` in a script
+        // silently no-ops while reporting OK.
         "start" | "stop" => match name_arg {
             Some(n) => match api::dispatch(sub, &[Value::String(n)]) {
                 Ok(v) => {
@@ -118,7 +131,7 @@ fn run_headless(args: &[String]) -> i32 {
             },
             None => {
                 usage();
-                0
+                2
             }
         },
         // api.supervise(arg, unattended=True): name|null, allow_pi=false, unattended=true.
@@ -145,7 +158,7 @@ fn run_headless(args: &[String]) -> i32 {
         }
         _ => {
             usage();
-            0
+            2
         }
     }
 }
@@ -296,4 +309,35 @@ fn run_gui() {
         })
         .run(tauri::generate_context!())
         .expect("error while running Solomon");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_headless;
+
+    // Usage errors on the main entrypoint must report non-zero (exit 2, the argparse convention
+    // improver::run::parse_args also uses) — not silent success. A scripted `solomon start && ...`
+    // that no-ops because the repo name was forgotten must fail the chain, not falsely report OK.
+    #[test]
+    fn run_headless_missing_name_is_usage_error() {
+        // `solomon start` (no repo name) -> usage error, exit 2 (was: exit 0 = silent success).
+        assert_eq!(run_headless(&["start".to_string()]), 2);
+        assert_eq!(run_headless(&["stop".to_string()]), 2);
+        // `--start` strips the leading dashes the same way main()'s is_sub filter does.
+        assert_eq!(run_headless(&["--start".to_string()]), 2);
+    }
+
+    // A short/empty argv must not panic on `args[0]`. main() only routes known subcommands here,
+    // but the function is the entrypoint's sub-dispatcher and must degrade to a usage error (exit 2)
+    // rather than index out of bounds if ever called with an empty slice.
+    #[test]
+    fn run_headless_empty_args_does_not_panic() {
+        assert_eq!(run_headless(&[]), 2);
+    }
+
+    // An unknown subcommand is a usage error, not exit-success.
+    #[test]
+    fn run_headless_unknown_subcommand_is_usage_error() {
+        assert_eq!(run_headless(&["frobnicate".to_string()]), 2);
+    }
 }
