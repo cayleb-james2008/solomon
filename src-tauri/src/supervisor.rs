@@ -412,10 +412,20 @@ pub fn diagnose(repo: &Value) -> Value {
     })
 }
 
-/// Anti-thrash helper: count recent supervisor.jsonl records (last 4) that are a RUNG-0, non-escalate
+/// Anti-thrash helper: count recent supervisor.jsonl records that are a RUNG-0, non-escalate
 /// auto-fix of `cat`. Mirrors the comprehension in diagnose().
+///
+/// The window is the last 7 records (not the source's 4). The Rust port's `note_healthy` — added
+/// to fix the stale-escalation-re-observation bug — stamps an "ok" supervisor record between each
+/// auto-fix when the lane transitions back to healthy. With the original window of 4, a thrashing
+/// lane (recover→ok→recover→ok→recover) only ever shows 2 same-category records in the window, so
+/// the >= 3 anti-thrash never fires and the lane loops forever without escalating — the exact
+/// "lanes thrashing/stalling without a real fix being found" class. 7 = 3 recoveries + 2
+/// interleaving "ok" records + 2 margin, so 3 same-category RUNG-0 fixes still trip the guard.
+/// The "ok" records don't match the category filter, so they only consume slots, never inflate the
+/// count; the threshold stays 3.
 fn supervisor_log_count_same(repo: &Value, cat: &str) -> usize {
-    heartbeat::read_supervisor_log(repo, 4)
+    heartbeat::read_supervisor_log(repo, 7)
         .into_iter()
         .filter(|s| {
             s.get("category").and_then(Value::as_str) == Some(cat)
@@ -1352,6 +1362,53 @@ mod tests {
         assert_eq!(d["category"], "stale_lock");
         assert_eq!(d["auto_safe"], false); // anti-thrash demoted
         assert!(d["evidence"].as_str().unwrap().contains("escalating instead of looping"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnose_anti_thrash_fires_despite_interleaved_ok_records() {
+        // The Rust port's note_healthy stamps an "ok" supervisor record between each auto-fix when
+        // the lane transitions back to healthy. A thrashing lane (recover→ok→recover→ok→recover)
+        // must STILL trip the anti-thrash — otherwise it loops forever without escalating, the
+        // exact "lanes thrashing without a real fix being found" class. With the old window of 4,
+        // the last 4 records [ok, stuck, ok, stuck] only showed 2 same-category fixes; the wider
+        // window catches the 3rd.
+        let (dir, repo) = tmp_repo("antithrash_ok");
+        // Interleaved pattern: stuck, ok, stuck, ok, stuck  (5 records, 3 stuck fixes)
+        let sup: Vec<Value> = vec![
+            json!({"category": "stale_lock", "rung": 0, "escalate": false, "actions": ["clear_lock"]}),
+            json!({"category": "ok", "rung": 0, "escalate": false, "actions": []}),
+            json!({"category": "stale_lock", "rung": 0, "escalate": false, "actions": ["clear_lock"]}),
+            json!({"category": "ok", "rung": 0, "escalate": false, "actions": []}),
+            json!({"category": "stale_lock", "rung": 0, "escalate": false, "actions": ["clear_lock"]}),
+        ];
+        let body: String = sup.iter().map(|l| serde_json::to_string(l).unwrap()).collect::<Vec<_>>().join("\n");
+        std::fs::write(dir.join("supervisor.jsonl"), body).unwrap();
+        std::fs::write(dir.join("lock"), "2147483646\ntok").unwrap(); // stale lock present
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], "stale_lock");
+        assert_eq!(d["auto_safe"], false); // anti-thrash demoted despite ok records interleaving
+        assert!(d["evidence"].as_str().unwrap().contains("escalating instead of looping"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnose_anti_thrash_does_not_fire_for_two_recoveries_with_ok() {
+        // Only 2 same-category fixes (with ok records interleaving) must NOT trip the anti-thrash —
+        // 2 recoveries is not thrashing. Guards against the wider window over-triggering.
+        let (dir, repo) = tmp_repo("antithrash_two");
+        let sup: Vec<Value> = vec![
+            json!({"category": "stale_lock", "rung": 0, "escalate": false, "actions": ["clear_lock"]}),
+            json!({"category": "ok", "rung": 0, "escalate": false, "actions": []}),
+            json!({"category": "stale_lock", "rung": 0, "escalate": false, "actions": ["clear_lock"]}),
+            json!({"category": "ok", "rung": 0, "escalate": false, "actions": []}),
+        ];
+        let body: String = sup.iter().map(|l| serde_json::to_string(l).unwrap()).collect::<Vec<_>>().join("\n");
+        std::fs::write(dir.join("supervisor.jsonl"), body).unwrap();
+        std::fs::write(dir.join("lock"), "2147483646\ntok").unwrap();
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], "stale_lock");
+        assert_eq!(d["auto_safe"], true); // only 2 recoveries -> not thrashing -> still auto-safe
         let _ = std::fs::remove_dir_all(&dir);
     }
 
