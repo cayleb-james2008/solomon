@@ -623,37 +623,56 @@ pub fn solomon_fix_session(repo: &Value, auto_push: bool) -> Value {
 /// RUNG-1 opt-in: gate_red_streak->solomon_fix_session if allow_pi.
 /// RUNG-2: escalate.
 /// ANTI-THRASH: same category fixed >= 3 times (read_supervisor_log) -> escalate instead of loop.
+/// Re-observe a healthy lane: clear any STALE `escalation.json` a prior transient error left
+/// behind, AND stamp a healthy `supervisor.jsonl` record ONLY when transitioning from a non-healthy
+/// state. Both halves are required to fully retire a stale escalation:
+///
+///   * `clear_escalation` removes the operator-visible escalation file.
+///   * the "ok" supervisor record breaks the `finish()` log-once dedupe (which compares against the
+///     LAST supervisor record): an "ok" record carries `escalate=false`, so the dedupe guard (which
+///     requires `escalate==true` on the prior record) no longer fires — a recurrence of the SAME
+///     problem re-escalates instead of being silently suppressed.
+///
+/// Only written when the last record is not already "ok" to avoid flooding the log on every healthy
+/// poll. Called from `recover()` (watchdog sweeps) AND from the dashboard poll (`api::repo_state`):
+/// the dashboard poll is the most frequent observer and the watchdog may be disabled, so the poll
+/// must re-observe the resolved state itself — previously it cleared escalation.json but left the
+/// dedupe state stale, the exact "stale escalation state that does not get re-observed after a fix
+/// lands" class of management bug.
+pub fn note_healthy(repo: &Value) {
+    clear_escalation(repo);
+    let last_was_ok = heartbeat::read_supervisor_log(repo, 1)
+        .last()
+        .map(|l| l.get("category").and_then(Value::as_str) == Some("ok"))
+        .unwrap_or(false);
+    if !last_was_ok {
+        append_jsonl(
+            repo,
+            "supervisor.jsonl",
+            &json!({
+                "ts": now(),
+                "category": "ok",
+                "rung": 0,
+                "actions": [],
+                "escalate": false,
+                "message": "healthy",
+            }),
+        );
+    }
+}
+
 pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: bool) -> Value {
     let d = diagnose(repo);
     let cat = d.get("category").and_then(Value::as_str).unwrap_or("").to_string();
     if cat == "ok" {
-        // healthy — clear any STALE escalation.json a prior transient error left behind.
-        clear_escalation(repo);
-        // Stamp a healthy supervisor.jsonl record ONLY when transitioning from a non-healthy state.
-        // Without this, the finish() log-once dedupe (which compares against the LAST supervisor
-        // record) would still see the stale pre-fix escalation on a recurrence and suppress
-        // re-escalation — the operator would never be re-notified that the same problem came back.
-        // An "ok" record carries escalate=false, so the dedupe guard (which requires
-        // escalate==true on the prior record) no longer fires. Only written when the last record is
-        // not already "ok" to avoid flooding the log on every healthy poll.
-        let last_was_ok = heartbeat::read_supervisor_log(repo, 1)
-            .last()
-            .map(|l| l.get("category").and_then(Value::as_str) == Some("ok"))
-            .unwrap_or(false);
-        if !last_was_ok {
-            append_jsonl(
-                repo,
-                "supervisor.jsonl",
-                &json!({
-                    "ts": now(),
-                    "category": "ok",
-                    "rung": 0,
-                    "actions": [],
-                    "escalate": false,
-                    "message": "healthy",
-                }),
-            );
-        }
+        // healthy — clear any STALE escalation.json a prior transient error left behind AND stamp
+        // a healthy supervisor.jsonl record when transitioning from a non-healthy state (see
+        // note_healthy). Both are required: clearing escalation.json alone (as the dashboard poll
+        // used to do) hides the stale escalation from the UI but leaves the finish() log-once
+        // dedupe seeing the stale escalate=true record, so a recurrence of the SAME problem is
+        // silently suppressed — the operator is never re-notified. The "ok" record carries
+        // escalate=false, breaking the dedupe guard.
+        note_healthy(repo);
         return json!({"ok": true, "category": "ok", "actions_taken": [], "escalate": false, "message": "healthy"});
     }
 
@@ -1301,6 +1320,50 @@ mod tests {
         let sup = std::fs::read_to_string(dir.join("supervisor.jsonl")).unwrap();
         let ok_count = sup.lines().filter(|l| l.contains("\"category\":\"ok\"")).count();
         assert_eq!(ok_count, 1, "only one ok record per transition, not one per poll");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------- note_healthy: the dashboard-poll re-observation path ----------------
+    // The dashboard poll (api::repo_state) calls note_healthy when diagnose() flips to "ok". This
+    // test exercises that path INDEPENDENTLY of recover(): it must clear escalation.json AND stamp
+    // an "ok" supervisor record so a later recurrence of the SAME category re-escalates instead of
+    // being deduped by finish() (which compares against the last supervisor record). This is the
+    // exact "stale escalation state that does not get re-observed after a fix lands" fix — the
+    // dashboard poll is the most frequent observer and the watchdog may be disabled.
+    #[test]
+    fn note_healthy_breaks_dedupe_so_recurrence_re_escalates() {
+        let (dir, repo) = tmp_repo("note_healthy_recur");
+
+        // 1. Simulate a prior escalation: a no_key diagnosis escalated through finish().
+        write_hb(&dir, &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}));
+        let d = diagnose(&repo);
+        let out1 = finish(&repo, &d, vec![], true, "escalated — operator action required");
+        assert_eq!(out1["category"], "no_key");
+        assert_eq!(out1["escalate"], true);
+        assert!(dir.join("escalation.json").exists());
+
+        // 2. The operator fixes it. The dashboard poll observes a healthy diagnosis and calls
+        //    note_healthy (NOT recover — the watchdog may be disabled / not yet run).
+        write_hb(&dir, &json!({"status": "idle"}));
+        assert_eq!(diagnose(&repo).get("category"), Some(&json!("ok")));
+        note_healthy(&repo);
+        assert!(!dir.join("escalation.json").exists(), "escalation.json cleared");
+        let sup = std::fs::read_to_string(dir.join("supervisor.jsonl")).unwrap();
+        let last = sup.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).last().unwrap();
+        assert_eq!(last["category"], "ok");
+        assert_eq!(last["escalate"], false);
+
+        // 3. The SAME problem recurs. finish() must re-escalate (the prior record is now "ok" with
+        //    escalate=false, so the dedupe guard does NOT fire). Without note_healthy stamping the
+        //    "ok" record, the stale escalate=true no_key record would still be last and this would
+        //    be silently deduped — the operator never re-notified.
+        write_hb(&dir, &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}));
+        let d2 = diagnose(&repo);
+        let out3 = finish(&repo, &d2, vec![], true, "escalated — operator action required");
+        assert_eq!(out3["category"], "no_key");
+        assert_eq!(out3["escalate"], true, "recurrence must re-escalate, not be deduped");
+        assert!(dir.join("escalation.json").exists(), "escalation.json re-written on recurrence");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
