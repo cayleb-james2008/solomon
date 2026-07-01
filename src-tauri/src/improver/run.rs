@@ -301,6 +301,15 @@ set this repo's PR-target branch to a real branch in Config."
         }
     }
 
+    // Load the LIVE per-repo config (provider/model/api_key/gate/...) from repos.json BEFORE the
+    // key guards so a repo keyed ONLY per-repo (no global .env key for its provider) is not silently
+    // blocked at startup with a misleading "<KEY> not set" error — the same silent-config-drift
+    // class already fixed for enrich_contract/ideate via provider_key_ready. refresh_config_from_registry
+    // loads api_key and calls apply_api_key (setting the env var), and also lets key_shape_mismatch
+    // see the REAL per-repo key at startup instead of only on the first mid-loop re-check. Safe: on
+    // a missing/corrupt repos.json or absent repo row it silently keeps the argv-seeded config.
+    ctx.refresh_config_from_registry();
+
     // required provider key
     let key = ctx.required_key();
     if std::env::var(&key).map(|v| v.is_empty()).unwrap_or(true) {
