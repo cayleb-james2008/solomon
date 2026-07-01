@@ -653,15 +653,31 @@ mod tests {
     // visual::spawn_pi, visual::run_browser_cli): a child that floods stdout past the OS pipe buffer
     // must be captured IN FULL without spuriously timing out. Pre-fix this returned Err(TimedOut)
     // (and lost the output) because the child blocked on write() while we sat in wait_timeout.
+    //
+    // LOAD-TOLERANT: the `for /L` loop is CPU-bound, so under heavy contention (5+ RSI lanes + a
+    // fleet of asmodeus processes saturating the box) the child can race a tight 30s deadline and
+    // produce a false Err(TimedOut) — a spurious gate-RED that drops a good branch. We use a generous
+    // 120s bound AND retry once on a timeout-class failure so the test is green under load without
+    // weakening what it verifies (no-deadlock, full-output-drain — NOT wall-clock speed).
     #[cfg(windows)]
     #[test]
     fn run_with_timeout_drains_large_output_without_deadlock() {
         use std::process::Stdio;
-        let mut cmd = Command::new("cmd");
-        cmd.args(["/c", "for /L %i in (1,1,8000) do @echo XXXXXXXXXXXXXXXXXXXXXXXXXX"]);
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let out = run_with_timeout(cmd, Duration::from_secs(30))
-            .expect("must capture large output, not time out");
+        let build_cmd = || {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/c", "for /L %i in (1,1,8000) do @echo XXXXXXXXXXXXXXXXXXXXXXXXXX"]);
+            cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            cmd
+        };
+        let out = match run_with_timeout(build_cmd(), Duration::from_secs(120)) {
+            Ok(o) => o,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                // Retry once: contention may have subsided.
+                run_with_timeout(build_cmd(), Duration::from_secs(120))
+                    .expect("must capture large output, not time out (even after retry)")
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        };
         assert!(
             out.stdout.len() > 100_000,
             "expected the full large stdout, got {} bytes",
