@@ -30,6 +30,7 @@ use crate::supervisor;
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::path::Path;
+use std::time::Duration;
 
 /// monitor.STALL_SWEEPS — consecutive error/preflight sweeps (incl. this one) that mark a lane STALLED.
 const STALL_SWEEPS: usize = 3;
@@ -287,26 +288,67 @@ fn base_is_pushed(path: &str, base: &str) -> bool {
     r.code == 0 && r.stdout.trim() == "0"
 }
 
+/// True iff the repo's gate command passes on the current checkout. Used to auto-recover a
+/// `base_gate_red_persistent` self-stop ONLY once the operator has actually fixed the gate, so
+/// clearing the stop can never thrash (a still-RED gate stays stopped). Bounded to 120 s so a hung
+/// gate does not stall the sweep. Safe on any error (spawn failure, timeout, missing interpreter):
+/// returns False, leaving the stop in place.
+fn base_gate_green(path: &str, gate_cmd: Option<&str>) -> bool {
+    if path.is_empty() || !Path::new(path).is_dir() {
+        return false;
+    }
+    let timeout = Duration::from_secs(120);
+    // Custom GATE_CMD: run via shell (compound syntax), cwd=path. Default: python -m pytest.
+    let result = if let Some(cmd) = gate_cmd.filter(|s| !s.is_empty()) {
+        if cfg!(windows) {
+            control::proc::run(
+                &["cmd", "/C", cmd],
+                Some(Path::new(path)),
+                Some(timeout),
+            )
+        } else {
+            control::proc::run(
+                &["/bin/sh", "-c", cmd],
+                Some(Path::new(path)),
+                Some(timeout),
+            )
+        }
+    } else {
+        control::proc::run(
+            &["python", "-m", "pytest", "-o", "addopts="],
+            Some(Path::new(path)),
+            Some(timeout),
+        )
+    };
+    match result {
+        Ok(r) => r.code == 0,
+        Err(_) => false, // spawn failure / timeout -> False, leave the stop in place
+    }
+}
+
 /// The persistent-bail self-stop re-observation policy. The runner self-stops (STOP sentinel +
-/// `status=error` + a `reason` marker) on a PERSISTENTLY dirty / un-pushed base so it doesn't spin
-/// forever — but that sentinel otherwise pins the lane DEAD until a human clicks Start, leaving a
-/// stale heartbeat that `diagnose` keeps re-escalating as `stop_lingering` even after the operator
-/// has fixed the cause. The watchdog re-observes the underlying condition each sweep and clears the
-/// sentinel once the cause is ACTUALLY healed, so the lane resumes on the next `should_restart`
-/// instead of lingering in a stale escalation.
+/// `status=error` + a `reason` marker) on a PERSISTENTLY dirty / un-pushed / gate-RED base so it
+/// doesn't spin forever — but that sentinel otherwise pins the lane DEAD until a human clicks Start,
+/// leaving a stale heartbeat that `diagnose` keeps re-escalating as `stop_lingering` even after the
+/// operator has fixed the cause. The watchdog re-observes the underlying condition each sweep and
+/// clears the sentinel once the cause is ACTUALLY healed, so the lane resumes on the next
+/// `should_restart` instead of lingering in a stale escalation.
 ///
 /// Returns the auto-recover action message (the suffix after `"{name} auto-recover: "`) when the
-/// sentinel should be cleared for this `reason`, else `None`. Pure — the git condition checks are
-/// passed in as bools — so the policy is unit-tested. Only fires on the runner's own reason markers
-/// AND a verified-healed condition, so it never thrashes and never touches a true operator Stop
-/// (status="stopped", no reason).
-fn persistent_stop_cleared(reason: &str, base_clean: bool, base_pushed: bool) -> Option<&'static str> {
+/// sentinel should be cleared for this `reason`, else `None`. Pure — the git/gate condition checks
+/// are passed in as bools — so the policy is unit-tested. Only fires on the runner's own reason
+/// markers AND a verified-healed condition, so it never thrashes and never touches a true operator
+/// Stop (status="stopped", no reason).
+fn persistent_stop_cleared(reason: &str, base_clean: bool, base_pushed: bool, base_gate_green: bool) -> Option<&'static str> {
     match reason {
         "dirty_base_persistent" if base_clean => {
             Some("base clean again — cleared dirty_base_persistent stop")
         }
         "unpushed_base_persistent" if base_pushed => {
             Some("base pushed again — cleared unpushed_base_persistent stop")
+        }
+        "base_gate_red_persistent" if base_gate_green => {
+            Some("base gate green again — cleared base_gate_red_persistent stop")
         }
         _ => None,
     }
@@ -331,14 +373,14 @@ fn sweep_repo(r: &Value, auto_push_flag: bool) -> (Vec<String>, Value) {
     let running = control::locks::is_running(r);
     let hb = control::heartbeat::read_heartbeat(r).unwrap_or_else(|| json!({}));
 
-    // Anti-wedge: the runner self-stops on a PERSISTENTLY dirty / un-pushed base (STOP sentinel +
-    // status=error + a reason marker) so it doesn't spin forever — but that sentinel otherwise pins
-    // the lane DEAD until a human clicks Start, leaving a stale heartbeat that diagnose keeps
-    // re-escalating as stop_lingering even AFTER the operator has fixed the cause. Re-observe the
-    // underlying condition each sweep and clear the self-written sentinel once the cause is actually
-    // healed, so should_restart heals the lane automatically. Safe: only fires on the runner's own
-    // reason marker AND a verified-healed condition (see persistent_stop_cleared), so it never
-    // thrashes and never touches a true operator Stop (status="stopped", no reason).
+    // Anti-wedge: the runner self-stops on a PERSISTENTLY dirty / un-pushed / gate-RED base (STOP
+    // sentinel + status=error + a reason marker) so it doesn't spin forever — but that sentinel
+    // otherwise pins the lane DEAD until a human clicks Start, leaving a stale heartbeat that
+    // diagnose keeps re-escalating as stop_lingering even AFTER the operator has fixed the cause.
+    // Re-observe the underlying condition each sweep and clear the self-written sentinel once the
+    // cause is actually healed, so should_restart heals the lane automatically. Safe: only fires on
+    // the runner's own reason marker AND a verified-healed condition (see persistent_stop_cleared),
+    // so it never thrashes and never touches a true operator Stop (status="stopped", no reason).
     if !running
         && !paused
         && stop_pending
@@ -347,7 +389,23 @@ fn sweep_repo(r: &Value, auto_push_flag: bool) -> (Vec<String>, Value) {
         if let Some(reason) = hb.get("reason").and_then(Value::as_str) {
             let path = paths::repo_path(r);
             let base = control::registry::project_pr_target_branch(r);
-            let msg = persistent_stop_cleared(reason, base_is_clean(&path), base_is_pushed(&path, &base));
+            // For base_gate_red_persistent, run the gate to verify the operator's fix actually
+            // landed; for dirty/unpushed, the cheap git checks suffice. Only run the gate when the
+            // reason is base_gate_red_persistent (the gate is expensive, ~120 s worst case).
+            let gate_green = if reason == "base_gate_red_persistent" {
+                base_gate_green(
+                    &path,
+                    control::registry::project_gate(r).as_deref(),
+                )
+            } else {
+                false
+            };
+            let msg = persistent_stop_cleared(
+                reason,
+                base_is_clean(&path),
+                base_is_pushed(&path, &base),
+                gate_green,
+            );
             if let Some(m) = msg {
                 if let Some(ref d) = rt {
                     if std::fs::remove_file(d.join("stop")).is_ok() {
@@ -678,32 +736,40 @@ mod tests {
     fn persistent_stop_cleared_dirty_when_clean() {
         // dirty_base_persistent + base now clean -> cleared (byte-identical legacy message).
         assert_eq!(
-            persistent_stop_cleared("dirty_base_persistent", true, false),
+            persistent_stop_cleared("dirty_base_persistent", true, false, false),
             Some("base clean again — cleared dirty_base_persistent stop")
         );
         // still dirty -> leave the stop (do not thrash).
-        assert_eq!(persistent_stop_cleared("dirty_base_persistent", false, false), None);
+        assert_eq!(persistent_stop_cleared("dirty_base_persistent", false, false, false), None);
     }
 
     #[test]
     fn persistent_stop_cleared_unpushed_when_pushed() {
         // unpushed_base_persistent + base no longer ahead of origin -> cleared.
         assert_eq!(
-            persistent_stop_cleared("unpushed_base_persistent", false, true),
+            persistent_stop_cleared("unpushed_base_persistent", false, true, false),
             Some("base pushed again — cleared unpushed_base_persistent stop")
         );
         // still ahead -> leave the stop.
-        assert_eq!(persistent_stop_cleared("unpushed_base_persistent", false, false), None);
+        assert_eq!(persistent_stop_cleared("unpushed_base_persistent", false, false, false), None);
+    }
+
+    #[test]
+    fn persistent_stop_cleared_gate_red_when_green() {
+        // base_gate_red_persistent + base gate now green -> cleared.
+        assert_eq!(
+            persistent_stop_cleared("base_gate_red_persistent", false, false, true),
+            Some("base gate green again — cleared base_gate_red_persistent stop")
+        );
+        // gate still red -> leave the stop (do not thrash).
+        assert_eq!(persistent_stop_cleared("base_gate_red_persistent", false, false, false), None);
     }
 
     #[test]
     fn persistent_stop_cleared_ignores_other_reasons() {
-        // base_gate_red_persistent is NOT re-observed here (running the gate is too expensive /
-        // gate-cmd-specific for the watchdog sweep) -> stays stopped until a human clicks Start.
-        assert_eq!(persistent_stop_cleared("base_gate_red_persistent", true, true), None);
         // a true operator Stop carries no reason marker -> never auto-cleared.
-        assert_eq!(persistent_stop_cleared("", true, true), None);
-        assert_eq!(persistent_stop_cleared("anything_else", true, true), None);
+        assert_eq!(persistent_stop_cleared("", true, true, true), None);
+        assert_eq!(persistent_stop_cleared("anything_else", true, true, true), None);
     }
 
     // -------- _auto_push truthiness --------
