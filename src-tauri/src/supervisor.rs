@@ -678,6 +678,41 @@ pub fn solomon_fix_session(repo: &Value, auto_push: bool) -> Value {
     }
 }
 
+/// True iff the lane is actively mid-iteration RIGHT NOW: running, heartbeat `status` is
+/// `"iterating"`, `phase` is a non-sleep active iteration phase, and the heartbeat is fresh (not
+/// stale). Used by the `noop_streak` recover branch to avoid stop-recovering a lane whose CURRENT
+/// iteration may itself break the streak.
+///
+/// This is the fix for the confirmed root cause of the 2026-07-01 asmodeus 90-min park: earlier
+/// iterations 14-18 no-op'd on hard L3/frontier items → `noop_streak` elevated. The NEXT iteration
+/// (05:17-05:36) did REAL work, gate GREEN (6 tests), review APPROVE — but the watchdog kept firing
+/// `noop_streak` stop-recoveries every 2min OFF THE STALE STREAK COUNT even while that good
+/// iteration was running, and one stop landed mid-iteration → "stop requested during iteration —
+/// committed locally, skipping PR". The lane's OWN success could not break the streak it was being
+/// punished for. A lane whose current iteration is actively progressing (heartbeat
+/// phase=implement/gate/review updated within the iteration window) is NOT a noop-streak candidate —
+/// do not issue stop-recoveries against an in-flight iteration; only act on a lane that is
+/// idle/looping-empty.
+fn is_in_flight_iteration(repo: &Value) -> bool {
+    if !locks::is_running(repo) {
+        return false;
+    }
+    let hb = heartbeat::read_heartbeat(repo).unwrap_or_else(|| json!({}));
+    // status must be "iterating" (the loop's active-iteration marker; "sleeping"/"stopped"/
+    // "error" are all non-in-flight).
+    if hb.get("status").and_then(Value::as_str) != Some("iterating") {
+        return false;
+    }
+    // phase must be an active iteration phase (not sleep / missing).
+    let phase = hb.get("phase").and_then(Value::as_str);
+    if matches!(phase, None | Some("sleep")) {
+        return false;
+    }
+    // heartbeat must be fresh (not stale) — a stale "iterating" heartbeat is a hung loop (the
+    // `stuck` category), not an in-flight iteration.
+    !stale(&hb, repo)
+}
+
 /// solomon.recover: walk the recovery ladder for one repo. Returns
 /// {ok, category, actions_taken:[...], escalate:bool, message}. auto_push threads the global gate so a
 /// restart / fix-session ships LOCAL-only when pushing is disabled.
@@ -819,6 +854,24 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
 
     // RUNG-0.5 noop_streak auto-heal.
     if cat == "noop_streak" {
+        // A lane whose CURRENT iteration is actively in-flight (running, status=iterating, active
+        // phase, fresh heartbeat) may itself break the streak — do NOT stop-recover it. The watchdog
+        // firing stop-recoveries off a stale historical streak count while a good iteration is
+        // running is the confirmed root cause of the 2026-07-01 asmodeus 90-min park: one stop landed
+        // mid-iteration → "stop requested during iteration — committed locally, skipping PR" → the
+        // approved work was stranded as an unshipped local branch that also failed to reset the
+        // streak. The lane's OWN success could not break the streak it was being punished for.
+        // Defer — the in-flight iteration will record its outcome on completion; if it ships, the
+        // next diagnose() won't see noop_streak at all.
+        if is_in_flight_iteration(repo) {
+            return json!({
+                "ok": true,
+                "category": "noop_streak",
+                "actions_taken": [],
+                "escalate": false,
+                "message": "in-flight iteration — deferring noop_streak stop-recovery (the current iteration may break the streak)",
+            });
+        }
         if provider_has_fallback(repo) {
             let prior_heals = heartbeat::read_supervisor_log(repo, 8)
                 .into_iter()
@@ -1424,6 +1477,77 @@ mod tests {
         assert_eq!(d["category"], "unknown_error");
         assert_eq!(d["evidence"], "weird thing");
         assert_eq!(d["auto_safe"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------- noop_streak: do NOT stop-recover an in-flight iteration ----------------
+    // The confirmed root cause of the 2026-07-01 asmodeus 90-min park: earlier iterations 14-18
+    // no-op'd → noop_streak elevated. The NEXT iteration did REAL work (gate GREEN, review APPROVE)
+    // but the watchdog kept firing noop_streak stop-recoveries every 2min off the stale streak
+    // count even while that good iteration was running, and one stop landed mid-iteration → "stop
+    // requested during iteration — committed locally, skipping PR" → the approved work was stranded
+    // as an unshipped local branch that also failed to reset the streak. A lane whose current
+    // iteration is actively progressing (heartbeat phase=implement/gate/review, fresh updated_at)
+    // is NOT a noop-streak candidate — do not issue stop-recoveries against an in-flight iteration.
+    #[test]
+    fn recover_noop_streak_defers_when_iteration_in_flight() {
+        let (dir, repo) = tmp_repo("noop_inflight");
+        // 5 consecutive noops in history → diagnose() returns noop_streak.
+        write_hist(&dir, &(0..5).map(|_| json!({"status": "noop"})).collect::<Vec<_>>());
+        // A LIVE lock (this process's PID) + a FRESH heartbeat with status=iterating,
+        // phase=implement → the lane is actively mid-iteration.
+        let run_id = "tok-inflight";
+        std::fs::write(dir.join("lock"), format!("{}\n{}", std::process::id(), run_id)).unwrap();
+        let fresh = (Utc::now() - chrono::Duration::seconds(1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        write_hb(&dir, &json!({
+            "status": "iterating",
+            "phase": "implement",
+            "run_id": run_id,
+            "updated_at": fresh,
+        }));
+        // diagnose must still see noop_streak (the history is stale, the heartbeat is fresh).
+        assert_eq!(diagnose(&repo)["category"], "noop_streak");
+        // recover must NOT stop the in-flight iteration — no "stop" action, no escalation.
+        let out = recover(&repo, false, true, true);
+        assert_eq!(out["category"], "noop_streak");
+        assert_eq!(out["escalate"], false);
+        assert_eq!(out["actions_taken"], json!([]));
+        assert!(out["message"].as_str().unwrap().contains("in-flight iteration"));
+        // No stop sentinel was written (the in-flight iteration was not killed).
+        assert!(!dir.join("stop").exists(), "recover wrote a stop sentinel against an in-flight iteration");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_noop_streak_stops_when_lane_sleeping() {
+        // Contrast: a sleeping lane (status=sleeping, phase=sleep) with the same 5-noop history IS
+        // a noop-streak candidate — the lane is idle/looping-empty, not mid-iteration. The
+        // stop-recovery must still fire (here: the default provider has a fallback, so the heal
+        // path runs; the stop sentinel is written).
+        let (dir, repo) = tmp_repo("noop_sleeping");
+        write_hist(&dir, &(0..5).map(|_| json!({"status": "noop"})).collect::<Vec<_>>());
+        let run_id = "tok-sleeping";
+        std::fs::write(dir.join("lock"), format!("{}\n{}", std::process::id(), run_id)).unwrap();
+        let fresh = (Utc::now() - chrono::Duration::seconds(1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        write_hb(&dir, &json!({
+            "status": "sleeping",
+            "phase": "sleep",
+            "run_id": run_id,
+            "updated_at": fresh,
+        }));
+        // diagnose: the sleeping heartbeat is not an error/stuck → the 5-noop history makes it
+        // noop_streak.
+        assert_eq!(diagnose(&repo)["category"], "noop_streak");
+        let out = recover(&repo, false, true, true);
+        // The stop-recovery fired (the lane was NOT in-flight). A "stop" action was taken — the
+        // sentinel was written, and the heal path attempted the ideate+restart (best-effort in
+        // this test; the key assertion is that the in-flight guard did NOT defer).
+        assert!(out["actions_taken"].as_array().unwrap().iter().any(|a| a.as_str() == Some("stop")),
+                "a sleeping lane with a noop streak must be stop-recovered, not deferred: {out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
