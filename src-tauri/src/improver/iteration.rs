@@ -107,6 +107,12 @@ consecutive preflight bails — writing STOP + error heartbeat (operator action 
     // a clean iteration resets the persistent-dirty-base counter
     escalation::note_dirty_base_bail(ctx, gitops::tree_dirty(ctx), &cur_branch, &base_branch);
 
+    // Clear a stale .git/index.lock orphaned by a prior killed-mid-git iteration BEFORE the
+    // checkout/reset, so the orphaned lock doesn't block the preflight and trigger a restart storm
+    // (5 concurrent maki improvers observed 2026-07-01, all blocked by one orphaned index.lock).
+    // Safe: only clears when no live git process is running.
+    gitops::clear_stale_index_lock(ctx);
+
     // Robust preflight: FORCE back to the base branch.
     let co = ctx.git(&["checkout", "--force", &base_branch], 120);
     if co.code != 0 {
