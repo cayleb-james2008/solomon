@@ -1653,6 +1653,44 @@ mod tests {
         assert_eq!(c.pi_provider, "maki-cloud"); // ollama-cloud's pi_provider
     }
 
+    // ---- refresh_config_from_registry loads the per-repo api_key BEFORE the startup key guard ----
+    //
+    // The startup `required_key` guard in run.rs::main() checks `std::env::var(required_key())`
+    // is non-empty. Before the fix, refresh_config_from_registry was only called INSIDE the loop —
+    // so a repo keyed ONLY per-repo (no global .env key for its provider) had api_key="" at the
+    // guard, the env var was empty, and the loop exited 2 with a misleading "<KEY> not set"
+    // error — the same silent-config-drift class already fixed for enrich_contract/ideate via
+    // provider_key_ready. The fix calls refresh_config_from_registry BEFORE the guard; this test
+    // models that invariant: after refresh, the per-repo key is loaded and apply_api_key has set
+    // the env var, so the required_key() env-var check passes.
+    #[test]
+    fn refresh_config_loads_per_repo_api_key_so_required_key_env_is_set() {
+        let _rg = ReposGuard::capture();
+        let _eg = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY", "OLLAMA_API_KEY"]);
+        // No global .env key for either provider — the per-repo key is the ONLY key.
+        std::env::remove_var("OPENROUTER_API_KEY");
+        std::env::remove_var("OLLAMA_API_KEY");
+
+        let mut c = test_ctx(); // name="testrepo", provider="ollama-cloud"
+        assert_eq!(c.api_key, "", "api_key is empty before refresh (argv seed)");
+
+        // repos.json carries a per-repo ollama-cloud key (no global .env key exists).
+        let per_repo_key = "oc-secret-key-abc123";
+        _rg.write(&[json!({"name": "testrepo", "provider": "ollama-cloud", "api_key": per_repo_key})]);
+
+        c.refresh_config_from_registry();
+
+        // The per-repo key is now loaded AND applied to the env var the startup guard checks.
+        assert_eq!(c.api_key, per_repo_key, "refresh must load the per-repo api_key");
+        let required = c.required_key();
+        assert_eq!(required, "OLLAMA_API_KEY");
+        assert_eq!(
+            std::env::var(&required).unwrap_or_default(),
+            per_repo_key,
+            "apply_api_key must set the env var so the startup required_key guard passes"
+        );
+    }
+
     // ---- live_ship: config-live ship mode (cures frozen argv --ship) ----
     //
     // A lane's ship mode is FROZEN in its argv at spawn (`--ship <mode>` from
