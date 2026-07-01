@@ -274,8 +274,20 @@ pub fn diagnose(repo: &Value) -> Value {
         safe = true;
     } else if status == Some("error")
         && phase == Some("preflight")
-        && (summary_lower.contains("out-of-band") || summary_lower.contains("refusing to hard-reset"))
+        && (summary_lower.contains("out-of-band")
+            || summary_lower.contains("refusing to hard-reset")
+            || reason == Some("unpushed_base"))
     {
+        // The `reason == "unpushed_base"` guard catches the runner's actual preflight error for an
+        // un-pushed base whose fast-forward push failed (iteration.rs writes `reason: "unpushed_base"`
+        // + a summary like "main has 3 commit(s) not on origin and the fast-forward push failed…").
+        // Without it the summary string match ("out-of-band" / "refusing to hard-reset") missed the
+        // runner's real message and the error fell through to the vague `unknown_error` catchall —
+        // the operator got "unclassified loop error" instead of the targeted base-out-of-band
+        // guidance, and the RUNG-0.5 auto-push recovery path never fired. The persistent variant
+        // (`unpushed_base_persistent`) carries a STOP sentinel + a different reason marker and is
+        // caught by the `persistent_self_stop` branch below, so this guard only matches the
+        // transient (first/second bail) case.
         cat = "base_out_of_band".into();
         ev = trunc(summary, 200);
         rec = vec![
@@ -1164,6 +1176,51 @@ mod tests {
         write_hb(&dir, &json!({"status": "error", "phase": "preflight",
                                "last_summary": "base has out-of-band commits"}));
         assert_eq!(diagnose(&repo)["category"], "base_out_of_band");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------- base_out_of_band: the runner's actual unpushed_base reason marker ----------------
+    // The runner's preflight writes `reason: "unpushed_base"` + a summary like "main has 3 commit(s)
+    // not on origin and the fast-forward push failed…" when the base is ahead of origin and the FF
+    // push fails (iteration.rs). The summary does NOT contain "out-of-band" or "refusing to
+    // hard-reset", so without the `reason == Some("unpushed_base")` guard this fell through to the
+    // vague `unknown_error` catchall — the operator got "unclassified loop error" instead of the
+    // targeted base-out-of-band guidance, and the RUNG-0.5 auto-push recovery never fired.
+    #[test]
+    fn diagnose_base_out_of_band_matches_unpushed_base_reason() {
+        let (dir, repo) = tmp_repo("oob_reason");
+        write_hb(&dir, &json!({
+            "status": "error",
+            "phase": "preflight",
+            "reason": "unpushed_base",
+            "last_summary": "main has 3 commit(s) not on origin and the fast-forward push failed (denied). Reconcile with origin; managed repos change only via gated PRs. Commits: abc123 def456"
+        }));
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], "base_out_of_band", "unpushed_base reason must classify as base_out_of_band, not unknown_error");
+        assert_eq!(d["auto_safe"], false);
+        assert_eq!(d["healthy"], false);
+        // The targeted recommendation, not the generic unknown_error fallback.
+        let rec = d["recommended"].as_array().unwrap();
+        assert!(rec.iter().any(|s| s.as_str().unwrap().contains("out-of-band")),
+                "recommendation must name the out-of-band class: {rec:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnose_base_out_of_band_persistent_unpushed_still_persistent_self_stop() {
+        // The PERSISTENT variant (unpushed_base_persistent) carries a STOP sentinel + a different
+        // reason marker and must still be caught by `persistent_self_stop`, NOT `base_out_of_band` —
+        // the `reason == Some("unpushed_base")` guard must not over-trigger on the persistent marker.
+        let (dir, repo) = tmp_repo("oob_persistent");
+        std::fs::write(dir.join("stop"), "unpushed_base_persistent\n").unwrap();
+        write_hb(&dir, &json!({
+            "status": "error",
+            "phase": "preflight",
+            "reason": "unpushed_base_persistent",
+            "last_summary": "Base has 3 un-pushed commit(s) and the fast-forward push to origin keeps failing — the loop self-stops so it doesn't spin forever."
+        }));
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], "persistent_self_stop", "persistent variant must stay persistent_self_stop");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
