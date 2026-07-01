@@ -1135,6 +1135,113 @@ largest coherent slice that can be edited, tested, and shipped in one cycle"
         assert_eq!(c.base_gate_red_bail_count, 0);
     }
 
+    // ---- bail counters: AT-limit self-stop writes the STOP sentinel + error heartbeat ----
+    // The watchdog's persistent_stop_cleared and the supervisor's persistent_self_stop diagnose
+    // branch BOTH depend on the heartbeat carrying the exact reason marker
+    // (dirty_base_persistent / unpushed_base_persistent / base_gate_red_persistent). If this
+    // contract breaks, the watchdog can't clear the stop after a fix and the supervisor misclassifies
+    // the lane as stop_lingering ("crash/kill mid-stop") instead of surfacing the real cause — the
+    // exact "stale heartbeat/escalation state not re-observed after a fix lands" class. These tests
+    // pin the AT-limit contract the existing below-limit tests skip.
+
+    /// A ctx with a UNIQUE runtime dir so the AT-limit tests (which write stop + heartbeat files)
+    /// don't collide with the shared `ctx()` dir used by the below-limit counting tests.
+    fn ctx_with_runtime(tag: &str) -> Ctx {
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut c = ctx();
+        c.runtime = std::env::temp_dir().join(format!(
+            "solomon_esc_persistent_{}_{}_{salt}",
+            std::process::id(),
+            tag
+        ));
+        std::fs::create_dir_all(&c.runtime).unwrap();
+        c.heartbeat_path = c.runtime.join("heartbeat.json");
+        c.log_path = c.runtime.join("improver.log");
+        c.stop_path = c.runtime.join("stop");
+        c
+    }
+
+    #[test]
+    fn note_dirty_base_bail_at_limit_writes_stop_and_error_heartbeat() {
+        let mut c = ctx_with_runtime("dirty");
+        // 2 bails below limit -> false, no stop, no heartbeat error
+        assert!(!note_dirty_base_bail(&mut c, true, "main", "main"));
+        assert!(!note_dirty_base_bail(&mut c, true, "main", "main"));
+        assert!(!c.stop_path.exists());
+        // 3rd bail hits the limit -> true, STOP sentinel + error heartbeat written
+        assert!(note_dirty_base_bail(&mut c, true, "main", "main"));
+        // STOP sentinel exists with the reason marker
+        assert!(c.stop_path.exists());
+        let stop_content = std::fs::read_to_string(&c.stop_path).unwrap();
+        assert_eq!(stop_content, "dirty_base_persistent\n");
+        // heartbeat carries the exact reason the watchdog/supervisor match on
+        let hb: Value = serde_json::from_str(&std::fs::read_to_string(&c.heartbeat_path).unwrap()).unwrap();
+        assert_eq!(hb["status"], "error");
+        assert_eq!(hb["phase"], "preflight");
+        assert_eq!(hb["reason"], "dirty_base_persistent");
+        assert!(hb["last_summary"].as_str().unwrap().contains("dirty"));
+        assert!(hb["last_summary"].as_str().unwrap().contains("self-stops"));
+        // counter reset after the stop so a later restart re-counts cleanly
+        assert_eq!(c.dirty_base_bail_count, 0);
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    #[test]
+    fn note_unpushed_base_bail_at_limit_writes_stop_and_error_heartbeat() {
+        let mut c = ctx_with_runtime("unpushed");
+        assert!(!note_unpushed_base_bail(&mut c, true, 2, "abc123 def456"));
+        assert!(!note_unpushed_base_bail(&mut c, true, 2, "abc123 def456"));
+        assert!(!c.stop_path.exists());
+        assert!(note_unpushed_base_bail(&mut c, true, 2, "abc123 def456"));
+        assert!(c.stop_path.exists());
+        let stop_content = std::fs::read_to_string(&c.stop_path).unwrap();
+        assert_eq!(stop_content, "unpushed_base_persistent\n");
+        let hb: Value = serde_json::from_str(&std::fs::read_to_string(&c.heartbeat_path).unwrap()).unwrap();
+        assert_eq!(hb["status"], "error");
+        assert_eq!(hb["phase"], "preflight");
+        assert_eq!(hb["reason"], "unpushed_base_persistent");
+        assert!(hb["last_summary"].as_str().unwrap().contains("un-pushed"));
+        assert!(hb["last_summary"].as_str().unwrap().contains("self-stops"));
+        assert_eq!(c.unpushed_base_bail_count, 0);
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    #[test]
+    fn note_base_gate_red_bail_at_limit_writes_stop_and_error_heartbeat() {
+        let mut c = ctx_with_runtime("gatered");
+        assert!(!note_base_gate_red_bail(&mut c, true, "pytest missing"));
+        assert!(!note_base_gate_red_bail(&mut c, true, "pytest missing"));
+        assert!(!c.stop_path.exists());
+        assert!(note_base_gate_red_bail(&mut c, true, "pytest missing"));
+        assert!(c.stop_path.exists());
+        let stop_content = std::fs::read_to_string(&c.stop_path).unwrap();
+        assert_eq!(stop_content, "base_gate_red_persistent\n");
+        let hb: Value = serde_json::from_str(&std::fs::read_to_string(&c.heartbeat_path).unwrap()).unwrap();
+        assert_eq!(hb["status"], "error");
+        assert_eq!(hb["phase"], "preflight");
+        assert_eq!(hb["reason"], "base_gate_red_persistent");
+        assert!(hb["last_summary"].as_str().unwrap().contains("self-stops"));
+        assert_eq!(c.base_gate_red_bail_count, 0);
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    #[test]
+    fn note_base_gate_red_bail_at_limit_uses_summary_when_provided() {
+        // When a non-empty summary is passed, it becomes the head of last_summary (not the generic
+        // "Base gate has been RED" fallback). The operator's fix guidance must surface the real
+        // gate failure, not a generic message.
+        let mut c = ctx_with_runtime("gatered_sum");
+        note_base_gate_red_bail(&mut c, true, "custom gate error: module not found");
+        note_base_gate_red_bail(&mut c, true, "custom gate error: module not found");
+        assert!(note_base_gate_red_bail(&mut c, true, "custom gate error: module not found"));
+        let hb: Value = serde_json::from_str(&std::fs::read_to_string(&c.heartbeat_path).unwrap()).unwrap();
+        assert!(hb["last_summary"].as_str().unwrap().starts_with("custom gate error: module not found"));
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
     // ---- py_splitlines ----
     #[test]
     fn py_splitlines_matches_python() {
