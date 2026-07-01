@@ -848,7 +848,7 @@ fn split_drive(p: &str) -> (String, &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -1140,7 +1140,7 @@ mod tests {
     // The crate's other file-touching suites (keys::EnvGuard, api::StateGuard) backup+restore the
     // real operator file under a process-wide mutex; mirror that for repos.json so the test is
     // hermetic and serializes against any future repos.json-writing test.
-    static REPOS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static REPOS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct ReposGuard {
         saved: Option<Vec<u8>>,

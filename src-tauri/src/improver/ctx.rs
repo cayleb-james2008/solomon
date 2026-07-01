@@ -414,6 +414,16 @@ impl Ctx {
         // prov = PROVIDERS.get(row.get("provider") or "ollama-cloud") or PROVIDERS["ollama-cloud"]
         let provider = str_or_truthy(row.get("provider"), "ollama-cloud");
         let prov = providers_or_default(&provider);
+        // PROVIDER_NAME = provider if provider in PROVIDERS else 'ollama-cloud'
+        // (kept in sync with pi_provider so escalation::apply_fallback_model and key_shape_mismatch
+        // see the CURRENT provider, not the launch-time one — a dashboard provider swap mid-loop
+        // previously left provider_name stale, silently routing the fallback ladder to the wrong
+        // provider's model and printing a stale provider name in the key-shape diagnostic.)
+        self.provider_name = if providers(&provider).is_some() {
+            provider.clone()
+        } else {
+            "ollama-cloud".to_string()
+        };
         self.pi_provider = prov.pi_provider.to_string();
         self.pi_ext = self.here.join(prov.ext);
         // PI_MODEL = row.get("model") or prov["default_model"]
@@ -1346,5 +1356,78 @@ mod tests {
         let text = "here is my key sk-or-v1-uniquerandperrepo for you";
         assert!(c.redact(text).contains("[REDACTED]"), "per-repo key value must be redacted");
         assert!(!c.redact(text).contains("sk-or-v1-uniquerandperrepo"));
+    }
+
+    // ---- refresh_config_from_registry: provider_name stays in sync with pi_provider ----
+    // Writes the real repos.json (paths::here()/repos.json); serialize against registry's
+    // repos.json-touching tests via the shared REPOS_LOCK, and save/restore the file.
+    use crate::control::registry::tests::REPOS_LOCK as SHARED_REPOS_LOCK;
+
+    struct ReposGuard {
+        saved: Option<Vec<u8>>,
+        _g: std::sync::MutexGuard<'static, ()>,
+    }
+    impl ReposGuard {
+        fn capture() -> Self {
+            let g = SHARED_REPOS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let p = paths::repos_json();
+            let saved = std::fs::read(&p).ok();
+            ReposGuard { saved, _g: g }
+        }
+        fn write(&self, rows: &[Value]) {
+            std::fs::write(paths::repos_json(), serde_json::to_string_pretty(rows).unwrap()).unwrap();
+        }
+    }
+    impl Drop for ReposGuard {
+        fn drop(&mut self) {
+            let p = paths::repos_json();
+            match &self.saved {
+                Some(b) => { let _ = std::fs::write(&p, b); }
+                None => { let _ = std::fs::remove_file(&p); }
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_config_updates_provider_name_on_provider_swap() {
+        // The bug: refresh_config_from_registry updated pi_provider/pi_ext/pi_model but NOT
+        // provider_name, so a mid-loop dashboard provider swap left provider_name stale —
+        // escalation::apply_fallback_model then looked up the WRONG provider's fallback model,
+        // and key_shape_mismatch printed a stale provider name in its diagnostic.
+        let _rg = ReposGuard::capture();
+        let _eg = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY", "OLLAMA_API_KEY"]);
+
+        // Launch the loop as ollama-cloud; provider_name and pi_provider both start as such.
+        let mut c = test_ctx(); // name="testrepo", provider="ollama-cloud"
+        assert_eq!(c.provider_name, "ollama-cloud");
+        assert_eq!(c.pi_provider, "maki-cloud");
+
+        // Operator edits repos.json: swaps the repo's provider to openrouter (no api_key so
+        // apply_api_key is a no-op; no phases so apply_phase_config is a no-op).
+        _rg.write(&[json!({"name": "testrepo", "provider": "openrouter"})]);
+
+        c.refresh_config_from_registry();
+
+        // provider_name MUST now match the refreshed provider, keeping it in sync with pi_provider
+        // so the fallback ladder and key-shape diagnostic see the current provider.
+        assert_eq!(c.provider_name, "openrouter", "provider_name must refresh on provider swap");
+        assert_eq!(c.pi_provider, "openrouter");
+        assert_eq!(c.pi_model, "qwen/qwen3-coder"); // openrouter default model
+    }
+
+    #[test]
+    fn refresh_config_unknown_provider_falls_back_to_ollama_cloud_name() {
+        let _rg = ReposGuard::capture();
+        let _eg = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY", "OLLAMA_API_KEY"]);
+
+        let mut c = test_ctx();
+        assert_eq!(c.provider_name, "ollama-cloud");
+
+        // An unknown provider in repos.json falls back to ollama-cloud (mirrors configure).
+        _rg.write(&[json!({"name": "testrepo", "provider": "bogus-provider"})]);
+        c.refresh_config_from_registry();
+
+        assert_eq!(c.provider_name, "ollama-cloud", "unknown provider -> ollama-cloud name");
+        assert_eq!(c.pi_provider, "maki-cloud"); // ollama-cloud's pi_provider
     }
 }
