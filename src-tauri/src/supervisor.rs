@@ -824,11 +824,19 @@ fn py_repr_scalar(v: Option<&Value>) -> String {
 
 /// `control.keys_status().get(control.project_provider(repo))` truthiness — the gate_red_streak
 /// fix-session precondition.
+/// Is there an API key available for this repo's provider? The active key is the per-repo
+/// `api_key` when set (it overrides the global .env key for the provider via Ctx::apply_api_key),
+/// otherwise the global .env key. Either counts as ready — previously this only consulted the
+/// global .env, so a repo keyed only per-repo was silently blocked from ever receiving a
+/// solomon_fix_session (gate_red_streak stalled forever even with 'Allow AI fix' ticked). The
+/// key-shape mismatch (owl-alpha class) is a separate loud guard that already fires inside
+/// run-improver before any work is done, so unblocking per-repo-keyed repos here is safe.
 fn keys_provider_ready(repo: &Value) -> bool {
-    crate::control::keys::keys_status()
-        .get(&registry::project_provider(repo))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+    !registry::project_api_key(repo).is_empty()
+        || crate::control::keys::keys_status()
+            .get(&registry::project_provider(repo))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1223,5 +1231,22 @@ mod tests {
     #[test]
     fn auto_safe_constant_matches_source() {
         assert_eq!(AUTO_SAFE, &["stale_lock", "stop_lingering", "dirty_tree", "stuck"]);
+    }
+
+    // ---------------- keys_provider_ready: per-repo api_key counts ----------------
+    // The per-repo `api_key` overrides the global .env key for the repo's provider (Ctx::apply_api_key),
+    // so a non-empty per-repo key must count as "provider ready". Previously keys_provider_ready
+    // only consulted the global .env, so a repo keyed only per-repo could never get a
+    // solomon_fix_session (gate_red_streak stalled forever even with 'Allow AI fix' ticked).
+    // The short-circuit (`||`) means a non-empty per-repo key never touches the real .env file,
+    // so this test is deterministic and machine-state-independent.
+    #[test]
+    fn keys_provider_ready_per_repo_key_counts_even_without_global() {
+        let repo = json!({ "name": "kpr_1", "provider": "openrouter", "api_key": "sk-or-v1-xyz" });
+        assert!(keys_provider_ready(&repo), "per-repo api_key must count as ready");
+
+        // also for the ollama-cloud provider shape
+        let repo2 = json!({ "name": "kpr_2", "provider": "ollama-cloud", "api_key": "oc-key-abc" });
+        assert!(keys_provider_ready(&repo2), "per-repo api_key must count as ready for any provider");
     }
 }
