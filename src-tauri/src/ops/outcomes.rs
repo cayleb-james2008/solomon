@@ -542,10 +542,8 @@ fn print_table(payload: &Value, only: Option<&str>) {
             .and_then(Value::as_i64)
             .unwrap_or(i64::MAX)
     });
-    println!(
-        "{:<10} {:<20} {:<7} {}",
-        "PROJECT", "PROBE", "STATUS", "DETAIL"
-    );
+    // (widths match the row format below: 10/20/7 + free-form detail)
+    println!("PROJECT    PROBE                STATUS  DETAIL");
     for (name, proj) in &items {
         let verdict: Value = std::fs::read(verdict_path(name))
             .ok()

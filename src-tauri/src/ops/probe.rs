@@ -210,6 +210,9 @@ pub fn evaluate(cfg: &Value, repo_path: &str) -> ProbeOutcome {
     }
 }
 
+// result_large_err: the Err IS the probe verdict (a ProbeOutcome), constructed once per probe per
+// sweep — not a hot path worth boxing.
+#[allow(clippy::result_large_err)]
 fn resolved_file(cfg: &Value, repo_path: &str) -> Result<PathBuf, ProbeOutcome> {
     match cfg_str(cfg, "file") {
         Some(f) => Ok(registry::resolve_path(f, repo_path)),
@@ -358,7 +361,7 @@ fn eval_json_field(cfg: &Value, repo_path: &str) -> ProbeOutcome {
         // "age" (default): the NEWEST parsable timestamp among the matches — a registry of many
         // posts is fresh if ANY entry is fresh.
         _ => {
-            let newest = hits.iter().filter_map(|v| parse_ts(v)).max();
+            let newest = hits.iter().filter_map(parse_ts).max();
             match newest {
                 Some(t) => age_outcome(cfg, t, dotted),
                 None => unobservable(&threshold, format!("no parsable timestamp at '{dotted}'")),
@@ -456,7 +459,7 @@ fn eval_jsonl_tail(cfg: &Value, repo_path: &str) -> ProbeOutcome {
         }
         _ => {
             let last = &records[records.len() - 1];
-            match last.get(field).and_then(|v| parse_ts(v)) {
+            match last.get(field).and_then(parse_ts) {
                 Some(t) => age_outcome(cfg, t, &format!("last .{field}")),
                 None => unobservable(&threshold, format!("last record has no parsable '{field}'")),
             }
@@ -473,6 +476,7 @@ fn eval_jsonl_tail(cfg: &Value, repo_path: &str) -> ProbeOutcome {
 ///   - `pattern` + `yellow_on` (no yellow_pattern): count(pattern) >= yellow_on -> yellow
 ///   - `yellow_pattern` + `yellow_on`: an INDEPENDENT yellow signal (auth_health: 401s red-scale,
 ///     429s yellow-scale in one probe)
+///
 /// Below every threshold -> green (transients tolerated by design). Missing file -> unobservable.
 fn eval_log_grep(cfg: &Value, repo_path: &str) -> ProbeOutcome {
     let path = match resolved_file(cfg, repo_path) {
@@ -756,6 +760,7 @@ fn sqlite_single_value(db: &Path, query: &str) -> Result<Value, String> {
 ///   - "number": stdout parsed as a number, >= red_at -> red, >= yellow_at -> yellow
 ///   - "json_array_len": stdout parsed as a JSON array (covers `gh pr list --json number`),
 ///     length judged like "number"
+///
 /// Spawn failure / non-zero exit in a parse mode -> unobservable.
 fn eval_cmd(cfg: &Value, repo_path: &str) -> ProbeOutcome {
     let command = match cfg_str(cfg, "command") {
