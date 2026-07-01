@@ -9,6 +9,7 @@
 
 use crate::control::proc;
 use crate::improver::ctx::Ctx;
+use crate::improver::gates;
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -324,6 +325,80 @@ fn slice_chars(s: &str, n: usize) -> String {
 }
 
 // --------------------------------------------------------------------------- #
+// post-merge ship-gate
+// --------------------------------------------------------------------------- #
+
+/// The ship-state string returned when a post-merge gate catches a RED merged main and reverts
+/// the merge. Factored out as a constant for unit testing the state-classification predicates
+/// (`ship_succeeded` / `ship_outcome`) without a live merge + gate.
+///
+/// Contains "reverted" so `ship_succeeded` returns false (not shipped) and `ship_outcome` returns
+/// "blocked" — the merge was undone, so the backlog item does NOT advance.
+pub const POST_MERGE_REVERT_STATE: &str = "reverted (main gate RED after merge)";
+
+/// Post-merge ship-gate: after a squash-merge is confirmed, fetch origin/main, reset the local base
+/// to the merged HEAD, and run the repo's gate against it. This catches the class of bug where two
+/// independently-green PRs conflict semantically — each branch gated green in isolation, but the
+/// merged main goes RED (verified 2026-07-01: solomon PRs #35+#36, both green in isolation, merged
+/// ~1s apart, main went gate-RED and tripped `base_gate_red_persistent` for ~25min until the
+/// supervisor fixed it).
+///
+/// On a GREEN post-merge gate: returns true (the merge is safe to keep).
+/// On a RED post-merge gate: reverts the just-merged squash commit on the base, pushes the revert,
+/// logs loudly, surfaces `main gate RED after merging #<n>` in the heartbeat, and returns false.
+/// The caller MUST NOT report "merged" — the base has been healed.
+fn post_merge_gate(c: &mut Ctx, num: i64) -> bool {
+    let base = c.base_branch.clone();
+    // Fetch origin so the local base reflects the just-merged commit.
+    c.git(&["fetch", "origin", "--quiet"], 120);
+    // Move to the base branch and reset to the merged HEAD.
+    c.git(&["checkout", &base], 120);
+    c.git(&["reset", "--hard", &format!("origin/{base}")], 120);
+
+    // Run the gate against the merged result.
+    let (green, tests, _tail) = gates::run_gate(c);
+    if green {
+        c.log(&format!(
+            "post-merge gate GREEN on origin/{base} after merging #{num} — base is safe"
+        ));
+        return true;
+    }
+
+    // RED main after merge — revert the just-merged commit to heal the base.
+    let failed = tests.get("failed").and_then(Value::as_i64).unwrap_or(0);
+    c.log(&format!(
+        "MAIN GATE RED after merging #{num} ({failed} failed) — reverting the merge to heal the base"
+    ));
+    c.heartbeat(json!({
+        "status": "error",
+        "phase": "ship",
+        "reason": "main_gate_red_after_merge",
+        "last_summary": format!(
+            "main gate RED after merging #{num} ({failed} failed) — the merged result broke the base \
+even though each PR was green in isolation. Reverting the merge commit on {base} to heal the base."
+        ),
+    }));
+    // Revert the squash-merge commit (HEAD on the base) and push.
+    let rev = c.git(&["revert", "--no-edit", "HEAD"], 120);
+    if rev.code == 0 {
+        c.git(&["push", "origin", &base], 120);
+        c.log(&format!("reverted merge of #{num} on {base} and pushed — base healed"));
+    } else {
+        // revert failed — hard-reset as a last resort to heal the base.
+        c.log(&format!(
+            "git revert failed on merge of #{num} ({}), hard-resetting {base} to HEAD~1 and force-pushing",
+            slice_chars(rev.stderr.trim(), 160)
+        ));
+        c.git(&["reset", "--hard", "HEAD~1"], 120);
+        c.git(&["push", "origin", &base, "--force-with-lease"], 120);
+        c.log(&format!(
+            "hard-reset {base} to before merge of #{num} and force-pushed — base healed"
+        ));
+    }
+    false
+}
+
+// --------------------------------------------------------------------------- #
 // _try_squash_merge / _auto_merge / _wait_for_ci_then_merge
 // --------------------------------------------------------------------------- #
 
@@ -410,7 +485,13 @@ pub fn auto_merge(c: &mut Ctx, pr: &Value) -> Value {
     // checks is None, "success", or "pending" with --auto rejected -> direct merge
     let m = try_squash_merge(c, num);
     if m.code == 0 && confirm_merged(c, num) {
-        return with_state(pr, "merged");
+        // Post-merge ship-gate: verify the MERGED RESULT on origin/main, not just this PR's
+        // branch. Two independently-green PRs can conflict semantically and break the merged
+        // base. If the post-merge gate is RED, revert the merge to heal the base.
+        if post_merge_gate(c, num) {
+            return with_state(pr, "merged");
+        }
+        return with_state(pr, POST_MERGE_REVERT_STATE);
     }
     if m.code == 0 {
         // The command returned 0 but mergedAt is null — the merge did NOT actually land. Never
@@ -460,7 +541,14 @@ pub fn wait_for_ci_then_merge(c: &mut Ctx, pr: &Value) -> Value {
         if checks.is_none() || checks.as_deref() == Some("success") {
             let m = try_squash_merge(c, num);
             if m.code == 0 && confirm_merged(c, num) {
-                return with_state(pr, "merged");
+                // Post-merge ship-gate: verify the MERGED RESULT on origin/main, not just this
+                // PR's branch. Two independently-green PRs can conflict semantically and break
+                // the merged base. If the post-merge gate is RED, revert the merge to heal the
+                // base rather than proceeding to the next iteration on a broken base.
+                if post_merge_gate(c, num) {
+                    return with_state(pr, "merged");
+                }
+                return with_state(pr, POST_MERGE_REVERT_STATE);
             }
             if m.code == 0 {
                 c.log(&format!(
@@ -486,7 +574,11 @@ pub fn wait_for_ci_then_merge(c: &mut Ctx, pr: &Value) -> Value {
             // instead of stranding the PR open for hours.
             let m = try_squash_merge(c, num);
             if m.code == 0 && confirm_merged(c, num) {
-                return with_state(pr, "merged");
+                // Post-merge ship-gate (same as the success/None path above).
+                if post_merge_gate(c, num) {
+                    return with_state(pr, "merged");
+                }
+                return with_state(pr, POST_MERGE_REVERT_STATE);
             }
             return with_state(pr, "open (awaiting CI)");
         }
@@ -932,5 +1024,44 @@ mod tests {
 
     fn test_ctx() -> Ctx {
         Ctx::configure(".", "maki", "ollama-cloud", None)
+    }
+
+    // ---- post-merge ship-gate: a merge producing a RED main is caught and reverted ----
+    //
+    // The systemic fix for "solomon lane self-stops on base_gate_red_persistent from its own
+    // back-to-back merges" (verified 2026-07-01: PRs #35+#36 both green in isolation, merged ~1s
+    // apart, main went gate-RED). After a squash-merge, the ship path now fetches origin/main and
+    // re-runs the gate against the MERGED HEAD. If RED, it reverts the merge and returns
+    // POST_MERGE_REVERT_STATE instead of "merged" — so the backlog item does NOT advance and the
+    // base is healed before the next iteration, rather than poisoning it and tripping
+    // base_gate_red_persistent.
+
+    #[test]
+    fn post_merge_revert_state_is_not_shipped() {
+        // Contains "reverted" -> ship_succeeded returns false (the merge was undone).
+        assert!(!ship_succeeded(&json!({"number": 36, "state": POST_MERGE_REVERT_STATE})));
+    }
+
+    #[test]
+    fn post_merge_revert_state_is_blocked() {
+        // Does NOT contain "merged" -> ship_outcome returns "blocked", not "shipped".
+        assert_eq!(
+            ship_outcome(
+                &json!({"number": 36, "state": POST_MERGE_REVERT_STATE}),
+                "auto-merge",
+            ),
+            "blocked"
+        );
+    }
+
+    #[test]
+    fn post_merge_revert_state_contains_diagnostic() {
+        // The state string must surface "main gate RED" so the lane log + dashboard show WHY the
+        // merge was reverted, not just a bare "reverted".
+        assert!(POST_MERGE_REVERT_STATE.contains("main gate RED"));
+        assert!(POST_MERGE_REVERT_STATE.contains("reverted"));
+        // Must NOT contain "merged" — otherwise ship_outcome's "merged" substring check would
+        // wrongly classify it as shipped.
+        assert!(!POST_MERGE_REVERT_STATE.contains("merged"));
     }
 }
