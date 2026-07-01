@@ -741,6 +741,10 @@ impl Ctx {
         }
         // The only key shape we can identify with confidence: OpenRouter keys are always prefixed
         // "sk-or-v1-" (per OpenRouter's own key format). Ollama Cloud keys never use that prefix.
+        // Both directions of the mismatch are the same class of silent drift: the per-repo key and
+        // the named provider point at DIFFERENT providers, so the model actually served is NOT the
+        // one repos.json's provider/model claim (the wrong-shaped key is either rejected by the
+        // wrong endpoint or, worse, silently authenticates against a DIFFERENT provider).
         let looks_openrouter = self.api_key.starts_with("sk-or-v1-");
         if looks_openrouter && self.pi_provider != "openrouter" {
             return Some(format!(
@@ -750,6 +754,23 @@ impl Ctx {
                  model. Fix repos.json: either set provider back to \"openrouter\", or clear/replace \
                  api_key with a key that matches the intended provider.",
                 self.name, self.provider_name, self.pi_provider
+            ));
+        }
+        // Mirror image: provider says openrouter but the per-repo key is NOT OpenRouter-shaped.
+        // An OpenRouter key is *always* sk-or-v1-..., so a non-empty per-repo key lacking that prefix
+        // cannot authenticate against OpenRouter — it's a stale key left behind when the provider
+        // was flipped TO openrouter (or a key pasted from the wrong provider). Same silent-drift
+        // class as the owl-alpha incident, just in the opposite direction.
+        if !looks_openrouter && self.pi_provider == "openrouter" {
+            return Some(format!(
+                "repos.json api_key for '{}' is set but does not look like an OpenRouter key \
+                 (OpenRouter keys are always prefixed sk-or-v1-...) while provider is '{}' \
+                 (resolved pi_provider 'openrouter') — the mirror image of the owl-alpha incident: \
+                 the per-repo key points at a different provider than repos.json names, so the model \
+                 actually served would NOT be the configured OpenRouter model. Fix repos.json: either \
+                 set provider back to the provider that owns this key, or replace api_key with an \
+                 OpenRouter key (sk-or-v1-...).",
+                self.name, self.provider_name
             ));
         }
         None
@@ -1339,6 +1360,20 @@ mod tests {
         assert_eq!(c.pi_provider, "openrouter");
         c.api_key = "sk-or-v1-abcdefghijklmnopqrstuvwxyz0123456789".to_string();
         assert!(c.key_shape_mismatch().is_none());
+    }
+
+    #[test]
+    fn key_shape_mismatch_flags_non_openrouter_key_on_openrouter_provider() {
+        // Mirror image of the owl-alpha incident: provider flipped TO openrouter while a stale
+        // ollama-shaped (non sk-or-v1-) per-repo key was left behind. Same silent-drift class — the
+        // guard must fire loudly so the operator notices the served model won't be the configured one.
+        let mut c = Ctx::configure("C:/x/repo", "asmodeus", "openrouter", None);
+        assert_eq!(c.pi_provider, "openrouter");
+        c.api_key = "some-ollama-cloud-key-12345".to_string();
+        let reason = c.key_shape_mismatch().expect("reverse-direction mismatch must be flagged");
+        assert!(reason.contains("asmodeus"), "reason must name the repo");
+        assert!(reason.contains("openrouter"), "reason must name the provider");
+        assert!(reason.contains("owl-alpha"), "must reference the prior incident for operator context");
     }
 
     #[test]
