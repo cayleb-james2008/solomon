@@ -18,6 +18,13 @@ which = "6"
 wait-timeout = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 regex = "1"
+# ops plane (Phase 1): read-only SQLite probes over the managed products' state DBs (asmodeus.db).
+# bundled so no system sqlite3 is required; opened SQLITE_OPEN_READ_ONLY only — never a write path.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+# test fixtures only: set file mtimes for the file_age probe's golden vectors
+filetime = "0.2"
 
 # Windows job objects — bind spawned improver children to the GUI process so closing the app
 # (normal exit, crash, or kill) terminates the whole backend tree (see control::proc::init_app_job).
