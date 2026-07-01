@@ -796,6 +796,29 @@ impl Ctx {
         None
     }
 
+    // ---- config-live ship mode ------------------------------------------- #
+
+    /// Read the LIVE ship mode from `.solomon.json` (auto_push) + repos.json (project_ship), so an
+    /// operator's config correction (an `auto_push` flip or a repos.json `ship` edit) takes effect
+    /// on the NEXT iteration without a restart — the argv `--ship` value is frozen at spawn and
+    /// never reflects a mid-loop config edit (this stranded ~6.5h of solomon self-work on
+    /// 2026-07-01 when a corrected `auto_push` never applied on a healthy long-lived lane).
+    ///
+    /// Returns `None` when the registry read fails (repo row not found in repos.json), so the
+    /// caller keeps the argv-frozen value as the fallback default. repos.json + .solomon.json are
+    /// already read fresh elsewhere each sweep, so this adds no new read cadence.
+    pub fn live_ship(&self) -> Option<String> {
+        // auto_push from .solomon.json (default true, matching AppState::get_auto_push).
+        let auto_push = read_auto_push(&self.control);
+        // repo row from repos.json (fresh read). An empty object means the row was not found
+        // (file missing/corrupt/name absent) -> keep the argv value.
+        let row = self.repo_row();
+        if row.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+            return None;
+        }
+        Some(crate::control::registry::effective_ship(&row, auto_push))
+    }
+
     // ---- exe discovery ---------------------------------------------------- #
 
     /// run_improver.pi_exe (~602-603): `_which("pi")`.
@@ -1023,6 +1046,26 @@ impl Ctx {
 // --------------------------------------------------------------------------- #
 // free helpers
 // --------------------------------------------------------------------------- #
+
+/// Read the `auto_push` dial from `.solomon.json` (the operator state file). Default `true` when
+/// the file or key is absent (matching `AppState::get_auto_push`). Best-effort: any read/parse
+/// failure -> `true` (the default), so a corrupt state file never silently downgrades a lane to
+/// ship=local.
+fn read_auto_push(control: &Path) -> bool {
+    let path = control.join(".solomon.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return true, // missing -> default true
+    };
+    let v: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return true, // corrupt -> default true
+    };
+    match v.get("auto_push") {
+        None => true, // absent -> default true
+        Some(val) => py_bool(Some(val)),
+    }
+}
 
 /// Path(repo).resolve(): canonicalize when the path exists; else best-effort absolute (Python's
 /// resolve() does not require existence). Strips the Windows \\?\ verbatim prefix canonicalize adds.
@@ -1608,5 +1651,96 @@ mod tests {
 
         assert_eq!(c.provider_name, "ollama-cloud", "unknown provider -> ollama-cloud name");
         assert_eq!(c.pi_provider, "maki-cloud"); // ollama-cloud's pi_provider
+    }
+
+    // ---- live_ship: config-live ship mode (cures frozen argv --ship) ----
+    //
+    // A lane's ship mode is FROZEN in its argv at spawn (`--ship <mode>` from
+    // effective_ship(repos.json ship, .solomon.json auto_push)). A long-running HEALTHY lane never
+    // picks up a corrected auto_push or repos.json ship without a manual process bounce. live_ship()
+    // re-reads effective_ship from the FRESH repos.json + .solomon.json so a config correction takes
+    // effect on the NEXT iteration with no restart. The argv value is the fallback when the registry
+    // read fails.
+
+    /// Write a `.solomon.json` with the given `auto_push` value into `dir`.
+    fn write_state_file(dir: &Path, auto_push: bool) {
+        let body = serde_json::to_vec_pretty(&json!({"auto_push": auto_push})).unwrap();
+        std::fs::write(dir.join(".solomon.json"), body).unwrap();
+    }
+
+    #[test]
+    fn live_ship_follows_auto_push_flip_false_to_true() {
+        // repo ship=pr; auto_push flips false→true between iterations. The resolved ship mode must
+        // follow the LIVE config, not the frozen launch arg.
+        let (dir, _g) = tmp_control_with_repos(Some(
+            br#"[{"name": "testrepo", "ship": "pr"}]
+"#,
+        ));
+        let mut c = Ctx::configure("C:/x/testrepo", "testrepo", "ollama-cloud", None);
+        c.control = dir.clone();
+        c.ship = "local".to_string(); // simulate argv-frozen ship=local (auto_push was false at spawn)
+
+        // auto_push=false → effective_ship returns "local"
+        write_state_file(&dir, false);
+        assert_eq!(c.live_ship(), Some("local".to_string()));
+
+        // Operator flips auto_push to true. The NEXT iteration's live_ship must now return "pr"
+        // (repos.json ship=pr + auto_push=true), NOT the frozen argv "local".
+        write_state_file(&dir, true);
+        assert_eq!(c.live_ship(), Some("pr".to_string()));
+    }
+
+    #[test]
+    fn live_ship_follows_repos_json_ship_edit() {
+        // auto_push=true (constant); operator edits repos.json ship from "pr" to "auto-merge".
+        // live_ship must pick up the new ship mode on the next iteration.
+        let (dir, _g) = tmp_control_with_repos(Some(
+            br#"[{"name": "testrepo", "ship": "pr"}]
+"#,
+        ));
+        let mut c = Ctx::configure("C:/x/testrepo", "testrepo", "ollama-cloud", None);
+        c.control = dir.clone();
+        c.ship = "pr".to_string(); // argv-frozen ship=pr
+        write_state_file(&dir, true);
+        assert_eq!(c.live_ship(), Some("pr".to_string()));
+
+        // Operator edits repos.json: ship → "auto-merge".
+        std::fs::write(
+            dir.join("repos.json"),
+            r#"[{"name": "testrepo", "ship": "auto-merge"}]
+"#,
+        )
+        .unwrap();
+        assert_eq!(c.live_ship(), Some("auto-merge".to_string()));
+    }
+
+    #[test]
+    fn live_ship_returns_none_when_repo_row_missing() {
+        // repos.json exists but has no row for this repo → registry read fails → return None so
+        // the caller keeps the argv-frozen value as the fallback default.
+        let (dir, _g) = tmp_control_with_repos(Some(
+            br#"[{"name": "other-repo", "ship": "pr"}]
+"#,
+        ));
+        let mut c = Ctx::configure("C:/x/testrepo", "testrepo", "ollama-cloud", None);
+        c.control = dir.clone();
+        c.ship = "auto-merge".to_string(); // argv-frozen
+        write_state_file(&dir, true);
+        assert_eq!(c.live_ship(), None, "missing repo row → None (keep argv fallback)");
+    }
+
+    #[test]
+    fn live_ship_defaults_auto_push_true_when_state_file_absent() {
+        // No .solomon.json → auto_push defaults to true (matching AppState::get_auto_push).
+        let (dir, _g) = tmp_control_with_repos(Some(
+            br#"[{"name": "testrepo", "ship": "push"}]
+"#,
+        ));
+        let _ = std::fs::remove_file(dir.join(".solomon.json"));
+        let mut c = Ctx::configure("C:/x/testrepo", "testrepo", "ollama-cloud", None);
+        c.control = dir.clone();
+        c.ship = "local".to_string();
+        // auto_push defaults true → effective_ship returns project_ship = "push"
+        assert_eq!(c.live_ship(), Some("push".to_string()));
     }
 }

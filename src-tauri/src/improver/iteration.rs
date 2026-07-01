@@ -925,6 +925,18 @@ data or a secret to the PUBLIC repo; fix the change to exclude it."
         return;
     }
 
+    // CONFIG-LIVE SHIP: re-read effective_ship from repos.json + .solomon.json so an operator's
+    // config correction (auto_push flip, repos.json ship edit) takes effect on the NEXT iteration
+    // without a restart. The argv --ship value is the fallback when the registry read fails. This
+    // cures the exact "silent config drift" class: a corrected config that silently never applies
+    // on a healthy long-lived lane (stranded ~6.5h of solomon self-work on 2026-07-01).
+    if let Some(live) = ctx.live_ship() {
+        if live != ctx.ship {
+            ctx.log(&format!("ship mode changed live: {}\u{2192}{}", ctx.ship, live));
+            ctx.ship = live;
+        }
+    }
+
     let title = if ctx.beautify {
         "beautify repo".to_string()
     } else {
