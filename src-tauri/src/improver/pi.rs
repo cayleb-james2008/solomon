@@ -24,6 +24,29 @@ use std::sync::{
     Arc,
 };
 
+// --------------------------------------------------------------------------- //
+// is_quota_error — provider 429 / rate-limit / quota detection
+// --------------------------------------------------------------------------- //
+
+/// Detect a provider QUOTA / rate-limit / transport error in pi's stderr.
+///
+/// When the shared Ollama account's session usage limit is saturated (HTTP 429 "you have reached
+/// your session usage limit"), pi returns empty stdout with the provider's error in stderr. This is
+/// a TRANSPORT/QUOTA error, NOT a reasoned model noop — counting it as a noop caused a fleet-wide
+/// noop storm that escalated and RESET lanes (lost iteration progress) whenever the 5 concurrent
+/// lanes saturated the single shared account's session quota.
+///
+/// Checks stderr only (pi's error channel — the provider HTTP error lands there), NOT stdout (the
+/// agent's output), so a task that legitimately mentions "429" or "rate limit" in its summary
+/// cannot trigger a false positive.
+pub fn is_quota_error(stderr: &str) -> bool {
+    let l = stderr.to_ascii_lowercase();
+    ["429", "session usage limit", "rate limit", "rate_limit", "rate-limit",
+     "too many requests", "quota exceeded"]
+        .iter()
+        .any(|pat| l.contains(pat))
+}
+
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -846,6 +869,42 @@ mod tests {
         assert_eq!(payload["model"], "openrouter/owl-alpha");
         assert_eq!(payload["status"], "running");
         assert!(payload["exit_code"].is_null());
+    }
+
+    // ---- is_quota_error: provider 429 / rate-limit / quota detection ----
+    #[test]
+    fn is_quota_error_detects_429_session_usage_limit() {
+        // The exact Ollama 429 body that caused the fleet-wide noop storm.
+        let stderr = "HTTP 429: you (cayleb_james) have reached your session usage limit";
+        assert!(is_quota_error(stderr));
+    }
+
+    #[test]
+    fn is_quota_error_detects_various_rate_limit_phrasings() {
+        assert!(is_quota_error("Error: 429 Too Many Requests"));
+        assert!(is_quota_error("rate limit exceeded — try again in 60s"));
+        assert!(is_quota_error("RATE_LIMIT: quota exceeded"));
+        assert!(is_quota_error("rate-limit: back off"));
+        assert!(is_quota_error("rate_limit: back off"));
+        assert!(is_quota_error("session usage limit reached"));
+    }
+
+    #[test]
+    fn is_quota_error_case_insensitive() {
+        assert!(is_quota_error("429 TOO MANY REQUESTS"));
+        assert!(is_quota_error("Rate Limit Exceeded"));
+        assert!(is_quota_error("QUOTA EXCEEDED"));
+    }
+
+    #[test]
+    fn is_quota_error_false_on_normal_output() {
+        assert!(!is_quota_error(""));
+        assert!(!is_quota_error("Pi completed successfully"));
+        assert!(!is_quota_error("some unrelated network error"));
+        assert!(!is_quota_error("Error: connection refused"));
+        // A model summary that happens to mention "429" in a coding context is in STDOUT, not
+        // stderr — is_quota_error checks stderr only, so it won't false-positive.
+        assert!(!is_quota_error("the agent wrote a retry handler"));
     }
 
     // ---- timeout constant parity with the source ----

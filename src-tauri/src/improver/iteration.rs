@@ -495,6 +495,29 @@ Then stop."
         ));
     }
 
+    // QUOTA-NOT-NOOP: a 429 / "session usage limit" / rate-limit from the provider is a
+    // TRANSPORT/QUOTA error, NOT a reasoned noop. The 5 lanes share ONE Ollama account; when
+    // concurrent they saturate its session quota and pi returns empty -> the old code counted this
+    // as a noop -> noop_streak escalation -> lane RESET (lost iteration progress) — a fleet-wide
+    // noop storm (CONFIRMED 2026-07-01: all 5 lanes noop'd within a 2-min window). Detect it, drop
+    // the branch WITHOUT escalating (no note_noop, no register_failure, no reset), and let the
+    // loop's natural interval sleep back off so the lanes self-throttle under the shared account cap.
+    if pi::is_quota_error(&p.stderr) {
+        let why = tail_chars(&ctx.redact(p.stderr.trim()), 300);
+        ctx.log(&format!(
+            "Pi QUOTA/TRANSPORT ERROR (429 / session usage limit / rate limit — NOT a model no-op; \
+NOT counted toward noop_streak, no reset): {why}"
+        ));
+        gitops::drop_branch(
+            ctx,
+            &branch,
+            "quota_error",
+            &format!("Provider quota/rate-limit error (not a noop — backing off this cycle): {why}"),
+            "sleeping",
+        );
+        return;
+    }
+
     if !gitops::tree_dirty(ctx) && gitops::head_sha(ctx) == base {
         let agent_untracked = gitops::untracked_non_ignored_files(ctx);
         if agent_untracked.is_empty() {
@@ -960,6 +983,15 @@ fn ideate(ctx: &mut Ctx) -> i64 {
     );
     // A timeout returns rc=124 with (usually) empty stdout — final_text is "" -> no ideas -> rc 5,
     // the same observable outcome as the Python `except TimeoutExpired -> return 5` branch.
+    // QUOTA-NOT-NOOP: a 429 / rate-limit from the provider is a TRANSPORT error, NOT "no parseable
+    // ideas" — log it as a quota error and back off this cycle (do NOT mislog as a model failure).
+    if pi::is_quota_error(&p.stderr) {
+        let why = tail_chars(&ctx.redact(p.stderr.trim()), 300);
+        ctx.log(&format!(
+            "ideate: provider quota/rate-limit error (429 — NOT 'no parseable ideas'); backing off this cycle: {why}"
+        ));
+        return 5;
+    }
     let raw = pi::final_text(&p.stdout);
     let ideas = parse_ideas(&raw);
     if ideas.is_empty() {
