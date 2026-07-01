@@ -591,6 +591,13 @@ pub fn main() -> i32 {
         writeln!(f, "{line}")?;
         Ok(())
     })();
+    // SELF-REDEPLOY: the periodic check that swaps Solomon's OWN production binary when the checkout
+    // is behind origin/main, but ONLY in a safe drain window (no lane mid-ship, no live-money lane
+    // with an open trade). Cheap when there is nothing to do (cooldown + single-flight guards no-op
+    // most sweeps); logs LOUDLY to _watchdog.out.log when a rebuild is staged but no safe window
+    // appears, so production running old code is surfaced rather than silent. Never forces an unsafe
+    // swap. See `redeploy::maybe_self_redeploy` for the hard invariant.
+    crate::redeploy::maybe_self_redeploy();
     0
 }
 

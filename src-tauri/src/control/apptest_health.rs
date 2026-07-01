@@ -609,7 +609,7 @@ pub fn current_sha() -> Option<String> {
 /// control._solomon_repo: locate Solomon's own git checkout (the source-rebuild target). SOLOMON_HOME
 /// if it is a repo, else a walk UP (<=8 levels) from HERE (and the exe dir) looking for the
 /// Rust/Tauri repo markers (src-tauri/Cargo.toml + SOLOMON_RSI.md). Returns the path, or None.
-fn solomon_repo() -> Option<PathBuf> {
+pub(crate) fn solomon_repo() -> Option<PathBuf> {
     // Post-port markers: the Rust crate manifest + the canonical RSI spec doc (was solomon.spec +
     // control.py pre-port; both removed in the Python->Rust/Tauri rewrite).
     let is_repo =

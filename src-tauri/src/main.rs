@@ -9,6 +9,7 @@
 mod api; // native port of app.py's Api — the `bridge` command + headless backend (get_state, dispatch)
 mod control; // native port of control.py — repos registry, git/gh, locks, runner (the `bridge` backend)
 mod improver; // native port of improver/run_improver.py — the per-repo RSI loop (`run-improver` subcommand)
+mod redeploy; // native self-redeploy: swap Solomon's own production binary in a safe drain window
 mod supervisor; // native port of improver/solomon.py — diagnose() + the 3-rung recover() ladder + escalation
 mod watchdog; // native port of monitor.py — the `watchdog` subcommand (SolomonWatchdog scheduled sweep)
 
