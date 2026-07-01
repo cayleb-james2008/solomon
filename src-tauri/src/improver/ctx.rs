@@ -1020,9 +1020,29 @@ fn which(name: &str, extra: &[&str]) -> String {
 /// registry::read_repos_json (lenient -> []), this keeps the present-but-corrupt error so the
 /// refresh logs "config refresh skipped". A non-list parse is still Ok(value) — run_improver guards
 /// the list-ness separately (`if isinstance(rows, list)`).
+///
+/// Two benign-but-noisy cases are normalized to an empty registry list (`Ok([])`) so a bakeoff
+/// control dir driven entirely by CLI `--provider`/`--model` keeps its current config SILENTLY
+/// instead of logging a scary parse error every iteration (the exact `config refresh skipped:
+/// expected value at line 1 column 1` noise that made the 2026-06-29 model-bakeoff logs unusable):
+///   1. a leading UTF-8 BOM (a Windows editor save) — serde_json does not skip it and chokes with
+///      `expected value at line 1 column 1`; strip it before parsing.
+///   2. an empty / whitespace-only file — equivalent to a valid `[]` repos.json (no rows => no
+///      per-repo override => keep current config). Treated as `Ok([])` rather than a parse error.
+/// Genuine non-empty corruption (garbage that is not whitespace) still errors and is logged loudly.
 fn read_repos_json_raw(control: &Path) -> Result<Value, String> {
     let path = control.join("repos.json");
-    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let mut bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    // Strip a leading UTF-8 BOM (Notepad/editor save) — serde_json fails "expected value at line 1
+    // column 1" on a BOM-prefixed file.
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        bytes.drain(..3);
+    }
+    // Empty / whitespace-only file == a valid empty registry list: no per-repo override, keep
+    // current config silently. (An empty slice also satisfies `all` -> Ok([]).)
+    if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+        return Ok(Value::Array(Vec::new()));
+    }
     serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string())
 }
 
@@ -1346,5 +1366,105 @@ mod tests {
         let text = "here is my key sk-or-v1-uniquerandperrepo for you";
         assert!(c.redact(text).contains("[REDACTED]"), "per-repo key value must be redacted");
         assert!(!c.redact(text).contains("sk-or-v1-uniquerandperrepo"));
+    }
+
+    // ---- read_repos_json_raw: the bakeoff JSON-parse bug fix ----
+    // A bakeoff control dir driven entirely by CLI --provider/--model has an EMPTY repos.json (or one
+    // saved by a Windows editor with a leading BOM). Both used to make serde_json fail with
+    // "expected value at line 1 column 1", logging a scary "config refresh skipped" line every
+    // iteration and making the bakeoff logs unusable. These are now normalized to an empty registry
+    // list (keep current config silently), matching a valid `[]` repos.json. Genuine corruption
+    // (non-empty garbage) still errors loudly.
+    fn tmp_control_with_repos(body: Option<&[u8]>) -> (std::path::PathBuf, std::sync::MutexGuard<'static, ()>) {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("solomon_rawread_test_{}", run_id_hex()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("repos.json");
+        let _ = std::fs::remove_file(&p);
+        if let Some(b) = body {
+            std::fs::write(&p, b).unwrap();
+        }
+        (dir, g)
+    }
+
+    #[test]
+    fn read_repos_json_raw_empty_file_is_empty_list() {
+        // 0-byte repos.json: a bakeoff control dir with no registry override. Must NOT error —
+        // refresh_config_from_registry keeps the CLI config silently.
+        let (dir, _g) = tmp_control_with_repos(Some(b""));
+        let v = read_repos_json_raw(&dir).expect("empty repos.json must parse as []");
+        assert_eq!(v, Value::Array(Vec::new()));
+    }
+
+    #[test]
+    fn read_repos_json_raw_whitespace_only_is_empty_list() {
+        // A repos.json saved as just blank lines / spaces: also empty registry, not a parse error.
+        let (dir, _g) = tmp_control_with_repos(Some(b"  \n\n\t  \r\n"));
+        let v = read_repos_json_raw(&dir).expect("whitespace-only repos.json must parse as []");
+        assert_eq!(v, Value::Array(Vec::new()));
+    }
+
+    #[test]
+    fn read_repos_json_raw_leading_bom_is_stripped() {
+        // A Windows editor (Notepad) save adds a UTF-8 BOM; serde_json would otherwise choke with
+        // "expected value at line 1 column 1". The BOM is stripped, then the body parses normally.
+        let (dir, _g) =
+            tmp_control_with_repos(Some(b"\xEF\xBB\xBF[{\"name\": \"bakeoff\"}]"));
+        let v = read_repos_json_raw(&dir).expect("BOM-prefixed repos.json must parse");
+        assert_eq!(v, json!([{"name": "bakeoff"}]));
+    }
+
+    #[test]
+    fn read_repos_json_raw_bom_only_is_empty_list() {
+        // A repos.json containing nothing but a BOM: strip + empty => empty registry list.
+        let (dir, _g) = tmp_control_with_repos(Some(b"\xEF\xBB\xBF"));
+        let v = read_repos_json_raw(&dir).expect("BOM-only repos.json must parse as []");
+        assert_eq!(v, Value::Array(Vec::new()));
+    }
+
+    #[test]
+    fn read_repos_json_raw_corrupt_still_errors() {
+        // Genuine corruption (non-empty garbage that is not whitespace) MUST still error so the
+        // refresh logs "config refresh skipped" loudly — the silent-config-drift guard stays.
+        let (dir, _g) = tmp_control_with_repos(Some(b"{not valid json"));
+        assert!(read_repos_json_raw(&dir).is_err(), "corrupt repos.json must still error");
+    }
+
+    #[test]
+    fn read_repos_json_raw_missing_file_errors() {
+        // A control dir with no repos.json at all: read fails (NotFound). This still surfaces as a
+        // refresh log (the file is genuinely absent), preserving bug-for-bug behavior for the
+        // missing-file case — only empty/whitespace/BOM are normalized to [].
+        let dir = std::env::temp_dir().join(format!("solomon_rawread_nomissing_{}", run_id_hex()));
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::remove_file(dir.join("repos.json"));
+        assert!(read_repos_json_raw(&dir).is_err(), "missing repos.json must still error");
+    }
+
+    #[test]
+    fn refresh_config_from_registry_empty_repos_keeps_cli_config_silently() {
+        // End-to-end of the bakeoff symptom: an empty repos.json must NOT log "config refresh
+        // skipped" and must keep the CLI-provided model/provider intact. Regression guard for the
+        // 2026-06-29 bakeoff JSON-parse bug.
+        let (dir, _g) = tmp_control_with_repos(Some(b""));
+        let mut c = Ctx::configure("C:/x/bakeoff", "bakeoff", "ollama-cloud", Some("minimax-m3"));
+        c.control = dir;
+        c.runtime = std::env::temp_dir().join(format!("solomon_refresh_test_{}", run_id_hex()));
+        c.log_path = c.runtime.join("improver.log");
+        let _ = std::fs::create_dir_all(&c.runtime);
+        let _ = std::fs::remove_file(&c.log_path);
+        // CLI gave us minimax-m3; an empty repos.json must not clobber it nor log a parse error.
+        c.refresh_config_from_registry();
+        assert_eq!(c.pi_model, "minimax-m3", "CLI model preserved when repos.json is empty");
+        let log = std::fs::read_to_string(&c.log_path).unwrap_or_default();
+        assert!(
+            !log.contains("config refresh skipped"),
+            "empty repos.json must not log a scary parse error; log was: {log}"
+        );
+        assert!(
+            !log.contains("expected value at line 1 column 1"),
+            "no serde parse noise; log was: {log}"
+        );
     }
 }
