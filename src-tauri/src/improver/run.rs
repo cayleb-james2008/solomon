@@ -383,6 +383,15 @@ set this repo's PR-target branch to a real branch in Config."
             break;
         }
         ctx.refresh_config_from_registry();
+        // The startup key_shape_mismatch guard refuses to run on a per-repo api_key whose shape
+        // doesn't match the configured provider. refresh_config_from_registry re-reads repos.json
+        // every iteration, so a MID-LOOP dashboard edit can flip provider while leaving a stale
+        // api_key — without this re-check the loop would silently run every subsequent iteration
+        // against the wrong provider (the owl-alpha-instead-of-glm-5.2 silent-drift class). Self-stop
+        // loudly so the supervisor's diagnose surfaces it as key_shape_mismatch.
+        if check_post_refresh_key_mismatch(&mut ctx) {
+            break;
+        }
         // run_improver.py wraps the loop body in try/…/finally: an unhandled exception in
         // one_iteration must fall through to the cleanup (release_lock + error/crashed heartbeat),
         // never kill the process with the runner lock still held. catch_unwind restores that
@@ -437,7 +446,10 @@ set this repo's PR-target branch to a real branch in Config."
     let persistent_self_stop = ctx.hb.get("status").and_then(Value::as_str) == Some("error")
         && matches!(
             ctx.hb.get("reason").and_then(Value::as_str),
-            Some("dirty_base_persistent" | "unpushed_base_persistent" | "base_gate_red_persistent")
+            Some("dirty_base_persistent"
+                | "unpushed_base_persistent"
+                | "base_gate_red_persistent"
+                | "key_shape_mismatch")
         );
     if ctx.halted || persistent_self_stop {
         // keep the error/reverted (or persistent self-stop) heartbeat untouched
@@ -462,6 +474,31 @@ set this repo's PR-target branch to a real branch in Config."
 /// the resolved value is exactly "pi" (the un-resolved fallback) AND "pi" is not itself on PATH.
 fn which_pi_missing() -> bool {
     which::which("pi").is_err()
+}
+
+/// Mid-loop re-check of the per-repo api_key/provider shape consistency AFTER
+/// `refresh_config_from_registry` has re-read repos.json. A dashboard/manual edit can flip
+/// `provider` while leaving a stale `api_key` whose shape points at a DIFFERENT provider — the
+/// exact silent-drift class (owl-alpha-instead-of-glm-5.2) the startup `key_shape_mismatch` guard
+/// exists to catch. Without this re-check the loop would silently run every subsequent iteration
+/// against the wrong provider with no loud error. On a mismatch, write an error heartbeat (reason
+/// `key_shape_mismatch` so the watchdog/supervisor recognize the persistent self-stop) + pin a STOP
+/// sentinel, and return true so the caller breaks. Mirrors the persistent-bail self-stop pattern.
+pub fn check_post_refresh_key_mismatch(ctx: &mut Ctx) -> bool {
+    if let Some(reason) = ctx.key_shape_mismatch() {
+        let _ = std::fs::create_dir_all(&ctx.runtime);
+        let _ = std::fs::write(&ctx.stop_path, "key_shape_mismatch\n");
+        ctx.heartbeat(json!({
+            "status": "error",
+            "phase": "preflight",
+            "reason": "key_shape_mismatch",
+            "last_summary": reason,
+        }));
+        ctx.log("config drift detected mid-loop — self-stopping (key_shape_mismatch)");
+        true
+    } else {
+        false
+    }
 }
 
 // --------------------------------------------------------------------------- //
@@ -586,5 +623,93 @@ fn acquire_lock(ctx: &mut Ctx) -> bool {
 fn release_lock(ctx: &Ctx) {
     if read_lock_pid(ctx) == std::process::id() as i64 {
         let _ = std::fs::remove_file(&ctx.lock_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ctx() -> Ctx {
+        let mut c = Ctx::configure("C:/nonexistent/repo", "testrepo", "ollama-cloud", None);
+        let rt = std::env::temp_dir().join(format!(
+            "solomon_run_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        c.runtime = rt;
+        c.heartbeat_path = c.runtime.join("heartbeat.json");
+        c.log_path = c.runtime.join("improver.log");
+        c.stop_path = c.runtime.join("stop");
+        c
+    }
+
+    fn read_hb(c: &Ctx) -> Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(&c.heartbeat_path).unwrap_or_default(),
+        )
+        .unwrap_or(json!({}))
+    }
+
+    // The core of the mid-loop config-drift guard: after refresh_config_from_registry re-reads
+    // repos.json, a per-repo api_key whose shape doesn't match the provider must self-stop loudly
+    // instead of silently running against the wrong provider.
+    #[test]
+    fn check_post_refresh_key_mismatch_stops_on_openrouter_key_with_ollama_provider() {
+        let mut c = ctx();
+        // simulate a mid-loop refresh that flipped provider to ollama-cloud but left an OpenRouter key
+        c.api_key = "sk-or-v1-abc123def456".to_string();
+        c.pi_provider = "maki-cloud".to_string(); // ollama-cloud's pi_provider
+        c.provider_name = "ollama-cloud".to_string();
+
+        assert!(check_post_refresh_key_mismatch(&mut c));
+        // STOP sentinel pinned
+        assert!(c.stop_path.exists());
+        // heartbeat carries the diagnostic the supervisor's diagnose classifies as key_shape_mismatch
+        let hb = read_hb(&c);
+        assert_eq!(hb["status"], json!("error"));
+        assert_eq!(hb["reason"], json!("key_shape_mismatch"));
+        assert_eq!(hb["phase"], json!("preflight"));
+        let summary = hb["last_summary"].as_str().unwrap();
+        assert!(summary.starts_with("repos.json api_key for"));
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    #[test]
+    fn check_post_refresh_key_mismatch_stops_on_non_openrouter_key_with_openrouter_provider() {
+        let mut c = ctx();
+        // mirror image: provider flipped TO openrouter but key is NOT sk-or-v1- shaped
+        c.api_key = "some-ollama-key-1234".to_string();
+        c.pi_provider = "openrouter".to_string();
+        c.provider_name = "openrouter".to_string();
+
+        assert!(check_post_refresh_key_mismatch(&mut c));
+        assert!(c.stop_path.exists());
+        let hb = read_hb(&c);
+        assert_eq!(hb["status"], json!("error"));
+        assert_eq!(hb["reason"], json!("key_shape_mismatch"));
+        let summary = hb["last_summary"].as_str().unwrap();
+        assert!(summary.starts_with("repos.json api_key for"));
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    #[test]
+    fn check_post_refresh_key_mismatch_noop_when_consistent() {
+        let mut c = ctx();
+        // no per-repo key -> no mismatch (falls through to the global .env key)
+        c.api_key = String::new();
+        assert!(!check_post_refresh_key_mismatch(&mut c));
+        assert!(!c.stop_path.exists());
+        // matching key/provider -> no mismatch
+        c.api_key = "sk-or-v1-correct-key".to_string();
+        c.pi_provider = "openrouter".to_string();
+        c.provider_name = "openrouter".to_string();
+        assert!(!check_post_refresh_key_mismatch(&mut c));
+        assert!(!c.stop_path.exists());
+        let _ = std::fs::remove_dir_all(&c.runtime);
     }
 }
