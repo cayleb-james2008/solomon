@@ -180,8 +180,8 @@ fn push_base_if_ahead(repo: &Value) -> Value {
 /// solomon.diagnose: deterministic, file-only health classification (no git shell-out — cheap on
 /// every poll). Returns {name, healthy, category, evidence, recommended:[...], auto_safe, running}.
 ///
-/// The 14-category cascade ORDER is load-bearing:
-///   ok / needs_goal / no_key / gh_not_ready / revert_failed / dirty_tree / base_out_of_band /
+/// The 15-category cascade ORDER is load-bearing:
+///   ok / needs_goal / no_key / key_shape_mismatch / gh_not_ready / revert_failed / dirty_tree / base_out_of_band /
 ///   untracked_refusal / stale_lock / stop_lingering / stuck / gate_red_streak / ci_red_streak /
 ///   noop_streak / unknown_error.
 pub fn diagnose(repo: &Value) -> Value {
@@ -229,6 +229,21 @@ pub fn diagnose(repo: &Value) -> Value {
         cat = "no_key".into();
         ev = trunc(summary, 160);
         rec = vec!["add the provider API key in Settings".into()];
+        safe = false;
+    } else if status == Some("error") && summary.starts_with("repos.json api_key for") {
+        // The loop's key_shape_mismatch guard (ctx.rs): a per-repo api_key whose shape doesn't match
+        // the configured provider (e.g. an `sk-or-v1-...` OpenRouter key left behind after flipping
+        // provider back to "ollama-cloud"). The loop refuses to run and writes status=error with a
+        // last_summary beginning "repos.json api_key for '<name>' looks like an OpenRouter key ...".
+        // Without this branch it fell through to the generic unknown_error catchall (git status),
+        // burying the exact provider/key drift the guard exists to surface.
+        cat = "key_shape_mismatch".into();
+        ev = trunc(summary, 200);
+        rec = vec![
+            "fix repos.json: the per-repo api_key does not match the configured provider \
+             — set provider back to the key's provider, or clear/replace api_key"
+                .into(),
+        ];
         safe = false;
     } else if status == Some("error") && summary.contains("GitHub not ready") {
         cat = "gh_not_ready".into();
@@ -402,6 +417,12 @@ fn suggested_steps(repo: &Value, cat: &str) -> Vec<String> {
             "git status".into(),
         ],
         "no_key" => vec!["Open Solomon → Settings and add the provider's API key, then retry".into()],
+        "key_shape_mismatch" => vec![
+            "Open Solomon → this repo → Config (or edit repos.json directly):".into(),
+            "  • set provider back to the key's provider (e.g. \"openrouter\" for an sk-or-v1-... key), OR".into(),
+            "  • clear the per-repo api_key field so it falls through to the global .env key".into(),
+            "the loop refuses to run until provider and api_key agree".into(),
+        ],
         "needs_goal" => vec![
             "Open Solomon → this repo → Config and set a north-star GOAL (or add an actionable".into(),
             "backlog item in improver/<name>/backlog.md); the loop resumes once it has an objective".into(),
@@ -933,6 +954,67 @@ mod tests {
     }
 
     #[test]
+    fn diagnose_key_shape_mismatch() {
+        // The loop's key_shape_mismatch guard writes status=error with a last_summary beginning
+        // "repos.json api_key for '<name>' looks like an OpenRouter key ...". The supervisor must
+        // classify this as key_shape_mismatch (targeted recovery), NOT the generic unknown_error
+        // catchall — otherwise the operator gets a vague escalation instead of the exact
+        // provider/key drift the guard exists to surface.
+        let (dir, repo) = tmp_repo("keyshape");
+        write_hb(
+            &dir,
+            &json!({
+                "status": "error",
+                "last_summary": "repos.json api_key for 'demo' looks like an OpenRouter key \
+                 (sk-or-v1-...) but provider is 'ollama-cloud' (resolved pi_provider 'ollama-cloud') \
+                 \u{2014} this is the exact mismatch that silently ran a prior iteration on \
+                 openrouter/owl-alpha instead of the configured model."
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], "key_shape_mismatch");
+        assert_eq!(d["auto_safe"], false);
+        assert_eq!(d["healthy"], false);
+        // evidence is the truncated summary (first 200 chars).
+        assert!(d["evidence"].as_str().unwrap().starts_with("repos.json api_key for 'demo'"));
+        // targeted recommendation, not the generic git-status fallback.
+        assert_eq!(
+            d["recommended"],
+            json!([
+                "fix repos.json: the per-repo api_key does not match the configured provider \
+                 \u{2014} set provider back to the key's provider, or clear/replace api_key"
+            ])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_key_shape_mismatch_escalates() {
+        // A key_shape_mismatch is not auto-safe and has no RUNG-0 action — recover() must escalate
+        // (operator action required) and leave the escalation.json on disk carrying the targeted
+        // category + suggested manual steps.
+        let (dir, repo) = tmp_repo("keyshaperec");
+        write_hb(
+            &dir,
+            &json!({
+                "status": "error",
+                "last_summary": "repos.json api_key for 'demo' looks like an OpenRouter key"
+            }),
+        );
+        let out = recover(&repo, false, false, false);
+        assert_eq!(out["category"], "key_shape_mismatch");
+        assert_eq!(out["escalate"], true);
+        assert_eq!(out["actions_taken"], json!([]));
+        let read = read_escalation(&repo).expect("escalation.json written");
+        assert_eq!(read["category"], "key_shape_mismatch");
+        let steps = read["suggested_manual_steps"].as_array().unwrap();
+        assert!(steps
+            .iter()
+            .any(|s| s.as_str().unwrap().contains("repos.json")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn diagnose_gh_not_ready() {
         let (dir, repo) = tmp_repo("ghnr");
         write_hb(&dir, &json!({"status": "error", "last_summary": "GitHub not ready (gh auth)"}));
@@ -1210,6 +1292,9 @@ mod tests {
         let repo = json!({"name": "x", "path": "C:/p/x", "pr_target_branch": "main"});
         assert_eq!(suggested_steps(&repo, "no_key"),
                    vec!["Open Solomon → Settings and add the provider's API key, then retry"]);
+        let ksm = suggested_steps(&repo, "key_shape_mismatch");
+        assert_eq!(ksm[0], "Open Solomon → this repo → Config (or edit repos.json directly):");
+        assert!(ksm.iter().any(|s| s.contains("sk-or-v1-")));
         assert_eq!(suggested_steps(&repo, "gh_not_ready"),
                    vec!["gh auth login   # authenticate, then retry"]);
         let rv = suggested_steps(&repo, "revert_failed");
