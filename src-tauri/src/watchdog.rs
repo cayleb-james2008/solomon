@@ -372,6 +372,10 @@ fn sweep_repo(r: &Value, auto_push_flag: bool) -> (Vec<String>, Value) {
         .unwrap_or(false);
     let running = control::locks::is_running(r);
     let hb = control::heartbeat::read_heartbeat(r).unwrap_or_else(|| json!({}));
+    // Set true when THIS sweep healed a persistent-bail self-stop (persistent_stop_cleared removed
+    // the sentinel + should_restart relaunched the loop). When healed, the RUNG-0 recover() pass
+    // below is SKIPPED for this repo on this sweep — see the heal block + the recover guard.
+    let mut healed = false;
 
     // Anti-wedge: the runner self-stops on a PERSISTENTLY dirty / un-pushed / gate-RED base (STOP
     // sentinel + status=error + a reason marker) so it doesn't spin forever — but that sentinel
@@ -410,6 +414,7 @@ fn sweep_repo(r: &Value, auto_push_flag: bool) -> (Vec<String>, Value) {
                 if let Some(ref d) = rt {
                     if std::fs::remove_file(d.join("stop")).is_ok() {
                         stop_pending = false;
+                        healed = true;
                         actions.push(format!("{name} auto-recover: {m}"));
                     }
                     // OSError -> pass (leave stop_pending as-is)
@@ -441,7 +446,15 @@ fn sweep_repo(r: &Value, auto_push_flag: bool) -> (Vec<String>, Value) {
     // operator-PAUSED lane — `paused` means "hands off this lane for the automated sweep", so the
     // watchdog must not stop/restart/reset_to_base it. should_restart already honors paused; recover()
     // did NOT, so a paused lane could still be stomped.
-    if !paused {
+    //
+    // ALSO skip recover() on the sweep that JUST healed a persistent-bail self-stop (healed=true):
+    // the heartbeat still carries the PRE-heal error (status=error, phase=preflight,
+    // reason=<persistent>) because the relaunched loop hasn't written a fresh one yet, so recover()
+    // -> diagnose() would re-observe that stale heartbeat and either escalate it as
+    // unknown_error/stuck or stop+restart the lane we just restarted — the exact "stale heartbeat /
+    // escalation state not re-observed after a fix lands" thrash. The next sweep re-observes the
+    // fresh heartbeat the relaunched loop has since written and runs recover() normally.
+    if !paused && !healed {
         // solomon.recover(r, allow_pi=False, allow_restart=auto_push, auto_push=auto_push).
         // catch Exception -> a watchdog must never die on one bad repo. recover() is total (no panics
         // expected); the catch is reproduced as a guard around the Value field reads.
@@ -777,6 +790,81 @@ mod tests {
         // a true operator Stop carries no reason marker -> never auto-cleared.
         assert_eq!(persistent_stop_cleared("", true, true, true), None);
         assert_eq!(persistent_stop_cleared("anything_else", true, true, true), None);
+    }
+
+    // -------- sweep_repo: recover() is SKIPPED on the sweep that heals a persistent stop --------
+    // The watchdog heals a persistent-bail self-stop (persistent_stop_cleared removes the sentinel
+    // + should_restart relaunches the loop), but the heartbeat still carries the PRE-heal error
+    // (status=error, phase=preflight, reason=<persistent>) until the relaunched loop writes a fresh
+    // one. Previously the RUNG-0 recover() pass ran on that SAME sweep, re-observed the stale error
+    // heartbeat, and either escalated it (unknown_error/stuck) or stop+restarted the just-restarted
+    // lane — the exact "stale heartbeat state not re-observed after a fix lands" thrash. Now
+    // recover() is skipped on the heal sweep; the next sweep re-observes the fresh heartbeat.
+    //
+    // Hermetic end-to-end check of sweep_repo: a real temp git repo (clean base -> base_is_clean)
+    // + a runtime dir carrying a dirty_base_persistent stop sentinel + error heartbeat. phase is
+    // set to "reverted" ONLY so should_restart returns false (the revert-failure HALT) and no
+    // improver is spawned by the test — the heal block gates on status==error, not phase, so the
+    // heal still fires. Without the skip, recover() would classify this as revert_failed and append
+    // a "<name> recover: ..." action (and do a real reset_to_base); with the skip, only the heal
+    // action appears.
+    #[test]
+    fn sweep_repo_skips_recover_after_persistent_stop_heal() {
+        use std::process::Command;
+        let tag = format!("wd_heal_{}_{}", std::process::id(),
+                          std::time::SystemTime::now()
+                              .duration_since(std::time::UNIX_EPOCH)
+                              .map(|d| d.as_nanos() % 1_000_000)
+                              .unwrap_or(0));
+        // temp git repo with a clean base tree.
+        let git_dir = std::env::temp_dir().join(format!("solomon_{tag}"));
+        let _ = std::fs::remove_dir_all(&git_dir);
+        std::fs::create_dir_all(&git_dir).unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+            vec!["commit", "--allow-empty", "-m", "init"],
+            vec!["branch", "-M", "main"],
+        ] {
+            let st = Command::new("git").args(&args).current_dir(&git_dir).status().unwrap();
+            assert!(st.success(), "git {:?} failed in {:?}", args, git_dir);
+        }
+        let repo = json!({"name": tag, "path": git_dir.to_string_lossy()});
+        let rt = paths::runtime_dir(&repo).unwrap();
+        let _ = std::fs::remove_dir_all(&rt);
+        std::fs::create_dir_all(&rt).unwrap();
+        std::fs::write(rt.join("stop"), "dirty_base_persistent\n").unwrap();
+        std::fs::write(
+            rt.join("heartbeat.json"),
+            serde_json::to_string(&json!({
+                "status": "error",
+                "phase": "reverted",
+                "reason": "dirty_base_persistent",
+                "last_summary": "Base branch 'main' has been dirty for 3 consecutive preflight bails",
+            })).unwrap(),
+        ).unwrap();
+
+        let (actions, _snap) = sweep_repo(&repo, false);
+
+        // The heal fired and removed the sentinel.
+        assert!(
+            actions.iter().any(|a| a.contains("auto-recover: base clean again")),
+            "heal action missing: {actions:?}"
+        );
+        assert!(!rt.join("stop").exists(), "stop sentinel not cleared");
+        // recover() was SKIPPED on this sweep: no recover action, no escalation.json written, no
+        // supervisor.jsonl record from recover (without the skip, a "<name> recover: ..." line and
+        // a supervisor.jsonl entry would appear from the revert_failed classification).
+        assert!(
+            !actions.iter().any(|a| a.contains(" recover: ")),
+            "recover ran on the heal sweep (re-observed stale heartbeat): {actions:?}"
+        );
+        assert!(!rt.join("escalation.json").exists(), "recover wrote a spurious escalation");
+        assert!(!rt.join("supervisor.jsonl").exists(), "recover wrote a spurious supervisor record");
+
+        let _ = std::fs::remove_dir_all(&rt);
+        let _ = std::fs::remove_dir_all(&git_dir);
     }
 
     // -------- _auto_push truthiness --------
