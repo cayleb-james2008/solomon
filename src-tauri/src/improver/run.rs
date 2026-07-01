@@ -383,6 +383,22 @@ set this repo's PR-target branch to a real branch in Config."
             break;
         }
         ctx.refresh_config_from_registry();
+        // Re-check the provider/api_key shape AFTER the mid-loop refresh: a dashboard (or manual)
+        // edit to repos.json can flip `provider` while leaving a stale `api_key` — or vice versa —
+        // mid-run. The startup guard (above) only catches this at launch; without this re-check the
+        // loop would silently keep iterating against a provider repos.json no longer claims, the
+        // exact owl-alpha-class silent drift. Halt with the SAME error heartbeat the startup guard
+        // writes (last_summary begins "repos.json api_key for ...") so supervisor.diagnose() surfaces
+        // the `key_shape_mismatch` category and escalates, instead of serving the wrong model.
+        if let Some(reason) = ctx.key_shape_mismatch() {
+            ctx.heartbeat(json!({"status": "error", "last_summary": reason}));
+            ctx.log(
+                "provider/api_key drifted mid-loop (repos.json edit) — halting for the supervisor \
+                 to escalate; fix repos.json (provider vs api_key) and restart",
+            );
+            clean_exit = true;
+            break;
+        }
         // run_improver.py wraps the loop body in try/…/finally: an unhandled exception in
         // one_iteration must fall through to the cleanup (release_lock + error/crashed heartbeat),
         // never kill the process with the runner lock still held. catch_unwind restores that
@@ -439,8 +455,13 @@ set this repo's PR-target branch to a real branch in Config."
             ctx.hb.get("reason").and_then(Value::as_str),
             Some("dirty_base_persistent" | "unpushed_base_persistent" | "base_gate_red_persistent")
         );
-    if ctx.halted || persistent_self_stop {
-        // keep the error/reverted (or persistent self-stop) heartbeat untouched
+    // A mid-loop key_shape_mismatch halt (above) wrote status=error with a last_summary beginning
+    // "repos.json api_key for ..." — the same shape the startup guard writes and diagnose() keys
+    // `key_shape_mismatch` off of. Preserve it through the finally so the supervisor surfaces the
+    // drift instead of clobbering it with "stopped"/"crashed".
+    let config_drift_halt = preserves_key_shape_mismatch_diagnostic(&ctx.hb);
+    if ctx.halted || persistent_self_stop || config_drift_halt {
+        // keep the error/reverted (or persistent self-stop / config-drift) heartbeat untouched
     } else if clean_exit {
         ctx.heartbeat(json!({"status": "stopped", "phase": Value::Null}));
     } else {
@@ -462,6 +483,20 @@ set this repo's PR-target branch to a real branch in Config."
 /// the resolved value is exactly "pi" (the un-resolved fallback) AND "pi" is not itself on PATH.
 fn which_pi_missing() -> bool {
     which::which("pi").is_err()
+}
+
+/// True iff `hb` carries the key_shape_mismatch diagnostic the loop's startup guard and the
+/// mid-loop re-check both write: status=="error" AND last_summary begins "repos.json api_key for".
+/// Pure so the finally's keep-condition is unit-testable. Mirrors the predicate
+/// supervisor::diagnose uses to classify the `key_shape_mismatch` category, so the two can never
+/// drift apart (a heartbeat this preserves is exactly one diagnose surfaces as key_shape_mismatch).
+fn preserves_key_shape_mismatch_diagnostic(hb: &Value) -> bool {
+    hb.get("status").and_then(Value::as_str) == Some("error")
+        && hb
+            .get("last_summary")
+            .and_then(Value::as_str)
+            .map(|s| s.starts_with("repos.json api_key for"))
+            .unwrap_or(false)
 }
 
 // --------------------------------------------------------------------------- //
@@ -772,5 +807,37 @@ mod tests {
     fn path_name_falls_back_to_input_on_root() {
         // Path::file_name is None for "/" — falls back to the input string
         assert_eq!(path_name("/"), "/");
+    }
+
+    // ---- preserves_key_shape_mismatch_diagnostic: the finally's keep-condition ----
+
+    #[test]
+    fn preserves_key_shape_mismatch_diagnostic_true_for_guard_summary() {
+        // The exact heartbeat the startup guard AND the mid-loop re-check write.
+        let hb = json!({
+            "status": "error",
+            "last_summary": "repos.json api_key for 'foo' looks like an OpenRouter key (sk-or-v1-...) but provider is 'ollama-cloud' ...",
+        });
+        assert!(preserves_key_shape_mismatch_diagnostic(&hb));
+    }
+
+    #[test]
+    fn preserves_key_shape_mismatch_diagnostic_true_for_mirror_image_summary() {
+        // The other direction the guard emits (provider=openrouter, key not sk-or-v1-).
+        let hb = json!({
+            "status": "error",
+            "last_summary": "repos.json api_key for 'foo' is set but does not look like an OpenRouter key ...",
+        });
+        assert!(preserves_key_shape_mismatch_diagnostic(&hb));
+    }
+
+    #[test]
+    fn preserves_key_shape_mismatch_diagnostic_false_for_other_errors() {
+        // A generic error / crashed / no_key heartbeat must NOT be preserved by this predicate —
+        // the finally should overwrite them per its normal branches.
+        assert!(!preserves_key_shape_mismatch_diagnostic(&json!({"status": "error", "phase": "crashed"})));
+        assert!(!preserves_key_shape_mismatch_diagnostic(&json!({"status": "error", "last_summary": "OLLAMA_API_KEY not set"})));
+        assert!(!preserves_key_shape_mismatch_diagnostic(&json!({"status": "stopped"})));
+        assert!(!preserves_key_shape_mismatch_diagnostic(&json!({})));
     }
 }
