@@ -608,6 +608,31 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
     if cat == "ok" {
         // healthy — clear any STALE escalation.json a prior transient error left behind.
         clear_escalation(repo);
+        // Stamp a healthy supervisor.jsonl record ONLY when transitioning from a non-healthy state.
+        // Without this, the finish() log-once dedupe (which compares against the LAST supervisor
+        // record) would still see the stale pre-fix escalation on a recurrence and suppress
+        // re-escalation — the operator would never be re-notified that the same problem came back.
+        // An "ok" record carries escalate=false, so the dedupe guard (which requires
+        // escalate==true on the prior record) no longer fires. Only written when the last record is
+        // not already "ok" to avoid flooding the log on every healthy poll.
+        let last_was_ok = heartbeat::read_supervisor_log(repo, 1)
+            .last()
+            .map(|l| l.get("category").and_then(Value::as_str) == Some("ok"))
+            .unwrap_or(false);
+        if !last_was_ok {
+            append_jsonl(
+                repo,
+                "supervisor.jsonl",
+                &json!({
+                    "ts": now(),
+                    "category": "ok",
+                    "rung": 0,
+                    "actions": [],
+                    "escalate": false,
+                    "message": "healthy",
+                }),
+            );
+        }
         return json!({"ok": true, "category": "ok", "actions_taken": [], "escalate": false, "message": "healthy"});
     }
 
@@ -1133,6 +1158,60 @@ mod tests {
         assert_eq!(out["category"], "ok");
         assert_eq!(out["message"], "healthy");
         assert!(!dir.join("escalation.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------- recover: healthy transition breaks the log-once dedupe ----------------
+    // After a fix lands (cat==ok), a supervisor.jsonl "ok" record is stamped so the finish()
+    // dedupe (which compares against the last record) does NOT suppress re-escalation when the
+    // SAME problem recurs. Without the "ok" record, the stale pre-fix escalation would still be
+    // the last record and the recurrence would be silently deduped.
+    #[test]
+    fn recover_ok_breaks_dedupe_so_recurrence_re_escalates() {
+        let (dir, repo) = tmp_repo("dedupe_recur");
+
+        // 1. Escalate a no_key problem.
+        write_hb(&dir, &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}));
+        let out1 = recover(&repo, false, true, true);
+        assert_eq!(out1["category"], "no_key");
+        assert_eq!(out1["escalate"], true);
+        assert!(dir.join("escalation.json").exists());
+
+        // 2. Fix lands: heartbeat clears -> healthy. An "ok" supervisor record is stamped.
+        write_hb(&dir, &json!({"status": "idle"}));
+        let out2 = recover(&repo, false, true, true);
+        assert_eq!(out2["category"], "ok");
+        assert!(!dir.join("escalation.json").exists());
+
+        // 3. The same problem recurs (key removed again). MUST re-escalate, NOT be deduped.
+        write_hb(&dir, &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}));
+        let out3 = recover(&repo, false, true, true);
+        assert_eq!(out3["category"], "no_key");
+        assert_eq!(out3["escalate"], true);
+        assert!(!out3.get("escalate_deduped").map(|v| v.as_bool().unwrap_or(false)).unwrap_or(false));
+        assert!(dir.join("escalation.json").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------- recover: healthy does not flood supervisor.jsonl ----------------
+    #[test]
+    fn recover_ok_writes_one_ok_record_per_transition() {
+        let (dir, repo) = tmp_repo("ok_no_flood");
+        // Pre-seed a non-ok supervisor record so the first healthy recover writes an "ok" record.
+        std::fs::write(
+            dir.join("supervisor.jsonl"),
+            "{\"category\":\"no_key\",\"escalate\":true,\"rung\":2}\n",
+        )
+        .unwrap();
+
+        let _out1 = recover(&repo, false, true, true); // healthy -> stamps "ok"
+        let _out2 = recover(&repo, false, true, true); // still healthy -> no new record
+
+        let sup = std::fs::read_to_string(dir.join("supervisor.jsonl")).unwrap();
+        let ok_count = sup.lines().filter(|l| l.contains("\"category\":\"ok\"")).count();
+        assert_eq!(ok_count, 1, "only one ok record per transition, not one per poll");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
