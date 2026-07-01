@@ -1020,10 +1020,27 @@ fn which(name: &str, extra: &[&str]) -> String {
 /// registry::read_repos_json (lenient -> []), this keeps the present-but-corrupt error so the
 /// refresh logs "config refresh skipped". A non-list parse is still Ok(value) — run_improver guards
 /// the list-ness separately (`if isinstance(rows, list)`).
+///
+/// TOLERANCE: a UTF-8 BOM prefix (written by Windows tools like Notepad/PowerShell Out-File) or an
+/// empty/whitespace-only file (a torn atomic-write read) makes serde_json fail with the confusing
+/// "expected value at line 1 column 1" — which silently skips the config refresh, leaving the
+/// improver stuck on stale model/provider/api_key. We strip a leading BOM so a BOM-prefixed but
+/// otherwise-valid file parses cleanly, and return a clear Err for empty/whitespace-only content so
+/// the log message is actionable instead of a cryptic serde_json column reference.
 fn read_repos_json_raw(control: &Path) -> Result<Value, String> {
     let path = control.join("repos.json");
     let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-    serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string())
+    // Strip a leading UTF-8 BOM (EF BB BF) so a BOM-prefixed-but-valid file parses.
+    let bytes: &[u8] = match bytes.as_slice() {
+        [0xEF, 0xBB, 0xBF, rest @ ..] => rest,
+        b => b,
+    };
+    // Empty or whitespace-only content is a torn read or a BOM-only file — skip with a clear message
+    // instead of the cryptic "expected value at line 1 column 1".
+    if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+        return Err("repos.json is empty or whitespace-only (torn read?)".to_string());
+    }
+    serde_json::from_slice::<Value>(bytes).map_err(|e| e.to_string())
 }
 
 /// Python `(d.get(k) or default)` for a STRING result: the value when it is a truthy string, else the
@@ -1346,5 +1363,67 @@ mod tests {
         let text = "here is my key sk-or-v1-uniquerandperrepo for you";
         assert!(c.redact(text).contains("[REDACTED]"), "per-repo key value must be redacted");
         assert!(!c.redact(text).contains("sk-or-v1-uniquerandperrepo"));
+    }
+
+    // ---- read_repos_json_raw: BOM / empty / whitespace tolerance ----
+    // The bakeoff harness hit "config refresh skipped: expected value at line 1 column 1" because a
+    // BOM-prefixed or empty/whitespace repos.json made serde_json fail at column 1, silently skipping
+    // the config refresh and leaving the improver on stale model/provider/api_key. These tests verify
+    // the fix: BOM is stripped (parse succeeds), empty/whitespace yields a clear Err (not the cryptic
+    // serde_json message), and a genuinely corrupt file still errors.
+    #[test]
+    fn read_repos_json_raw_strips_utf8_bom() {
+        let dir = std::env::temp_dir().join(format!("solomon_bom_test_{}", run_id_hex()));
+        let _ = std::fs::create_dir_all(&dir);
+        // BOM + valid JSON array
+        let mut content = vec![0xEF, 0xBB, 0xBF];
+        content.extend_from_slice(b"[{\"name\": \"bomtest\"}]");
+        std::fs::write(dir.join("repos.json"), &content).unwrap();
+        let val = read_repos_json_raw(&dir).expect("BOM-prefixed valid JSON must parse");
+        assert_eq!(val[0]["name"], json!("bomtest"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_repos_json_raw_empty_returns_clear_error() {
+        let dir = std::env::temp_dir().join(format!("solomon_empty_test_{}", run_id_hex()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("repos.json"), b"").unwrap();
+        let err = read_repos_json_raw(&dir).expect_err("empty file must error");
+        assert!(err.contains("empty"), "error should be actionable, not cryptic: {err}");
+        assert!(!err.contains("column 1"), "must not leak serde_json column message: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_repos_json_raw_whitespace_returns_clear_error() {
+        let dir = std::env::temp_dir().join(format!("solomon_ws_test_{}", run_id_hex()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("repos.json"), b"  \n  \t  ").unwrap();
+        let err = read_repos_json_raw(&dir).expect_err("whitespace-only file must error");
+        assert!(err.contains("empty"), "error should mention empty/whitespace: {err}");
+        assert!(!err.contains("column 1"), "must not leak serde_json column message: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_repos_json_raw_bom_only_returns_clear_error() {
+        // A file with just a BOM and whitespace — BOM is stripped, leaving whitespace-only content.
+        let dir = std::env::temp_dir().join(format!("solomon_bomonly_test_{}", run_id_hex()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("repos.json"), b"\xEF\xBB\xBF\n  ").unwrap();
+        let err = read_repos_json_raw(&dir).expect_err("BOM+whitespace file must error");
+        assert!(err.contains("empty"), "error should mention empty/whitespace: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_repos_json_raw_corrupt_still_errors() {
+        // A genuinely corrupt (non-JSON) file must still error so the refresh skips with a log.
+        let dir = std::env::temp_dir().join(format!("solomon_corrupt_test_{}", run_id_hex()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("repos.json"), b"not json at all {{").unwrap();
+        assert!(read_repos_json_raw(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
