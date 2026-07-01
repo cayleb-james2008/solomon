@@ -28,7 +28,8 @@ All commands run in `src-tauri/`. The app is pure Rust now — there is no Pytho
 - **Build exe:** `cargo build --release` in `src-tauri/` → `src-tauri/target/release/solomon.exe`
   (copy to repo-root `Solomon.exe`); or the Tauri bundler for the NSIS installer.
 - **One RSI iteration (dry run):** `solomon run-improver --repo <path> --name <name> --once`.
-- **Watchdog sweep:** `solomon watchdog` (the SolomonWatchdog scheduled task runs this).
+- **Watchdog sweep:** `solomon watchdog` on demand; the automatic every-2-min sweep runs inside the visibly-open Solomon.exe (run_gui tick thread) — no scheduled task exists and none may be created (operator rule).
+- **Ops / CEO planes (v2):** `solomon probe [name]` (ground-truth outcome probes, ops.json), `solomon plan` / `solomon report` (morning plan / evening verified-outcome summary; the day-gated automatic runs ride the watchdog tick). Incidents and reports push to the operator via ntfy + Windows toast (`NTFY_TOPIC` in `.env`).
 - **Other headless subcommands:** `solomon state | start <name> | stop <name> | supervise [name] | serve-health [port]` (see `src-tauri/src/main.rs`).
 
 ## Keystone invariant

@@ -7,12 +7,14 @@
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
 mod api; // native port of app.py's Api — the `bridge` command + headless backend (get_state, dispatch)
+mod ceo; // CEO rhythm (v2 Phase B): morning plan + evening verified-outcome summary (`plan`/`report` + watchdog graft)
 mod control; // native port of control.py — repos registry, git/gh, locks, runner (the `bridge` backend)
 mod improver; // native port of improver/run_improver.py — the per-repo RSI loop (`run-improver` subcommand)
+mod notify; // operator notifications (v2 Phase A): ntfy push + Windows toast, fed by ops incidents + CEO reports
 mod ops; // ops plane (Phase 1): ground-truth probes + honest fleet status (`probe` subcommand + watchdog graft)
 mod redeploy; // native self-redeploy: swap Solomon's own production binary in a safe drain window
 mod supervisor; // native port of improver/solomon.py — diagnose() + the 3-rung recover() ladder + escalation
-mod watchdog; // native port of monitor.py — the `watchdog` subcommand (SolomonWatchdog scheduled sweep)
+mod watchdog; // native port of monitor.py — the `watchdog` subcommand + the in-app 2-min tick (run_gui)
 
 use serde_json::{json, Value};
 use tauri_plugin_updater::UpdaterExt;
@@ -167,7 +169,7 @@ fn run_headless(args: &[String]) -> i32 {
 
 fn usage() {
     eprintln!(
-        "usage: solomon state | start <name> | stop <name> | supervise [name] | serve-health [port]"
+        "usage: solomon state | start <name> | stop <name> | supervise [name] | serve-health [port] | probe [name] | plan | report | watchdog"
     );
 }
 
@@ -258,8 +260,9 @@ fn main() {
     if argv.first().map(String::as_str) == Some("run-improver") {
         std::process::exit(improver::run::main(&argv[1..]));
     }
-    // `solomon watchdog` — the native overnight watchdog sweep (called by the SolomonWatchdog scheduled
-    // task). Dispatch BEFORE run_gui so no window is created, and exit with watchdog::main's return code.
+    // `solomon watchdog` — one on-demand watchdog sweep (the automatic every-2-min sweep lives in
+    // run_gui's tick thread; no scheduled task exists and none may be created — operator rule).
+    // Dispatch BEFORE run_gui so no window is created, and exit with watchdog::main's return code.
     if argv.first().map(String::as_str) == Some("watchdog") {
         std::process::exit(watchdog::main());
     }
@@ -268,6 +271,20 @@ fn main() {
     // 3 = any yellow, 4 = any red (2 stays the usage-error code).
     if argv.first().map(String::as_str) == Some("probe") {
         std::process::exit(ops::outcomes::probe_main(&argv[1..]));
+    }
+    // `solomon plan` / `solomon report` — run the CEO morning plan / evening summary ON DEMAND
+    // (the day-gated automatic runs ride the watchdog tick; the CLI bypasses the day gate WITHOUT
+    // touching _ceo_state.json, so a manual run never suppresses the scheduled one). Exit 0 on
+    // ok, 1 on failure — the JSON result is printed either way.
+    if matches!(argv.first().map(String::as_str), Some("plan") | Some("report")) {
+        let out = if argv[0] == "plan" {
+            ceo::morning_plan()
+        } else {
+            ceo::evening_summary()
+        };
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        let ok = out.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        std::process::exit(if ok { 0 } else { 1 });
     }
     let is_sub = argv
         .first()
@@ -289,6 +306,19 @@ fn run_gui() {
     // bridge once the window is up). Every backend loop the GUI starts is bound to this job and dies
     // when the GUI process exits — closing the app shuts down its backend processes.
     control::proc::init_app_job();
+    // THE IN-APP WATCHDOG TICK (v2 Phase A): the every-2-min sweep lives INSIDE the visibly-open
+    // Solomon.exe — crash-restart + RUNG-0 recovery + ops probes + incident notifications + the
+    // CEO rhythm all ride it. This is the Solomon-native replacement for the external loop the
+    // retired fleet-supervisor routine used to run. NO SCHEDULED TASK exists and none may be
+    // created (operator rule): app closed = an honest, notified blind window, never silent
+    // monitoring theater. The thread dies with the process; catch_unwind keeps one bad sweep from
+    // killing the tick.
+    std::thread::spawn(|| loop {
+        let _ = std::panic::catch_unwind(|| {
+            let _ = watchdog::main();
+        });
+        std::thread::sleep(std::time::Duration::from_secs(120));
+    });
     tauri::Builder::default()
         // single-instance MUST be registered FIRST (Tauri 2 requirement) so it runs before other
         // plugins. Launching solomon.exe again focuses the running dashboard instead of opening a

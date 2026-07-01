@@ -25,8 +25,12 @@ cargo build --release
 # One RSI iteration on a repo (dry-run / headless)
 solomon run-improver --repo <path> --name <name> --once
 
-# Overnight watchdog sweep (the SolomonWatchdog scheduled task runs this)
+# One watchdog sweep on demand (the automatic every-2-min sweep runs inside the open Solomon.exe;
+# no scheduled task exists and none may be created — operator rule)
 solomon watchdog
+
+# CEO rhythm on demand (the day-gated runs ride the in-app watchdog tick)
+solomon plan | report
 
 # Headless status / control
 solomon state | start <name> | stop <name> | supervise [name] | serve-health [port]
