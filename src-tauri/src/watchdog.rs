@@ -454,6 +454,15 @@ fn sweep_repo(r: &Value, auto_push_flag: bool) -> (Vec<String>, Value) {
     // unknown_error/stuck or stop+restart the lane we just restarted — the exact "stale heartbeat /
     // escalation state not re-observed after a fix lands" thrash. The next sweep re-observes the
     // fresh heartbeat the relaunched loop has since written and runs recover() normally.
+    // Snapshot the escalation category BEFORE recover() runs. recover() overwrites
+    // escalation.json with its own diagnosis (e.g. "unknown_error") on an error/preflight lane, so
+    // reading it AFTER recover() would never see a prior "running_stalled" the stall detector wrote
+    // on a previous sweep — defeating the stall detector's anti-thrash check (it would re-emit the
+    // "STALLED" action and re-write the escalation every sweep instead of escalating once).
+    let pre_recover_escalation_cat = supervisor::read_escalation(r)
+        .and_then(|e| e.get("category").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_default();
+
     if !paused && !healed {
         // solomon.recover(r, allow_pi=False, allow_restart=auto_push, auto_push=auto_push).
         // catch Exception -> a watchdog must never die on one bad repo. recover() is total (no panics
@@ -520,8 +529,13 @@ fn sweep_repo(r: &Value, auto_push_flag: bool) -> (Vec<String>, Value) {
                 && s.get("phase").and_then(Value::as_str) == Some("preflight")
         });
         if window.len() >= STALL_SWEEPS && all_preflight {
-            let existing = supervisor::read_escalation(r).unwrap_or_else(|| json!({}));
-            if existing.get("category").and_then(Value::as_str) != Some("running_stalled") {
+            // Anti-thrash: skip if an escalation with this category was ALREADY present before this
+            // sweep's recover() overwrote it. Using the pre-recover snapshot (not a fresh read here)
+            // is load-bearing: recover() runs before the stall detector and overwrites escalation.json
+            // with its own diagnosis (e.g. "unknown_error"), so a fresh read would never see the
+            // "running_stalled" from a prior sweep and the anti-thrash would never fire — the stall
+            // action would be re-emitted every sweep.
+            if pre_recover_escalation_cat != "running_stalled" {
                 actions.push(format!(
                     "{name} STALLED: stuck in preflight for {STALL_SWEEPS} sweeps"
                 ));
@@ -1077,5 +1091,130 @@ mod tests {
             lane_health(true, &h, 3),
             Some("degraded:3x timed_out".to_string())
         );
+    }
+
+    // -------- stall detector anti-thrash: pre-recover escalation snapshot --------
+    // The stall detector's anti-thrash checks the escalation category BEFORE recover() overwrites
+    // it. Without the pre-recover snapshot, recover() runs first and overwrites escalation.json
+    // with its own diagnosis (e.g. "unknown_error"), so the anti-thrash check would never see a
+    // prior "running_stalled" and would re-emit the STALLED action every sweep.
+    //
+    // This test exercises the full sweep_repo path: a live lock + fresh error/preflight heartbeat
+    // + 2 prior error/preflight snapshots in _monitor.jsonl (so the stall window is met) + a
+    // pre-existing "running_stalled" escalation.json. The stall detector must NOT re-emit the
+    // STALLED action (the anti-thrash suppresses it via the pre-recover snapshot).
+    #[test]
+    fn stall_detector_anti_thrash_uses_pre_recover_escalation() {
+        use std::process::Command;
+        let tag = format!(
+            "wd_stall_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() % 1_000_000)
+                .unwrap_or(0)
+        );
+        // temp git repo with a clean base tree (so diagnose doesn't classify it as dirty/etc).
+        let git_dir = std::env::temp_dir().join(format!("solomon_{tag}"));
+        let _ = std::fs::remove_dir_all(&git_dir);
+        std::fs::create_dir_all(&git_dir).unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+            vec!["commit", "--allow-empty", "-m", "init"],
+            vec!["branch", "-M", "main"],
+        ] {
+            let st = Command::new("git").args(&args).current_dir(&git_dir).status().unwrap();
+            assert!(st.success(), "git {:?} failed in {:?}", args, git_dir);
+        }
+        let repo = json!({"name": tag, "path": git_dir.to_string_lossy()});
+        let rt = paths::runtime_dir(&repo).unwrap();
+        let _ = std::fs::remove_dir_all(&rt);
+        std::fs::create_dir_all(&rt).unwrap();
+
+        // Live lock (this process's PID) + fresh error/preflight heartbeat with a generic summary
+        // that falls through to unknown_error in diagnose().
+        let run_id = format!("tok-{tag}");
+        std::fs::write(rt.join("lock"), format!("{}\n{}", std::process::id(), run_id)).unwrap();
+        let fresh = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        std::fs::write(
+            rt.join("heartbeat.json"),
+            serde_json::to_string(&json!({
+                "status": "error",
+                "phase": "preflight",
+                "run_id": run_id,
+                "updated_at": fresh,
+                "last_summary": "an unclassified preflight error occurred",
+            })).unwrap(),
+        ).unwrap();
+
+        // Pre-existing "running_stalled" escalation — the anti-thrash must see this BEFORE recover()
+        // overwrites it, and suppress the re-escalation.
+        std::fs::write(
+            rt.join("escalation.json"),
+            serde_json::to_string_pretty(&json!({
+                "ts": fresh,
+                "category": "running_stalled",
+                "evidence": "running but stuck in preflight for 3 consecutive sweeps",
+                "suggested_manual_steps": ["cd \"<repo>\"", "git status"],
+            })).unwrap(),
+        ).unwrap();
+
+        // 2 prior error/preflight snapshots in _monitor.jsonl (for STALL_SWEEPS=3, we need
+        // STALL_SWEEPS-1=2 prior + the current snap from this sweep). Fresh timestamps so the
+        // max_age_s recency bound doesn't drop them.
+        let mon = mon_log();
+        if let Some(parent) = mon.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let ts = fresh.clone();
+        let snap_line = |repo: &str| {
+            serde_json::to_string(&json!({
+                "ts": ts,
+                "repo": repo,
+                "running": true,
+                "restarted": false,
+                "paused": false,
+                "status": "error",
+                "phase": "preflight",
+                "iteration": Value::Null,
+                "last_status": Value::Null,
+                "diagnosis": "unknown_error",
+            })).unwrap()
+        };
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&mon)
+                .unwrap();
+            writeln!(f, "{}", snap_line(&tag)).unwrap();
+            writeln!(f, "{}", snap_line(&tag)).unwrap();
+        }
+
+        let (actions, _snap) = sweep_repo(&repo, false);
+
+        // The stall detector must NOT re-emit the STALLED action — the pre-existing
+        // "running_stalled" escalation (captured before recover() overwrote it) suppresses it.
+        assert!(
+            !actions.iter().any(|a| a.contains(" STALLED:")),
+            "stall detector re-escalated despite a pre-existing running_stalled escalation: {actions:?}"
+        );
+
+        // Cleanup: remove this test's entries from _monitor.jsonl (filter out lines whose repo
+        // matches our unique tag), and tear down the runtime + git dirs.
+        if let Ok(content) = std::fs::read_to_string(&mon) {
+            let kept: Vec<&str> = content
+                .lines()
+                .filter(|line| {
+                    !line.contains(&format!("\"repo\":\"{}\"", tag))
+                })
+                .collect();
+            let _ = std::fs::write(&mon, format!("{}\n", kept.join("\n")));
+        }
+        let _ = std::fs::remove_dir_all(&rt);
+        let _ = std::fs::remove_dir_all(&git_dir);
     }
 }
