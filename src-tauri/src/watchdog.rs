@@ -1,7 +1,8 @@
-//! Native Rust port of `monitor.py` — Solomon's overnight watchdog + data collector.
+//! Native Rust port of `monitor.py` — Solomon's watchdog + data collector.
 //!
-//! Behavior is bug-for-bug with `monitor.py`. Run periodically (a Windows scheduled task — see
-//! scripts/watchdog.cmd). Each sweep, for every registered repo, it:
+//! Behavior is bug-for-bug with `monitor.py`. Runs every ~2 min INSIDE the visibly-open
+//! Solomon.exe (the run_gui tick thread — NO scheduled task exists and none may be created,
+//! operator rule) or on demand via `solomon watchdog`. Each sweep, for every registered repo, it:
 //!
 //!   1. **Restarts a CRASHED loop.** A loop that exits cleanly (operator Stop, or max-iterations)
 //!      writes `status="stopped"` in its last heartbeat via the runner's `finally` block; a
@@ -22,8 +23,9 @@
 //! The returns that back the JSONL/log are `serde_json::Value` whose keys are byte-identical to the
 //! Python dicts; status/category/reason strings are quoted verbatim from `monitor.py`.
 //!
-//! Wired to the `solomon watchdog` subcommand (main.rs), which the SolomonWatchdog scheduled task
-//! runs every 2 minutes. Some helpers are exercised only by tests, so allow dead-code for this module.
+//! Wired to the `solomon watchdog` subcommand (main.rs) and the in-app run_gui tick thread
+//! (every 2 minutes while the app is open). Some helpers are exercised only by tests, so allow
+//! dead-code for this module.
 #![allow(dead_code)]
 
 use crate::control::{self, paths};
@@ -690,6 +692,10 @@ pub fn main() -> i32 {
         writeln!(f, "{line}")?;
         Ok(())
     })();
+    // CEO RHYTHM GRAFT (v2 Phase B): after the two-plane sweep, the day-gated morning plan +
+    // evening verified-outcome summary (see ceo::tick — cheap no-op on all but two sweeps a day).
+    // catch_unwind mirrors the ops graft: a CEO failure must never abort crash-recovery.
+    let _ = std::panic::catch_unwind(crate::ceo::tick);
     // SELF-REDEPLOY: the periodic check that swaps Solomon's OWN production binary when the checkout
     // is behind origin/main, but ONLY in a safe drain window (no lane mid-ship, no live-money lane
     // with an open trade). Cheap when there is nothing to do (cooldown + single-flight guards no-op

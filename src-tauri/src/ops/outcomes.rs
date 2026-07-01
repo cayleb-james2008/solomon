@@ -390,11 +390,14 @@ fn sweep_project(entry: &Value, ts: &str) -> Value {
 }
 
 /// Append transition records to runtime/_incidents.jsonl (append-only; OSError -> pass, matching
-/// the watchdog's monitor-log append).
+/// the watchdog's monitor-log append) — and push each one to the operator (Phase A: an incident
+/// the operator never hears about is the June failure mode). The evolve() dedupe upstream means a
+/// persisting red notifies exactly once; notify::send is best-effort and can never fail the sweep.
 fn append_incidents(records: &[Value]) {
     if records.is_empty() {
         return;
     }
+    crate::notify::notify_incidents(records);
     let _ = (|| -> std::io::Result<()> {
         let path = incidents_path();
         if let Some(parent) = path.parent() {
