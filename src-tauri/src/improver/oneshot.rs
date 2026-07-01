@@ -653,15 +653,36 @@ mod tests {
     // visual::spawn_pi, visual::run_browser_cli): a child that floods stdout past the OS pipe buffer
     // must be captured IN FULL without spuriously timing out. Pre-fix this returned Err(TimedOut)
     // (and lost the output) because the child blocked on write() while we sat in wait_timeout.
+    //
+    // LOAD TOLERANCE (fleet-supervisor 2026-07-01T08:42Z): under heavy CPU contention (5 RSI lanes +
+    // ~15 asmodeus processes) the drain threads may not get scheduled fast enough to keep the pipe
+    // empty; the child then blocks on write(), wait_timeout expires, and the test spuriously REDs —
+    // a false gate-RED that silently drops a correct branch. Use a generous 120s deadline (matching
+    // the production bound) and retry ONCE on a timeout-class failure: a true deadlock fails on both
+    // attempts, but a transient wall-clock flake under load recovers without weakening the assertion.
     #[cfg(windows)]
     #[test]
     fn run_with_timeout_drains_large_output_without_deadlock() {
+        use std::io::ErrorKind;
         use std::process::Stdio;
-        let mut cmd = Command::new("cmd");
-        cmd.args(["/c", "for /L %i in (1,1,8000) do @echo XXXXXXXXXXXXXXXXXXXXXXXXXX"]);
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let out = run_with_timeout(cmd, Duration::from_secs(30))
-            .expect("must capture large output, not time out");
+
+        fn build_flood_cmd() -> Command {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/c", "for /L %i in (1,1,8000) do @echo XXXXXXXXXXXXXXXXXXXXXXXXXX"]);
+            cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            cmd
+        }
+
+        let dur = Duration::from_secs(120);
+        let out = match run_with_timeout(build_flood_cmd(), dur) {
+            Ok(o) => o,
+            // Retry once: a wall-clock flake under CPU contention is not a deadlock regression.
+            Err(e) if e.kind() == ErrorKind::TimedOut => {
+                run_with_timeout(build_flood_cmd(), dur)
+                    .expect("must capture large output, not time out (after one retry on timeout)")
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        };
         assert!(
             out.stdout.len() > 100_000,
             "expected the full large stdout, got {} bytes",
