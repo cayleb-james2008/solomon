@@ -257,6 +257,96 @@ pub fn auto_stash_base(ctx: &mut Ctx, label: &str) -> bool {
 /// count is 0 — this cap is a safety net for crash-recovery bursts.
 const PREFLIGHT_STASH_CAP: usize = 20;
 
+/// True iff a `git` process is currently running anywhere on the system. Used by
+/// [`clear_stale_index_lock`] to avoid removing a `.git/index.lock` that a LIVE git operation
+/// still holds — only an orphaned lock (from a killed-mid-git improver) is safe to clear. On
+/// Windows, scans `tasklist` for `git.exe`; on Unix, scans `/proc/*/comm` for `git`. A spawn
+/// failure or a missing `/proc` is CONSERVATIVE: returns true (assume git is running, leave the
+/// lock alone) — never clobbers a lock that might be live.
+fn any_git_running() -> bool {
+    #[cfg(windows)]
+    {
+        match crate::control::proc::run(
+            &["tasklist", "/FI", "IMAGENAME eq git.exe", "/NH", "/FO", "CSV"],
+            None,
+            None,
+        ) {
+            Ok(out) => out.stdout.lines().any(|l| l.contains("git.exe")),
+            Err(_) => true, // tasklist spawn failure -> conservative (leave the lock)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let entries = match std::fs::read_dir("/proc") {
+            Ok(e) => e,
+            Err(_) => return true, // no /proc -> conservative
+        };
+        for entry in entries.flatten() {
+            if let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) {
+                if comm.trim() == "git" {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Pure core of [`clear_stale_index_lock`]: remove the lock file iff it exists AND no live git
+/// process holds it. Returns true iff a stale lock was removed. Split out so the policy is
+/// unit-tested without spawning git / tasklist.
+fn remove_stale_index_lock(lock_path: &std::path::Path, git_running: bool) -> bool {
+    if !lock_path.exists() || git_running {
+        return false;
+    }
+    std::fs::remove_file(lock_path).is_ok()
+}
+
+/// Remove a stale `.git/index.lock` left behind by a KILLED-mid-git improver iteration. A killed
+/// `git reset`/`checkout`/`commit` orphans the lock; without recovery, every subsequent iteration's
+/// `git checkout --force` fails with "index.lock exists" → status=error → watchdog restarts → same
+/// lock → an infinite "checkout main failed — skipping iteration" storm (5 concurrent maki
+/// improvers observed 2026-07-01, all blocked by one orphaned `.git/index.lock`). SAFE: only clears
+/// when NO live git process is running anywhere (the lock is provably orphaned) — a lock that might
+/// be held by an in-flight git op is left untouched. Best-effort: a removal failure is logged but
+/// never wedges the preflight. Returns true iff a stale lock was removed.
+///
+/// Called at the top of the preflight, BEFORE `git checkout --force`/`reset --hard`, so an orphaned
+/// lock from a prior killed iteration doesn't block the next. The single-instance lane lock
+/// (run.rs `acquire_lock`) already guarantees only one improver per repo, so an index.lock here is
+/// almost certainly orphaned — the `any_git_running` guard is the belt-and-suspenders against an
+/// external (non-Solomon) git op on the same repo.
+pub fn clear_stale_index_lock(ctx: &mut Ctx) -> bool {
+    let git_dir = ctx.git(&["rev-parse", "--git-dir"], 10).stdout.trim().to_string();
+    let lock_path = if git_dir.is_empty() {
+        // rev-parse failed (bad repo / corrupt) — fall back to the conventional .git/index.lock.
+        ctx.repo.join(".git").join("index.lock")
+    } else {
+        // rev-parse returns a path relative to the repo root (or absolute for worktrees).
+        let p = std::path::Path::new(&git_dir);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            ctx.repo.join(p)
+        }
+        .join("index.lock")
+    };
+    if !lock_path.exists() {
+        return false;
+    }
+    let git_running = any_git_running();
+    if remove_stale_index_lock(&lock_path, git_running) {
+        ctx.log("preflight: cleared stale .git/index.lock (orphaned by a killed-mid-git iteration)");
+        return true;
+    }
+    if git_running {
+        ctx.log("preflight: .git/index.lock exists but a git process is running — leaving it (may be live)");
+    } else {
+        ctx.log("preflight: .git/index.lock exists but could not be removed — git checkout may fail");
+    }
+    false
+}
+
 /// Reconcile `solomon-auto-preflight` stashes accumulated in the stash list:
 ///   - EMPTY stashes (agent-artifact-only — AGENT_LOG.md, capabilities/, etc.) are DROPPED.
 ///   - NON-EMPTY stashes (real swept work — a non-agent-artifact tracked change or untracked file)
@@ -996,5 +1086,69 @@ mod tests {
         // Cleanup.
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    // ---- clear_stale_index_lock: the orphaned-index.lock recovery ----
+    //
+    // A killed-mid-git iteration orphans a `.git/index.lock`; without recovery, every subsequent
+    // `git checkout --force` fails → status=error → watchdog restart → same lock → infinite storm.
+    // The pure policy core is tested directly (the `any_git_running` IO guard is belt-and-suspenders
+    // and conservative by construction).
+
+    #[test]
+    fn remove_stale_index_lock_removes_when_no_git_running() {
+        let dir = std::env::temp_dir().join(format!(
+            "solomon_idxlock_clean_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("index.lock");
+        std::fs::write(&lock, "").unwrap();
+        assert!(remove_stale_index_lock(&lock, false));
+        assert!(!lock.exists(), "stale lock must be removed when no git is running");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_stale_index_lock_leaves_lock_when_git_running() {
+        let dir = std::env::temp_dir().join(format!(
+            "solomon_idxlock_live_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("index.lock");
+        std::fs::write(&lock, "").unwrap();
+        assert!(!remove_stale_index_lock(&lock, true));
+        assert!(lock.exists(), "lock must NOT be removed while a git process might hold it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_stale_index_lock_noop_when_no_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "solomon_idxlock_none_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("index.lock");
+        // no file created
+        assert!(!remove_stale_index_lock(&lock, false));
+        assert!(!lock.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
