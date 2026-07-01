@@ -1742,7 +1742,9 @@ mod tests {
         // Heartbeat with a MATCHING run_id (so lock_is_live's orphan check passes), a non-sleep
         // phase, but a STALE updated_at (5000s ago > 4500s floor). lock_is_live_decide sees the
         // stale age -> is_running returns false -> the `stuck` branch (which needs running=true)
-        // CANNOT fire. Instead has_lock && !running -> stale_lock.
+        // CANNOT fire. Instead has_lock && !running -> stale_lock. Because the lock PID here is
+        // THIS process (genuinely alive), the stale_lock branch's live-PID guard makes it NOT
+        // auto-safe (a hung loop must be killed by the operator before the lock is cleared).
         write_hb(
             &dir,
             &json!({
@@ -1754,7 +1756,7 @@ mod tests {
         );
         let d = diagnose(&repo);
         assert_eq!(d["category"], "stale_lock", "a stale heartbeat makes is_running false, so the lane is stale_lock not stuck");
-        assert_eq!(d["auto_safe"], true);
+        assert_eq!(d["auto_safe"], false, "a live lock PID + stale heartbeat is a hung loop — not auto-safe");
         assert_eq!(d["running"], false);
         let _ = std::fs::remove_dir_all(&dir);
     }
