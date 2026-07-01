@@ -246,6 +246,9 @@ pub struct Ctx {
     // ---- escalation ladder ----
     pub fail_counts: HashMap<String, i64>,
     pub escalated_goals: HashSet<String>,
+
+    // ---- anti-thrash: consecutive-revert counter keyed on goal text ----
+    pub consecutive_reverts: HashMap<String, i64>,
 }
 
 impl Ctx {
@@ -378,6 +381,9 @@ impl Ctx {
             // escalation ladder
             fail_counts: HashMap::new(),
             escalated_goals: HashSet::new(),
+
+            // anti-thrash
+            consecutive_reverts: HashMap::new(),
         }
     }
 

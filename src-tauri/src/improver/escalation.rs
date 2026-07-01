@@ -35,6 +35,13 @@ const UNPUSHED_BASE_PERSISTENT_LIMIT: i64 = 3;
 /// run_improver._BASE_GATE_RED_PERSISTENT_LIMIT — consecutive base-gate-RED bails before self-stop.
 const BASE_GATE_RED_PERSISTENT_LIMIT: i64 = 3;
 
+/// Anti-thrash limit: consecutive reverts of the SAME goal before forcing a different goal
+/// next iteration (defer + corrective note + surface stuck_goal in the heartbeat). Lower than
+/// the escalation ladder's cumulative `limit` (3) so a thrashing lane is caught early — the
+/// escalation ladder's noop/deviation/timeout counts are cumulative and may never reach 3 if
+/// reverts dominate, leaving the lane silently retrying the same reverted change.
+const ANTI_THRASH_LIMIT: i64 = 2;
+
 // --------------------------------------------------------------------------- #
 // build_task (run_improver.build_task ~258-317)
 // --------------------------------------------------------------------------- #
@@ -530,6 +537,7 @@ pub fn register_failure(ctx: &mut Ctx, goal: &str, kind: &str, reason: &str, lim
 pub fn clear_failure_state(ctx: &mut Ctx, goal: &str) {
     ctx.fail_counts.remove(goal);
     ctx.escalated_goals.remove(goal);
+    reset_consecutive_reverts(ctx, goal);
 }
 
 /// run_improver._apply_fallback_model (~1821-1830): escalation rung 1 — if `goal` has hit the
@@ -557,6 +565,7 @@ pub fn apply_fallback_model(ctx: &mut Ctx, goal: &str) {
 /// run_improver._note_noop (~1833-1838): no-change iteration — escalate (feedback -> fallback model ->
 /// decompose/defer) with the templated noop corrective note.
 pub fn note_noop(ctx: &mut Ctx, goal: &str, limit: i64) {
+    reset_consecutive_reverts(ctx, goal); // a noop breaks the consecutive-revert streak
     register_failure(
         ctx,
         goal,
@@ -571,6 +580,7 @@ concrete approach and actually edit files to implement THIS item",
 /// than the generic no-change case so the next attempt stops narrating possible edits and either
 /// writes a real diff or honestly deviates.
 pub fn note_narrated_noop(ctx: &mut Ctx, goal: &str, limit: i64) {
+    reset_consecutive_reverts(ctx, goal);
     register_failure(
         ctx,
         goal,
@@ -585,6 +595,7 @@ if there is no safe change",
 /// Implement timeouts usually mean the item needs a smaller shippable slice. Count them in the same
 /// escalation ladder as noops/reverts so the runner adapts instead of retrying forever.
 pub fn note_timeout(ctx: &mut Ctx, goal: &str, limit: i64) {
+    reset_consecutive_reverts(ctx, goal);
     register_failure(
         ctx,
         goal,
@@ -598,6 +609,7 @@ largest coherent slice that can be edited, tested, and shipped in one cycle",
 /// The agent shipped a real change to something OTHER than the named item. Escalate with the
 /// templated deviation corrective note.
 pub fn note_deviation(ctx: &mut Ctx, goal: &str, limit: i64) {
+    reset_consecutive_reverts(ctx, goal);
     register_failure(
         ctx,
         goal,
@@ -613,6 +625,68 @@ specific backlog item, not an unrelated change",
 /// `reason` back to the next attempt.
 pub fn note_revert(ctx: &mut Ctx, goal: &str, reason: &str, limit: i64) {
     register_failure(ctx, goal, "revert", reason, limit);
+}
+
+// --------------------------------------------------------------------------- #
+// anti-thrash: consecutive-revert counter (the systemic fix for "lanes thrashing without a fix")
+// --------------------------------------------------------------------------- #
+
+/// Anti-thrash: track consecutive reverts of the SAME goal. After [`ANTI_THRASH_LIMIT`]
+/// consecutive reverts, force a different goal next iteration instead of silently retrying the
+/// reverted change:
+///   * defer the backlog item so `top_backlog_item` returns the NEXT item (no-op for the
+///     `model-chosen improvement` placeholder, which has no backlog line to match),
+///   * override `last_gate_feedback` with a "pick a DIFFERENT goal" corrective note,
+///   * surface `stuck_goal` in the heartbeat so the watchdog/dashboard sees the stuck lane,
+///   * reset the consecutive-revert counter (so it re-counts cleanly after the forced switch).
+///
+/// Beautify/solomon modes have a fixed goal — the "pick a different goal" directive doesn't apply
+/// (and beautify skips the gate anyway), so they are skipped. An empty goal means the iteration
+/// never reached the implement phase — also skipped.
+///
+/// Called from `gitops::drop_branch` when `phase == "reverted"`, so it covers ALL revert paths
+/// (gate-red, anti-gaming, cross-repo, eval, leak guard, visual, review reject), not just the two
+/// that call `note_revert`.
+pub fn note_consecutive_revert(ctx: &mut Ctx, goal: &str) {
+    if ctx.beautify || ctx.solomon || goal.is_empty() {
+        return;
+    }
+    let n = ctx.consecutive_reverts.get(goal).copied().unwrap_or(0) + 1;
+    if n >= ANTI_THRASH_LIMIT {
+        ctx.consecutive_reverts.insert(goal.to_string(), 0);
+        // Defer the backlog item so top_backlog_item returns the NEXT item. The placeholder
+        // "model-chosen improvement" has no backlog line to match -> defer returns false (fine).
+        if goal.to_lowercase() != "model-chosen improvement" {
+            defer_backlog_item(ctx, goal);
+        }
+        ctx.last_gate_feedback = format!(
+            "this goal has been REVERTED {n} consecutive times — the approach is stuck. \
+Pick a DIFFERENT goal or a fundamentally different approach; do NOT retry the same change."
+        );
+        // Surface the stuck goal in the heartbeat so the watchdog/dashboard sees it (set in-memory;
+        // the next heartbeat() call from drop_branch persists it to disk).
+        if let serde_json::Value::Object(hb) = &mut ctx.hb {
+            hb.insert("stuck_goal".to_string(), json!(goal));
+        }
+        ctx.log(&format!(
+            "anti-thrash: '{}' reverted {n} consecutive times — forcing a different goal next iteration",
+            goal_head(goal)
+        ));
+    } else {
+        ctx.consecutive_reverts.insert(goal.to_string(), n);
+    }
+}
+
+/// Reset the consecutive-revert counter for a goal (a non-revert outcome — ship, noop, deviation,
+/// timeout — breaks the streak) and clear any stale `stuck_goal` from the heartbeat so the
+/// watchdog no longer sees the lane as stuck.
+pub fn reset_consecutive_reverts(ctx: &mut Ctx, goal: &str) {
+    if !goal.is_empty() {
+        ctx.consecutive_reverts.remove(goal);
+    }
+    if let serde_json::Value::Object(hb) = &mut ctx.hb {
+        hb.remove("stuck_goal");
+    }
 }
 
 /// run_improver._defer_backlog_item (~1857-1878): move a stuck `- [ ]` item to the BOTTOM of the
@@ -704,6 +778,7 @@ fn py_splitlines(s: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     fn ctx() -> Ctx {
         let mut c = Ctx::configure("C:/nonexistent/repo", "testrepo", "ollama-cloud", None);
@@ -1067,5 +1142,149 @@ largest coherent slice that can be edited, tested, and shipped in one cycle"
         assert_eq!(py_splitlines("a\r\nb"), vec!["a", "b"]);
         assert_eq!(py_splitlines("a\nb"), vec!["a", "b"]);
         assert_eq!(py_splitlines(""), Vec::<String>::new());
+    }
+
+    // ---- anti-thrash: note_consecutive_revert / reset_consecutive_reverts ----
+    fn ctx_with_backlog(goal: &str, backlog_text: &str) -> Ctx {
+        let mut c = ctx();
+        // Give each test a UNIQUE runtime subdir so parallel tests don't collide on the same
+        // backlog.md (ctx() uses a single shared path keyed by PID).
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        c.runtime = std::env::temp_dir().join(format!(
+            "solomon_esc_antithrash_{}_{}",
+            std::process::id(),
+            salt
+        ));
+        std::fs::create_dir_all(&c.runtime).unwrap();
+        c.backlog = c.runtime.join("backlog.md");
+        c.heartbeat_path = c.runtime.join("heartbeat.json");
+        c.log_path = c.runtime.join("improver.log");
+        c.stop_path = c.runtime.join("stop");
+        std::fs::write(&c.backlog, backlog_text).unwrap();
+        // set hb["goal"] so note_consecutive_revert can read it via drop_branch (not used directly,
+        // but mirrors the real heartbeat state at revert time)
+        if let serde_json::Value::Object(hb) = &mut c.hb {
+            hb.insert("goal".to_string(), json!(goal));
+        }
+        c
+    }
+
+    #[test]
+    fn consecutive_revert_below_limit_just_counts() {
+        let mut c = ctx_with_backlog("add a widget", "- [ ] add a widget\n- [ ] other item\n");
+        note_consecutive_revert(&mut c, "add a widget");
+        assert_eq!(c.consecutive_reverts.get("add a widget"), Some(&1));
+        assert!(c.last_gate_feedback.is_empty()); // no anti-thrash feedback yet
+        assert!(c.hb.get("stuck_goal").is_none());
+    }
+
+    #[test]
+    fn consecutive_revert_at_limit_defers_and_surfaces_stuck_goal() {
+        let mut c =
+            ctx_with_backlog("add a widget", "- [ ] add a widget\n- [ ] other item\n");
+        // first revert — just counts
+        note_consecutive_revert(&mut c, "add a widget");
+        // second revert — anti-thrash fires (ANTI_THRASH_LIMIT == 2)
+        note_consecutive_revert(&mut c, "add a widget");
+        // counter reset after firing
+        assert_eq!(c.consecutive_reverts.get("add a widget"), Some(&0));
+        // backlog item deferred (moved to bottom with deferred note)
+        let bl = std::fs::read_to_string(&c.backlog).unwrap();
+        assert!(bl.contains("(deferred"), "backlog item was deferred: {bl}");
+        assert!(bl.contains("other item"), "next item still present: {bl}");
+        // corrective note injected
+        assert!(c.last_gate_feedback.contains("REVERTED 2 consecutive times"));
+        assert!(c.last_gate_feedback.contains("DIFFERENT goal"));
+        // stuck_goal surfaced in the heartbeat
+        assert_eq!(c.hb.get("stuck_goal").and_then(Value::as_str), Some("add a widget"));
+    }
+
+    #[test]
+    fn consecutive_revert_noop_resets_streak() {
+        let mut c = ctx_with_backlog("add a widget", "- [ ] add a widget\n");
+        note_consecutive_revert(&mut c, "add a widget"); // streak == 1
+        assert_eq!(c.consecutive_reverts.get("add a widget"), Some(&1));
+        // a noop breaks the consecutive-revert streak
+        note_noop(&mut c, "add a widget", 3);
+        assert!(c.consecutive_reverts.get("add a widget").is_none());
+        assert!(c.hb.get("stuck_goal").is_none(), "stuck_goal cleared on noop");
+        // next revert starts from 1 again (not 2)
+        note_consecutive_revert(&mut c, "add a widget");
+        assert_eq!(c.consecutive_reverts.get("add a widget"), Some(&1));
+        assert!(c.last_gate_feedback.contains("NO changes")); // the noop feedback, not anti-thrash
+    }
+
+    #[test]
+    fn consecutive_revert_ship_resets_counter_and_stuck_goal() {
+        let mut c = ctx_with_backlog("add a widget", "- [ ] add a widget\n");
+        note_consecutive_revert(&mut c, "add a widget");
+        note_consecutive_revert(&mut c, "add a widget"); // anti-thrash fires
+        assert_eq!(c.hb.get("stuck_goal").and_then(Value::as_str), Some("add a widget"));
+        // a successful ship clears everything
+        clear_failure_state(&mut c, "add a widget");
+        assert!(c.consecutive_reverts.get("add a widget").is_none());
+        assert!(c.hb.get("stuck_goal").is_none(), "stuck_goal cleared on ship");
+    }
+
+    #[test]
+    fn consecutive_revert_skips_beautify_and_solomon_and_empty() {
+        let mut c = ctx_with_backlog("some goal", "- [ ] some goal\n");
+        c.beautify = true;
+        note_consecutive_revert(&mut c, "some goal");
+        assert!(c.consecutive_reverts.is_empty(), "beautify skipped");
+        c.beautify = false;
+        c.solomon = true;
+        note_consecutive_revert(&mut c, "some goal");
+        assert!(c.consecutive_reverts.is_empty(), "solomon skipped");
+        c.solomon = false;
+        // empty goal is a no-op
+        note_consecutive_revert(&mut c, "");
+        assert!(c.consecutive_reverts.is_empty(), "empty goal skipped");
+    }
+
+    #[test]
+    fn consecutive_revert_different_goals_have_independent_counters() {
+        let mut c = ctx_with_backlog("goal A", "- [ ] goal A\n- [ ] goal B\n");
+        note_consecutive_revert(&mut c, "goal A"); // A: 1
+        note_consecutive_revert(&mut c, "goal B"); // B: 1 (independent)
+        assert_eq!(c.consecutive_reverts.get("goal A"), Some(&1));
+        assert_eq!(c.consecutive_reverts.get("goal B"), Some(&1));
+        assert!(c.last_gate_feedback.is_empty(), "neither hit the limit");
+    }
+
+    #[test]
+    fn consecutive_revert_placeholder_goal_injects_feedback_without_defer() {
+        let mut c = ctx();
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        c.runtime = std::env::temp_dir().join(format!(
+            "solomon_esc_placeholder_{}_{}",
+            std::process::id(),
+            salt
+        ));
+        std::fs::create_dir_all(&c.runtime).unwrap();
+        c.backlog = c.runtime.join("backlog.md");
+        c.heartbeat_path = c.runtime.join("heartbeat.json");
+        c.log_path = c.runtime.join("improver.log");
+        c.stop_path = c.runtime.join("stop");
+        std::fs::write(&c.backlog, "- [ ] some real item\n").unwrap();
+        // placeholder goal — no backlog line to match, so defer is a no-op
+        note_consecutive_revert(&mut c, "model-chosen improvement");
+        note_consecutive_revert(&mut c, "model-chosen improvement");
+        // feedback still injected (the model must pick a DIFFERENT goal)
+        assert!(c.last_gate_feedback.contains("DIFFERENT goal"));
+        // stuck_goal surfaced
+        assert_eq!(
+            c.hb.get("stuck_goal").and_then(Value::as_str),
+            Some("model-chosen improvement")
+        );
+        // backlog unchanged (no line matched "model-chosen improvement")
+        let bl = std::fs::read_to_string(&c.backlog).unwrap();
+        assert_eq!(bl, "- [ ] some real item\n");
     }
 }
