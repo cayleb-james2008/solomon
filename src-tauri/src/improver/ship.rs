@@ -327,6 +327,30 @@ fn slice_chars(s: &str, n: usize) -> String {
 // _try_squash_merge / _auto_merge / _wait_for_ci_then_merge
 // --------------------------------------------------------------------------- #
 
+/// Parse the stdout of `gh pr view <num> --json mergedAt`: true only when `mergedAt` is a
+/// non-empty string (an ISO timestamp). null / missing / unparseable -> false (not merged).
+/// Factored out of [`confirm_merged`] for unit testing without a live `gh`.
+fn parse_merged_at(stdout: &str) -> bool {
+    let raw = if stdout.is_empty() { "{}" } else { stdout };
+    let parsed: Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    match parsed.get("mergedAt") {
+        Some(Value::String(s)) => !s.is_empty(),
+        _ => false,
+    }
+}
+
+/// Verify PR `<num>` is actually merged by polling `gh pr view <num> --json mergedAt`. Never trust
+/// the `gh pr merge` exit code alone — a 0 return can mean the command queued but did not complete,
+/// or a transient blip swallowed the API error. Returns true only when `mergedAt` is a real
+/// timestamp.
+fn confirm_merged(c: &Ctx, num: i64) -> bool {
+    let p = c.gh(&["pr", "view", &num.to_string(), "--json", "mergedAt"], 120);
+    parse_merged_at(&p.stdout)
+}
+
 /// run_improver._try_squash_merge (~1998-2011): `gh pr merge <num> --squash --delete-branch` with up
 /// to 3 attempts (5s backoff between) to ride out a transient gh/network blip on already-green CI.
 /// Returns the last RunOut (code 0 == merged).
@@ -350,8 +374,15 @@ pub fn try_squash_merge(c: &Ctx, num: i64) -> proc::RunOut {
 
 /// run_improver._auto_merge (~2014-2036): squash-merge an open PR, but NEVER on CI-red. checks
 /// "failure" -> leave open ("open (CI red — not merged)"); "pending" -> queue GitHub native
-/// auto-merge (or "open (awaiting CI)" if --auto unavailable); "success"/None -> merge now. On a
-/// successful squash-merge state="merged"; a failed merge leaves the PR unchanged (logged).
+/// auto-merge, but if `--auto` is rejected (no required status checks on the repo) FALL THROUGH to
+/// a direct squash-merge instead of stranding the PR open; "success"/None -> merge now. On a
+/// confirmed merge state="merged"; a failed or unverified merge leaves the PR open (logged).
+///
+/// ship-bug fix: the original code used `--auto` even when the repo had NO required status checks.
+/// GitHub rejects `--auto` on a clean-mergeable PR (auto-merge needs a pending gate), so the command
+/// failed and the PR was left OPEN while the lane mis-logged 'merged'. Now `--auto` is only used when
+/// checks are actually pending, a `--auto` rejection falls through to direct merge, and the merge is
+/// VERIFIED by polling `gh pr view --json mergedAt` before ever returning "merged".
 pub fn auto_merge(c: &mut Ctx, pr: &Value) -> Value {
     let num = match pr.get("number").and_then(Value::as_i64) {
         Some(n) if n != 0 => n,
@@ -370,14 +401,24 @@ pub fn auto_merge(c: &mut Ctx, pr: &Value) -> Value {
         if am.code == 0 {
             return with_state(pr, "auto-merge queued (awaiting CI)");
         }
+        // --auto was rejected (likely no required status checks on the repo) — fall through to a
+        // direct merge instead of stranding the PR open for hours.
         c.log(&format!(
-            "auto-merge: CI pending and native --auto unavailable on PR {num} — leaving open until CI resolves"
+            "auto-merge: --auto unavailable on PR {num} (likely no required checks) — trying direct merge"
         ));
-        return with_state(pr, "open (awaiting CI)");
     }
+    // checks is None, "success", or "pending" with --auto rejected -> direct merge
     let m = try_squash_merge(c, num);
-    if m.code == 0 {
+    if m.code == 0 && confirm_merged(c, num) {
         return with_state(pr, "merged");
+    }
+    if m.code == 0 {
+        // The command returned 0 but mergedAt is null — the merge did NOT actually land. Never
+        // trust the exit code alone (the ship-bug: PRs piled up open while the lane logged 'merged').
+        c.log(&format!(
+            "gh pr merge {num} returned 0 but mergedAt is null — PR NOT actually merged"
+        ));
+        return with_state(pr, "open (merge unverified)");
     }
     c.log(&format!(
         "gh pr merge {num} failed: {} — PR left open",
@@ -418,8 +459,14 @@ pub fn wait_for_ci_then_merge(c: &mut Ctx, pr: &Value) -> Value {
         // checks in ("success", None)
         if checks.is_none() || checks.as_deref() == Some("success") {
             let m = try_squash_merge(c, num);
-            if m.code == 0 {
+            if m.code == 0 && confirm_merged(c, num) {
                 return with_state(pr, "merged");
+            }
+            if m.code == 0 {
+                c.log(&format!(
+                    "gh pr merge {num} returned 0 but mergedAt is null — PR NOT actually merged"
+                ));
+                return with_state(pr, "open (merge unverified)");
             }
             c.log(&format!(
                 "gh pr merge {num} failed after retries: {} — PR left open",
@@ -432,14 +479,16 @@ pub fn wait_for_ci_then_merge(c: &mut Ctx, pr: &Value) -> Value {
                 &["pr", "merge", &num.to_string(), "--auto", "--squash", "--delete-branch"],
                 120,
             );
-            return with_state(
-                pr,
-                if am.code == 0 {
-                    "auto-merge queued (awaiting CI)"
-                } else {
-                    "open (awaiting CI)"
-                },
-            );
+            if am.code == 0 {
+                return with_state(pr, "auto-merge queued (awaiting CI)");
+            }
+            // --auto rejected (likely no required checks) — try direct merge with verification
+            // instead of stranding the PR open for hours.
+            let m = try_squash_merge(c, num);
+            if m.code == 0 && confirm_merged(c, num) {
+                return with_state(pr, "merged");
+            }
+            return with_state(pr, "open (awaiting CI)");
         }
         std::thread::sleep(Duration::from_secs(CI_POLL_DELAY_S));
     }
@@ -800,6 +849,85 @@ mod tests {
         } else {
             "success".to_string()
         })
+    }
+
+    // ---- parse_merged_at: the merge-verification gate (ship-bug fix) ----
+    //
+    // `gh pr view <n> --json mergedAt` is the authoritative source of truth for whether a PR
+    // actually landed. The `gh pr merge` exit code alone is NOT trusted — a 0 return can mean the
+    // command queued but did not complete, or a transient blip swallowed the API error. This is the
+    // fix for the ship-bug where PRs #13-22 piled up open for 8h while the lane mis-logged 'merged'.
+
+    #[test]
+    fn merged_at_real_timestamp_is_merged() {
+        assert!(parse_merged_at(r#"{"mergedAt":"2026-07-01T12:00:00Z"}"#));
+    }
+
+    #[test]
+    fn merged_at_null_is_not_merged() {
+        assert!(!parse_merged_at(r#"{"mergedAt":null}"#));
+    }
+
+    #[test]
+    fn merged_at_missing_is_not_merged() {
+        assert!(!parse_merged_at(r#"{}"#));
+        assert!(!parse_merged_at(""));
+    }
+
+    #[test]
+    fn merged_at_empty_string_is_not_merged() {
+        assert!(!parse_merged_at(r#"{"mergedAt":""}"#));
+    }
+
+    #[test]
+    fn merged_at_garbage_json_is_not_merged() {
+        assert!(!parse_merged_at("not json"));
+        assert!(!parse_merged_at("{broken"));
+    }
+
+    // ---- ship_succeeded rejects the new unverified state ----
+    //
+    // 'open (merge unverified)' must NOT be treated as shipped — it contains 'open (' so the
+    // existing predicate already rejects it, but pin the invariant explicitly.
+
+    #[test]
+    fn ss_merge_unverified_is_not_shipped() {
+        assert!(!ship_succeeded(&json!({"number": 1, "state": "open (merge unverified)"})));
+        assert_eq!(
+            ship_outcome(&json!({"number": 1, "state": "open (merge unverified)"}), "auto-merge"),
+            "blocked"
+        );
+    }
+
+    // ---- no-CI PR is direct-merged, not left open ----
+    //
+    // When checks is None (no CI configured / no required checks), auto_merge must take the direct
+    // merge path (try_squash_merge, no --auto). The --auto flag is only used when checks are
+    // actually "pending". A confirmed merge (mergedAt is a real timestamp) returns "merged";
+    // an unverified merge (code 0 but mergedAt null) returns "open (merge unverified)" — NOT
+    // "merged". This is the regression test for the ship-bug where --auto was used on a no-CI
+    // repo, GitHub rejected it, and the PR was left open while the lane logged 'merged'.
+
+    #[test]
+    fn no_ci_pr_confirmed_merge_is_merged() {
+        // parse_merged_at with a real timestamp -> true -> state would be "merged"
+        let gh_view_out = r#"{"mergedAt":"2026-07-01T12:00:00Z"}"#;
+        assert!(parse_merged_at(gh_view_out));
+        // and "merged" state is correctly classified as shipped
+        assert!(ship_succeeded(&json!({"number": 1, "state": "merged"})));
+        assert_eq!(ship_outcome(&json!({"number": 1, "state": "merged"}), "auto-merge"), "shipped");
+    }
+
+    #[test]
+    fn no_ci_pr_unverified_merge_is_not_merged() {
+        // parse_merged_at with null mergedAt -> false -> state would be "open (merge unverified)"
+        let gh_view_out = r#"{"mergedAt":null}"#;
+        assert!(!parse_merged_at(gh_view_out));
+        // and "open (merge unverified)" is correctly classified as blocked, NOT shipped
+        assert_eq!(
+            ship_outcome(&json!({"number": 1, "state": "open (merge unverified)"}), "auto-merge"),
+            "blocked"
+        );
     }
 
     fn test_ctx() -> Ctx {
