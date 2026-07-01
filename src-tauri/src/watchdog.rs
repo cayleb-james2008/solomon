@@ -663,12 +663,23 @@ pub fn main() -> i32 {
         .iter()
         .filter(|s| s.get("running").and_then(Value::as_bool) == Some(true))
         .count();
+    // OPS PLANE GRAFT (Phase 1): after the code-plane sweep, run the ground-truth outcome probes
+    // over the live fleet (ops::outcomes::sweep — all probes, all projects) and append the ops
+    // summary so the watchdog line is TWO-PLANE truth: "code 5/6 running | ops: asmodeus
+    // RED(fills_recency) ...". A running loop with a dead product can never print "all healthy"
+    // again. NO scheduled task exists and none may be created (operator rule) — this sweep runs
+    // only while Solomon.exe is visibly open; the first sweep after process start writes the
+    // blind-window gap into runtime/ops_status.json. catch_unwind mirrors the per-repo guard
+    // above: an ops-plane failure must never abort the code-plane crash-recovery sweep.
+    let ops_summary = std::panic::catch_unwind(crate::ops::outcomes::sweep_and_summarize)
+        .unwrap_or_else(|_| "ops sweep panicked".to_string());
     let line = format!(
-        "{} watchdog: {}/{} running | {}",
+        "{} watchdog: {}/{} running | {} | ops: {}",
         out.get("ts").and_then(Value::as_str).unwrap_or(""),
         running,
         snapshots.len(),
-        summary
+        summary,
+        ops_summary
     );
     println!("{line}");
     // self-log so the task can run windowless (no stdout redirection needed). OSError -> pass.
