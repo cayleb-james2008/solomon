@@ -61,6 +61,11 @@ pub fn one_iteration(ctx: &mut Ctx) {
         .to_string();
     let base_branch = ctx.base_branch.clone();
 
+    // Stash hygiene: reconcile preflight stashes from prior iterations — drop agent-artifact-only
+    // ones, preserve real swept work to solomon-recovered/* branches. Without this, 100s of
+    // stashes accumulate and bury real work (337 observed on maki 2026-06-30).
+    gitops::reconcile_preflight_stashes(ctx);
+
     // AUTO-RECOVER: a dirty BASE tree, or operator-looking untracked files on the base — stash them
     // (recoverable) instead of wedging the loop, but ONLY on the base branch.
     if cur_branch == base_branch {

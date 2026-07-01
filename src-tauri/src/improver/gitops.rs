@@ -251,6 +251,174 @@ pub fn auto_stash_base(ctx: &mut Ctx, label: &str) -> bool {
     true
 }
 
+/// Maximum empty (agent-artifact-only) preflight stashes tolerated before pruning oldest. Since
+/// `reconcile_preflight_stashes` runs every preflight and drops ALL empty ones, the steady-state
+/// count is 0 — this cap is a safety net for crash-recovery bursts.
+const PREFLIGHT_STASH_CAP: usize = 20;
+
+/// Reconcile `solomon-auto-preflight` stashes accumulated in the stash list:
+///   - EMPTY stashes (agent-artifact-only — AGENT_LOG.md, capabilities/, etc.) are DROPPED.
+///   - NON-EMPTY stashes (real swept work — a non-agent-artifact tracked change or untracked file)
+///     are preserved to a `solomon-recovered/<ts>-<idx>` branch before being dropped, so swept
+///     work is recoverable, never orphaned.
+/// Called at the start of each iteration's preflight so preflight stashes never accumulate.
+/// HARD INVARIANT: a stash with real content is NEVER dropped without first preserving its content.
+/// If the stash count exceeds `PREFLIGHT_STASH_CAP`, the oldest empty ones are pruned (a safety net
+/// for crash-recovery bursts where reconciliation could not run).
+pub fn reconcile_preflight_stashes(ctx: &mut Ctx) {
+    let list = ctx.git(&["stash", "list"], 120).stdout;
+    // Parse "stash@{N}: On branch: solomon-auto-preflight ..." (stash@{0} is newest).
+    let mut preflight: Vec<usize> = Vec::new();
+    for line in list.lines() {
+        let Some(rest) = line.strip_prefix("stash@{") else { continue };
+        let Some((idx_str, after)) = rest.split_once('}') else { continue };
+        let Ok(idx) = idx_str.parse::<usize>() else { continue };
+        if after.contains("solomon-auto-preflight") {
+            preflight.push(idx);
+        }
+    }
+    if preflight.is_empty() {
+        return;
+    }
+    preflight.sort();
+    // Collect artifact patterns while holding ctx immutably, then process stashes mutably.
+    let extra = repo_artifact_patterns(ctx, &ctx.name.clone());
+    let mut dropped: i64 = 0;
+    let mut recovered: i64 = 0;
+    // Process highest index first so drops don't shift lower indices.
+    for idx in preflight.iter().rev() {
+        let ref_str = format!("stash@{{{idx}}}");
+        if stash_has_real_content(ctx, &ref_str, &extra) {
+            if recover_stash_to_branch(ctx, &ref_str, *idx) {
+                recovered += 1;
+            }
+        } else {
+            ctx.git(&["stash", "drop", &ref_str], 120);
+            dropped += 1;
+        }
+    }
+    // Safety-net cap: if more than PREFLIGHT_STASH_CAP empty preflight stashes somehow remain
+    // (e.g. recovery failures retained non-empty stashes that shifted indices), prune oldest empty.
+    prune_excess_empty_preflight_stashes(ctx, &extra);
+    if dropped > 0 || recovered > 0 {
+        ctx.log(&format!(
+            "stash-hygiene: dropped {dropped} empty preflight stash(es), recovered {recovered} \
+             to solomon-recovered/* branch(es)"
+        ));
+    }
+}
+
+/// Whether a stash carries REAL (non-agent-artifact) content — a tracked diff entry OR an
+/// untracked file (the stash's third parent from `--include-untracked`) that is NOT an agent
+/// artifact. A stash whose every file matches an agent-artifact heuristic is "empty" for hygiene
+/// purposes and may be safely dropped. Pure over `ctx.git` results + `is_agent_artifact`.
+fn stash_has_real_content(ctx: &Ctx, ref_str: &str, extra: &[Regex]) -> bool {
+    // Tracked changes (git stash show --name-only lists modified tracked files only).
+    let tracked = ctx
+        .git(&["stash", "show", "--name-only", ref_str], 120)
+        .stdout;
+    for line in tracked.lines() {
+        let f = line.trim();
+        if !f.is_empty() && !is_agent_artifact(f, Some(extra)) {
+            return true;
+        }
+    }
+    // Untracked files (stash's third parent — only exists when --include-untracked was used).
+    // `git ls-tree --name-only` lists the files IN the untracked commit; `git diff ^1 ^3` would
+    // also list base files absent from ^3 (all of them when ^3 is empty), producing false
+    // positives. ls-tree gives exactly the untracked files swept into the stash.
+    let untracked = ctx.git(
+        &["ls-tree", "--name-only", &format!("{ref_str}^3")],
+        120,
+    );
+    if untracked.code == 0 {
+        for line in untracked.stdout.lines() {
+            let f = line.trim();
+            if !f.is_empty() && !is_agent_artifact(f, Some(extra)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Preserve a stash's content to a `solomon-recovered/<ts>-<idx>` branch via `git stash branch`,
+/// then commit and return to the base branch. `git stash branch` applies the stash to a new branch
+/// and DROPS the stash on success. Returns true on success; on failure the stash is RETAINED and
+/// the error is surfaced loudly (heartbeat + log) for manual recovery.
+fn recover_stash_to_branch(ctx: &mut Ctx, stash_ref: &str, idx: usize) -> bool {
+    let ts = ctx::stamp();
+    let branch = format!("solomon-recovered/{ts}-{idx}");
+    let res = ctx.git(&["stash", "branch", &branch, stash_ref], 120);
+    if res.code == 0 {
+        // Stash applied + auto-dropped. Commit the changes so they survive a checkout.
+        ctx.git(&["add", "-A"], 120);
+        let msg = format!("solomon-recovered: swept preflight work from {stash_ref}");
+        let _ = ctx.git(&["commit", "-m", &msg], 120);
+        ctx.git(&["checkout", "--force", &ctx.base_branch], 120);
+        ctx.log(&format!(
+            "stash-hygiene: recovered real content from {stash_ref} to branch '{branch}'"
+        ));
+        true
+    } else {
+        let err: String = res.stderr.trim().chars().take(200).collect();
+        // Clean up the partial branch (if created) and return to base.
+        ctx.git(&["checkout", "--force", &ctx.base_branch], 120);
+        let _ = ctx.git(&["branch", "-D", &branch], 120);
+        ctx.log(&format!(
+            "stash-hygiene: WARNING — could not auto-recover {stash_ref} to a branch ({err}); \
+             stash RETAINED for manual recovery"
+        ));
+        ctx.heartbeat(json!({
+            "status": "error",
+            "phase": "preflight",
+            "last_summary": format!(
+                "A preflight stash has real content but could not be auto-recovered to a branch ({err}). \
+                 Manual recovery: git stash apply {stash_ref}"
+            ),
+        }));
+        false
+    }
+}
+
+/// Safety-net cap: when empty (agent-artifact-only) preflight stashes exceed
+/// `PREFLIGHT_STASH_CAP`, prune the oldest ones. Oldest = highest stash index (stash@{0} is
+/// newest). Non-empty stashes are NEVER touched here.
+fn prune_excess_empty_preflight_stashes(ctx: &mut Ctx, extra: &[Regex]) {
+    let list = ctx.git(&["stash", "list"], 120).stdout;
+    let mut empty: Vec<usize> = Vec::new();
+    for line in list.lines() {
+        let Some(rest) = line.strip_prefix("stash@{") else { continue };
+        let Some((idx_str, after)) = rest.split_once('}') else { continue };
+        let Ok(idx) = idx_str.parse::<usize>() else { continue };
+        if !after.contains("solomon-auto-preflight") {
+            continue;
+        }
+        let ref_str = format!("stash@{{{idx}}}");
+        if !stash_has_real_content(ctx, &ref_str, extra) {
+            empty.push(idx);
+        }
+    }
+    if empty.len() <= PREFLIGHT_STASH_CAP {
+        return;
+    }
+    let to_prune = empty.len() - PREFLIGHT_STASH_CAP;
+    // Oldest = highest index. Drop from highest to lowest to avoid index shifting.
+    empty.sort_by(|a, b| b.cmp(a));
+    let mut pruned = 0i64;
+    for idx in empty.iter().take(to_prune) {
+        let ref_str = format!("stash@{{{idx}}}");
+        if ctx.git(&["stash", "drop", &ref_str], 120).code == 0 {
+            pruned += 1;
+        }
+    }
+    if pruned > 0 {
+        ctx.log(&format!(
+            "stash-hygiene: safety-net pruned {pruned} oldest empty preflight stash(es) (cap {PREFLIGHT_STASH_CAP})"
+        ));
+    }
+}
+
 /// run_improver._abort_branch (~923-938): revert the working tree and delete `branch`, fail-closed.
 /// Returns True only when verifiably back on BASE_BRANCH with the branch removed; logs + returns False
 /// otherwise so the caller surfaces an error.
@@ -669,5 +837,153 @@ mod tests {
 
     fn test_ctx() -> Ctx {
         Ctx::configure("C:/nonexistent/repo", "testrepo", "ollama-cloud", None)
+    }
+
+    // ---- reconcile_preflight_stashes: real git repo integration tests ----
+
+    /// Helper: create a real throwaway git repo + Ctx for stash-hygiene tests.
+    fn real_repo_ctx() -> (Ctx, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "solomon_stash_real_{}_{}",
+            std::process::id(),
+            uniq
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut c = Ctx::configure(&dir.to_string_lossy(), "testrepo", "ollama-cloud", None);
+        c.runtime = std::env::temp_dir().join(format!(
+            "solomon_stash_rt_{}_{}",
+            std::process::id(),
+            uniq
+        ));
+        std::fs::create_dir_all(&c.runtime).unwrap();
+
+        // git init + minimal config (CI environments may lack global git config).
+        assert_eq!(c.git(&["init", "--quiet"], 30).code, 0);
+        c.git(&["config", "user.email", "test@test.test"], 10);
+        c.git(&["config", "user.name", "Test"], 10);
+        // Create an initial commit so HEAD resolves to a real branch.
+        std::fs::write(dir.join("README.md"), "# test\n").unwrap();
+        c.git(&["add", "-A"], 10);
+        c.git(&["commit", "--quiet", "-m", "initial"], 10);
+        // Detect the default branch name (main / master / etc.).
+        let branch = c
+            .git(&["rev-parse", "--abbrev-ref", "HEAD"], 10)
+            .stdout
+            .trim()
+            .to_string();
+        c.base_branch = if branch.is_empty() || branch == "HEAD" {
+            "main".to_string()
+        } else {
+            branch
+        };
+        (c, dir)
+    }
+
+    /// HARD INVARIANT: a preflight stash with real dirty-base content (a non-agent-artifact
+    /// tracked file) ends with that content committed to a solomon-recovered/* branch, NOT
+    /// orphaned in the stash list.
+    #[test]
+    fn reconcile_recovers_real_dirty_base_content() {
+        let (mut c, dir) = real_repo_ctx();
+
+        // Dirty the base with REAL content (backend.py is not an agent artifact).
+        std::fs::write(dir.join("backend.py"), "print('hello')\n").unwrap();
+        c.git(&["add", "-A"], 10);
+        c.git(&["commit", "--quiet", "-m", "add backend"], 10);
+        std::fs::write(dir.join("backend.py"), "print('hello world')\n").unwrap();
+
+        // Stash the dirty base (simulating preflight auto-stash).
+        assert!(
+            auto_stash_base(&mut c, "rsi/iter-test"),
+            "auto_stash_base should succeed on a dirty tree"
+        );
+        let list = c.git(&["stash", "list"], 10).stdout;
+        assert!(
+            list.contains("solomon-auto-preflight"),
+            "stash should exist after auto_stash_base"
+        );
+
+        // Reconcile — should recover the real content to a branch.
+        reconcile_preflight_stashes(&mut c);
+
+        // The stash should be GONE (recovered, not orphaned).
+        let list2 = c.git(&["stash", "list"], 10).stdout;
+        assert!(
+            !list2.contains("solomon-auto-preflight"),
+            "real-content stash should be recovered, not orphaned in the stash list"
+        );
+
+        // A solomon-recovered/* branch should exist.
+        let branches = c
+            .git(&["branch", "--list", "solomon-recovered/*"], 10)
+            .stdout;
+        assert!(
+            !branches.trim().is_empty(),
+            "a solomon-recovered/* branch should exist with the swept work"
+        );
+
+        // Verify the recovery branch actually has the real content.
+        let recovered = branches
+            .lines()
+            .next()
+            .unwrap()
+            .replace('*', "")
+            .trim()
+            .to_string();
+        c.git(&["checkout", "--force", &recovered], 10);
+        let content = std::fs::read_to_string(dir.join("backend.py")).unwrap();
+        assert!(
+            content.contains("hello world"),
+            "recovered branch should contain the real swept work, not the original"
+        );
+
+        // Cleanup.
+        c.git(&["checkout", "--force", &c.base_branch], 10);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    /// A preflight stash containing ONLY an agent artifact (AGENT_LOG.md) is DROPPED — no
+    /// recovery branch is created. This is the "empty" case: agent debris, not real work.
+    #[test]
+    fn reconcile_drops_agent_artifact_only_stash() {
+        let (mut c, dir) = real_repo_ctx();
+
+        // Track AGENT_LOG.md (an agent artifact) and dirty it.
+        std::fs::write(dir.join("AGENT_LOG.md"), "original log\n").unwrap();
+        c.git(&["add", "-A"], 10);
+        c.git(&["commit", "--quiet", "-m", "add agent log"], 10);
+        std::fs::write(dir.join("AGENT_LOG.md"), "modified log\n").unwrap();
+
+        // Stash the dirty base (only an agent-artifact file changed).
+        assert!(auto_stash_base(&mut c, "rsi/iter-test"));
+
+        // Reconcile — should DROP it (agent artifact only, no real content).
+        reconcile_preflight_stashes(&mut c);
+
+        // No preflight stash should remain.
+        let list = c.git(&["stash", "list"], 10).stdout;
+        assert!(
+            !list.contains("solomon-auto-preflight"),
+            "agent-artifact-only stash should be dropped"
+        );
+
+        // No recovery branch should be created.
+        let branches = c
+            .git(&["branch", "--list", "solomon-recovered/*"], 10)
+            .stdout;
+        assert!(
+            branches.trim().is_empty(),
+            "no recovery branch should be created for agent-artifact-only stashes"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&c.runtime);
     }
 }
