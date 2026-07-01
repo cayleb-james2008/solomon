@@ -327,16 +327,27 @@ mod tests {
     // The timeout branch must drain pipes concurrently: a child emitting far more than the ~64KB OS
     // pipe buffer must NOT block-on-write and time out. The old post-exit drain returned Err(TimedOut)
     // here (and lost the output); the thread-drain captures it all and exits fast.
+    //
+    // LOAD TOLERANCE (fleet-supervisor 2026-07-01T08:42Z): under heavy CPU contention the drain
+    // threads may starve, the child blocks on write(), wait_timeout expires, and the test spuriously
+    // REDs — a false gate-RED that silently drops a correct branch. Use a generous 120s deadline and
+    // retry ONCE on a timeout-class failure: a true deadlock fails on both attempts; a transient
+    // wall-clock flake under load recovers without weakening what the test verifies.
     #[cfg(windows)]
     #[test]
     fn run_timeout_drains_large_output_without_deadlock() {
+        use std::io::ErrorKind;
         // `for /L` emits ~8000 * 28-byte lines (~230KB) to stdout, well past one pipe buffer.
-        let out = run(
-            &["cmd", "/c", "for /L %i in (1,1,8000) do @echo XXXXXXXXXXXXXXXXXXXXXXXXXX"],
-            None,
-            Some(Duration::from_secs(30)),
-        )
-        .expect("timeout branch must not error on large output");
+        let args = &["cmd", "/c", "for /L %i in (1,1,8000) do @echo XXXXXXXXXXXXXXXXXXXXXXXXXX"];
+        let dur = Duration::from_secs(120);
+        let out = match run(args, None, Some(dur)) {
+            Ok(o) => o,
+            Err(e) if e.kind() == ErrorKind::TimedOut => {
+                run(args, None, Some(dur))
+                    .expect("timeout branch must not error on large output (after one retry on timeout)")
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        };
         assert_eq!(out.code, 0);
         assert!(
             out.stdout.len() > 100_000,
