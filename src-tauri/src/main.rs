@@ -9,6 +9,7 @@
 mod api; // native port of app.py's Api — the `bridge` command + headless backend (get_state, dispatch)
 mod control; // native port of control.py — repos registry, git/gh, locks, runner (the `bridge` backend)
 mod improver; // native port of improver/run_improver.py — the per-repo RSI loop (`run-improver` subcommand)
+mod ops; // ops plane (Phase 1): ground-truth probes + honest fleet status (`probe` subcommand + watchdog graft)
 mod redeploy; // native self-redeploy: swap Solomon's own production binary in a safe drain window
 mod supervisor; // native port of improver/solomon.py — diagnose() + the 3-rung recover() ladder + escalation
 mod watchdog; // native port of monitor.py — the `watchdog` subcommand (SolomonWatchdog scheduled sweep)
@@ -261,6 +262,12 @@ fn main() {
     // task). Dispatch BEFORE run_gui so no window is created, and exit with watchdog::main's return code.
     if argv.first().map(String::as_str) == Some("watchdog") {
         std::process::exit(watchdog::main());
+    }
+    // `solomon probe [name] [--json]` — the ops-plane ground-truth probe runner (Phase 1). Dispatch
+    // BEFORE run_gui so no window is created, and exit with the verdict code: 0 = all green,
+    // 3 = any yellow, 4 = any red (2 stays the usage-error code).
+    if argv.first().map(String::as_str) == Some("probe") {
+        std::process::exit(ops::outcomes::probe_main(&argv[1..]));
     }
     let is_sub = argv
         .first()
