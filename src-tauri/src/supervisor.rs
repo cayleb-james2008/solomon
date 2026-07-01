@@ -1162,6 +1162,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ---------------- key_shape_mismatch: MIRROR IMAGE (non-OpenRouter key on OpenRouter provider) ----------------
+    // The guard's second direction (ctx.rs): provider is 'openrouter' but the per-repo key does NOT
+    // start with sk-or-v1- — a stale key left behind when the provider was flipped TO openrouter.
+    // The message starts with "repos.json api_key for ... is set but does not look like an OpenRouter
+    // key ...". The no_key branch (checked BEFORE key_shape_mismatch) tests
+    // `summary.contains("not set") || summary.contains("API key")`. The mirror-image message says
+    // "is set but does not" (NOT "not set") and uses "api_key" (underscore, not "API key" with
+    // space), so no_key must NOT catch it — it must fall through to key_shape_mismatch. Without this
+    // test, a wording change to the guard's message (e.g. "API key not set correctly") would silently
+    // reroute the mirror-image drift to the generic no_key escalation, burying the exact provider/key
+    // mismatch the guard exists to surface — the same class of silent config drift as the original
+    // owl-alpha incident, just in the opposite direction.
+    #[test]
+    fn diagnose_key_shape_mismatch_mirror_image() {
+        let (dir, repo) = tmp_repo("keyshape_mirror");
+        write_hb(
+            &dir,
+            &json!({
+                "status": "error",
+                "last_summary": "repos.json api_key for 'demo' is set but does not look like an \
+                 OpenRouter key (OpenRouter keys are always prefixed sk-or-v1-...) while provider is \
+                 'openrouter' (resolved pi_provider 'openrouter') \u{2014} the mirror image of the \
+                 owl-alpha incident: the per-repo key points at a different provider than repos.json \
+                 names, so the model actually served would NOT be the configured OpenRouter model."
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], "key_shape_mismatch",
+            "mirror-image drift must classify as key_shape_mismatch, not no_key or unknown_error");
+        assert_eq!(d["auto_safe"], false);
+        assert_eq!(d["healthy"], false);
+        assert!(d["evidence"].as_str().unwrap().starts_with("repos.json api_key for 'demo'"));
+        // Same targeted recommendation as the first direction.
+        assert_eq!(
+            d["recommended"],
+            json!([
+                "fix repos.json: the per-repo api_key does not match the configured provider \
+                 \u{2014} set provider back to the key's provider, or clear/replace api_key"
+            ])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn recover_key_shape_mismatch_escalates() {
         // A key_shape_mismatch is not auto-safe and has no RUNG-0 action — recover() must escalate
@@ -1173,6 +1216,35 @@ mod tests {
             &json!({
                 "status": "error",
                 "last_summary": "repos.json api_key for 'demo' looks like an OpenRouter key"
+            }),
+        );
+        let out = recover(&repo, false, false, false);
+        assert_eq!(out["category"], "key_shape_mismatch");
+        assert_eq!(out["escalate"], true);
+        assert_eq!(out["actions_taken"], json!([]));
+        let read = read_escalation(&repo).expect("escalation.json written");
+        assert_eq!(read["category"], "key_shape_mismatch");
+        let steps = read["suggested_manual_steps"].as_array().unwrap();
+        assert!(steps
+            .iter()
+            .any(|s| s.as_str().unwrap().contains("repos.json")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_key_shape_mismatch_mirror_image_escalates() {
+        // The mirror-image direction (non-OpenRouter key on OpenRouter provider) must also escalate
+        // and write escalation.json with the targeted key_shape_mismatch category + suggested steps.
+        // Without this test, a wording change that reroutes the mirror-image message to no_key would
+        // silently bury the drift in a generic "add the provider API key in Settings" escalation.
+        let (dir, repo) = tmp_repo("keyshaperec_mirror");
+        write_hb(
+            &dir,
+            &json!({
+                "status": "error",
+                "last_summary": "repos.json api_key for 'demo' is set but does not look like an \
+                 OpenRouter key (OpenRouter keys are always prefixed sk-or-v1-...) while provider is \
+                 'openrouter' (resolved pi_provider 'openrouter')"
             }),
         );
         let out = recover(&repo, false, false, false);
