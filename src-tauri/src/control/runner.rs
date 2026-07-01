@@ -317,6 +317,19 @@ pub fn stop(repo: &Value) -> Value {
     json!({"ok": true})
 }
 
+/// True iff an API key is available for this repo's provider — either the per-repo `api_key`
+/// (which overrides the global .env key for this repo's iterations via Ctx::apply_api_key) or the
+/// global .env key. Mirrors supervisor::keys_provider_ready so enrich_contract/ideate don't silently
+/// block a repo keyed only per-repo (the same class of bug that stalled gate_red_streak fix-sessions
+/// for per-repo-keyed repos before that fix).
+fn provider_key_ready(repo: &Value) -> bool {
+    !crate::control::registry::project_api_key(repo).is_empty()
+        || crate::control::keys::keys_status()
+            .get(&crate::control::registry::project_provider(repo))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
 /// control.enrich_contract: run a one-shot provisioner (run_improver.py --provision). background=true
 /// spawns detached -> {ok, started}; otherwise blocks and passes through the runner's JSON line.
 pub fn enrich_contract(repo: &Value, background: bool) -> Value {
@@ -326,13 +339,9 @@ pub fn enrich_contract(repo: &Value, background: bool) -> Value {
     if name.is_empty() || path.is_empty() {
         return json!({"ok": false, "error": "repo has no name/path"});
     }
-    // 2. provider key.
+    // 2. provider key — per-repo api_key counts (see provider_key_ready).
     let prov = crate::control::registry::project_provider(repo);
-    if !crate::control::keys::keys_status()
-        .get(&prov)
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+    if !provider_key_ready(repo) {
         return json!({"ok": false, "error": format!("{} API key not set (add it in Settings)", prov)});
     }
     // 3/4. the runner is now this same binary's `run-improver` subcommand (no external Python host).
@@ -372,13 +381,9 @@ pub fn ideate(repo: &Value) -> Value {
     if locks::is_running(repo) {
         return json!({"ok": false, "error": "loop is running — stop it first to ideate manually (ideation also runs in-loop)"});
     }
-    // 3. provider key.
+    // 3. provider key — per-repo api_key counts (see provider_key_ready).
     let prov = crate::control::registry::project_provider(repo);
-    if !crate::control::keys::keys_status()
-        .get(&prov)
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+    if !provider_key_ready(repo) {
         return json!({"ok": false, "error": format!("{} API key not set (add it in Settings)", prov)});
     }
     // 4/5. the runner is now this same binary's `run-improver` subcommand (no external Python host).
@@ -630,5 +635,28 @@ mod tests {
     fn provision_error_strips_before_truncate() {
         let e = provision_error("   hello world   ", "", "provision failed");
         assert_eq!(e, "hello world");
+    }
+
+    // ---- provider_key_ready: per-repo api_key counts ----
+    // enrich_contract/ideate pre-flight on the provider key. A repo keyed only per-repo (no global
+    // .env key for its provider) must NOT be silently blocked — the per-repo api_key overrides the
+    // global key in the spawned run-improver process, so it is a valid key. The short-circuit (||)
+    // means a non-empty per-repo key never touches the real .env file, so this test is deterministic
+    // and machine-state-independent. Mirrors supervisor::keys_provider_ready's fix for the same class
+    // of silent-config-drift bug.
+    #[test]
+    fn provider_key_ready_per_repo_key_counts() {
+        // per-repo key set -> ready regardless of global .env state
+        let repo = json!({ "name": "pkr_1", "provider": "openrouter", "api_key": "sk-or-v1-xyz" });
+        assert!(provider_key_ready(&repo), "per-repo api_key must count as ready");
+        let repo2 = json!({ "name": "pkr_2", "provider": "ollama-cloud", "api_key": "oc-key-abc" });
+        assert!(provider_key_ready(&repo2), "per-repo api_key counts for any provider");
+        // no per-repo key, no global key -> not ready (the global check is env-dependent, but an
+        // unknown provider with no per-repo key is deterministically not ready)
+        let repo3 = json!({ "name": "pkr_3", "provider": "definitely-not-a-real-provider" });
+        assert!(!provider_key_ready(&repo3), "no per-repo key + unknown provider -> not ready");
+        // empty per-repo key falls through to the global check
+        let repo4 = json!({ "name": "pkr_4", "provider": "definitely-not-a-real-provider", "api_key": "" });
+        assert!(!provider_key_ready(&repo4), "empty per-repo key -> falls through to global (unknown provider -> not ready)");
     }
 }
