@@ -192,6 +192,53 @@ fn base_is_clean(path: &str) -> bool {
     r.code == 0 && r.stdout.trim().is_empty()
 }
 
+/// True iff the local `base` branch is NOT ahead of `origin/<base>` — i.e. the un-pushed commits
+/// that triggered an `unpushed_base_persistent` self-stop have since been pushed (or the base was
+/// reset back to origin). Used to auto-recover that self-stop ONLY once the operator has actually
+/// reconciled the base, so clearing the stop can never thrash (a still-ahead base stays stopped).
+/// Safe on any error (missing remote ref, spawn failure): returns False, leaving the stop in place.
+fn base_is_pushed(path: &str, base: &str) -> bool {
+    if path.is_empty() || base.is_empty() || !Path::new(path).is_dir() {
+        return false;
+    }
+    // git -C path rev-list --count origin/<base>..<base> -> "0" when base is not ahead of origin.
+    let range = format!("origin/{base}..{base}");
+    let r = match control::proc::run(
+        &["git", "-C", path, "rev-list", "--count", range.as_str()],
+        None,
+        None,
+    ) {
+        Ok(r) => r,
+        Err(_) => return false, // OSError -> False
+    };
+    r.code == 0 && r.stdout.trim() == "0"
+}
+
+/// The persistent-bail self-stop re-observation policy. The runner self-stops (STOP sentinel +
+/// `status=error` + a `reason` marker) on a PERSISTENTLY dirty / un-pushed base so it doesn't spin
+/// forever — but that sentinel otherwise pins the lane DEAD until a human clicks Start, leaving a
+/// stale heartbeat that `diagnose` keeps re-escalating as `stop_lingering` even after the operator
+/// has fixed the cause. The watchdog re-observes the underlying condition each sweep and clears the
+/// sentinel once the cause is ACTUALLY healed, so the lane resumes on the next `should_restart`
+/// instead of lingering in a stale escalation.
+///
+/// Returns the auto-recover action message (the suffix after `"{name} auto-recover: "`) when the
+/// sentinel should be cleared for this `reason`, else `None`. Pure — the git condition checks are
+/// passed in as bools — so the policy is unit-tested. Only fires on the runner's own reason markers
+/// AND a verified-healed condition, so it never thrashes and never touches a true operator Stop
+/// (status="stopped", no reason).
+fn persistent_stop_cleared(reason: &str, base_clean: bool, base_pushed: bool) -> Option<&'static str> {
+    match reason {
+        "dirty_base_persistent" if base_clean => {
+            Some("base clean again — cleared dirty_base_persistent stop")
+        }
+        "unpushed_base_persistent" if base_pushed => {
+            Some("base pushed again — cleared unpushed_base_persistent stop")
+        }
+        _ => None,
+    }
+}
+
 /// monitor._sweep_repo: process ONE repo for sweep(); returns (actions, snap). The caller runs this
 /// inside a blanket try/except so one bad repo can never abort the whole sweep — the module's
 /// documented 'a watchdog must never die on one bad repo' contract.
@@ -211,27 +258,32 @@ fn sweep_repo(r: &Value, auto_push_flag: bool) -> (Vec<String>, Value) {
     let running = control::locks::is_running(r);
     let hb = control::heartbeat::read_heartbeat(r).unwrap_or_else(|| json!({}));
 
-    // Anti-wedge: the runner self-stops on a PERSISTENTLY dirty base (STOP sentinel +
-    // reason="dirty_base_persistent") so it doesn't spin forever — but that sentinel otherwise pins
-    // the lane DEAD until a human clicks Start. If the base is now CLEAN again, clear the
-    // self-written sentinel so should_restart heals the lane automatically. Safe: only fires on the
-    // runner's own reason marker AND a verified-clean tree, so it never thrashes and never touches a
-    // true operator Stop (status="stopped", no reason).
+    // Anti-wedge: the runner self-stops on a PERSISTENTLY dirty / un-pushed base (STOP sentinel +
+    // status=error + a reason marker) so it doesn't spin forever — but that sentinel otherwise pins
+    // the lane DEAD until a human clicks Start, leaving a stale heartbeat that diagnose keeps
+    // re-escalating as stop_lingering even AFTER the operator has fixed the cause. Re-observe the
+    // underlying condition each sweep and clear the self-written sentinel once the cause is actually
+    // healed, so should_restart heals the lane automatically. Safe: only fires on the runner's own
+    // reason marker AND a verified-healed condition (see persistent_stop_cleared), so it never
+    // thrashes and never touches a true operator Stop (status="stopped", no reason).
     if !running
         && !paused
         && stop_pending
         && hb.get("status").and_then(Value::as_str) == Some("error")
-        && hb.get("reason").and_then(Value::as_str) == Some("dirty_base_persistent")
-        && base_is_clean(&paths::repo_path(r))
     {
-        if let Some(ref d) = rt {
-            if std::fs::remove_file(d.join("stop")).is_ok() {
-                stop_pending = false;
-                actions.push(format!(
-                    "{name} auto-recover: base clean again — cleared dirty_base_persistent stop"
-                ));
+        if let Some(reason) = hb.get("reason").and_then(Value::as_str) {
+            let path = paths::repo_path(r);
+            let base = control::registry::project_pr_target_branch(r);
+            let msg = persistent_stop_cleared(reason, base_is_clean(&path), base_is_pushed(&path, &base));
+            if let Some(m) = msg {
+                if let Some(ref d) = rt {
+                    if std::fs::remove_file(d.join("stop")).is_ok() {
+                        stop_pending = false;
+                        actions.push(format!("{name} auto-recover: {m}"));
+                    }
+                    // OSError -> pass (leave stop_pending as-is)
+                }
             }
-            // OSError -> pass (leave stop_pending as-is)
         }
     }
 
@@ -530,6 +582,42 @@ mod tests {
             false,
             false
         ));
+    }
+
+    // -------- persistent_stop_cleared: re-observe-after-fix policy --------
+    // The watchdog must clear a persistent-bail self-stop sentinel ONLY when the underlying cause
+    // is actually healed, so a stale stop_lingering escalation does not outlive the fix. Pure
+    // policy under test; the git condition checks are passed in as bools.
+    #[test]
+    fn persistent_stop_cleared_dirty_when_clean() {
+        // dirty_base_persistent + base now clean -> cleared (byte-identical legacy message).
+        assert_eq!(
+            persistent_stop_cleared("dirty_base_persistent", true, false),
+            Some("base clean again — cleared dirty_base_persistent stop")
+        );
+        // still dirty -> leave the stop (do not thrash).
+        assert_eq!(persistent_stop_cleared("dirty_base_persistent", false, false), None);
+    }
+
+    #[test]
+    fn persistent_stop_cleared_unpushed_when_pushed() {
+        // unpushed_base_persistent + base no longer ahead of origin -> cleared.
+        assert_eq!(
+            persistent_stop_cleared("unpushed_base_persistent", false, true),
+            Some("base pushed again — cleared unpushed_base_persistent stop")
+        );
+        // still ahead -> leave the stop.
+        assert_eq!(persistent_stop_cleared("unpushed_base_persistent", false, false), None);
+    }
+
+    #[test]
+    fn persistent_stop_cleared_ignores_other_reasons() {
+        // base_gate_red_persistent is NOT re-observed here (running the gate is too expensive /
+        // gate-cmd-specific for the watchdog sweep) -> stays stopped until a human clicks Start.
+        assert_eq!(persistent_stop_cleared("base_gate_red_persistent", true, true), None);
+        // a true operator Stop carries no reason marker -> never auto-cleared.
+        assert_eq!(persistent_stop_cleared("", true, true), None);
+        assert_eq!(persistent_stop_cleared("anything_else", true, true), None);
     }
 
     // -------- _auto_push truthiness --------
