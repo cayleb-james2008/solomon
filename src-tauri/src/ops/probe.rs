@@ -724,7 +724,8 @@ fn sqlite_value_eq(got: &Value, expect: &Value) -> bool {
 }
 
 /// First column of the first row, as a JSON value. Read-only open — no create, no write, ever.
-fn sqlite_single_value(db: &Path, query: &str) -> Result<Value, String> {
+/// pub(crate): the outcomes ledger reuses this for its finance collector (same read-only contract).
+pub(crate) fn sqlite_single_value(db: &Path, query: &str) -> Result<Value, String> {
     use rusqlite::types::ValueRef;
     let conn = rusqlite::Connection::open_with_flags(
         db,
