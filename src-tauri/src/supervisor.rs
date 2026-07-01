@@ -1428,6 +1428,109 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ---------------- diagnose: stale-heartbeat + live PID recovery path ----------------
+    // The `stuck` category (running && non-sleep phase && stale heartbeat) is one of the four
+    // AUTO_SAFE recovery paths, but it has a subtle interaction with `is_running`: both `stale` and
+    // `lock_is_live_decide` use the SAME staleness threshold (max(3*interval, LOCK_LIVE_FLOOR_S)).
+    // So when the heartbeat is stale, `is_running` returns false (the lock is not live), which makes
+    // `running=false`, which PREVENTS the `stuck` branch from firing. Instead the lane falls through
+    // to `stale_lock` (has_lock && !running), which clears the lock and lets the watchdog's
+    // should_restart heal the lane. This is bug-for-bug with the Python source — the `stuck` branch
+    // fires only in the narrow race where diagnose's local `hb` is stale but is_running's re-read is
+    // fresh. These tests pin the ACTUAL cascade behavior (the recovery path operators hit in
+    // practice when a loop freezes with a live PID) so a future change to `stuck` or the staleness
+    // threshold can't silently reroute the recovery without a test catching it.
+    fn ts_ago(secs: i64) -> String {
+        (Utc::now() - chrono::Duration::seconds(secs))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    }
+
+    #[test]
+    fn diagnose_stale_heartbeat_live_pid_is_stale_lock_not_stuck() {
+        let (dir, repo) = tmp_repo("stale_live_pid");
+        // Lock held by THIS process (a genuinely live PID) with a run_id.
+        let run_id = "tok-stale-live";
+        std::fs::write(
+            dir.join("lock"),
+            format!("{}\n{}", std::process::id(), run_id),
+        )
+        .unwrap();
+        // Heartbeat with a MATCHING run_id (so lock_is_live's orphan check passes), a non-sleep
+        // phase, but a STALE updated_at (5000s ago > 4500s floor). lock_is_live_decide sees the
+        // stale age -> is_running returns false -> the `stuck` branch (which needs running=true)
+        // CANNOT fire. Instead has_lock && !running -> stale_lock.
+        write_hb(
+            &dir,
+            &json!({
+                "status": "iterating",
+                "phase": "implement",
+                "run_id": run_id,
+                "updated_at": ts_ago(5000),
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], "stale_lock", "a stale heartbeat makes is_running false, so the lane is stale_lock not stuck");
+        assert_eq!(d["auto_safe"], true);
+        assert_eq!(d["running"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnose_fresh_heartbeat_live_pid_is_ok_not_stuck() {
+        let (dir, repo) = tmp_repo("fresh_live_pid");
+        let run_id = "tok-fresh-live";
+        std::fs::write(
+            dir.join("lock"),
+            format!("{}\n{}", std::process::id(), run_id),
+        )
+        .unwrap();
+        // Fresh heartbeat (1s ago) + matching run_id + non-sleep phase -> is_running true, but
+        // stale() is false -> not stuck. No error conditions -> ok.
+        write_hb(
+            &dir,
+            &json!({
+                "status": "iterating",
+                "phase": "implement",
+                "run_id": run_id,
+                "updated_at": ts_ago(1),
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], "ok");
+        assert_eq!(d["running"], true);
+        assert_eq!(d["healthy"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnose_sleeping_lane_with_stale_heartbeat_is_stale_lock_not_stuck() {
+        // A lane in phase "sleep" is explicitly EXCLUDED from `stuck` (a sleeping lane between
+        // iterations has a legitimately older heartbeat). With a stale heartbeat + a live-PID lock,
+        // it's stale_lock (is_running false), NOT stuck — confirming the phase guard is moot here
+        // because the staleness guard in is_running already short-circuits running to false.
+        let (dir, repo) = tmp_repo("sleep_stale");
+        let run_id = "tok-sleep-stale";
+        std::fs::write(
+            dir.join("lock"),
+            format!("{}\n{}", std::process::id(), run_id),
+        )
+        .unwrap();
+        write_hb(
+            &dir,
+            &json!({
+                "status": "sleeping",
+                "phase": "sleep",
+                "run_id": run_id,
+                "updated_at": ts_ago(5000),
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], "stale_lock");
+        assert_eq!(d["running"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---------------- suggested_steps ----------------
     #[test]
     fn suggested_steps_per_category() {
