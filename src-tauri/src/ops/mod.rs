@@ -7,11 +7,11 @@
 //! fleet-supervisor failure mode: "all healthy" while Sover wasn't posting and Asmodeus wasn't
 //! trading.
 //!
-//!   - `registry`  — ops.json (sibling of repos.json, joined to it BY NAME), lenient Value parse
-//!   - `probe`     — the per-kind evaluators (file_age, json_field, jsonl_tail, log_grep, process,
-//!                   sqlite_query, cmd, http_get, git_sha_match, file_exists)
-//!   - `outcomes`  — the sweep: run all probes, persist verdicts + fleet status + incident
-//!                   transitions under runtime/, and the `solomon probe` CLI entry
+//!   - `registry` — ops.json (sibling of repos.json, joined to it BY NAME), lenient Value parse
+//!   - `probe` — the per-kind evaluators (file_age, json_field, jsonl_tail, log_grep, process,
+//!     sqlite_query, cmd, http_get, git_sha_match, file_exists)
+//!   - `outcomes` — the sweep: run all probes, persist verdicts + fleet status + incident
+//!     transitions under runtime/, and the `solomon probe` CLI entry
 //!
 //! All state is file-based under runtime/ (gitignored): runtime/<name>/probes_verdict.json,
 //! runtime/ops_status.json, append-only runtime/_incidents.jsonl. No scheduled task exists and

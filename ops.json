@@ -31,7 +31,7 @@
                 "query": "SELECT MAX(ts) FROM equity WHERE source='tradelocker'",
                 "mode": "age",
                 "red_after_s": 900,
-                "comment": "Best-effort: the equity table read currently fails ('database disk image is malformed', verified 2026-07-01) -> yellow unobservable until the db is repaired."
+                "comment": "Best-effort: this table intermittently reads as 'database disk image is malformed' (observed 2026-07-01, succeeded later the same day) -> such failures degrade to yellow unobservable, never a crash."
             },
             {
                 "id": "auth_health",
