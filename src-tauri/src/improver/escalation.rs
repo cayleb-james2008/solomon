@@ -1016,7 +1016,7 @@ mod tests {
         c.fail_counts.insert("g".to_string(), 2);
         c.escalated_goals.insert("g".to_string());
         clear_failure_state(&mut c, "g");
-        assert!(c.fail_counts.get("g").is_none());
+        assert!(!c.fail_counts.contains_key("g"));
         assert!(!c.escalated_goals.contains("g"));
         // safe when absent
         clear_failure_state(&mut c, "missing");
@@ -1316,7 +1316,7 @@ largest coherent slice that can be edited, tested, and shipped in one cycle"
         assert_eq!(c.consecutive_reverts.get("add a widget"), Some(&1));
         // a noop breaks the consecutive-revert streak
         note_noop(&mut c, "add a widget", 3);
-        assert!(c.consecutive_reverts.get("add a widget").is_none());
+        assert!(!c.consecutive_reverts.contains_key("add a widget"));
         assert!(c.hb.get("stuck_goal").is_none(), "stuck_goal cleared on noop");
         // next revert starts from 1 again (not 2)
         note_consecutive_revert(&mut c, "add a widget");
@@ -1332,7 +1332,7 @@ largest coherent slice that can be edited, tested, and shipped in one cycle"
         assert_eq!(c.hb.get("stuck_goal").and_then(Value::as_str), Some("add a widget"));
         // a successful ship clears everything
         clear_failure_state(&mut c, "add a widget");
-        assert!(c.consecutive_reverts.get("add a widget").is_none());
+        assert!(!c.consecutive_reverts.contains_key("add a widget"));
         assert!(c.hb.get("stuck_goal").is_none(), "stuck_goal cleared on ship");
     }
 

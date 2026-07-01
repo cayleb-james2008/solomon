@@ -4,13 +4,14 @@
 //! changes) live here together with their pure predicates/parsers:
 //!   1. the test/command gate            — `run_gate` / `run_gate_once`
 //!   2. the anti-gaming skip-marker scan — `anti_gaming_reason` (+ new_skip_markers / added_test_defs /
-//!                                          removed_test_defs / item_demands_tests)
+//!      removed_test_defs / item_demands_tests)
 //!   3. the cross-repo gate              — `run_cross_repo_gates` (+ cross_repo_deps)
 //!   4. the eval gate                    — `run_eval_gate` (+ parse_eval_score / eval_cmd /
-//!                                          eval_gate_reason)
+//!      eval_gate_reason)
 //!   5. the leak/secret guard            — `leak_in_diff`
-//!   6/7. review/visual gate predicates  — `visual_gate_enabled` / `visual_gate_reason`
-//!   plus the no-op model-quality signal — `narrated_without_writing`.
+//!
+//! 6/7. review/visual gate predicates  — `visual_gate_enabled` / `visual_gate_reason`;
+//! plus the no-op model-quality signal — `narrated_without_writing`.
 //!
 //! Returned dicts are `serde_json::Value` with keys byte-identical to the Python dicts, and the
 //! revert-reason / log strings are quoted verbatim from the source (em-dashes and arrows included).
@@ -467,7 +468,7 @@ pub fn new_skip_markers(diff_text: &str) -> Vec<String> {
     let js = skip_marker_js_re();
     diff_text
         .lines()
-        .filter(|ln| ln.starts_with('+') && !ln.starts_with("+++") && skip_marker_matches(ln, &plain, &js))
+        .filter(|ln| ln.starts_with('+') && !ln.starts_with("+++") && skip_marker_matches(ln, plain, js))
         .map(|s| s.to_string())
         .collect()
 }

@@ -86,9 +86,8 @@ fn read_jsonl_tail(repo: &Value, file: &str, limit: usize) -> Vec<Value> {
     };
     // Python str.splitlines(): split on line boundaries, no trailing empty element.
     let lines = splitlines(&content);
-    let window: &[&str] = if limit == 0 {
-        &lines[..] // [-0:] == [0:] == all
-    } else if limit >= lines.len() {
+    let window: &[&str] = if limit == 0 || limit >= lines.len() {
+        // limit == 0: [-0:] == [0:] == all; limit >= len: whole slice.
         &lines[..]
     } else {
         &lines[lines.len() - limit..]

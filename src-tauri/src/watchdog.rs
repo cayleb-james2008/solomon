@@ -16,6 +16,7 @@
 //! Operator controls (honored, non-destructive):
 //!   - `runtime/_watchdog.disabled`  — global kill-switch; the sweep does nothing.
 //!   - `runtime/<name>/paused`       — never auto-restart this one repo.
+//!
 //! A clean Stop from the GUI already sets `status="stopped"` and is respected automatically.
 //!
 //! The returns that back the JSONL/log are `serde_json::Value` whose keys are byte-identical to the
@@ -130,9 +131,10 @@ fn recent_snapshots_from(
 /// (iterating/sleeping/idle) AND a transient/retryable error (e.g. a flaky red base gate). Left alone:
 ///   - `"stopped"`                  — a clean exit (operator Stop / max-iterations);
 ///   - `"error"` + `phase=reverted` — a revert-failure HALT that needs operator cleanup (a blind
-///                                     restart just re-hits the known-bad tree);
+///     restart just re-hits the known-bad tree);
 ///   - no heartbeat                 — a repo that never ran (the watchdog keeps enabled loops alive,
-///                                     it does not auto-enable new ones).
+///     it does not auto-enable new ones).
+///
 /// A persistent error (no key, dirty base) restarts, re-errors immediately, and the supervisor's
 /// diagnose/anti-thrash escalates it — so it surfaces without the watchdog having to classify it.
 pub fn should_restart(running: bool, hb: &Value, paused: bool, stop_pending: bool) -> bool {
@@ -165,6 +167,7 @@ pub fn should_restart(running: bool, hb: &Value, paused: bool, stop_pending: boo
 ///     `"Pi session timed out."`).
 ///   - **GATE-RED** — `status == "reverted"` and `tests.green == false` (the test gate failed).
 ///   - **SHIP** — `status == "shipped"` (a successful merge/push).
+///
 /// Any other outcome (a ship, a non-timeout noop, a non-gate revert, an error, a blocked) or fewer
 /// than `k` records breaks the streak → healthy (no false degradation from a single flake).
 ///
@@ -585,7 +588,7 @@ pub fn sweep() -> Value {
         }
         let has_name = r
             .get("name")
-            .map(|n| json_truthy(n))
+            .map(json_truthy)
             .unwrap_or(false);
         if !has_name {
             continue;

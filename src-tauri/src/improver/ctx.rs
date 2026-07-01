@@ -1113,6 +1113,7 @@ fn which(name: &str, extra: &[&str]) -> String {
 ///      `expected value at line 1 column 1`; strip it before parsing.
 ///   2. an empty / whitespace-only file — equivalent to a valid `[]` repos.json (no rows => no
 ///      per-repo override => keep current config). Treated as `Ok([])` rather than a parse error.
+///
 /// Genuine non-empty corruption (garbage that is not whitespace) still errors and is logged loudly.
 fn read_repos_json_raw(control: &Path) -> Result<Value, String> {
     let path = control.join("repos.json");

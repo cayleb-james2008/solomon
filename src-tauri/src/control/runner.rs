@@ -325,7 +325,7 @@ pub fn stop(repo: &Value) -> Value {
 fn provider_key_ready(repo: &Value) -> bool {
     !crate::control::registry::project_api_key(repo).is_empty()
         || crate::control::keys::keys_status()
-            .get(&crate::control::registry::project_provider(repo))
+            .get(crate::control::registry::project_provider(repo))
             .and_then(Value::as_bool)
             .unwrap_or(false)
 }

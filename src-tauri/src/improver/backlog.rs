@@ -91,6 +91,7 @@ pub fn recent_noop_streak(ctx: &Ctx) -> i64 {
 ///   2. the chosen item `goal.lower()` contains the generic placeholder `"model-chosen improvement"`
 ///      OR an already-deferred marker `"(deferred"`, AND
 ///   3. `recent_noop_streak() > 0`.
+///
 /// A repo with a REAL backlog item OR one still shipping real changes with no GOAL still runs.
 pub fn needs_goal_skip(ctx: &Ctx, goal: &str) -> bool {
     let g = goal.to_lowercase();
@@ -124,9 +125,9 @@ pub fn top_backlog_item(ctx: &Ctx) -> Option<(String, String)> {
     if let Ok(content) = std::fs::read_to_string(&ctx.backlog) {
         for line in content.lines() {
             let s = line.trim();
-            if s.starts_with("- [ ]") {
+            if let Some(after) = s.strip_prefix("- [ ]") {
                 // s[5:].strip() — slice past "- [ ]" (5 bytes, all ASCII) then strip.
-                let rest = s[5..].trim();
+                let rest = after.trim();
                 return Some(strip_tier(rest));
             }
         }

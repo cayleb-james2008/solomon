@@ -123,10 +123,7 @@ pub fn discover_projects() -> Vec<Value> {
 
 /// control._read_repos_json: lenient raw list read. [] on missing/corrupt/non-list (display paths).
 pub fn read_repos_json() -> Vec<Value> {
-    match read_repos_json_strict() {
-        Ok(v) => v,
-        Err(_) => Vec::new(),
-    }
+    read_repos_json_strict().unwrap_or_default()
 }
 
 /// control._read_repos_json_strict: open utf-8 + json.load. FileNotFound -> Ok([]); a parsed
@@ -481,7 +478,7 @@ pub fn parse_repo_spec(spec: &str) -> Option<(String, String)> {
             return None;
         }
         // s.split("github.com/", 1)[1]
-        s = s.splitn(2, "github.com/").nth(1).unwrap_or("").to_string();
+        s = s.split_once("github.com/").map(|x| x.1).unwrap_or("").to_string();
     }
     let s = s.trim_matches('/');
     let s = s.strip_suffix(".git").unwrap_or(s);
