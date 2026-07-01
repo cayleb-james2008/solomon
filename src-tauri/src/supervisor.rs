@@ -191,6 +191,11 @@ pub fn diagnose(repo: &Value) -> Value {
     let rtd = rt(repo);
     let has_lock = rtd.as_ref().map(|d| d.join("lock").exists()).unwrap_or(false);
     let has_stop = rtd.as_ref().map(|d| d.join("stop").exists()).unwrap_or(false);
+    // The lock's PID, read once so both the stale_lock branch and downstream logic see the same value.
+    // Used to distinguish a truly-dead lock (PID gone -> safe to clear) from a HUNG loop (PID alive
+    // but heartbeat stale -> must NOT auto-clear; the hung process would keep running and a new
+    // improver would start alongside it).
+    let lock_pid = rtd.as_ref().map(|d| locks::read_lock(d).0).unwrap_or(0);
 
     let status = hb.get("status").and_then(Value::as_str);
     let phase = hb.get("phase").and_then(Value::as_str);
@@ -318,9 +323,25 @@ pub fn diagnose(repo: &Value) -> Value {
         safe = false;
     } else if has_lock && !running {
         cat = "stale_lock".into();
-        ev = "lock file present but no live improver PID".into();
-        rec = vec!["clear the stale lock".into()];
-        safe = true;
+        if lock_pid != 0 && locks::pid_alive(lock_pid) {
+            // is_running returned false because the heartbeat is stale, but the lock PID is
+            // actually ALIVE — the loop is HUNG, not dead. Auto-clearing the lock would leave the
+            // hung process running and let the watchdog's should_restart spawn a SECOND improver
+            // on the same repo (two processes mutating one git tree). NOT auto-safe: the operator
+            // must kill the hung PID before the lock is cleared (Solomon will not force-kill).
+            ev = format!(
+                "lock held by pid {lock_pid} (alive) but heartbeat is stale — the loop is hung; \
+                 kill pid {lock_pid} then clear the lock (Solomon will not force-kill)"
+            );
+            rec = vec![format!(
+                "kill the hung improver (pid {lock_pid}), then clear the stale lock"
+            )];
+            safe = false;
+        } else {
+            ev = "lock file present but no live improver PID".into();
+            rec = vec!["clear the stale lock".into()];
+            safe = true;
+        }
     } else if has_stop && !running {
         let clean_exit = status == Some("stopped");
         cat = "stop_lingering".into();
@@ -1291,6 +1312,64 @@ mod tests {
         let d = diagnose(&repo);
         assert_eq!(d["category"], "stop_lingering");
         assert_eq!(d["auto_safe"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------- stale_lock: PID alive (hung loop) is NOT auto-safe ----------------
+    // is_running returns false when the heartbeat is stale, EVEN when the lock PID is alive.
+    // Previously this was classified as stale_lock with auto_safe=true, so recover() would
+    // clear_lock (just remove the file) — leaving the hung process running — and the watchdog's
+    // should_restart would spawn a SECOND improver on the same repo. Now diagnose detects the
+    // alive PID and sets auto_safe=false so recover() escalates (operator must kill the hung PID).
+    #[test]
+    fn diagnose_stale_lock_with_live_pid_is_not_auto_safe() {
+        let (dir, repo) = tmp_repo("stalelock_livepid");
+        // Lock held by THIS process's PID (alive) + a stale heartbeat (old updated_at).
+        let my_pid = std::process::id().to_string();
+        std::fs::write(dir.join("lock"), format!("{my_pid}\ntokA")).unwrap();
+        let old = (Utc::now() - chrono::Duration::seconds(5000))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        write_hb(
+            &dir,
+            &json!({"status": "iterating", "phase": "implement", "run_id": "tokA",
+                    "updated_at": old}),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], "stale_lock");
+        assert_eq!(d["auto_safe"], false, "alive PID + stale heartbeat must NOT be auto-safe");
+        let ev = d["evidence"].as_str().unwrap();
+        assert!(ev.contains("hung"), "evidence must say the loop is hung: {ev}");
+        assert!(ev.contains(&my_pid), "evidence must name the PID: {ev}");
+        let rec = d["recommended"].as_array().unwrap();
+        assert!(rec.iter().any(|s| s.as_str().unwrap().contains("kill")),
+                "recommendation must say to kill the hung PID: {rec:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_stale_lock_with_live_pid_escalates() {
+        // The same scenario through recover(): auto_safe=false means recover() escalates instead
+        // of auto-clearing the lock. The lock file must remain on disk (the hung PID still holds
+        // it) and an escalation.json must be written so the operator is notified.
+        let (dir, repo) = tmp_repo("recstale_livepid");
+        let my_pid = std::process::id().to_string();
+        std::fs::write(dir.join("lock"), format!("{my_pid}\ntokA")).unwrap();
+        let old = (Utc::now() - chrono::Duration::seconds(5000))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        write_hb(
+            &dir,
+            &json!({"status": "iterating", "phase": "implement", "run_id": "tokA",
+                    "updated_at": old}),
+        );
+        let out = recover(&repo, false, true, true);
+        assert_eq!(out["category"], "stale_lock");
+        assert_eq!(out["escalate"], true);
+        assert_eq!(out["actions_taken"], json!([]));
+        // The lock must NOT have been cleared (the hung PID still holds it).
+        assert!(dir.join("lock").exists(), "lock must not be auto-cleared for a live PID");
+        assert!(dir.join("escalation.json").exists(), "escalation.json must be written");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
