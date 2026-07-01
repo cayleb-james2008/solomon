@@ -249,6 +249,9 @@ pub struct Ctx {
 
     // ---- anti-thrash: consecutive-revert counter keyed on goal text ----
     pub consecutive_reverts: HashMap<String, i64>,
+
+    // ---- anti-thrash: consecutive empty-ideate counter (ideate-empty thrash guard) ----
+    pub consecutive_empty_ideate: i64,
 }
 
 impl Ctx {
@@ -384,6 +387,7 @@ impl Ctx {
 
             // anti-thrash
             consecutive_reverts: HashMap::new(),
+            consecutive_empty_ideate: 0,
         }
     }
 

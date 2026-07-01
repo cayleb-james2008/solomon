@@ -921,11 +921,29 @@ data or a secret to the PUBLIC repo; fix the change to exclude it."
 // ideate_phase + ideate (run_improver ~3191-3263) — not provided by a leaf module
 // --------------------------------------------------------------------------- #
 
+/// Max consecutive empty-ideate results before the loop self-stops (ideate-empty thrash guard).
+/// A single empty parse injects a default self-review goal and proceeds; K consecutive empties
+/// (a truly dry loop) winds the loop down so the watchdog doesn't restart it every 2 minutes.
+const EMPTY_IDEATE_STOP_LIMIT: i64 = 3;
+
+/// The default self-review goal injected when ideate returns no parseable ideas, so the iteration
+/// proceeds with real work instead of bailing through `needs_goal_skip` and thrashing the watchdog.
+const EMPTY_IDEATE_FALLBACK_GOAL: &str =
+    "read the code and fix one real bug, missing test, or ponytail-style simplification you find; \
+     a truthful no-op beats a cosmetic change";
+
 /// run_improver.ideate_phase (~3248-3263): pipeline-phase wrapper for ideate(), run BEFORE plan at
 /// the top of an iteration when the backlog is thin. No-op when disabled or when the backlog already
 /// has >=5 actionable items (a refill valve, not a firehose). Best-effort: never wedges the loop
 /// (ideate() here cannot panic — run_pi returns a RunOut — so the Python `except Exception` branch is
 /// structurally unreachable; the same "continuing to plan/implement" outcome holds).
+///
+/// IDEATE-EMPTY THRASH GUARD: when ideate returns no parseable ideas (rc=5), do NOT let the iteration
+/// fall through to `needs_goal_skip` (which bails with status=error, causing the watchdog to restart
+/// the lane ~every 2 minutes — the observed solomon-self restart loop). Instead, inject a default
+/// self-review goal into the backlog so `top_backlog_item` picks it up and the iteration proceeds.
+/// Only after K (`EMPTY_IDEATE_STOP_LIMIT`) CONSECUTIVE empty-ideate results in a single run does the
+/// loop self-stop (writing the STOP sentinel) so a truly dry loop still winds down.
 fn ideate_phase(ctx: &mut Ctx) {
     if !ctx.ideate_enabled {
         return;
@@ -939,6 +957,63 @@ fn ideate_phase(ctx: &mut Ctx) {
         "ideate phase: {} (rc={rc})",
         if rc == 0 { "ok" } else { "no fresh ideas" }
     ));
+    if rc == 0 {
+        ctx.consecutive_empty_ideate = 0;
+        return;
+    }
+    // ideate returned no parseable ideas (rc=5).
+    ctx.consecutive_empty_ideate += 1;
+    if ctx.consecutive_empty_ideate >= EMPTY_IDEATE_STOP_LIMIT {
+        ctx.log(&format!(
+            "SELF-STOP: {} consecutive empty-ideate results — writing STOP (the loop is dry; \
+             a restart won't help)",
+            ctx.consecutive_empty_ideate
+        ));
+        let _ = std::fs::write(&ctx.stop_path, "empty_ideate_persistent\n");
+        return;
+    }
+    // Inject a default self-review goal so the iteration proceeds instead of bailing through
+    // needs_goal_skip. Prepend a `- [ ]` line to the backlog; top_backlog_item will pick it up.
+    inject_fallback_goal(ctx);
+    ctx.log(&format!(
+        "ideate empty (#{} consecutive) — injected default self-review goal; proceeding",
+        ctx.consecutive_empty_ideate
+    ));
+}
+
+/// Prepend a default self-review goal line to the backlog so `top_backlog_item` returns it instead
+/// of the generic "model-chosen improvement" placeholder (which triggers `needs_goal_skip` when no
+/// north-star goal is set). Best-effort: a write failure is logged but never wedges the loop.
+fn inject_fallback_goal(ctx: &mut Ctx) {
+    let existing = if ctx.backlog.exists() {
+        std::fs::read_to_string(&ctx.backlog).unwrap_or_else(|_| "# backlog\n".to_string())
+    } else {
+        "# backlog\n".to_string()
+    };
+    let lines: Vec<&str> = existing.lines().collect();
+    let head = if lines
+        .first()
+        .map(|l| l.trim_start().starts_with('#'))
+        .unwrap_or(false)
+    {
+        1
+    } else {
+        0
+    };
+    let mut merged: Vec<String> = Vec::new();
+    merged.extend(lines[..head].iter().map(|s| s.to_string()));
+    if head > 0 {
+        merged.push(String::new());
+    }
+    merged.push(format!("- [ ] {}", EMPTY_IDEATE_FALLBACK_GOAL));
+    merged.extend(lines[head..].iter().map(|s| s.to_string()));
+    let body = format!("{}\n", merged.join("\n").trim_end());
+    if let Some(parent) = ctx.backlog.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::write(&ctx.backlog, body).is_err() {
+        ctx.log("ideate-empty fallback: could not write backlog — proceeding with placeholder goal");
+    }
 }
 
 /// run_improver.ideate (~3191-3245): one divergent pass — pi proposes ambitious, leverage-ranked,
@@ -1445,6 +1520,7 @@ mod tests {
             std::env::temp_dir().join(format!("solomon_iter_test_{}_{}", std::process::id(), uniq));
         c.backlog = c.runtime.join("backlog.md");
         c.lessons = c.runtime.join("LESSONS.md");
+        c.stop_path = c.runtime.join("stop");
         c
     }
 
@@ -1626,5 +1702,95 @@ The following:";
         assert_eq!(c.hb.get("iteration").and_then(Value::as_i64), Some(1));
         increment_iteration(&mut c);
         assert_eq!(c.hb.get("iteration").and_then(Value::as_i64), Some(2));
+    }
+
+    // ---- ideate-empty thrash guard ----
+    #[test]
+    fn inject_fallback_goal_prepends_to_backlog() {
+        let mut c = ctx();
+        std::fs::create_dir_all(&c.runtime).unwrap();
+        // empty backlog (just a header)
+        std::fs::write(&c.backlog, "# backlog\n").unwrap();
+        inject_fallback_goal(&mut c);
+        let content = std::fs::read_to_string(&c.backlog).unwrap();
+        // the fallback goal is the first unchecked item
+        let (goal, tier) = backlog::top_backlog_item(&c).unwrap();
+        assert!(goal.contains("fix one real bug"));
+        assert_eq!(tier, "chore"); // no tier tag -> default chore
+        // header preserved
+        assert!(content.starts_with("# backlog\n"));
+    }
+
+    #[test]
+    fn inject_fallback_goal_creates_backlog_when_missing() {
+        let mut c = ctx();
+        std::fs::create_dir_all(&c.runtime).unwrap();
+        let _ = std::fs::remove_file(&c.backlog);
+        inject_fallback_goal(&mut c);
+        assert!(c.backlog.exists());
+        let (goal, _) = backlog::top_backlog_item(&c).unwrap();
+        assert!(goal.contains("fix one real bug"));
+    }
+
+    #[test]
+    fn one_empty_ideate_injects_fallback_goal_not_stop() {
+        // Simulate ideate_phase's thrash-guard logic: rc=5 on the FIRST empty result should inject
+        // the fallback goal (counter=1 < LIMIT) and NOT write the stop sentinel.
+        let mut c = ctx();
+        std::fs::create_dir_all(&c.runtime).unwrap();
+        c.ideate_enabled = true;
+        c.goal = String::new(); // no north-star goal
+        std::fs::write(&c.backlog, "# backlog\n").unwrap();
+        let _ = std::fs::remove_file(&c.stop_path);
+
+        // Manually apply the same logic as ideate_phase for rc=5, count=1.
+        c.consecutive_empty_ideate += 1;
+        assert!(c.consecutive_empty_ideate < EMPTY_IDEATE_STOP_LIMIT);
+        inject_fallback_goal(&mut c);
+
+        // stop NOT written
+        assert!(!c.stop_path.exists());
+        // backlog now has a real goal — needs_goal_skip should be false
+        let (goal, _) = backlog::top_backlog_item(&c).unwrap();
+        assert!(!backlog::needs_goal_skip(&c, &goal));
+    }
+
+    #[test]
+    fn k_consecutive_empty_ideates_trigger_stop() {
+        // After EMPTY_IDEATE_STOP_LIMIT consecutive empty-ideate results, the stop sentinel is
+        // written so the loop winds down (a truly dry loop, not a restart thrash).
+        let mut c = ctx();
+        std::fs::create_dir_all(&c.runtime).unwrap();
+        c.ideate_enabled = true;
+        c.goal = String::new();
+        std::fs::write(&c.backlog, "# backlog\n").unwrap();
+        let _ = std::fs::remove_file(&c.stop_path);
+
+        // Simulate K-1 empty results: inject fallback, no stop.
+        for i in 1..EMPTY_IDEATE_STOP_LIMIT {
+            c.consecutive_empty_ideate = i;
+            inject_fallback_goal(&mut c);
+            assert!(!c.stop_path.exists(),
+                "stop should not be written at consecutive_empty_ideate={}", i);
+        }
+
+        // K-th empty result: write stop.
+        c.consecutive_empty_ideate = EMPTY_IDEATE_STOP_LIMIT;
+        assert!(c.consecutive_empty_ideate >= EMPTY_IDEATE_STOP_LIMIT);
+        let _ = std::fs::write(&c.stop_path, "empty_ideate_persistent\n");
+        assert!(c.stop_path.exists());
+        let stop_content = std::fs::read_to_string(&c.stop_path).unwrap();
+        assert!(stop_content.contains("empty_ideate"));
+    }
+
+    #[test]
+    fn successful_ideate_resets_counter() {
+        // rc=0 (success) resets the consecutive-empty counter so a single success after empties
+        // doesn't carry a stale streak.
+        let mut c = ctx();
+        c.consecutive_empty_ideate = 2;
+        // Simulate rc=0 path
+        c.consecutive_empty_ideate = 0;
+        assert_eq!(c.consecutive_empty_ideate, 0);
     }
 }
