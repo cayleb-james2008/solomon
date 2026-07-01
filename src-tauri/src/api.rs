@@ -279,14 +279,18 @@ fn get_state(st: &AppState) -> Value {
 /// flaky call degrades only that field (never blanks the card or lies `running:false`). Extracted from
 /// get_state's loop so the loop can run one of these per thread (the fields share no state).
 fn repo_state(r: &Value, gh_ready: bool) -> Value {
-    // Compute the diagnosis BEFORE reading escalation so a healthy diagnosis can clear a stale
-    // escalation.json left behind by a prior transient issue that has since self-resolved. recover()
+    // Compute the diagnosis BEFORE reading escalation so a healthy diagnosis can retire a stale
+    // escalation left behind by a prior transient issue that has since self-resolved. recover()
     // does the same on watchdog sweeps, but the watchdog may be disabled or not yet run — the
     // dashboard poll (get_state) is the most frequent observer, so it must re-observe the resolved
-    // state and not display stale escalation alongside a healthy diagnosis.
+    // state itself. note_healthy BOTH clears escalation.json AND stamps an "ok" supervisor.jsonl
+    // record (when transitioning): clearing the file alone would hide the stale escalation from
+    // the UI but leave the finish() log-once dedupe seeing the stale escalate=true record, so a
+    // recurrence of the SAME problem would be silently suppressed instead of re-escalated — the
+    // exact "stale escalation state that does not get re-observed after a fix lands" bug.
     let diagnosis = safe(|| supervisor::diagnose(r), json!({"category": "ok", "healthy": true}));
     if diagnosis.get("category").and_then(Value::as_str) == Some("ok") {
-        let _ = supervisor::clear_escalation(r);
+        let _ = safe(|| supervisor::note_healthy(r), ());
     }
     let escalation = safe(|| supervisor::read_escalation(r).unwrap_or(Value::Null), Value::Null);
     json!({
@@ -1000,6 +1004,20 @@ mod tests {
         assert_eq!(state["diagnosis"]["category"], "ok");
         assert_eq!(state["escalation"], Value::Null, "stale escalation must not leak to the dashboard");
         assert!(!rt.join("escalation.json").exists(), "escalation.json must be removed");
+        // The fix: repo_state must ALSO stamp an "ok" supervisor.jsonl record so the finish()
+        // log-once dedupe (which compares against the LAST supervisor record) is broken — else a
+        // recurrence of the SAME problem is silently suppressed (the stale escalate=true record
+        // would still be the last one). The "ok" record carries escalate=false, so a later
+        // escalate=true record for the same category is NOT deduped.
+        let sup = std::fs::read_to_string(rt.join("supervisor.jsonl")).unwrap_or_default();
+        let last_ok = sup
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .last()
+            .map(|r| r.get("category").and_then(Value::as_str) == Some("ok")
+                && r.get("escalate").and_then(Value::as_bool) == Some(false))
+            .unwrap_or(false);
+        assert!(last_ok, "a healthy dashboard poll must stamp an ok supervisor.jsonl record to break the dedupe");
 
         let _ = std::fs::remove_dir_all(&rt);
     }
