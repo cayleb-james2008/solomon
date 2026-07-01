@@ -275,6 +275,18 @@ fn get_state(st: &AppState) -> Value {
     })
 }
 
+/// The diagnose() fallback used by `repo_state` when `supervisor::diagnose` panics (caught by
+/// `safe()`). MUST be a NON-"ok" category: `repo_state` calls `note_healthy` (which clears
+/// `escalation.json` AND stamps an "ok" supervisor.jsonl record, breaking the `finish()` log-once
+/// dedupe) only when the diagnosis is "ok". A false-"ok" fallback on a panic would silently retire
+/// a LIVE escalation and suppress re-escalation on recurrence — the same stale-escalation
+/// re-observation bug, triggered by a panic instead of a heal. `health_payload` already reports a
+/// panicked repo as category "?"; this matches so the dashboard poll (the most frequent observer)
+/// never masks a real problem as healthy.
+fn panicked_diagnose_fallback() -> Value {
+    json!({"category": "?", "healthy": false})
+}
+
 /// One repo's get_state payload. Independent git/gh/fs probes, each field guarded by `safe()` so a
 /// flaky call degrades only that field (never blanks the card or lies `running:false`). Extracted from
 /// get_state's loop so the loop can run one of these per thread (the fields share no state).
@@ -288,7 +300,15 @@ fn repo_state(r: &Value, gh_ready: bool) -> Value {
     // the UI but leave the finish() log-once dedupe seeing the stale escalate=true record, so a
     // recurrence of the SAME problem would be silently suppressed instead of re-escalated — the
     // exact "stale escalation state that does not get re-observed after a fix lands" bug.
-    let diagnosis = safe(|| supervisor::diagnose(r), json!({"category": "ok", "healthy": true}));
+    //
+    // The fallback when diagnose() PANICS (caught by safe()) MUST be a non-"ok" category: the
+    // note_healthy call below clears escalation.json AND stamps an "ok" supervisor.jsonl record
+    // (breaking the dedupe guard). A false-"ok" fallback on a panic would silently retire a LIVE
+    // escalation and suppress re-escalation on recurrence — the same stale-escalation-re-observation
+    // bug, just triggered by a panic instead of a heal. health_payload already reports a panicked
+    // repo as category "?"; the dashboard poll (the most frequent observer) must match so it never
+    // masks a real problem as healthy.
+    let diagnosis = safe(|| supervisor::diagnose(r), panicked_diagnose_fallback());
     if diagnosis.get("category").and_then(Value::as_str) == Some("ok") {
         let _ = safe(|| supervisor::note_healthy(r), ());
     }
@@ -1048,6 +1068,26 @@ mod tests {
         assert!(rt.join("escalation.json").exists(), "live escalation must NOT be cleared");
 
         let _ = std::fs::remove_dir_all(&rt);
+    }
+
+    #[test]
+    fn panicked_diagnose_fallback_is_not_ok_so_note_healthy_never_fires() {
+        // Regression guard for the stale-escalation re-observation bug, panic-triggered variant:
+        // when supervisor::diagnose() panics inside repo_state, safe() returns this fallback. It
+        // MUST be a non-"ok" category — otherwise repo_state would call note_healthy, clearing a
+        // LIVE escalation.json and stamping an "ok" supervisor.jsonl record that breaks the
+        // finish() log-once dedupe (a recurrence of the same problem would then be silently
+        // suppressed instead of re-escalated). health_payload reports a panicked repo as category
+        // "?"; repo_state's fallback must match so the dashboard poll never masks a real problem
+        // as healthy.
+        let fb = panicked_diagnose_fallback();
+        assert_ne!(
+            fb.get("category").and_then(Value::as_str),
+            Some("ok"),
+            "a panicked diagnose must never look healthy to repo_state"
+        );
+        assert_eq!(fb.get("category").and_then(Value::as_str), Some("?"));
+        assert_eq!(fb.get("healthy").and_then(Value::as_bool), Some(false));
     }
 
     #[test]
