@@ -180,10 +180,10 @@ fn push_base_if_ahead(repo: &Value) -> Value {
 /// solomon.diagnose: deterministic, file-only health classification (no git shell-out — cheap on
 /// every poll). Returns {name, healthy, category, evidence, recommended:[...], auto_safe, running}.
 ///
-/// The 15-category cascade ORDER is load-bearing:
+/// The 16-category cascade ORDER is load-bearing:
 ///   ok / needs_goal / no_key / key_shape_mismatch / gh_not_ready / revert_failed / dirty_tree / base_out_of_band /
-///   untracked_refusal / stale_lock / stop_lingering / stuck / gate_red_streak / ci_red_streak /
-///   noop_streak / unknown_error.
+///   untracked_refusal / persistent_self_stop / stale_lock / stop_lingering / stuck / gate_red_streak /
+///   ci_red_streak / noop_streak / unknown_error.
 pub fn diagnose(repo: &Value) -> Value {
     let name = paths::repo_name(repo);
     let hb = heartbeat::read_heartbeat(repo).unwrap_or_else(|| json!({}));
@@ -288,6 +288,31 @@ pub fn diagnose(repo: &Value) -> Value {
         rec = vec![
             "untracked files on the base block the preflight clean — review them, \
              then commit or remove them (the loop won't delete possible operator work)"
+                .into(),
+        ];
+        safe = false;
+    } else if has_stop && !running
+        && matches!(
+            reason,
+            Some("dirty_base_persistent" | "unpushed_base_persistent" | "base_gate_red_persistent")
+        )
+    {
+        // The loop's three persistent-bail self-stops (escalation.rs): the runner wrote a STOP
+        // sentinel + status=error + a reason marker so it wouldn't spin on a base it can't make
+        // runnable. WITHOUT this branch that state fell through to stop_lingering with the
+        // "did not exit cleanly (crash/kill mid-stop)" evidence — a LIE about a deliberate,
+        // diagnostic-rich self-stop that buries the exact cause the operator must fix (the base
+        // is dirty / un-pushed / gate-RED). Surface the real reason + the loop's own last_summary
+        // (which already carries the fix guidance) instead. Not auto-safe: the operator must fix
+        // the underlying base/gate; the watchdog's persistent_stop_cleared re-observes the two
+        // git-state reasons and clears the sentinel once healed, and the operator presses Start
+        // for base_gate_red_persistent (running the gate from the sweep is too costly / cmd-specific).
+        cat = "persistent_self_stop".into();
+        ev = trunc_or(summary, 200, "loop self-stopped after a persistent preflight failure");
+        rec = vec![
+            "the loop deliberately self-stopped after a persistent preflight failure — fix the \
+             underlying cause described above (dirty / un-pushed / gate-RED base), then press Start \
+             to resume"
                 .into(),
         ];
         safe = false;
@@ -456,6 +481,15 @@ fn suggested_steps(repo: &Value, cat: &str) -> Vec<String> {
             "Open Solomon → this repo → Ideate to refill the backlog with fresh items,".into(),
             "or edit improver/<name>/backlog.md to add/simplify items,".into(),
             "or raise the repo's model in Config (the current one keeps failing to implement)".into(),
+        ],
+        "persistent_self_stop" => vec![
+            "The loop deliberately self-stopped after a persistent preflight failure — the loop's".into(),
+            "last_summary (shown in the dashboard diagnosis) names the exact cause and the fix:".into(),
+            "  • dirty_base_persistent   — commit/stash/reset the dirty base tree".into(),
+            "  • unpushed_base_persistent — push or reset the base to origin".into(),
+            "  • base_gate_red_persistent — fix the gate command or the failing base tests".into(),
+            "Once the cause is fixed, press Start to resume (the watchdog auto-clears the first two".into(),
+            "once the git state heals)".into(),
         ],
         _ => vec![cd, "git status".into()],
     }
@@ -1111,6 +1145,119 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ---------------- persistent self-stop: NOT misclassified as stop_lingering ----------------
+    // The runner's three persistent-bail self-stops (escalation.rs) write a STOP sentinel +
+    // status=error + a reason marker. Without the persistent_self_stop branch this fell through to
+    // stop_lingering with the "did not exit cleanly (crash/kill mid-stop)" evidence — a lie about a
+    // deliberate, diagnostic-rich self-stop that buries the exact cause the operator must fix.
+    #[test]
+    fn diagnose_persistent_self_stop_surfaces_real_reason_not_crash() {
+        let (dir, repo) = tmp_repo("pss_dirty");
+        // Real runner state: STOP sentinel + status=error + reason + a summary carrying the fix.
+        std::fs::write(dir.join("stop"), "dirty_base_persistent\n").unwrap();
+        write_hb(
+            &dir,
+            &json!({
+                "status": "error",
+                "phase": "preflight",
+                "reason": "dirty_base_persistent",
+                "last_summary": "Base branch 'main' has been dirty for 3 consecutive preflight bails \
+                 — the loop self-stops so it doesn't spin forever. Commit, stash, or reset the base tree; \
+                 then clear the stop sentinel (Solomon → Start) to resume."
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], "persistent_self_stop");
+        assert_eq!(d["healthy"], false);
+        assert_eq!(d["auto_safe"], false);
+        // evidence is the REAL summary (truncated to 200 chars), NOT the misleading crash/kill text.
+        assert!(d["evidence"].as_str().unwrap().starts_with("Base branch 'main' has been dirty"));
+        assert!(!d["evidence"].as_str().unwrap().contains("crash/kill mid-stop"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // base_gate_red_persistent — the third reason the watchdog does NOT auto-clear; must still
+        // surface the real cause (gate-RED base), not "crash/kill mid-stop".
+        let (dir, repo) = tmp_repo("pss_gatered");
+        std::fs::write(dir.join("stop"), "base_gate_red_persistent\n").unwrap();
+        write_hb(
+            &dir,
+            &json!({
+                "status": "error",
+                "phase": "preflight",
+                "reason": "base_gate_red_persistent",
+                "last_summary": "Base gate has been RED for several consecutive preflight bails — \
+                 the loop self-stops so it doesn't spin forever. Fix the gate command or the base, \
+                 then Start to resume."
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], "persistent_self_stop");
+        assert!(d["evidence"].as_str().unwrap().starts_with("Base gate has been RED"));
+        assert!(!d["evidence"].as_str().unwrap().contains("crash/kill mid-stop"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // unpushed_base_persistent too.
+        let (dir, repo) = tmp_repo("pss_unpushed");
+        std::fs::write(dir.join("stop"), "unpushed_base_persistent\n").unwrap();
+        write_hb(
+            &dir,
+            &json!({
+                "status": "error",
+                "phase": "preflight",
+                "reason": "unpushed_base_persistent",
+                "last_summary": "Base is ahead of origin — push or reset it, then Start to resume."
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], "persistent_self_stop");
+        assert!(d["evidence"].as_str().unwrap().starts_with("Base is ahead of origin"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnose_persistent_self_stop_requires_reason_marker() {
+        let (dir, repo) = tmp_repo("pss_noreason");
+        // A stop sentinel + status=error but NO persistent reason marker is a genuine crash/kill
+        // mid-stop (or an operator stop of a crashed loop) — that stays stop_lingering, NOT
+        // persistent_self_stop. The branch must not over-trigger and erase the crash signal.
+        std::fs::write(dir.join("stop"), "").unwrap();
+        write_hb(&dir, &json!({"status": "error", "phase": "crashed", "last_summary": "boom"}));
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], "stop_lingering");
+        assert_eq!(d["auto_safe"], false);
+        assert!(d["evidence"].as_str().unwrap().contains("crash/kill mid-stop"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_persistent_self_stop_escalates_with_targeted_steps() {
+        // A persistent_self_stop is not auto-safe and has no RUNG-0 action — recover() must escalate
+        // (operator action required) and leave escalation.json carrying the targeted category +
+        // suggested manual steps that name the three persistent reasons (not the generic git-status
+        // fallback nor the misleading "crash/kill mid-stop").
+        let (dir, repo) = tmp_repo("pss_rec");
+        std::fs::write(dir.join("stop"), "base_gate_red_persistent\n").unwrap();
+        write_hb(
+            &dir,
+            &json!({
+                "status": "error",
+                "phase": "preflight",
+                "reason": "base_gate_red_persistent",
+                "last_summary": "Base gate has been RED for several consecutive preflight bails"
+            }),
+        );
+        let out = recover(&repo, false, false, false);
+        assert_eq!(out["category"], "persistent_self_stop");
+        assert_eq!(out["escalate"], true);
+        assert_eq!(out["actions_taken"], json!([]));
+        let read = read_escalation(&repo).expect("escalation.json written");
+        assert_eq!(read["category"], "persistent_self_stop");
+        let steps = read["suggested_manual_steps"].as_array().unwrap();
+        assert!(steps.iter().any(|s| s.as_str().unwrap().contains("base_gate_red_persistent")));
+        assert!(steps.iter().any(|s| s.as_str().unwrap().contains("dirty_base_persistent")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn diagnose_stale_lock_and_stop_lingering() {
         let (dir, repo) = tmp_repo("stalelock");
@@ -1444,6 +1591,11 @@ mod tests {
         assert_eq!(rv[1], "git checkout --force main");
         // default fall-through
         assert_eq!(suggested_steps(&repo, "stale_lock"), vec!["cd \"C:/p/x\"".to_string(), "git status".into()]);
+        // persistent_self_stop names the three persistent-bail reasons (operator-action guidance)
+        let pss = suggested_steps(&repo, "persistent_self_stop");
+        assert!(pss.iter().any(|s| s.contains("dirty_base_persistent")));
+        assert!(pss.iter().any(|s| s.contains("unpushed_base_persistent")));
+        assert!(pss.iter().any(|s| s.contains("base_gate_red_persistent")));
     }
 
     // ---------------- _now format ----------------
