@@ -1,0 +1,241 @@
+[
+    {
+        "name": "asmodeus",
+        "priority": 1,
+        "comment": "Live-money trading system. All db probes are read-only (SQLITE_OPEN_READ_ONLY); a corrupt/locked db degrades to yellow 'unobservable', never a crash. Paths verified against the live filesystem 2026-07-01.",
+        "probes": [
+            {
+                "id": "fills_recency",
+                "kind": "sqlite_query",
+                "db": "%LOCALAPPDATA%\\Asmodeus\\state\\asmodeus.db",
+                "query": "SELECT MAX(created_at) FROM venue_fills",
+                "mode": "age",
+                "yellow_after_s": 43200,
+                "red_after_s": 86400,
+                "comment": "Market-hours awareness is OUT of scope for Phase 1 — weekend/closed-market gaps will show yellow/red honestly; a market-hours-aware threshold is a Phase 2+ follow-up."
+            },
+            {
+                "id": "open_trade_stuck",
+                "kind": "sqlite_query",
+                "db": "%LOCALAPPDATA%\\Asmodeus\\state\\asmodeus.db",
+                "query": "SELECT MIN(created_at) FROM trades WHERE status='open' AND mode='live'",
+                "mode": "age",
+                "yellow_after_s": 172800,
+                "null_status": "green",
+                "comment": "NULL = no open live trades = nothing stuck (green by design)."
+            },
+            {
+                "id": "equity_fresh",
+                "kind": "sqlite_query",
+                "db": "%LOCALAPPDATA%\\Asmodeus\\state\\asmodeus.db",
+                "query": "SELECT MAX(ts) FROM equity WHERE source='tradelocker'",
+                "mode": "age",
+                "red_after_s": 900,
+                "comment": "Best-effort: this table intermittently reads as 'database disk image is malformed' (observed 2026-07-01, succeeded later the same day) -> such failures degrade to yellow unobservable, never a crash."
+            },
+            {
+                "id": "auth_health",
+                "kind": "log_grep",
+                "file": "%LOCALAPPDATA%\\Asmodeus\\logs\\fleet_ticker.log",
+                "pattern": "-> 401|JWT token expired",
+                "red_on": 3,
+                "yellow_pattern": "-> 429",
+                "yellow_on": 5,
+                "tail_bytes": 65536
+            },
+            {
+                "id": "heartbeat_fresh",
+                "kind": "json_field",
+                "file": "%LOCALAPPDATA%\\Asmodeus\\heartbeats\\fleet_ticker.json",
+                "path": "t",
+                "mode": "age",
+                "red_after_s": 300,
+                "comment": "Field 't' is epoch seconds (verified). Never matched by pid — PIDs recycle."
+            },
+            {
+                "id": "binary_current",
+                "kind": "git_sha_match",
+                "heartbeat_file": "%LOCALAPPDATA%\\Asmodeus\\heartbeats\\fleet_ticker.json",
+                "sha_field": "git_sha",
+                "comment": "The deploy-gap probe: the running binary's build sha vs the repo HEAD (repos.json path join). Mismatch = yellow drift warning."
+            },
+            {
+                "id": "kill_breaker",
+                "kind": "sqlite_query",
+                "db": "%LOCALAPPDATA%\\Asmodeus\\state\\asmodeus.db",
+                "query": "SELECT (SELECT engaged FROM kill_switch WHERE id=1) + (SELECT CASE WHEN state <> 'open' THEN 1 ELSE 0 END FROM breaker_state WHERE id=1)",
+                "mode": "equals",
+                "equals": 0,
+                "restart_forbidden_on_red": true,
+                "comment": "breaker_state 'open' is the NORMAL state (open|pause_entries|halt, schema.rs:165). Engaged kill-switch or a tripped breaker -> red with restart_forbidden — never blind-restart over it."
+            },
+            {
+                "id": "process",
+                "kind": "process",
+                "process_name": "Asmodeus.exe",
+                "path_contains": "projects\\asmodeus"
+            }
+        ]
+    },
+    {
+        "name": "sover",
+        "priority": 2,
+        "comment": "Autonomous social executive (GGG brand). Live state root is %LOCALAPPDATA%\\Sover — the repo .runtime copy is STALE (that is what fooled the old monitor). Paths verified against the live filesystem 2026-07-01.",
+        "probes": [
+            {
+                "id": "publish_recency",
+                "kind": "json_field",
+                "file": "%LOCALAPPDATA%\\Sover\\data\\ggg\\post_registry.json",
+                "path": "*.published_at",
+                "mode": "age",
+                "yellow_after_s": 43200,
+                "red_after_s": 86400,
+                "comment": "Registry is a dict keyed 'id:platform'; per-entry field is 'published_at' (naive-local timestamp, verified). Newest across all entries."
+            },
+            {
+                "id": "produce_recency",
+                "kind": "file_age",
+                "file": "%LOCALAPPDATA%\\Sover\\content\\ggg\\final\\*.mp4",
+                "red_after_s": 86400
+            },
+            {
+                "id": "cdp_alive",
+                "kind": "http_get",
+                "url": "http://127.0.0.1:9242/json/version",
+                "timeout_s": 3,
+                "red_after_consecutive": 3,
+                "comment": "One blip is yellow; three consecutive failed sweeps is red."
+            },
+            {
+                "id": "post_failures",
+                "kind": "log_grep",
+                "file": "%LOCALAPPDATA%\\Sover\\logs\\ggg.post.out.log",
+                "pattern": "failed after 3 attempts|auto_post is OFF|chrome binary not found|exited during startup",
+                "yellow_on": 1,
+                "tail_bytes": 65536
+            },
+            {
+                "id": "lane_freshness",
+                "kind": "json_field",
+                "file": "%LOCALAPPDATA%\\Sover\\.runtime\\ggg\\lane_state.json",
+                "path": "post.last_run",
+                "mode": "age",
+                "red_after_s": 21600,
+                "comment": "The LIVE lane state under %LOCALAPPDATA% — NOT the stale repo copy."
+            },
+            {
+                "id": "autopost_gate",
+                "kind": "json_field",
+                "file": "%LOCALAPPDATA%\\Sover\\data\\ggg\\strategy.json",
+                "path": "auto_post",
+                "mode": "equals",
+                "equals": true,
+                "comment": "auto_post silently OFF is the classic silent-stop; anything but true is red."
+            },
+            {
+                "id": "process",
+                "kind": "process",
+                "process_name": "Sover.exe",
+                "path_contains": "projects\\sover\\dist"
+            }
+        ]
+    },
+    {
+        "name": "daedulus",
+        "priority": 3,
+        "comment": "Probe-only for Phase 1. Best-effort: runtime\\daedulus has no history.jsonl/heartbeat.json yet (verified 2026-07-01) — both probes report yellow 'unobservable' until the lane runs, by design.",
+        "probes": [
+            {
+                "id": "outcome_streak",
+                "kind": "jsonl_tail",
+                "file": "runtime\\daedulus\\history.jsonl",
+                "field": "status",
+                "mode": "streak",
+                "want": "shipped",
+                "last_n": 5
+            },
+            {
+                "id": "heartbeat_fresh",
+                "kind": "json_field",
+                "file": "runtime\\daedulus\\heartbeat.json",
+                "path": "updated_at",
+                "mode": "age",
+                "yellow_after_s": 21600,
+                "red_after_s": 86400
+            }
+        ]
+    },
+    {
+        "name": "dotz",
+        "priority": 4,
+        "probes": [
+            {
+                "id": "outcome_streak",
+                "kind": "jsonl_tail",
+                "file": "runtime\\dotz\\history.jsonl",
+                "field": "status",
+                "mode": "streak",
+                "want": "shipped",
+                "last_n": 5
+            },
+            {
+                "id": "heartbeat_fresh",
+                "kind": "json_field",
+                "file": "runtime\\dotz\\heartbeat.json",
+                "path": "updated_at",
+                "mode": "age",
+                "yellow_after_s": 21600,
+                "red_after_s": 86400
+            }
+        ]
+    },
+    {
+        "name": "maki",
+        "priority": 5,
+        "probes": [
+            {
+                "id": "outcome_streak",
+                "kind": "jsonl_tail",
+                "file": "runtime\\maki\\history.jsonl",
+                "field": "status",
+                "mode": "streak",
+                "want": "shipped",
+                "last_n": 5
+            },
+            {
+                "id": "heartbeat_fresh",
+                "kind": "json_field",
+                "file": "runtime\\maki\\heartbeat.json",
+                "path": "updated_at",
+                "mode": "age",
+                "yellow_after_s": 21600,
+                "red_after_s": 86400
+            }
+        ]
+    },
+    {
+        "name": "solomon",
+        "priority": 6,
+        "probes": [
+            {
+                "id": "outcome_streak",
+                "kind": "jsonl_tail",
+                "file": "runtime\\solomon\\history.jsonl",
+                "field": "status",
+                "mode": "streak",
+                "want": "shipped",
+                "last_n": 5
+            },
+            {
+                "id": "monitor_fresh",
+                "kind": "jsonl_tail",
+                "file": "runtime\\_monitor.jsonl",
+                "field": "ts",
+                "mode": "age",
+                "yellow_after_s": 600,
+                "red_after_s": 1800,
+                "comment": "The watchdog appends here every ~2min while Solomon.exe is open; stale while the app is closed is the honest blind-window signal."
+            }
+        ]
+    }
+]
