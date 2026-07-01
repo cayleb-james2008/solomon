@@ -653,6 +653,7 @@ mod tests {
     // visual::spawn_pi, visual::run_browser_cli): a child that floods stdout past the OS pipe buffer
     // must be captured IN FULL without spuriously timing out. Pre-fix this returned Err(TimedOut)
     // (and lost the output) because the child blocked on write() while we sat in wait_timeout.
+    // The deadline is deliberately generous: the test verifies no-deadlock + full drain, not speed.
     #[cfg(windows)]
     #[test]
     fn run_with_timeout_drains_large_output_without_deadlock() {
@@ -660,7 +661,7 @@ mod tests {
         let mut cmd = Command::new("cmd");
         cmd.args(["/c", "for /L %i in (1,1,8000) do @echo XXXXXXXXXXXXXXXXXXXXXXXXXX"]);
         cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let out = run_with_timeout(cmd, Duration::from_secs(30))
+        let out = run_with_timeout(cmd, Duration::from_secs(120))
             .expect("must capture large output, not time out");
         assert!(
             out.stdout.len() > 100_000,

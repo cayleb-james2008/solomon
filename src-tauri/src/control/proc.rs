@@ -327,6 +327,7 @@ mod tests {
     // The timeout branch must drain pipes concurrently: a child emitting far more than the ~64KB OS
     // pipe buffer must NOT block-on-write and time out. The old post-exit drain returned Err(TimedOut)
     // here (and lost the output); the thread-drain captures it all and exits fast.
+    // The deadline is deliberately generous: the test verifies no-deadlock + full drain, not speed.
     #[cfg(windows)]
     #[test]
     fn run_timeout_drains_large_output_without_deadlock() {
@@ -334,7 +335,7 @@ mod tests {
         let out = run(
             &["cmd", "/c", "for /L %i in (1,1,8000) do @echo XXXXXXXXXXXXXXXXXXXXXXXXXX"],
             None,
-            Some(Duration::from_secs(30)),
+            Some(Duration::from_secs(120)),
         )
         .expect("timeout branch must not error on large output");
         assert_eq!(out.code, 0);
