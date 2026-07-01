@@ -325,6 +325,138 @@ repo that has tests; retrying in 3s",
 }
 
 // --------------------------------------------------------------------------- #
+// Gate #1b — judge-mirror lint gate (clippy + fmt) for execution-surface Rust
+// --------------------------------------------------------------------------- #
+//
+// The implement step historically checked ONLY the runner's objective gate (e.g. `cargo test`) and
+// declared done, while the adversarial REVIEW/JUDGE separately enforces `cargo clippy --workspace
+// --all-targets -- -D warnings` AND `cargo fmt --check`. A clippy-clean-but-test-green change was
+// shipped, the judge REJECTED it, and the branch reverted — so complex execution-surface changes
+// thrashed (asmodeus L3 Lorentzian: 5 ship / 4 reject / 1 bug-reject, then escalate+abandon). This
+// gate runs the EXACT judge gate in the implement step, auto-corrects (`cargo clippy --fix
+// --allow-dirty --allow-staged` + `cargo fmt`) up to 3 attempts, and reverts in-loop if lints remain
+// — the judge never sees a clippy/fmt-failing change. Inert (ok) for non-Rust repos.
+
+/// Bounded timeout for ONE clippy/fmt invocation in the lint gate. Smaller than GATE_TIMEOUT (3600s)
+/// so a hung `cargo clippy` doesn't burn an hour per attempt; 1800s is ample for a cold workspace.
+const LINT_GATE_TIMEOUT: u64 = 1800;
+
+/// Resolve the directory holding the repo's Cargo manifest: `repo/Cargo.toml` first, then the
+/// `repo/src-tauri/Cargo.toml` Tauri layout (Solomon itself). None when this isn't a Rust crate — the
+/// lint gate then no-ops (ok). Pure over the filesystem.
+pub fn cargo_manifest_dir(repo: &Path) -> Option<std::path::PathBuf> {
+    if repo.join("Cargo.toml").is_file() {
+        return Some(repo.to_path_buf());
+    }
+    let sub = repo.join("src-tauri").join("Cargo.toml");
+    if sub.is_file() {
+        return Some(repo.join("src-tauri"));
+    }
+    None
+}
+
+/// Run `cargo <args>` in `dir` with a scrubbed env and a bounded timeout, returning a RunOut. A
+/// timeout maps to code 124 (mirroring run_pi's timeout marker); a spawn failure to code -1.
+fn run_cargo(c: &mut Ctx, dir: &Path, args: &[&str], timeout: Option<Duration>) -> proc::RunOut {
+    let mut cmd = Command::new("cargo");
+    cmd.args(args);
+    cmd.current_dir(dir);
+    c.apply_clean_env(&mut cmd);
+    match run_command_timed(cmd, timeout) {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => proc::RunOut {
+            code: 124,
+            stdout: String::new(),
+            stderr: format!("[lint gate timed out after {}s]", LINT_GATE_TIMEOUT),
+        },
+        Err(e) => proc::RunOut {
+            code: -1,
+            stdout: String::new(),
+            stderr: e.to_string(),
+        },
+    }
+}
+
+/// Judge-mirror lint gate: BEFORE the implement step declares done, run the EXACT gate the judge
+/// enforces for execution-surface Rust — `cargo clippy --workspace --all-targets -- -D warnings`
+/// AND `cargo fmt --check` — auto-correcting (`cargo clippy --fix --allow-dirty --allow-staged` +
+/// `cargo fmt`) up to 3 attempts so a clippy/fmt-failing change is fixed in-loop rather than
+/// shipped-then-reverted. Returns `(ok, reason)`. A non-Rust repo (no Cargo.toml at the repo root or
+/// `src-tauri/`) is ok with no reason (the gate is inert). `cwd` is the manifest dir. The caller
+/// reverts on `ok=false` BEFORE staging/commit, so the auto-fix (when it succeeded) lands in the
+/// committed diff and the judge sees a clean tree.
+pub fn run_judge_mirror_lint_gate(c: &mut Ctx) -> (bool, String) {
+    let dir = match cargo_manifest_dir(&c.repo) {
+        Some(d) => d,
+        None => return (true, String::new()),
+    };
+    let dur = Some(Duration::from_secs(LINT_GATE_TIMEOUT));
+    let clip_args: &[&str] = &[
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ];
+    let fix_args: &[&str] = &[
+        "clippy",
+        "--fix",
+        "--allow-dirty",
+        "--allow-staged",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ];
+    let mut last_tail = String::new();
+    let mut clippy_ok = false;
+    for attempt in 0..3u32 {
+        // fmt: check, and if dirty, fix in place.
+        let fmt_check = run_cargo(c, &dir, &["fmt", "--check"], dur);
+        if fmt_check.code != 0 {
+            let _ = run_cargo(c, &dir, &["fmt"], dur);
+        }
+        // clippy with -D warnings (the judge's gate).
+        let clip = run_cargo(c, &dir, clip_args, dur);
+        last_tail = format!("{}{}", clip.stdout, clip.stderr);
+        if clip.code == 0 {
+            clippy_ok = true;
+            break;
+        }
+        if attempt < 2 {
+            // auto-correct: apply machine-applicable clippy fixes, then fmt, then re-check on the
+            // next loop iteration.
+            let _ = run_cargo(c, &dir, fix_args, dur);
+            let _ = run_cargo(c, &dir, &["fmt"], dur);
+        }
+    }
+    // final fmt verification (the judge's `cargo fmt --check`).
+    let fmt_final = run_cargo(c, &dir, &["fmt", "--check"], dur);
+    let fmt_ok = fmt_final.code == 0;
+    if clippy_ok && fmt_ok {
+        c.log("judge-mirror lint gate: clippy + fmt clean (auto-corrected in-loop)");
+        return (true, String::new());
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    if !clippy_ok {
+        parts.push("cargo clippy --workspace --all-targets -- -D warnings still RED after 3 auto-fix attempts");
+    }
+    if !fmt_ok {
+        parts.push("cargo fmt --check still RED");
+    }
+    let reason = format!(
+        "judge-mirror lint gate FAILED: {} — auto-correct budget exhausted; reverting so the judge \
+never sees a clippy/fmt-failing change. Tail: {}",
+        parts.join("; "),
+        tail_1500(&last_tail)
+    );
+    c.log(&reason);
+    (false, reason)
+}
+
+// --------------------------------------------------------------------------- #
 // Gate #2 — anti-gaming skip-marker scan (pure predicates)
 // --------------------------------------------------------------------------- #
 
@@ -1282,5 +1414,156 @@ mod tests {
     fn visual_gate_reason_ok_no_findings() {
         assert_eq!(visual_gate_reason(&json!({"ok": true})), None);
         assert_eq!(visual_gate_reason(&json!({"ok": true, "findings": []})), None);
+    }
+
+    // ---- cargo_manifest_dir (Gate #1b detection) ----
+
+    #[test]
+    fn cargo_manifest_dir_root() {
+        let tmp = std::env::temp_dir().join(format!("solomon-lint-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        assert_eq!(cargo_manifest_dir(&tmp), Some(tmp.clone()));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cargo_manifest_dir_src_tauri_layout() {
+        // Solomon itself: Cargo.toml lives under src-tauri/, not the repo root.
+        let tmp = std::env::temp_dir().join(format!("solomon-lint-sub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("src-tauri")).unwrap();
+        std::fs::write(
+            tmp.join("src-tauri").join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        assert_eq!(cargo_manifest_dir(&tmp), Some(tmp.join("src-tauri")));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cargo_manifest_dir_non_rust_is_none() {
+        // A non-Rust repo: the lint gate must silently no-op (ok), never error on a missing cargo.
+        let tmp = std::env::temp_dir().join(format!("solomon-lint-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("README.md"), "not rust").unwrap();
+        assert_eq!(cargo_manifest_dir(&tmp), None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- run_judge_mirror_lint_gate (real cargo + clippy + rustfmt) ----
+    //
+    // These exercise the actual auto-fix loop end-to-end. They skip (early return, not fail) when
+    // `cargo`/`cargo clippy`/`rustfmt` aren't on PATH, so `cargo test` stays green in a rustc-only
+    // env; in the Solomon dev/deploy env (which has the full toolchain) they run and assert.
+
+    fn cargo_toolchain_present() -> bool {
+        let ok = |tool: &str, args: &[&str]| {
+            std::process::Command::new(tool)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        ok("cargo", &["--version"])
+            && ok("cargo", &["clippy", "--version"])
+            && ok("cargo", &["fmt", "--version"])
+    }
+
+    /// `cargo init` a throwaway binary crate at `dir` (no deps, no vcs) and overwrite src/main.rs
+    /// with `src`. Returns true on success.
+    fn init_temp_crate(dir: &std::path::Path, src: &str) -> bool {
+        let init = std::process::Command::new("cargo")
+            .args(["init", "--name", "linttest", "--vcs", "none"])
+            .current_dir(dir)
+            .output();
+        match init {
+            Ok(o) if o.status.success() => {}
+            _ => return false,
+        }
+        std::fs::write(dir.join("src").join("main.rs"), src).is_ok()
+    }
+
+    fn unique_tmp(prefix: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static C: AtomicU64 = AtomicU64::new(0);
+        let n = C.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}-{}",
+            std::process::id(),
+            n,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    #[test]
+    fn lint_gate_auto_corrects_fmt_in_loop() {
+        // Unformatted-but-clippy-clean code: `cargo fmt --check` is RED, the gate runs `cargo fmt`,
+        // re-checks, and ships ok — the judge never sees an unformatted change.
+        if !cargo_toolchain_present() {
+            eprintln!(
+                "lint_gate_auto_corrects_fmt_in_loop: cargo/clippy/rustfmt not on PATH — skipping"
+            );
+            return;
+        }
+        let dir = unique_tmp("solomon-lint-fmt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "fn main(){let x=1;println!(\"{}\",x);}\n";
+        assert!(init_temp_crate(&dir, src), "cargo init failed");
+        let mut c = Ctx::configure(dir.to_str().unwrap(), "lintgatetest", "ollama-cloud", None);
+        let (ok, reason) = run_judge_mirror_lint_gate(&mut c);
+        assert!(
+            ok,
+            "expected lint gate ok after fmt auto-fix, but: {reason}"
+        );
+        // the file was reformatted in place by `cargo fmt`
+        let after = std::fs::read_to_string(dir.join("src").join("main.rs")).unwrap();
+        assert!(
+            after.contains("fn main() {"),
+            "cargo fmt did not reformat the file: {after:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    #[test]
+    fn lint_gate_reverts_non_auto_fixable_clippy_lint() {
+        // A clippy::eq_op lint is NOT machine-applicable, so `cargo clippy --fix` can't remove it;
+        // after the 3-attempt budget the gate returns RED (revert in-loop) — the change is NOT shipped
+        // for the judge to reject-and-revert (the thrash/abandon failure mode this gate fixes).
+        if !cargo_toolchain_present() {
+            eprintln!(
+                "lint_gate_reverts_non_auto_fixable_clippy_lint: cargo/clippy/rustfmt not on PATH — skipping"
+            );
+            return;
+        }
+        let dir = unique_tmp("solomon-lint-revert");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "fn main() {\n    let a = 1;\n    if a + 1 == a + 1 {\n        println!(\"x\");\n    }\n}\n";
+        assert!(init_temp_crate(&dir, src), "cargo init failed");
+        let mut c = Ctx::configure(dir.to_str().unwrap(), "lintgatetest", "ollama-cloud", None);
+        let (ok, reason) = run_judge_mirror_lint_gate(&mut c);
+        assert!(
+            !ok,
+            "expected lint gate RED for a non-auto-fixable clippy lint, but it returned ok"
+        );
+        assert!(
+            reason.contains("clippy"),
+            "reason should name clippy: {reason}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&c.runtime);
     }
 }
