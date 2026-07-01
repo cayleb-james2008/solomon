@@ -1605,4 +1605,42 @@ mod tests {
         assert_eq!(c.provider_name, "ollama-cloud", "unknown provider -> ollama-cloud name");
         assert_eq!(c.pi_provider, "maki-cloud"); // ollama-cloud's pi_provider
     }
+
+    // ---- refresh_config_from_registry + key_shape_mismatch: mid-loop drift detection ----
+    // The startup key_shape_mismatch guard refuses to run on a stale per-repo api_key. But
+    // refresh_config_from_registry re-reads repos.json every iteration so a dashboard edit takes
+    // effect mid-loop — if the operator flips provider while leaving a stale OpenRouter-shaped
+    // api_key (the owl-alpha incident), the refreshed Ctx must still flag the mismatch so the loop
+    // can halt instead of silently authenticating against the wrong provider. This tests the
+    // predicate the run.rs post-refresh guard relies on.
+    #[test]
+    fn refresh_config_then_key_shape_mismatch_flags_mid_loop_drift() {
+        let _rg = ReposGuard::capture();
+        let _eg = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY", "OLLAMA_API_KEY"]);
+
+        // Launch as openrouter with a matching per-repo OpenRouter key — no mismatch at startup.
+        let mut c = test_ctx(); // name="testrepo", provider="ollama-cloud"
+        // Simulate a launch on openrouter with a matching key.
+        c.provider_name = "openrouter".to_string();
+        c.pi_provider = "openrouter".to_string();
+        c.api_key = or_key("matching-key-abcdef123456");
+        assert!(c.key_shape_mismatch().is_none(), "no drift at launch");
+
+        // Operator edits repos.json: flips provider back to ollama-cloud but leaves the stale
+        // OpenRouter-shaped api_key in place.
+        _rg.write(&[json!({
+            "name": "testrepo",
+            "provider": "ollama-cloud",
+            "api_key": or_key("stale-key-0123456789abcdef"),
+        })]);
+        c.refresh_config_from_registry();
+
+        // After refresh, pi_provider is now maki-cloud (ollama-cloud) but api_key is still
+        // OpenRouter-shaped — key_shape_mismatch MUST fire so the loop halts and escalates.
+        assert_eq!(c.pi_provider, "maki-cloud", "provider refreshed to ollama-cloud");
+        assert!(c.api_key.starts_with("sk-or-v1-"), "stale OpenRouter key still set");
+        let reason = c.key_shape_mismatch().expect("mid-loop drift must be flagged");
+        assert!(reason.contains("testrepo"));
+        assert!(reason.contains("ollama-cloud"));
+    }
 }

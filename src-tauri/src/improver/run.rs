@@ -383,6 +383,20 @@ set this repo's PR-target branch to a real branch in Config."
             break;
         }
         ctx.refresh_config_from_registry();
+        // Re-check the provider/api_key shape mismatch AFTER a mid-loop config refresh: a dashboard
+        // edit that flips provider while leaving a stale per-repo api_key (or vice versa) would
+        // otherwise silently run the next iteration against the wrong provider — the exact
+        // owl-alpha-class drift the startup guard exists to prevent. Halt the loop so the
+        // supervisor escalates the mismatch (the error heartbeat is preserved by the finally
+        // block's halted branch, and diagnose() classifies it as key_shape_mismatch).
+        if let Some(reason) = ctx.key_shape_mismatch() {
+            ctx.heartbeat(json!({
+                "status": "error",
+                "last_summary": reason,
+            }));
+            ctx.halted = true;
+            break;
+        }
         // run_improver.py wraps the loop body in try/…/finally: an unhandled exception in
         // one_iteration must fall through to the cleanup (release_lock + error/crashed heartbeat),
         // never kill the process with the runner lock still held. catch_unwind restores that
