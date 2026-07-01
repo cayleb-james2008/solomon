@@ -561,6 +561,35 @@ tests by correcting the implementation"
             );
             return;
         }
+        // JUDGE-MIRROR LINT GATE (Gate #1b): BEFORE declaring done, run the EXACT gate the
+        // adversarial REVIEW/JUDGE enforces for execution-surface Rust — `cargo clippy --workspace
+        // --all-targets -- -D warnings` AND `cargo fmt --check` — auto-correcting (cargo clippy
+        // --fix + cargo fmt) up to 3 attempts. Without this the implementer ships clippy-failing
+        // code (it checked only `cargo test`) and the judge REJECTS+reverts, so complex L3 changes
+        // thrash and get abandoned. Inert for non-Rust repos. Runs BEFORE staging so an auto-fix
+        // lands in the committed diff.
+        ctx.heartbeat(json!({"phase": "lint"}));
+        let (lint_ok, lint_reason) = gates::run_judge_mirror_lint_gate(ctx);
+        if !lint_ok {
+            escalation::note_revert(
+                ctx,
+                &goal,
+                &format!(
+                    "the change FAILED the judge-mirror lint gate (clippy/fmt) — {lint_reason}; \
+auto-correct was attempted but lints remained. Fix the clippy/fmt lints in your change before \
+declaring done"
+                ),
+                NOTE_LIMIT,
+            );
+            gitops::drop_branch(
+                ctx,
+                &branch,
+                "reverted",
+                &format!("Reverted — judge-mirror lint gate: {lint_reason}. {summary}"),
+                "sleeping",
+            );
+            return;
+        }
         // Anti-gaming: stage first so NEW UNTRACKED test files are in the diff, then diff vs base.
         gitops::git_add_all(ctx);
         let diff = ctx.git(&["diff", "--cached", &base_branch], 120).stdout;
