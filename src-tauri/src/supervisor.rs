@@ -1029,7 +1029,7 @@ fn py_repr_scalar(v: Option<&Value>) -> String {
 fn keys_provider_ready(repo: &Value) -> bool {
     !registry::project_api_key(repo).is_empty()
         || crate::control::keys::keys_status()
-            .get(&registry::project_provider(repo))
+            .get(registry::project_provider(repo))
             .and_then(Value::as_bool)
             .unwrap_or(false)
 }
@@ -1886,7 +1886,7 @@ mod tests {
         note_healthy(&repo);
         assert!(!dir.join("escalation.json").exists(), "escalation.json cleared");
         let sup = std::fs::read_to_string(dir.join("supervisor.jsonl")).unwrap();
-        let last = sup.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).last().unwrap();
+        let last = sup.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).next_back().unwrap();
         assert_eq!(last["category"], "ok");
         assert_eq!(last["escalate"], false);
 

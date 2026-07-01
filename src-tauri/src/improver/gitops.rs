@@ -352,6 +352,7 @@ pub fn clear_stale_index_lock(ctx: &mut Ctx) -> bool {
 ///   - NON-EMPTY stashes (real swept work — a non-agent-artifact tracked change or untracked file)
 ///     are preserved to a `solomon-recovered/<ts>-<idx>` branch before being dropped, so swept
 ///     work is recoverable, never orphaned.
+///
 /// Called at the start of each iteration's preflight so preflight stashes never accumulate.
 /// HARD INVARIANT: a stash with real content is NEVER dropped without first preserving its content.
 /// If the stash count exceeds `PREFLIGHT_STASH_CAP`, the oldest empty ones are pruned (a safety net

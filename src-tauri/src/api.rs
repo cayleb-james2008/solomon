@@ -187,7 +187,7 @@ fn truthy(v: &Value) -> bool {
 // arg helpers (JS calls dispatch positionally)
 // --------------------------------------------------------------------------- #
 
-fn arg<'a>(args: &'a [Value], i: usize) -> &'a Value {
+fn arg(args: &[Value], i: usize) -> &Value {
     args.get(i).unwrap_or(&Value::Null)
 }
 
@@ -245,8 +245,8 @@ fn find_repo(name: &str) -> Option<Value> {
 /// `running:false`. The control::* ports return Values rather than panicking, but the guard preserves
 /// app.py's `_safe(fn, default)` contract exactly (and shields a future panic in any delegate).
 fn get_state(st: &AppState) -> Value {
-    let repos = safe(|| registry::load_repos(), Vec::new());
-    let gh_ready = safe(|| gh::gh_ready(), false);
+    let repos = safe(registry::load_repos, Vec::new());
+    let gh_ready = safe(gh::gh_ready, false);
 
     // Each repo's payload is independent — its own git/gh/fs probes, including a network `gh pr list`
     // and ~5 git spawns. The old serial loop made one 4s dashboard refresh cost N×(those spawns).
@@ -270,8 +270,8 @@ fn get_state(st: &AppState) -> Value {
         "auto_push": st.get_auto_push(),
         "auto_ai_fix": st.get_auto_ai_fix(),
         "providers": ["ollama-cloud", "openrouter"],
-        "keys": safe(|| keys::keys_status(), json!({})),
-        "github": safe(|| gh::github_status(), json!({})),
+        "keys": safe(keys::keys_status, json!({})),
+        "github": safe(gh::github_status, json!({})),
     })
 }
 
@@ -310,7 +310,7 @@ fn repo_state(r: &Value, gh_ready: bool) -> Value {
     // masks a real problem as healthy.
     let diagnosis = safe(|| supervisor::diagnose(r), panicked_diagnose_fallback());
     if diagnosis.get("category").and_then(Value::as_str) == Some("ok") {
-        let _ = safe(|| supervisor::note_healthy(r), ());
+        safe(|| supervisor::note_healthy(r), ());
     }
     let escalation = safe(|| supervisor::read_escalation(r).unwrap_or(Value::Null), Value::Null);
     json!({
@@ -947,18 +947,18 @@ mod tests {
             "app_test_state", "app_test_frame", "read_app_test_report", "ensure_contracts",
             "enrich_contract", "ideate", "clear_escalation",
         ] {
-            let r = dispatch(m, &[none.clone()]).unwrap();
+            let r = dispatch(m, std::slice::from_ref(&none)).unwrap();
             assert_eq!(r, unknown_repo(), "method {m} should return the unknown-repo sentinel");
         }
         // list-default methods.
-        assert_eq!(dispatch("read_history", &[none.clone()]).unwrap(), json!([]));
-        assert_eq!(dispatch("read_supervisor_log", &[none.clone()]).unwrap(), json!([]));
+        assert_eq!(dispatch("read_history", std::slice::from_ref(&none)).unwrap(), json!([]));
+        assert_eq!(dispatch("read_supervisor_log", std::slice::from_ref(&none)).unwrap(), json!([]));
         // dict-default metrics.
-        assert_eq!(dispatch("metrics", &[none.clone()]).unwrap(), json!({}));
+        assert_eq!(dispatch("metrics", std::slice::from_ref(&none)).unwrap(), json!({}));
         // null-default escalation read.
-        assert_eq!(dispatch("read_escalation", &[none.clone()]).unwrap(), Value::Null);
+        assert_eq!(dispatch("read_escalation", std::slice::from_ref(&none)).unwrap(), Value::Null);
         // supervise(name) with no matching repo -> unknown repo.
-        assert_eq!(dispatch("supervise", &[none.clone()]).unwrap(), unknown_repo());
+        assert_eq!(dispatch("supervise", std::slice::from_ref(&none)).unwrap(), unknown_repo());
     }
 
     #[test]
@@ -1033,7 +1033,7 @@ mod tests {
         let last_ok = sup
             .lines()
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-            .last()
+            .next_back()
             .map(|r| r.get("category").and_then(Value::as_str) == Some("ok")
                 && r.get("escalate").and_then(Value::as_bool) == Some(false))
             .unwrap_or(false);
@@ -1104,7 +1104,7 @@ mod tests {
         assert_eq!(dispatch("get_layout", &[]).unwrap(), Value::Null); // unset default
         // round-trip layout
         let layout = json!([{"id": "a", "type": "card", "repo": "r"}]);
-        assert_eq!(dispatch("set_layout", &[layout.clone()]).unwrap(), json!({"ok": true}));
+        assert_eq!(dispatch("set_layout", std::slice::from_ref(&layout)).unwrap(), json!({"ok": true}));
         assert_eq!(dispatch("get_layout", &[]).unwrap(), layout);
     }
 }

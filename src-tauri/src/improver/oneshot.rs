@@ -645,6 +645,21 @@ pub fn ideate(ctx: &mut Ctx) -> i32 {
     0
 }
 
+// --------------------------------------------------------------------------- #
+// small helpers (Python-string semantics)
+// --------------------------------------------------------------------------- #
+
+/// len(s) in Python is the count of Unicode code points (chars), NOT bytes — matters for the
+/// agent_written/backlog_written byte-vs-char counts when the contract has non-ASCII glyphs.
+fn char_len(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// str.rstrip() with no args: strip trailing ASCII+Unicode whitespace.
+fn py_rstrip(s: &str) -> String {
+    s.trim_end().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,19 +704,4 @@ mod tests {
             out.stdout.len()
         );
     }
-}
-
-// --------------------------------------------------------------------------- #
-// small helpers (Python-string semantics)
-// --------------------------------------------------------------------------- #
-
-/// len(s) in Python is the count of Unicode code points (chars), NOT bytes — matters for the
-/// agent_written/backlog_written byte-vs-char counts when the contract has non-ASCII glyphs.
-fn char_len(s: &str) -> usize {
-    s.chars().count()
-}
-
-/// str.rstrip() with no args: strip trailing ASCII+Unicode whitespace.
-fn py_rstrip(s: &str) -> String {
-    s.trim_end().to_string()
 }

@@ -310,7 +310,7 @@ fn run_capture(
         // Only embed the frame when THIS page's capture is fresh (observe() sets state["frame"] only
         // when the screenshot CLI succeeded). frame_file is a reused fixed path, so reading it
         // unconditionally would embed the PRIOR page's image on this page's failure.
-        let has_frame = state.get("frame").map(|v| frame_truthy(v)).unwrap_or(false);
+        let has_frame = state.get("frame").map(frame_truthy).unwrap_or(false);
         if has_frame {
             match std::fs::read(&browser.frame_file) {
                 Ok(bytes) => {
@@ -1039,7 +1039,7 @@ impl AgentBrowser {
                     Some(o) => o,
                     None => return false,
                 };
-                let has_failure = o.get("failure").map(|v| frame_truthy(v)).unwrap_or(false);
+                let has_failure = o.get("failure").map(frame_truthy).unwrap_or(false);
                 let status = o.get("status").and_then(Value::as_i64).unwrap_or(0);
                 has_failure || status >= 400
             })
@@ -1511,7 +1511,7 @@ const B64_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn b64_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;
@@ -1619,7 +1619,7 @@ fn origin_host(url: &str) -> Option<String> {
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))?;
     let authority = rest.split('/').next().unwrap_or(rest);
-    let host = authority.split('@').last().unwrap_or(authority);
+    let host = authority.split('@').next_back().unwrap_or(authority);
     // strip a :port if present (but keep IPv6 simple — inputs here are 127.0.0.1:NNNNN).
     let host = host.split(':').next().unwrap_or(host);
     if host.is_empty() {
@@ -1936,10 +1936,8 @@ mod tests {
     #[test]
     fn run_capture_all_failed_returns_none_semantics() {
         // Mirror the predicate directly: captured non-empty but no screenshot_b64 → None.
-        let captured = vec![
-            json!({"path": "/", "screenshot_b64": ""}),
-            json!({"path": "/x", "nav_error": "navigation failed"}),
-        ];
+        let captured = [json!({"path": "/", "screenshot_b64": ""}),
+            json!({"path": "/x", "nav_error": "navigation failed"})];
         let any_shot = captured.iter().any(|p| {
             p.get("screenshot_b64").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false)
         });
