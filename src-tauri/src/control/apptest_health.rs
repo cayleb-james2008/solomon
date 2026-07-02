@@ -961,8 +961,25 @@ mod tests {
 
         std::thread::scope(|s| {
             let stopper = s.spawn(|| mgr.stop(&name));
-            // Let stop() take A's handle and enter its (lock-free) join loop.
-            std::thread::sleep(Duration::from_millis(80));
+            // Wait (bounded) until stop() has taken A's handle — observable as handle == None,
+            // since only stop() takes it — before swapping in B. A fixed 80ms sleep flaked under
+            // fleet load (2026-07-02 base-gate RED): when the stopper thread wasn't scheduled in
+            // time, stop() captured B instead and returned sessionId "B". The 10s bound stays
+            // well inside stop()'s own 20s join budget; on expiry the assert fails loudly.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                {
+                    let sessions = mgr.sessions.lock().unwrap();
+                    if sessions.get(&name).is_some_and(|s| s.handle.is_none()) {
+                        break;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "stop() did not capture session A's handle within 10s"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
             // A concurrent start() replaces the slot with a fresh live session "B".
             let handle_b = std::thread::spawn(|| {});
             mgr.sessions.lock().unwrap().insert(
