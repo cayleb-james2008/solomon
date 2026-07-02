@@ -489,8 +489,25 @@ pub fn evening_summary() -> Value {
     json!({"ok": true, "report": report_path.to_string_lossy(), "urgent": urgent, "flags": flags})
 }
 
+/// CEO day-state for the dashboard: today's gate state, due hours, and today's plan/report
+/// markdown (empty strings when not yet written). Read-only, cheap.
+pub fn ceo_status() -> Value {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let st = read_state();
+    let read_md = |p: PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+    json!({
+        "today": today,
+        "plan_hour": PLAN_HOUR,
+        "summary_hour": SUMMARY_HOUR,
+        "plan": st.get("plan").cloned().unwrap_or(json!({})),
+        "summary": st.get("summary").cloned().unwrap_or(json!({})),
+        "plan_md": read_md(reports_dir().join(format!("{today}-plan.md"))),
+        "report_md": read_md(reports_dir().join(format!("{today}.md"))),
+    })
+}
+
 /// The last 24 h of incident transitions from runtime/_incidents.jsonl (lenient parse, capped 20).
-fn recent_incidents(now: chrono::DateTime<Utc>) -> Vec<Value> {
+pub fn recent_incidents(now: chrono::DateTime<Utc>) -> Vec<Value> {
     let cutoff = now - chrono::Duration::seconds(86_400);
     let content = std::fs::read_to_string(ops::outcomes::incidents_path()).unwrap_or_default();
     let mut out: Vec<Value> = Vec::new();

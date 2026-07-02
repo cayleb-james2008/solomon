@@ -237,6 +237,61 @@ fn find_repo(name: &str) -> Option<Value> {
 }
 
 // --------------------------------------------------------------------------- #
+// ops_state — the v2 dashboard payload (fleet truth + CEO rhythm)
+// --------------------------------------------------------------------------- #
+
+/// Last `n` parsed records of a JSONL file, oldest→newest (lenient parse; [] on missing/corrupt —
+/// the same contract as every other runtime/ tail reader).
+fn jsonl_tail(path: &std::path::Path, n: usize) -> Value {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let mut out: Vec<Value> = content
+        .lines()
+        .filter_map(|l| serde_json::from_str(l.trim()).ok())
+        .collect();
+    let keep = out.len().saturating_sub(n);
+    Value::Array(out.split_off(keep))
+}
+
+/// The v2 dashboard payload: fleet probe rollup (runtime/ops_status.json — maintained by the
+/// watchdog tick, NEVER recomputed here: a 4s dashboard poll must not run probes), 24h business
+/// outcomes (the ledger snapshot — read-only fs/sqlite, the one computed piece), CEO day-state +
+/// today's plan/report markdown, and the incident/notify tails. Cached ~15s so the 4s poll costs
+/// one snapshot per TTL, not four. Per-field safe() mirrors get_state's resilience contract.
+fn ops_state() -> Value {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(Instant, Value)>> = Mutex::new(None);
+    if let Ok(g) = CACHE.lock() {
+        if let Some((t, v)) = g.as_ref() {
+            if t.elapsed() < Duration::from_secs(15) {
+                return v.clone();
+            }
+        }
+    }
+    let ops: Value = std::fs::read(crate::ops::outcomes::ops_status_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null);
+    let payload = json!({
+        "ops": ops,
+        "outcomes": safe(crate::ops::ledger::snapshot, Value::Null),
+        "ceo": safe(crate::ceo::ceo_status, Value::Null),
+        "incidents": safe(
+            || Value::Array(crate::ceo::recent_incidents(chrono::Utc::now())),
+            json!([]),
+        ),
+        "notify_tail": jsonl_tail(
+            &paths::here().join("runtime").join("_notify.jsonl"),
+            12,
+        ),
+    });
+    if let Ok(mut g) = CACHE.lock() {
+        *g = Some((Instant::now(), payload.clone()));
+    }
+    payload
+}
+
+// --------------------------------------------------------------------------- #
 // get_state — the composite dashboard payload (per-field _safe resilience)
 // --------------------------------------------------------------------------- #
 
@@ -386,6 +441,24 @@ pub fn dispatch(method: &str, args: &[Value]) -> Result<Value, String> {
 
         // ---- combined dashboard state -----------------------------------
         "get_state" => get_state(&st),
+
+        // ---- ops / CEO plane (dashboard v2) ------------------------------
+        "ops_state" => ops_state(),
+        // Fire-and-forget: the morning plan blocks minutes on an LLM call — a bridge call must
+        // return immediately; the dashboard sees the result on a later ops_state poll.
+        // catch_unwind mirrors the watchdog's CEO graft.
+        "run_plan" => {
+            std::thread::spawn(|| {
+                let _ = std::panic::catch_unwind(crate::ceo::morning_plan);
+            });
+            json!({"ok": true, "started": true})
+        }
+        "run_report" => {
+            std::thread::spawn(|| {
+                let _ = std::panic::catch_unwind(crate::ceo::evening_summary);
+            });
+            json!({"ok": true, "started": true})
+        }
 
         // ---- control ----------------------------------------------------
         "start" => match find_repo(&arg_str(args, 0)) {
@@ -816,6 +889,21 @@ fn health_repo(r: &Value) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // -------- jsonl_tail (v2 dashboard payload helper) --------
+    #[test]
+    fn jsonl_tail_takes_last_n_lenient() {
+        let p = std::env::temp_dir().join(format!("solomon_api_tail_{}.jsonl", std::process::id()));
+        std::fs::write(&p, "{\"a\":1}\nnot json\n{\"a\":2}\n{\"a\":3}\n").unwrap();
+        let got = jsonl_tail(&p, 2);
+        // malformed line skipped; last 2 parsed records, oldest→newest
+        assert_eq!(got, json!([{"a":2},{"a":3}]));
+        // n larger than available -> all
+        assert_eq!(jsonl_tail(&p, 50), json!([{"a":1},{"a":2},{"a":3}]));
+        // missing file -> []
+        assert_eq!(jsonl_tail(std::path::Path::new("Z:/absent.jsonl"), 5), json!([]));
+        let _ = std::fs::remove_file(&p);
+    }
 
     // AppState tests mutate the real .solomon.json under control::paths::here(); snapshot + restore it
     // so the suite is hermetic (the file is operator state, not a fixture). All AppState tests share
