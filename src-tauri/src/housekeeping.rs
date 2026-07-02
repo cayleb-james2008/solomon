@@ -103,32 +103,28 @@ pub fn run() -> Value {
             actions.push(format!("{name}: {deleted} merged {prefix}* branches"));
         }
 
-        // 3 + 4. build dirs: stale ones die; oversized active ones die only when the lane is quiet.
-        let quiet = lane_quiet(&r);
+        // 3. build dirs: ONLY delete a dir untouched for STALE_DAYS+ (abandoned = safe). The old
+        //    size-cap-on-ACTIVE-dirs path was REMOVED after it deleted the LIVE Asmodeus trader's
+        //    binary (2026-07-02): `lane_quiet` only checks the improver heartbeat, so it treated a
+        //    15GB target/ as "quiet" and removable while a production Asmodeus.exe was running out
+        //    of it — freezing capital. A recent (non-stale) build dir is presumed in use by a lane
+        //    OR a production app and is NEVER force-deleted for size; the operator can clean big
+        //    active targets manually. Disk stays bounded via stale-cleanup + merged-branch pruning.
         for dir in candidate_build_dirs(Path::new(&path)) {
-            let stale = is_stale(&dir, STALE_DAYS);
+            if !is_stale(&dir, STALE_DAYS) {
+                continue;
+            }
             let size = dir_size(&dir);
-            let over_cap = size > CAP_BYTES;
-            if stale || (over_cap && quiet) {
-                if std::fs::remove_dir_all(&dir).is_ok() {
-                    freed += size;
-                    actions.push(format!(
-                        "{name}: removed {} ({} — {})",
-                        dir.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
-                        human(size),
-                        if stale { "stale" } else { "over cap" },
-                    ));
-                } else {
-                    actions.push(format!(
-                        "{name}: FAILED to remove {} (locked?)",
-                        dir.display()
-                    ));
-                }
-            } else if over_cap && !quiet {
+            if std::fs::remove_dir_all(&dir).is_ok() {
+                freed += size;
                 actions.push(format!(
-                    "{name}: target over cap ({}) but lane busy — deferred",
-                    human(size)
+                    "{name}: removed {} ({}, stale >{}d)",
+                    dir.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+                    human(size),
+                    STALE_DAYS,
                 ));
+            } else {
+                actions.push(format!("{name}: FAILED to remove {} (locked?)", dir.display()));
             }
         }
     }
