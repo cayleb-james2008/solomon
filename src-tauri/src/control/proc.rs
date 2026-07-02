@@ -280,10 +280,17 @@ mod app_job {
 /// than byte-compares. Swap in an ASCII-escaping formatter only if byte-identical output is required.
 pub fn atomic_write_json(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
     let body = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
+    atomic_write_bytes(path, &body)
+}
+
+/// Atomic byte write: temp + rename (control appends ".tmp" to the full name, not an ext swap).
+/// A crash mid-write can never leave a half-written target — the reader sees the old file or the
+/// new one, never a truncation. Used by atomic_write_json and the CEO backlog writer.
+pub fn atomic_write_bytes(path: &Path, body: &[u8]) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp"); // control appends ".tmp" to the full name (repos.json.tmp), not an ext swap
+    tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, &body)?;
+    std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, path)
 }
 

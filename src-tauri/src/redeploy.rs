@@ -195,11 +195,16 @@ pub fn stage_build() -> Result<PathBuf, String> {
         .ok_or_else(|| "solomon repo not located — cannot self-redeploy".to_string())?;
     let cargo = which_cargo().ok_or_else(|| "cargo not found on PATH".to_string())?;
     let cargo_s = cargo.to_string_lossy().into_owned();
-    // `cargo build --release` in the checkout. Long timeout — a clean release build can take many
+    // The Cargo workspace is `src-tauri/`, NOT the repo root — running cargo in the root fails with
+    // "could not find Cargo.toml" and the built artifact lands under src-tauri/target, not target.
+    // (Bug-bounty cycle 1, conf 97: self-redeploy was permanently inoperative because both the cwd
+    // and the artifact path pointed at the repo root.) cwd + paths are the workspace dir.
+    let workspace = repo.join("src-tauri");
+    // `cargo build --release` in the workspace. Long timeout — a clean release build can take many
     // minutes; an incremental one is fast. A timeout aborts the child and returns Err (no swap).
     let r = proc::run(
         &[cargo_s.as_str(), "build", "--release"],
-        Some(&repo),
+        Some(&workspace),
         Some(Duration::from_secs(60 * 30)),
     )
     .map_err(|e| format!("cargo build spawn failed: {e}"))?;
@@ -208,9 +213,9 @@ pub fn stage_build() -> Result<PathBuf, String> {
         let tail: String = tail.chars().take(300).collect();
         return Err(format!("cargo build --release failed (code {}): {tail}", r.code));
     }
-    // The built exe: target/release/<default-run>.exe (Cargo.toml default-run = "solomon").
+    // The built exe: src-tauri/target/release/<default-run>.exe (Cargo.toml default-run = "solomon").
     let exe_name = exe_file_name();
-    let built = repo.join("target").join("release").join(&exe_name);
+    let built = workspace.join("target").join("release").join(&exe_name);
     if !built.is_file() {
         return Err(format!(
             "build reported success but {} not found",
@@ -219,7 +224,7 @@ pub fn stage_build() -> Result<PathBuf, String> {
     }
     // Staging path: same dir, <exe>.new.exe — never the locked live exe.
     let staged_name = new_exe_name(&exe_name);
-    let staged = repo.join("target").join("release").join(&staged_name);
+    let staged = workspace.join("target").join("release").join(&staged_name);
     std::fs::copy(&built, &staged)
         .map_err(|e| format!("copy {} -> {} failed: {e}", built.display(), staged.display()))?;
     Ok(staged)

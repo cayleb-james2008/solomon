@@ -288,11 +288,21 @@ pub fn morning_plan() -> Value {
         }
         let line = format!("- [ ] [{tier}] {goal} {}", ceo_marker(&today));
         let path = backlog_path(lane);
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        // DATA-SAFETY (bug-bounty cycle 1, conf 82): distinguish "file absent" (existing = "") from
+        // "read failed" (the improver's own mark_backlog_done is mid-rewrite / the file is locked).
+        // On a read ERROR we must NOT write — an unwrap_or_default() there truncates the entire
+        // backlog to just today's one line, destroying every pending item. Skip the lane this cycle
+        // instead; it gets planned next tick. The write is atomic (temp+rename) so a crash mid-write
+        // can never leave a half-file, narrowing the RMW race with the improver.
+        let existing = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => continue, // read failed — do NOT risk truncating a live backlog
+        };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if std::fs::write(&path, format!("{line}\n{existing}")).is_ok() {
+        if proc::atomic_write_bytes(&path, format!("{line}\n{existing}").as_bytes()).is_ok() {
             report.push_str(&format!("## {lane}\n- **goal** [{tier}]: {goal}\n- **why**: {why}\n\n"));
             applied.insert(lane.clone(), json!({"tier": tier, "goal": goal}));
         }
