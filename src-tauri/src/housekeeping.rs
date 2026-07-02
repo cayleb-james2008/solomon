@@ -69,8 +69,15 @@ pub fn run() -> Value {
     let mut actions: Vec<String> = Vec::new();
     let mut seen_paths: Vec<String> = Vec::new();
 
-    for r in registry::load_repos() {
+    // ONLY explicitly-registered repos (repos.json), NOT load_repos()'s auto-discovered merge:
+    // deleting branches/build dirs from a repo the operator never put under management is a
+    // data-safety hazard (bug-bounty cycle 1, conf 78). A repo counts as managed only if it has an
+    // explicit repos.json entry — the discovered-dir scan of workspace/projects is excluded.
+    for r in registry::read_repos_json() {
         let name = r.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+        if name.is_empty() {
+            continue;
+        }
         let path = paths::repo_path(&r);
         if path.is_empty() || !Path::new(&path).is_dir() || seen_paths.contains(&path) {
             continue;
