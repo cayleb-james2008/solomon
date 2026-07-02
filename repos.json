@@ -118,7 +118,7 @@
         "public":  true,
         "provider":  "ollama-cloud",
         "model":  "glm-5.2",
-        "ship":  "pr",
+        "ship":  "auto-merge",
         "pr_target_branch":  "main",
         "gate":  "cd src-tauri && cargo test",
         "interval":  120,
