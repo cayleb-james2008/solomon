@@ -38,6 +38,12 @@ use std::time::Duration;
 /// monitor.STALL_SWEEPS — consecutive error/preflight sweeps (incl. this one) that mark a lane STALLED.
 const STALL_SWEEPS: usize = 3;
 
+/// Max crash-restarts per sweep (the disk-meltdown guard — see sweep_repo). At most this many lanes
+/// are (re)started in one 2-min sweep; the rest defer to later sweeps so their cargo build gates
+/// never stack. 2 allows a little parallelism while staying far under the 6-at-once that melted the
+/// disk on 2026-07-02.
+const MAX_LANE_RESTARTS_PER_SWEEP: usize = 2;
+
 /// HEALTH_K — the iteration window the degraded-health classifier inspects. A lane whose last
 /// `HEALTH_K` iterations all failed to ship AND were every one a timeout or a gate-RED is
 /// `degraded:<reason>`, not `healthy` — even when its PID is alive. Pure observability: the
@@ -362,7 +368,18 @@ fn persistent_stop_cleared(reason: &str, base_clean: bool, base_pushed: bool, ba
 /// monitor._sweep_repo: process ONE repo for sweep(); returns (actions, snap). The caller runs this
 /// inside a blanket try/except so one bad repo can never abort the whole sweep — the module's
 /// documented 'a watchdog must never die on one bad repo' contract.
-fn sweep_repo(r: &Value, auto_push_flag: bool) -> (Vec<String>, Value) {
+///
+/// `restart_budget` rate-limits crash-restarts ACROSS the sweep: each restart decrements it, and a
+/// lane that would restart while the budget is exhausted is DEFERRED to a later sweep (2 min apart)
+/// instead of started now. This is the fix for the 2026-07-02 disk meltdown, where the watchdog
+/// restarted all 6 crashed lanes in ONE sweep -> 6 simultaneous cargo builds saturated the disk and
+/// froze the live trader. Spreading restarts across sweeps (with staggered lane intervals) keeps
+/// heavy build gates from ever stacking. A deferred lane is not lost — the next sweep retries it.
+fn sweep_repo(
+    r: &Value,
+    auto_push_flag: bool,
+    restart_budget: &std::cell::Cell<usize>,
+) -> (Vec<String>, Value) {
     let mut actions: Vec<String> = Vec::new();
     // name = r["name"] — the caller guarantees a truthy name before calling.
     let name = r.get("name").and_then(Value::as_str).unwrap_or("").to_string();
@@ -430,20 +447,25 @@ fn sweep_repo(r: &Value, auto_push_flag: bool) -> (Vec<String>, Value) {
 
     let mut restarted = false;
     if should_restart(running, &hb, paused, stop_pending) {
-        let res = control::runner::start(r, auto_push_flag, false);
-        // restarted = bool(res.get("ok") and not res.get("already"))
-        restarted = res.get("ok").and_then(Value::as_bool).unwrap_or(false)
-            && !res.get("already").and_then(Value::as_bool).unwrap_or(false);
-        if restarted {
+        if restart_budget.get() == 0 {
+            // Budget exhausted this sweep — defer to avoid stacking heavy build gates (see the
+            // meltdown note on the signature). The lane stays down; the next sweep retries it.
             actions.push(format!(
-                "restarted {name} (pid {})",
-                py_repr(res.get("pid"))
+                "{name} restart DEFERRED (restart budget spent this sweep — retries next sweep)"
             ));
         } else {
-            actions.push(format!(
-                "restart {name} FAILED: {}",
-                py_repr(res.get("error"))
-            ));
+            let res = control::runner::start(r, auto_push_flag, false);
+            // restarted = bool(res.get("ok") and not res.get("already"))
+            restarted = res.get("ok").and_then(Value::as_bool).unwrap_or(false)
+                && !res.get("already").and_then(Value::as_bool).unwrap_or(false);
+            if restarted {
+                // Only a REAL start (spawned a new process) spends budget — an "already running"
+                // no-op or a failed start must not consume a slot.
+                restart_budget.set(restart_budget.get().saturating_sub(1));
+                actions.push(format!("restarted {name} (pid {})", py_repr(res.get("pid"))));
+            } else {
+                actions.push(format!("restart {name} FAILED: {}", py_repr(res.get("error"))));
+            }
         }
     }
 
@@ -583,6 +605,9 @@ pub fn sweep() -> Value {
     let auto_push_flag = auto_push();
     let mut actions: Vec<String> = Vec::new();
     let mut snapshots: Vec<Value> = Vec::new();
+    // Crash-restart budget for THIS sweep (disk-meltdown guard — see sweep_repo). Shared across
+    // every repo; each real (re)start spends one, and lanes over budget defer to a later sweep.
+    let restart_budget = std::cell::Cell::new(MAX_LANE_RESTARTS_PER_SWEEP);
     for r in control::registry::load_repos() {
         // if not isinstance(r, dict) or not r.get("name"): continue
         if !r.is_object() {
@@ -601,7 +626,7 @@ pub fn sweep() -> Value {
         // crash-recovery layer, so a panic in one repo's recover()/start() must NOT stop the others
         // from being restarted. (Requires unwinding panics — see [profile.release] in Cargo.toml.)
         let name = r.get("name").and_then(Value::as_str).unwrap_or("?").to_string();
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sweep_repo(&r, auto_push_flag))) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sweep_repo(&r, auto_push_flag, &restart_budget))) {
             Ok((repo_actions, snap)) => {
                 actions.extend(repo_actions);
                 snapshots.push(snap);
@@ -882,7 +907,7 @@ mod tests {
             })).unwrap(),
         ).unwrap();
 
-        let (actions, _snap) = sweep_repo(&repo, false);
+        let (actions, _snap) = sweep_repo(&repo, false, &std::cell::Cell::new(MAX_LANE_RESTARTS_PER_SWEEP));
 
         // The heal fired and removed the sentinel.
         assert!(
@@ -899,6 +924,67 @@ mod tests {
         );
         assert!(!rt.join("escalation.json").exists(), "recover wrote a spurious escalation");
         assert!(!rt.join("supervisor.jsonl").exists(), "recover wrote a spurious supervisor record");
+
+        let _ = std::fs::remove_dir_all(&rt);
+        let _ = std::fs::remove_dir_all(&git_dir);
+    }
+
+    // -------- restart budget: an exhausted budget DEFERS a crash-restart (disk-meltdown guard) ----
+    // The 2026-07-02 meltdown: the watchdog restarted all crashed lanes in ONE sweep -> simultaneous
+    // cargo builds saturated the disk and froze the live trader. With the per-sweep restart budget
+    // spent (0), a restartable (crashed) lane must be DEFERRED — NOT started — so its heavy build
+    // gate can't stack this sweep; the next sweep retries it. Crucially, deferral must NOT spawn the
+    // improver subprocess, so this test is spawn-free (a real start would launch `run-improver`).
+    #[test]
+    fn sweep_repo_defers_restart_when_budget_exhausted() {
+        use std::process::Command;
+        let tag = format!(
+            "wd_budget_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() % 1_000_000)
+                .unwrap_or(0)
+        );
+        let git_dir = std::env::temp_dir().join(format!("solomon_{tag}"));
+        let _ = std::fs::remove_dir_all(&git_dir);
+        std::fs::create_dir_all(&git_dir).unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+            vec!["commit", "--allow-empty", "-m", "init"],
+            vec!["branch", "-M", "main"],
+        ] {
+            let st = Command::new("git").args(&args).current_dir(&git_dir).status().unwrap();
+            assert!(st.success(), "git {:?} failed in {:?}", args, git_dir);
+        }
+        let repo = json!({"name": tag, "path": git_dir.to_string_lossy()});
+        let rt = paths::runtime_dir(&repo).unwrap();
+        let _ = std::fs::remove_dir_all(&rt);
+        std::fs::create_dir_all(&rt).unwrap();
+        // A crashed-but-restartable lane: not running (no lock), status a live phase (not stopped,
+        // not error+reverted), no paused/stop sentinel -> should_restart() == true.
+        std::fs::write(
+            rt.join("heartbeat.json"),
+            serde_json::to_string(&json!({"status": "iterating", "phase": "implement"})).unwrap(),
+        )
+        .unwrap();
+
+        // Budget already spent this sweep.
+        let budget = std::cell::Cell::new(0usize);
+        let (actions, _snap) = sweep_repo(&repo, false, &budget);
+
+        assert!(
+            actions.iter().any(|a| a.contains("restart DEFERRED")),
+            "expected a DEFERRED action when budget is 0: {actions:?}"
+        );
+        // MUST NOT have started the lane (no spawn) — no "restarted <name> (pid ...)" action.
+        assert!(
+            !actions.iter().any(|a| a.contains(&format!("restarted {tag}"))),
+            "lane was restarted despite an exhausted budget: {actions:?}"
+        );
+        assert_eq!(budget.get(), 0, "a deferred restart must not change the budget");
 
         let _ = std::fs::remove_dir_all(&rt);
         let _ = std::fs::remove_dir_all(&git_dir);
@@ -1217,7 +1303,7 @@ mod tests {
             writeln!(f, "{}", snap_line(&tag)).unwrap();
         }
 
-        let (actions, _snap) = sweep_repo(&repo, false);
+        let (actions, _snap) = sweep_repo(&repo, false, &std::cell::Cell::new(MAX_LANE_RESTARTS_PER_SWEEP));
 
         // The stall detector must NOT re-emit the STALLED action — the pre-existing
         // "running_stalled" escalation (captured before recover() overwrote it) suppresses it.
