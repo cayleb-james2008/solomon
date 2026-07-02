@@ -696,6 +696,9 @@ pub fn main() -> i32 {
     // evening verified-outcome summary (see ceo::tick — cheap no-op on all but two sweeps a day).
     // catch_unwind mirrors the ops graft: a CEO failure must never abort crash-recovery.
     let _ = std::panic::catch_unwind(crate::ceo::tick);
+    // HOUSEKEEPING GRAFT (v2): day-gated (04:00) storage sweep — worktree prune, merged rsi/
+    // branches, stale/oversized build dirs (see housekeeping.rs). Same isolation contract.
+    let _ = std::panic::catch_unwind(crate::housekeeping::tick);
     // SELF-REDEPLOY: the periodic check that swaps Solomon's OWN production binary when the checkout
     // is behind origin/main, but ONLY in a safe drain window (no lane mid-ship, no live-money lane
     // with an open trade). Cheap when there is nothing to do (cooldown + single-flight guards no-op
