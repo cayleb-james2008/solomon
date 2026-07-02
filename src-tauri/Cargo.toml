@@ -33,8 +33,12 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Securit
 
 [profile.release]
 strip = true
-lto = true
+# Build-speed streamlining (operator ask 2026-07-02): full LTO + codegen-units=1 made every
+# release link take ~10 min under lane load. Thin LTO + a few codegen units cuts link time
+# several-fold for a few percent of binary size — Solomon redeploys often (self-redeploy +
+# fix-sessions), so build time IS an operational cost here.
+lto = "thin"
 opt-level = "s"
-codegen-units = 1
+codegen-units = 4
 # NB: panic=unwind (the default) is intentional — the watchdog sweep uses catch_unwind to isolate
 # a panicking repo so it cannot abort crash-recovery for the others (matches monitor.py per-repo try/except).
