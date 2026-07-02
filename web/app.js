@@ -1,6 +1,8 @@
-/* Solomon — glassmorphic control surface over the pywebview Api bridge.
-   Customizable panel workspace: open panels from the bento menu, drag to rearrange.
-   Append ?mock=1 to render with sample data in a plain browser (no backend). */
+/* Solomon v2 — cyberbrutalist fleet control over the pywebview Api bridge.
+   Leads with FLEET TRUTH (ops probes + 24h business outcomes), the CEO rhythm
+   (morning plan / evening report), and the incident feed; loop config, activity,
+   and approvals remain as panels. Customizable workspace: open panels from the
+   bento menu, drag to rearrange. Append ?mock=1 for sample data in a browser. */
 
 /* ---------- tiny DOM helpers ---------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -15,6 +17,9 @@ const REASON = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const PROV = { "ollama-cloud": "Ollama Cloud", "openrouter": "OpenRouter" };
 const KNOWN_MODELS = ["kimi-k2.7-code", "glm-5.2", "minimax-m3", "nex-agi/nex-n2-pro:free", "qwen3-coder", "deepseek-v3"];
 const PANEL_TYPES = {
+  fleet: { title: "Fleet", icon: '<rect x="3" y="3" width="8" height="8" rx="1"/><rect x="13" y="3" width="8" height="8" rx="1"/><rect x="3" y="13" width="8" height="8" rx="1"/><rect x="13" y="13" width="8" height="8" rx="1"/>', desc: "Ground-truth probes + 24h outcomes per project" },
+  ceo: { title: "CEO Rhythm", icon: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/>', desc: "Morning plan · evening report · deliveries" },
+  incidents: { title: "Incidents", icon: '<path d="M12 3l10 18H2z"/><path d="M12 10v5"/><circle cx="12" cy="18" r="0.5"/>', desc: "Red / recovered transitions (24h)" },
   loops: { title: "Loop Controls", icon: '<rect x="3" y="4" width="18" height="6" rx="2"/><rect x="3" y="14" width="18" height="6" rx="2"/><circle cx="7" cy="7" r="1.2"/><circle cx="7" cy="17" r="1.2"/>', desc: "Start/Stop + selectors for every repo" },
   activity: { title: "Activity", icon: '<path d="M3 12h4l2 6 4-14 2 8h6"/>', desc: "Live log + recent iterations" },
   approvals: { title: "Approvals", icon: '<path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/>', desc: "Open pull requests across repos" },
@@ -52,11 +57,16 @@ function ago(iso) {
 }
 
 /* ---------- app state ---------- */
-const state = { repos: [], providers: ["ollama-cloud", "openrouter"], gh_ready: false, keys: {}, github: {}, auto_push: true };
+const state = { repos: [], providers: ["ollama-cloud", "openrouter"], gh_ready: false, keys: {}, github: {}, auto_push: true, ops: null };
 let layout = [];
 const panels = new Map();   // id -> { el, update }
 
-const DEFAULT_LAYOUT = () => ([{ id: uid(), type: "loops" }, { id: uid(), type: "approvals" }]);
+const DEFAULT_LAYOUT = () => ([
+  { id: uid(), type: "fleet", span2: true },
+  { id: uid(), type: "ceo" },
+  { id: uid(), type: "incidents" },
+  { id: uid(), type: "approvals" },
+]);
 function repoByName(n) { return state.repos.find(r => r.name === n); }
 function statusOf(r) {
   const hb = r.heartbeat || {}; const st = hb.status || (r.running ? "running" : "stopped");
@@ -315,6 +325,231 @@ function approvalsPanel(body) {
   return { update() { const s = JSON.stringify([state.gh_ready, state.repos.map(r => [r.name, (r.prs || []).map(p => p.number)])]); if (s !== sig) { sig = s; build(); } } };
 }
 
+/* ---------- panel: FLEET (v2 — probe truth + 24h outcomes) ---------- */
+function fmtDelta(d) {
+  if (d == null) return "?";
+  const s = (d >= 0 ? "+" : "") + Number(d).toFixed(2);
+  return s;
+}
+function fleetCard(name, p, oc) {
+  const cls = p.status || "grey";
+  const card = h("div", "fcard " + cls);
+
+  const top = h("div", "fcard-top");
+  top.append(
+    h("span", "fcard-name", esc(name)),
+    h("span", "fcard-prio", "P" + esc(p.priority ?? oc.priority ?? "?")),
+    h("span", "fcard-status " + cls, esc(cls)),
+  );
+  card.appendChild(top);
+
+  // 24h outcomes — only what this project actually measures
+  const stats = h("div", "fcard-outcomes");
+  const stat = (val, lbl, tone) => {
+    const s = h("div", "fstat");
+    s.innerHTML = `<b class="${tone || ""}">${esc(val)}</b><span>${esc(lbl)}</span>`;
+    return s;
+  };
+  const it = oc.iterations_24h, sh = oc.shipped_24h;
+  stats.appendChild(stat(`${it ?? "?"}/${sh ?? "?"}`, "iters/ship", it === 0 ? "err" : ""));
+  if (oc.posts_24h !== undefined) {
+    stats.appendChild(stat(oc.posts_24h ?? "?", "posts 24h", oc.posts_24h === 0 ? "err" : "ok"));
+    if ((oc.posts_missing_url_24h || 0) > 0) stats.appendChild(stat(oc.posts_missing_url_24h, "no-url!", "warn"));
+  }
+  if (oc.equity_usd !== undefined) {
+    stats.appendChild(stat("$" + (oc.equity_usd ?? "?"), "equity"));
+    const d = oc.equity_delta_24h;
+    stats.appendChild(stat(fmtDelta(d), "Δ 24h", d > 0 ? "ok" : d < 0 ? "err" : "warn"));
+    stats.appendChild(stat(oc.live_trades_24h ?? "?", "live trades", oc.live_trades_24h === 0 ? "err" : ""));
+    stats.appendChild(stat(oc.fills_24h ?? "?", "fills"));
+  }
+  card.appendChild(stats);
+
+  // probe chips (id → status color)
+  const probes = p.probes || {};
+  if (Object.keys(probes).length) {
+    const chips = h("div", "fcard-probes");
+    Object.entries(probes).forEach(([id, st]) => {
+      chips.appendChild(h("span", "probe-chip " + esc(st), esc(id)));
+    });
+    card.appendChild(chips);
+  }
+
+  // reasons — the honest "why not green"
+  if ((p.reasons || []).length) {
+    card.appendChild(h("div", "fcard-reasons" + (cls === "red" ? " red" : ""), esc(p.reasons.join("\n"))));
+  }
+
+  // lane row: live status + start/stop (reuses the loops panel actions)
+  const lane = h("div", "fcard-lane");
+  const r = repoByName(name);
+  const dot = h("span", "dot");
+  const meta = h("span", "lane-meta");
+  lane.append(dot, meta);
+  if (p.restart_forbidden) lane.appendChild(h("span", "restart-forbidden", "restart forbidden"));
+  lane.appendChild(h("span", "spacer"));
+  if (r) {
+    const btn = h("button", "btn sm");
+    btn.onclick = async () => {
+      btn.disabled = true;
+      const running = (repoByName(name) || r).running;
+      const x = await act(running ? "stop" : "start", name);
+      toast(x && x.ok ? `${name}: ${running ? "stopping" : "starting"}…` : `${(x && x.error) || "failed"}`, x && x.ok ? "ok" : "err");
+      btn.disabled = false;
+      setTimeout(refresh, 600);
+    };
+    lane.appendChild(btn);
+    card._laneBtn = btn;
+  }
+  card._dot = dot; card._meta = meta; card._name = name;
+  card.appendChild(lane);
+  return card;
+}
+function fleetPanel(body) {
+  let sig = "";
+  let cards = [];
+  function build() {
+    body.innerHTML = "";
+    cards = [];
+    const o = state.ops || {};
+    const opsProjects = (o.ops && o.ops.projects) || {};
+    const outProjects = (o.outcomes && o.outcomes.projects) || {};
+    const names = [...new Set([...Object.keys(opsProjects), ...Object.keys(outProjects)])];
+    if (!names.length) {
+      body.appendChild(h("p", "muted", "No fleet data yet — the watchdog tick writes probe verdicts within ~2 minutes of launch."));
+      return;
+    }
+    const note = h("div", "fleet-note");
+    const bw = o.ops && o.ops.blind_window_s;
+    note.innerHTML = `<span>probes checked ${esc(ago(o.ops && o.ops.checked_at) || "—")}</span>`
+      + (bw > 600 ? `<span class="blind">· blind ${(bw / 3600).toFixed(1)}h before that (app was closed)</span>` : "");
+    body.appendChild(note);
+    const grid = h("div", "fleet-grid");
+    names
+      .map(n => [n, opsProjects[n] || {}, outProjects[n] || {}])
+      .sort((a, b) => (a[1].priority ?? a[2].priority ?? 99) - (b[1].priority ?? b[2].priority ?? 99))
+      .forEach(([n, p, oc]) => { const c = fleetCard(n, p, oc); cards.push(c); grid.appendChild(c); });
+    body.appendChild(grid);
+  }
+  function updateLaneRows() {
+    cards.forEach(c => {
+      const r = repoByName(c._name);
+      const s = r ? statusOf(r) : { cls: "grey", label: "not a lane", phase: "" };
+      if (c._dot) c._dot.className = "dot " + s.cls;
+      if (c._meta) c._meta.textContent = s.label + (s.phase ? " · " + s.phase : "") + (r && r.model ? " · " + r.model : "");
+      if (c._laneBtn && r) {
+        const running = r.running;
+        c._laneBtn.classList.toggle("primary", !running);
+        c._laneBtn.classList.toggle("danger", running);
+        c._laneBtn.innerHTML = (running ? ic("stop", 13) : ic("play", 13)) + (running ? "Stop" : "Start");
+      }
+    });
+  }
+  build(); updateLaneRows();
+  return { update() {
+    const o = state.ops || {};
+    const s = JSON.stringify([o.ops, o.outcomes]);
+    if (s !== sig) { sig = s; build(); }
+    updateLaneRows();
+  } };
+}
+
+/* ---------- panel: CEO rhythm (v2 — plan / report / deliveries) ---------- */
+function ceoPanel(body) {
+  let sig = "";
+  let tab = "report";
+  function gateState(sec, today) {
+    if (!sec) return ["pending", "pending"];
+    if (sec.done === today) return ["done", "done"];
+    if ((sec.attempts || 0) > 0) return ["failed", `${sec.attempts} failed`];
+    return ["pending", "pending"];
+  }
+  function build() {
+    body.innerHTML = "";
+    const o = state.ops || {};
+    const c = o.ceo || {};
+    const today = c.today || "";
+
+    const day = h("div", "ceo-day");
+    const [pCls, pTxt] = gateState(c.plan, today);
+    const [sCls, sTxt] = gateState(c.summary, today);
+    day.append(
+      h("span", "ceo-gate", `plan ≥ ${esc(String(c.plan_hour ?? 7).padStart(2, "0"))}:00 <span class="st ${pCls}">${esc(pTxt)}</span>`),
+      h("span", "ceo-gate", `report ≥ ${esc(String(c.summary_hour ?? 20).padStart(2, "0"))}:00 <span class="st ${sCls}">${esc(sTxt)}</span>`),
+    );
+    body.appendChild(day);
+
+    const actions = h("div", "ceo-actions");
+    const mkRun = (label, method) => {
+      const b = h("button", "btn sm primary", esc(label));
+      b.onclick = async () => {
+        b.disabled = true;
+        const x = await act(method);
+        toast(x && x.ok ? `${label} started — result lands on the next refresh` : `${(x && x.error) || "failed"}`, x && x.ok ? "ok" : "err");
+        setTimeout(() => { b.disabled = false; }, 4000);
+      };
+      return b;
+    };
+    actions.append(mkRun("Run plan now", "run_plan"), mkRun("Run report now", "run_report"));
+    body.appendChild(actions);
+
+    const tabs = h("div", "ceo-tabs");
+    const md = h("div", "ceo-md");
+    const renderMd = () => {
+      const text = tab === "plan" ? (c.plan_md || "(no plan yet today)") : (c.report_md || "(no report yet today)");
+      md.innerHTML = esc(text).split("\n").map(l => l.includes("⚠") ? `<span class="flag">${l}</span>` : l).join("\n");
+    };
+    ["report", "plan"].forEach(t => {
+      const b = h("button", "ceo-tab" + (tab === t ? " active" : ""), t);
+      b.onclick = () => { tab = t; tabs.querySelectorAll(".ceo-tab").forEach(x => x.classList.toggle("active", x.textContent === t)); renderMd(); };
+      tabs.appendChild(b);
+    });
+    renderMd();
+    body.append(tabs, md);
+
+    const dl = h("div", "deliveries", "<h5>deliveries (ntfy · toast)</h5>");
+    const tail = (o.notify_tail || []).slice(-6).reverse();
+    if (!tail.length) dl.appendChild(h("div", "delivery", "none yet"));
+    tail.forEach(n => {
+      const okN = n.ntfy === "sent", okT = n.toast === "shown";
+      dl.appendChild(h("div", "delivery",
+        `<span>${esc(ago(n.ts))}</span><span>${esc(n.title || "")}</span>`
+        + `<span class="${okN ? "ok" : "err"}">${okN ? "ntfy✓" : esc("ntfy:" + (n.ntfy || "?"))}</span>`
+        + `<span class="${okT ? "ok" : "err"}">${okT ? "toast✓" : esc("toast:" + (n.toast || "?"))}</span>`));
+    });
+    body.appendChild(dl);
+  }
+  build();
+  return { update() {
+    const o = state.ops || {};
+    const s = JSON.stringify([o.ceo, (o.notify_tail || []).length && o.notify_tail[o.notify_tail.length - 1]]);
+    if (s !== sig) { sig = s; build(); }
+  } };
+}
+
+/* ---------- panel: incidents (v2 — red/recovered transitions, 24h) ---------- */
+function incidentsPanel(body) {
+  let sig = "";
+  function build() {
+    body.innerHTML = "";
+    const inc = ((state.ops || {}).incidents || []).slice().reverse();
+    if (!inc.length) { body.appendChild(h("p", "muted", "No incidents in the last 24h. Quiet is only good when the Fleet panel is green.")); return; }
+    inc.forEach(i => {
+      const ev = i.event === "recovered" ? "recovered" : "red";
+      const row = h("div", "inc " + ev);
+      row.innerHTML = `<span class="inc-ev">${esc(ev)}</span><span class="inc-id">${esc(i.probe_id || "?")}</span>`
+        + `<span class="inc-detail" title="${esc(i.detail || "")}">${esc(i.detail || "")}</span>`
+        + `<span class="inc-ts">${esc(ago(i.ts))}</span>`;
+      body.appendChild(row);
+    });
+  }
+  build();
+  return { update() {
+    const s = JSON.stringify((state.ops || {}).incidents);
+    if (s !== sig) { sig = s; build(); }
+  } };
+}
+
 /* ---------- panel shell ---------- */
 function makePanel(spec) {
   const el = h("div", "panel" + (spec.span2 ? " span2" : ""));
@@ -340,7 +575,10 @@ function makePanel(spec) {
   el.ondrop = e => { e.preventDefault(); el.classList.remove("dragover"); if (dragId && dragId !== spec.id) reorder(dragId, spec.id); };
 
   let api = { update() {} };
-  if (spec.type === "loops") api = loopsPanel(body);
+  if (spec.type === "fleet") api = fleetPanel(body);
+  else if (spec.type === "ceo") api = ceoPanel(body);
+  else if (spec.type === "incidents") api = incidentsPanel(body);
+  else if (spec.type === "loops") api = loopsPanel(body);
   else if (spec.type === "activity") api = activityPanel(body, spec);
   else if (spec.type === "approvals") api = approvalsPanel(body);
   return { el, update: api.update };
@@ -368,7 +606,12 @@ function renderWorkspace() {
 function applyState() { panels.forEach(p => { try { p.update(); } catch (e) { /* one panel must not break the rest */ } }); }
 
 /* ---------- data ---------- */
-async function refresh() { try { const s = await call("get_state"); Object.assign(state, s); applyState(); } catch (e) { /* keep prior */ } }
+async function refresh() {
+  try { const s = await call("get_state"); Object.assign(state, s); } catch (e) { /* keep prior */ }
+  // v2 fleet payload rides the same tick (server-side cached ~15s, so the 4s poll stays cheap).
+  try { state.ops = await call("ops_state"); } catch (e) { /* keep prior */ }
+  applyState();
+}
 function saveLayout() { const clean = layout.map(({ id, type, repo, span2 }) => ({ id, type, repo, span2 })); act("set_layout", clean); try { localStorage.setItem("solomon.layout", JSON.stringify(clean)); } catch {} }
 
 /* ---------- bento (add panel) ---------- */
@@ -442,10 +685,25 @@ async function boot() {
   $("#settingsScrim").onclick = closeSettings;
 
   try { const s = await call("get_state"); Object.assign(state, s); } catch (e) { toast("Backend not ready: " + e.message, "err"); }
+  try { state.ops = await call("ops_state"); } catch {}
   let saved = null;
   try { saved = await call("get_layout"); } catch {}
   if (!Array.isArray(saved) || !saved.length) { try { saved = JSON.parse(localStorage.getItem("solomon.layout") || "null"); } catch {} }
   layout = (Array.isArray(saved) && saved.length ? saved : DEFAULT_LAYOUT()).map(p => ({ id: p.id || uid(), type: p.type, repo: p.repo, span2: !!p.span2 }));
+  // v2 migration (once): a layout saved before the fleet-first redesign gets the new planes
+  // prepended so the redesign is what the operator actually sees. The one-shot flag means a
+  // deliberately-removed fleet panel never comes back on its own.
+  let migrated = false;
+  try { migrated = localStorage.getItem("solomon.v2fleet") === "1"; } catch {}
+  if (!migrated && !layout.some(p => p.type === "fleet" || p.type === "ceo")) {
+    layout = [
+      { id: uid(), type: "fleet", span2: true },
+      { id: uid(), type: "ceo" },
+      { id: uid(), type: "incidents" },
+    ].concat(layout);
+    try { localStorage.setItem("solomon.v2fleet", "1"); } catch {}
+    saveLayout();
+  }
   try { const sha = await call("current_sha"); $("#version").textContent = (sha && (sha.sha || sha)) ? String(sha.sha || sha).slice(0, 7) : ""; } catch {}
   // Render the dashboard NOW — first paint must NOT be gated on the network update check below.
   renderWorkspace(); applyState();
@@ -488,6 +746,41 @@ const mock = (() => {
     get_state: () => ({ repos, providers: ["ollama-cloud", "openrouter"], gh_ready: true, keys: { "ollama-cloud": true }, github: { user: "cayleb" }, auto_push: true }),
     get_layout: () => lay, set_layout: (l) => { lay = l; return { ok: true }; },
     current_sha: () => ({ sha: "efd7ba2" }),
+    // v2 fleet payload (shape byte-identical to api::ops_state).
+    ops_state: () => ({
+      ops: {
+        checked_at: new Date(Date.now() - 90000).toISOString().replace(/\.\d+Z$/, "Z"),
+        blind_window_s: 8200,
+        projects: {
+          asmodeus: { priority: 1, status: "yellow", worst_probe: "auth_health", reasons: ["auth_health=yellow (188 yellow-pattern)"], restart_forbidden: false, probes: { fills_recency: "green", equity_fresh: "green", auth_health: "yellow", kill_breaker: "green", process: "green" } },
+          sover: { priority: 2, status: "red", worst_probe: "publish_recency", reasons: ["publish_recency=red (age 26.1h)"], restart_forbidden: false, probes: { publish_recency: "red", cdp_alive: "green", autopost_gate: "green", process: "green" } },
+          daedulus: { priority: 3, status: "yellow", worst_probe: "outcome_streak", reasons: ["outcome_streak=yellow (unobservable)"], restart_forbidden: false, probes: { outcome_streak: "yellow", heartbeat_fresh: "yellow" } },
+          dotz: { priority: 4, status: "green", worst_probe: null, reasons: [], restart_forbidden: false, probes: { outcome_streak: "green", heartbeat_fresh: "green" } },
+        },
+      },
+      outcomes: { projects: {
+        asmodeus: { priority: 1, iterations_24h: 39, shipped_24h: 19, equity_usd: 168.97, equity_delta_24h: -3.71, live_trades_24h: 2, fills_24h: 4 },
+        sover: { priority: 2, iterations_24h: 82, shipped_24h: 43, posts_24h: 0, posts_missing_url_24h: 1, last_post_at: "2026-06-30T19:43:53Z" },
+        daedulus: { priority: 3, iterations_24h: 0, shipped_24h: 0 },
+        dotz: { priority: 4, iterations_24h: 68, shipped_24h: 41 },
+      } },
+      ceo: {
+        today: "2026-07-02", plan_hour: 7, summary_hour: 20,
+        plan: { done: "2026-07-02" }, summary: {},
+        plan_md: "# Solomon morning plan — 2026-07-02\n\n## asmodeus\n- **goal** [refactor]: decouple the equity writers\n- **why**: the fitness signal is corrupted\n",
+        report_md: "# Solomon evening report — 2026-07-01\n\nfleet: asmodeus YELLOW(auth_health) sover RED(publish_recency)\n\n## sover (priority 2)\n- ⚠ sover: ZERO posts in 24h\n",
+      },
+      incidents: [
+        { ts: new Date(Date.now() - 7200000).toISOString(), event: "red", probe_id: "sover/publish_recency", detail: "age 26.1h > 24h" },
+        { ts: new Date(Date.now() - 300000).toISOString(), event: "recovered", probe_id: "solomon/monitor_fresh", detail: "age 45s" },
+      ],
+      notify_tail: [
+        { ts: new Date(Date.now() - 7200000).toISOString(), title: "Solomon: sover/publish_recency RED", priority: "urgent", ntfy: "sent", toast: "shown" },
+        { ts: new Date(Date.now() - 300000).toISOString(), title: "Solomon: solomon/monitor_fresh recovered", priority: "default", ntfy: "sent", toast: "error: powershell exit 1" },
+      ],
+    }),
+    run_plan: () => ({ ok: true, started: true }),
+    run_report: () => ({ ok: true, started: true }),
     read_log: (n) => ({ text: `2026-06-22T06:44Z iteration 3: branch rsi/iter — Pi working (${n})\n2026-06-22T06:45Z gate: pytest…\n2026-06-22T06:46Z Pi made one improvement; opening PR` }),
     // mock metrics + history so ?mock=1 previews the rich activity panel (shape byte-identical to the
     // real backend: control.metrics / control.read_history).
