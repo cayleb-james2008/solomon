@@ -669,31 +669,37 @@ mod tests {
     // must be captured IN FULL without spuriously timing out. Pre-fix this returned Err(TimedOut)
     // (and lost the output) because the child blocked on write() while we sat in wait_timeout.
     //
-    // LOAD TOLERANCE (fleet-supervisor 2026-07-01T08:42Z): under heavy CPU contention (5 RSI lanes +
-    // ~15 asmodeus processes) the drain threads may not get scheduled fast enough to keep the pipe
-    // empty; the child then blocks on write(), wait_timeout expires, and the test spuriously REDs —
-    // a false gate-RED that silently drops a correct branch. Use a generous 120s deadline (matching
-    // the production bound) and retry ONCE on a timeout-class failure: a true deadlock fails on both
-    // attempts, but a transient wall-clock flake under load recovers without weakening the assertion.
+    // LOAD TOLERANCE (2026-07-02 deflake, supersedes the 2026-07-01 deadline bump): the flood is
+    // `type` of a pre-written ~224KB fixture — I/O-bound, so wall time no longer scales with CPU
+    // contention. The old `for /L` echo loop was interpreted by cmd.exe (8000 iterations); its wall
+    // time scaled ~18x with fleet load (3s quiet, 58s loaded) and blew the 120s deadline + retry
+    // twice on 2026-07-02, false-REDding the base gate and stopping the RSI lane. Serialized against
+    // the sibling control::proc flood test via proc::flood_serial_lock; the retry-once-on-timeout
+    // stays as belt-and-braces (a true deadlock still fails both attempts). Assertion unchanged.
     #[cfg(windows)]
     #[test]
     fn run_with_timeout_drains_large_output_without_deadlock() {
         use std::io::ErrorKind;
         use std::process::Stdio;
 
-        fn build_flood_cmd() -> Command {
+        let _serial = proc::flood_serial_lock();
+        let fixture = proc::flood_fixture();
+
+        fn build_flood_cmd(fixture: &std::path::Path) -> Command {
             let mut cmd = Command::new("cmd");
-            cmd.args(["/c", "for /L %i in (1,1,8000) do @echo XXXXXXXXXXXXXXXXXXXXXXXXXX"]);
-            cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            cmd.args(["/c", "type"]).arg(fixture);
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             cmd
         }
 
         let dur = Duration::from_secs(120);
-        let out = match run_with_timeout(build_flood_cmd(), dur) {
+        let out = match run_with_timeout(build_flood_cmd(fixture), dur) {
             Ok(o) => o,
             // Retry once: a wall-clock flake under CPU contention is not a deadlock regression.
             Err(e) if e.kind() == ErrorKind::TimedOut => {
-                run_with_timeout(build_flood_cmd(), dur)
+                run_with_timeout(build_flood_cmd(fixture), dur)
                     .expect("must capture large output, not time out (after one retry on timeout)")
             }
             Err(e) => panic!("unexpected error: {e}"),

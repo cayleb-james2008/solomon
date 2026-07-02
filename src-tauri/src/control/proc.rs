@@ -316,6 +316,39 @@ pub fn which_gh() -> Option<PathBuf> {
     .clone()
 }
 
+// --------------------------------------------------------------------------- #
+// Test support shared by the two pipe-flood drain tests (tests below + improver::oneshot::tests).
+// --------------------------------------------------------------------------- #
+
+/// Path to a ~224KB flood fixture (8000 x 28-byte lines), written atomically once per process.
+/// `cmd /c type <fixture>` streams it I/O-bound: still 3.4x the ~64KB pipe buffer (the deadlock
+/// trigger the drain tests exist to catch), but its wall time no longer scales with CPU load.
+/// The old generator (`cmd /c for /L ... do @echo ...`) interpreted 8000 echo iterations inside
+/// cmd.exe — measured 3s on a quiet box vs 58s under fleet load — and blew the 120s deadline plus
+/// retry twice on 2026-07-02, false-REDding the base gate and stopping the RSI lane.
+#[cfg(all(test, windows))]
+pub(crate) fn flood_fixture() -> &'static Path {
+    static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        let p = std::env::temp_dir().join("solomon_flood_fixture_224k.txt");
+        // Atomic write (temp + rename): concurrent test binaries share the fixed path safely —
+        // a reader always sees a complete 224,000-byte file, never a truncation.
+        atomic_write_bytes(&p, "XXXXXXXXXXXXXXXXXXXXXXXXXX\r\n".repeat(8000).as_bytes())
+            .expect("write flood fixture to temp dir");
+        p
+    })
+}
+
+/// Serializes the two flood tests (control::proc + improver::oneshot share one test binary) so
+/// their >64KB floods never run concurrently and compound drain-thread contention under load.
+/// Poison-tolerant: a panic in one holder must not cascade-fail the sibling test.
+#[cfg(all(test, windows))]
+pub(crate) fn flood_serial_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,17 +368,20 @@ mod tests {
     // pipe buffer must NOT block-on-write and time out. The old post-exit drain returned Err(TimedOut)
     // here (and lost the output); the thread-drain captures it all and exits fast.
     //
-    // LOAD TOLERANCE (fleet-supervisor 2026-07-01T08:42Z): under heavy CPU contention the drain
-    // threads may starve, the child blocks on write(), wait_timeout expires, and the test spuriously
-    // REDs — a false gate-RED that silently drops a correct branch. Use a generous 120s deadline and
-    // retry ONCE on a timeout-class failure: a true deadlock fails on both attempts; a transient
-    // wall-clock flake under load recovers without weakening what the test verifies.
+    // LOAD TOLERANCE (2026-07-02 deflake, supersedes the 2026-07-01 deadline bump): the flood is
+    // `type` of a pre-written ~224KB fixture — I/O-bound, so wall time is load-insensitive. The old
+    // CPU-bound `for /L` echo loop's wall time scaled ~18x with fleet contention (3s quiet, 58s
+    // loaded) and blew the 120s deadline + retry twice, false-REDding the base gate. Serialized
+    // against the sibling oneshot flood test via flood_serial_lock; the retry-once-on-timeout stays
+    // as belt-and-braces (a true deadlock still fails both attempts). Assertions unchanged.
     #[cfg(windows)]
     #[test]
     fn run_timeout_drains_large_output_without_deadlock() {
         use std::io::ErrorKind;
-        // `for /L` emits ~8000 * 28-byte lines (~230KB) to stdout, well past one pipe buffer.
-        let args = &["cmd", "/c", "for /L %i in (1,1,8000) do @echo XXXXXXXXXXXXXXXXXXXXXXXXXX"];
+        let _serial = flood_serial_lock();
+        // 224,000 bytes to stdout, well past one ~64KB pipe buffer.
+        let fixture = flood_fixture().to_string_lossy().into_owned();
+        let args = &["cmd", "/c", "type", fixture.as_str()];
         let dur = Duration::from_secs(120);
         let out = match run(args, None, Some(dur)) {
             Ok(o) => o,
