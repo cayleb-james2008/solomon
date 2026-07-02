@@ -9,6 +9,7 @@
 mod api; // native port of app.py's Api — the `bridge` command + headless backend (get_state, dispatch)
 mod ceo; // CEO rhythm (v2 Phase B): morning plan + evening verified-outcome summary (`plan`/`report` + watchdog graft)
 mod control; // native port of control.py — repos registry, git/gh, locks, runner (the `bridge` backend)
+mod housekeeping; // storage housekeeping (v2): day-gated build-dir/branch/worktree cleanup on the watchdog tick
 mod improver; // native port of improver/run_improver.py — the per-repo RSI loop (`run-improver` subcommand)
 mod notify; // operator notifications (v2 Phase A): ntfy push + Windows toast, fed by ops incidents + CEO reports
 mod ops; // ops plane (Phase 1): ground-truth probes + honest fleet status (`probe` subcommand + watchdog graft)
