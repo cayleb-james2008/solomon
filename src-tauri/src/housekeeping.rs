@@ -100,7 +100,7 @@ pub fn run() -> Value {
         let quiet = lane_quiet(&r);
         for dir in candidate_build_dirs(Path::new(&path)) {
             let stale = is_stale(&dir, STALE_DAYS);
-            let size = if stale { dir_size(&dir) } else { dir_size(&dir) };
+            let size = dir_size(&dir);
             let over_cap = size > CAP_BYTES;
             if stale || (over_cap && quiet) {
                 if std::fs::remove_dir_all(&dir).is_ok() {
