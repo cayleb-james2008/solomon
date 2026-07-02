@@ -29,3 +29,6 @@ web/assets/_exe_icon_verify.png
 /Solomon.exe
 # transient backup when overwriting a locked (running) Solomon.exe — rename-aside then copy
 /Solomon.exe.old
+
+# transient rename-aside artifacts while a running/recorded exe is being swapped
+/Solomon.exe.*
