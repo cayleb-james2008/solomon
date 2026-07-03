@@ -185,7 +185,13 @@ pub fn project_outcomes(entry: &Value, now: DateTime<Utc>) -> Value {
     for cfg in registry::project_probes(entry) {
         let id = cfg.get("id").and_then(Value::as_str).unwrap_or("");
         let kind = cfg.get("kind").and_then(Value::as_str).unwrap_or("");
-        if id == "publish_recency" {
+        // 2026-07-03: publish_recency was split into one probe per platform
+        // (publish_recency_instagram/tiktok/youtube, all pointing at the same post_registry.json) so
+        // a dead platform can't hide behind a healthy one's fresh timestamp — see ops.json. Match the
+        // family by prefix so posts_activity (aggregate counts, not platform-specific) still computes
+        // from whichever one is present; the contains_key guard means it only runs once even though
+        // all 3 probes point at the same file.
+        if id.starts_with("publish_recency") && !out.contains_key("posts_24h") {
             if let Some(f) = cfg.get("file").and_then(Value::as_str) {
                 if let Value::Object(m) = posts_activity(&registry::resolve_path(f, &repo_path), now) {
                     out.extend(m);

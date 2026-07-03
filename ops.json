@@ -83,14 +83,32 @@
         "comment": "Autonomous social executive (GGG brand). Live state root is %LOCALAPPDATA%\\Sover — the repo .runtime copy is STALE (that is what fooled the old monitor). Paths verified against the live filesystem 2026-07-01.",
         "probes": [
             {
-                "id": "publish_recency",
+                "id": "publish_recency_instagram",
                 "kind": "json_field",
                 "file": "%LOCALAPPDATA%\\Sover\\data\\ggg\\post_registry.json",
-                "path": "*.published_at",
+                "path": "*:instagram.published_at",
                 "mode": "age",
                 "yellow_after_s": 43200,
                 "red_after_s": 86400,
-                "comment": "Registry is a dict keyed 'id:platform'; per-entry field is 'published_at' (naive-local timestamp, verified). Newest across all entries."
+                "comment": "Registry is a dict keyed 'id:platform'; per-entry field is 'published_at' (naive-local timestamp, verified). 2026-07-03: split the old aggregate 'publish_recency' (path '*.published_at', newest across ALL platforms) into one probe per platform — Instagram publishing regularly masked control_tiktok/control_youtube being dead ('legacy runner no-op' stubs that update their own last_run but never actually post) because the aggregate's newest-wins semantics only needed ONE platform alive to read green."
+            },
+            {
+                "id": "publish_recency_tiktok",
+                "kind": "json_field",
+                "file": "%LOCALAPPDATA%\\Sover\\data\\ggg\\post_registry.json",
+                "path": "*:tiktok.published_at",
+                "mode": "age",
+                "yellow_after_s": 43200,
+                "red_after_s": 86400
+            },
+            {
+                "id": "publish_recency_youtube",
+                "kind": "json_field",
+                "file": "%LOCALAPPDATA%\\Sover\\data\\ggg\\post_registry.json",
+                "path": "*:youtube.published_at",
+                "mode": "age",
+                "yellow_after_s": 43200,
+                "red_after_s": 86400
             },
             {
                 "id": "produce_recency",
