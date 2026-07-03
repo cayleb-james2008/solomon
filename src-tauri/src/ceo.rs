@@ -247,30 +247,38 @@ pub fn morning_plan() -> Value {
         let top_item = std::fs::read_to_string(backlog_path(name))
             .ok()
             .and_then(|c| c.lines().find(|l| l.trim().starts_with("- [ ]")).map(str::to_string));
+        let velocity = velocity_context(&outcomes, goal);
         ctx.push(json!({
             "lane": name,
             "priority": prio,
             "north_star": goal,
             "outcomes_24h": outcomes,
+            "velocity": velocity,
             "probes": probes,
             "current_top_backlog_item": top_item,
         }));
     }
 
-    let system = "You are the CEO planner of Solomon, a control plane running autonomous \
-        improvement lanes over the operator's projects. Given each lane's north star, measured \
-        24h outcomes, and probe status, choose ONE concrete, verifiable goal per lane for today. \
-        HARD RULES: asmodeus is priority 1 — give it the deepest, most specific goal (its north \
-        star is capital velocity: fast, frequent profits across assets and short timeframes; \
-        NEVER weaken kill-switch/breaker/capital_guard mechanisms, only tunable thresholds). \
-        Growth must be organic/free only — no ad spend, no paid services; any money-out step \
-        stays human-gated. Lanes whose north star says GROWTH IS IN SCOPE (public projects) \
-        should get an ORGANIC growth goal (README, docs, examples, release notes, showcase \
-        content) on days when their measured outcomes are healthy — growth is how public \
-        projects scale; never paid channels. Prefer fixing a measured zero (zero posts, zero \
-        trades, lane never fired, red probe) over cosmetic work. Goals must be implementable by \
-        a coding agent in one iteration and verifiable from files/tests/logs. Reply with STRICT \
-        JSON only: \
+    let system = "You are the CEO planner of Solomon, a growth executive running autonomous \
+        improvement lanes over the operator's projects — an AI that grows the company while the \
+        operator sleeps. Given each lane's north star, measured 24h outcomes, its velocity \
+        (current throughput vs target/trend), and probe status, choose ONE concrete, verifiable \
+        goal per lane for today. GROWTH IS THE JOB: every lane's daily goal must measurably \
+        ADVANCE its north-star velocity metric — shrink the days to its next follower / \
+        engagement / trade / fill / user / monetization milestone — moving a real number in the \
+        velocity object FORWARD. A healthy lane is NOT done: push it to its next milestone, never \
+        give it cosmetic busywork. HARD RULES: asmodeus is priority 1 — give it the deepest, most \
+        specific goal (its north star is capital velocity: fast, frequent profits across assets \
+        and short timeframes; NEVER weaken kill-switch/breaker/capital_guard mechanisms, only \
+        tunable thresholds). Growth must be organic/free only — no ad spend, no paid services; \
+        any money-out step stays human-gated. Lanes whose north star says GROWTH IS IN SCOPE \
+        (public projects) grow ORGANICALLY (README, docs, examples, release notes, showcase \
+        content, throughput) — growth is how public projects scale; never paid channels. Fix a \
+        measured RED outcome FIRST (zero posts, zero trades, lane never fired, red probe) — a \
+        dead engine can't grow — but a lane with a healthy engine STILL gets pushed forward \
+        toward its next growth milestone, not idled. Growth must never become reward-hacking, \
+        off-brand, or unbounded. Goals must be implementable by a coding agent in one iteration \
+        and verifiable from files/tests/logs. Reply with STRICT JSON only: \
         {\"lanes\": {\"<lane>\": {\"tier\": \"chore|feature|refactor|architecture\", \
         \"goal\": \"<one sentence>\", \"why\": \"<one sentence>\"}}} — one entry per lane given.";
     let user = serde_json::to_string_pretty(&json!({"date": today, "lanes": ctx}))
@@ -290,9 +298,15 @@ pub fn morning_plan() -> Value {
         return json!({"ok": false, "error": "llm JSON contained no usable lane goals"});
     }
 
-    // Apply: prepend the day item to each UNPLANNED lane's backlog; report + notify.
+    // Apply: prepend the day item to each UNPLANNED lane's backlog; report + notify. The report is
+    // the founder's morning email (Polsia "while you slept"): (1) OVERNIGHT — verified, from the
+    // ledger, never fabricated; (2) TODAY'S PLAN — the growth goals just chosen; (3) NEXT — the one
+    // thing to watch. Section (1) is computed deterministically before the plan loop.
+    let incidents = recent_incidents(Utc::now());
     let mut applied = Map::new();
     let mut report = format!("# Solomon morning plan — {today}\n\n");
+    report.push_str(&overnight_section(&snapshot, &incidents));
+    report.push_str("## TODAY'S PLAN\n\n");
     for (lane, tier, goal, why) in &items {
         if !unplanned.iter().any(|(_, n, _)| n == lane) {
             continue; // already planned today — never double-stack
@@ -321,6 +335,7 @@ pub fn morning_plan() -> Value {
     if applied.is_empty() {
         return json!({"ok": false, "error": "no backlog was writable"});
     }
+    report.push_str(&format!("## NEXT\n\n{}\n", next_watch(&snapshot, &status)));
     let report_path = reports_dir().join(format!("{today}-plan.md"));
     let _ = std::fs::create_dir_all(reports_dir());
     let _ = std::fs::write(&report_path, &report);
@@ -543,6 +558,74 @@ pub fn plan_items(parsed: &Value, known_lanes: &[String]) -> Vec<(String, String
         out.push((name.clone(), tier, goal, why));
     }
     out
+}
+
+/// The compact per-lane VELOCITY object handed to the growth planner (pure — unit-tested). It
+/// anchors the daily goal to a real number to move FORWARD: the lane's primary 24h throughput
+/// metric (posts, else live trades / fills, else shipped iterations — the north-star signal that
+/// exists in the measured outcomes), the numeric daily target parsed from the north star when one
+/// is stated (e.g. sover's "3 reels/day"), the remaining gap to that target, and a trend label.
+///
+/// `trend` is DERIVED, never fabricated:
+///   - "stalled"  — current is a measured zero (the engine is dead; fix before growth)
+///   - "behind"   — a target is stated and current is under it (room to grow toward the milestone)
+///   - "healthy"  — a target is stated and current meets/exceeds it (push to the NEXT milestone)
+///   - "growing"  — no numeric target in the north star, but throughput is non-zero (keep pushing)
+///   - "unknown"  — no throughput metric is observable (null outcomes; can't anchor a number)
+pub fn velocity_context(outcomes: &Value, north_star: &str) -> Value {
+    // The primary throughput metric, in north-star priority order: posts (public reach), then live
+    // trades / venue fills (capital velocity), then shipped iterations (code lanes). First present
+    // non-null wins — matches which collector actually ran for this lane.
+    let (metric, current) = [
+        "posts_24h",
+        "live_trades_24h",
+        "fills_24h",
+        "shipped_24h",
+    ]
+    .iter()
+    .find_map(|k| outcomes.get(*k).and_then(Value::as_i64).map(|n| (*k, n)))
+    .map(|(k, n)| (Some(k), Some(n)))
+    .unwrap_or((None, None));
+
+    let target = parse_daily_target(north_star);
+    let gap = match (current, target) {
+        (Some(c), Some(t)) => Some((t - c).max(0)),
+        _ => None,
+    };
+    let trend = match (current, target) {
+        (Some(0), _) => "stalled",
+        (Some(c), Some(t)) if c < t => "behind",
+        (Some(_), Some(_)) => "healthy",
+        (Some(_), None) => "growing",
+        (None, _) => "unknown",
+    };
+    json!({
+        "metric": metric,
+        "current": current,
+        "target": target,
+        "gap": gap,
+        "trend": trend,
+    })
+}
+
+/// Parse a stated numeric DAILY target out of a north-star sentence (pure — unit-tested). Matches
+/// the operator's convention "<N> ... /day" or "<N> ... per day" (e.g. "Post 3 verified reels/day"
+/// -> 3). Returns None when no daily cadence number is stated (most lanes state a direction, not a
+/// number — those grow on trend, not a fixed target).
+fn parse_daily_target(north_star: &str) -> Option<i64> {
+    let lower = north_star.to_lowercase();
+    // Find "/day" or "per day", then read the nearest preceding integer.
+    let anchor = lower.find("/day").or_else(|| lower.find("per day"))?;
+    let before = &lower[..anchor];
+    let mut digits = String::new();
+    // Walk backwards over the words before the anchor to the first integer token.
+    for tok in before.split(|c: char| !c.is_ascii_digit()).rev() {
+        if !tok.is_empty() {
+            digits = tok.to_string();
+            break;
+        }
+    }
+    digits.parse::<i64>().ok()
 }
 
 /// One chat completion over Ollama Cloud via curl.exe (no HTTP client dependency; TLS handled by
@@ -822,6 +905,105 @@ pub fn render_report(
     (md, flags, urgent)
 }
 
+// --------------------------------------------------------------------------- //
+// "while you slept" overnight report (pure — deterministic, never fabricated)
+// --------------------------------------------------------------------------- //
+
+/// The OVERNIGHT section of the morning plan (pure — unit-tested): a Polsia "while you slept"
+/// narrative built DETERMINISTICALLY from the outcome ledger — shipped counts, posts, live trades /
+/// fills, equity delta, and lanes that never fired. Never fabricated: a missing/null metric is
+/// stated plainly ("no post registry", "equity unobservable"), a measured zero is stated as a zero,
+/// and a lane that never fired is called out by name. Priority-ordered, one line per lane.
+pub fn overnight_section(snapshot: &Value, incidents: &[Value]) -> String {
+    let mut md = String::from("## OVERNIGHT\n\n");
+    md.push_str("What VERIFIABLY happened since the last report (from the ledger — honest nulls):\n\n");
+    let projects = snapshot
+        .get("projects")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if projects.is_empty() {
+        md.push_str("- no projects observed (empty ledger)\n\n");
+        return md;
+    }
+    let mut items: Vec<(&String, &Value)> = projects.iter().collect();
+    items.sort_by_key(|(_, p)| p.get("priority").and_then(Value::as_i64).unwrap_or(i64::MAX));
+
+    for (name, p) in items {
+        let iters = p.get("iterations_24h").and_then(Value::as_i64).unwrap_or(0);
+        let shipped = p.get("shipped_24h").and_then(Value::as_i64).unwrap_or(0);
+        let mut parts: Vec<String> = Vec::new();
+        if iters == 0 {
+            parts.push("lane NEVER fired".into());
+        } else {
+            parts.push(format!("{iters} iterations / {shipped} shipped"));
+        }
+        // posts — only when the collector ran (Null = registry unobservable, an honest null)
+        if let Some(posts) = p.get("posts_24h") {
+            match posts.as_i64() {
+                Some(n) => parts.push(format!("{n} posts")),
+                None => parts.push("posts unobservable".into()),
+            }
+        }
+        // finance — only when the collector ran
+        if p.get("equity_usd").is_some() {
+            let trades = p.get("live_trades_24h").and_then(Value::as_i64);
+            let fills = p.get("fills_24h").and_then(Value::as_i64);
+            parts.push(format!(
+                "{} live trades / {} fills",
+                trades.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+                fills.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+            ));
+            let delta = p.get("equity_delta_24h").and_then(Value::as_f64);
+            parts.push(format!(
+                "equity Δ{}",
+                delta.map(|d| format!("{d:+.2}")).unwrap_or_else(|| "?".into())
+            ));
+        }
+        md.push_str(&format!("- **{name}**: {}\n", parts.join(", ")));
+    }
+    md.push_str(&format!("- incidents (24h): {}\n", incidents.len()));
+    md.push('\n');
+    md
+}
+
+/// The single most important thing to watch (pure — unit-tested): the NEXT section. Picks the
+/// highest-priority lane whose OUTCOME probe is RED (a dead engine is the top risk to growth), and
+/// falls back to the highest-priority lane with a measured zero-throughput outcome, else a calm
+/// "all engines live — push growth" note. Deterministic; never fabricated.
+pub fn next_watch(snapshot: &Value, status: &Value) -> String {
+    let projects = snapshot
+        .get("projects")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut items: Vec<(&String, &Value)> = projects.iter().collect();
+    items.sort_by_key(|(_, p)| p.get("priority").and_then(Value::as_i64).unwrap_or(i64::MAX));
+
+    // 1) highest-priority RED probe status
+    for (name, _) in &items {
+        let red = status
+            .get("projects")
+            .and_then(|s| s.get(name.as_str()))
+            .and_then(|p| p.get("status"))
+            .and_then(Value::as_str)
+            == Some("red");
+        if red {
+            return format!("{name} is RED — restore the engine before any growth work can compound.");
+        }
+    }
+    // 2) highest-priority measured zero-throughput lane
+    for (name, p) in &items {
+        let dead_lane = p.get("iterations_24h").and_then(Value::as_i64) == Some(0);
+        let zero_posts = p.get("posts_24h").and_then(Value::as_i64) == Some(0);
+        let zero_trades = p.get("live_trades_24h").and_then(Value::as_i64) == Some(0);
+        if dead_lane || zero_posts || zero_trades {
+            return format!("{name} has zero measured throughput in 24h — confirm the engine is producing before pushing the milestone.");
+        }
+    }
+    "All engines live — watch that today's growth goals actually move each lane's velocity number forward.".into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,6 +1183,130 @@ mod tests {
         // no matching reason (or no reasons key) -> the bare probe name
         assert_eq!(red_probe_detail(&proj, "fills_recency"), "fills_recency");
         assert_eq!(red_probe_detail(&json!({}), "process"), "process");
+    }
+
+    // -------- velocity context (pure — growth anchor) --------
+    #[test]
+    fn velocity_context_anchors_the_growth_number() {
+        // sover: posts throughput, a stated "3 reels/day" target -> behind, gap 1
+        let sover = json!({"posts_24h": 2, "shipped_24h": 0, "iterations_24h": 2});
+        let v = velocity_context(&sover, "Post 3 verified reels/day across IG/TikTok/YT; grow followers.");
+        assert_eq!(v["metric"], json!("posts_24h"));
+        assert_eq!(v["current"], json!(2));
+        assert_eq!(v["target"], json!(3));
+        assert_eq!(v["gap"], json!(1));
+        assert_eq!(v["trend"], json!("behind"));
+
+        // healthy: current meets the target -> push to next milestone
+        let healthy = json!({"posts_24h": 3});
+        assert_eq!(velocity_context(&healthy, "Post 3 reels/day")["trend"], json!("healthy"));
+
+        // measured zero -> stalled (a dead engine, regardless of target)
+        let zero = json!({"posts_24h": 0});
+        let vz = velocity_context(&zero, "Post 3 reels/day");
+        assert_eq!(vz["trend"], json!("stalled"));
+        assert_eq!(vz["gap"], json!(3));
+
+        // finance lane, no numeric target: live trades throughput, non-zero -> growing
+        let asmo = json!({"live_trades_24h": 4, "fills_24h": 9, "shipped_24h": 1});
+        let va = velocity_context(&asmo, "Grow capital velocity — more live fills/day.");
+        // "fills/day" states a per-day cadence but no NUMBER before it -> no target
+        assert_eq!(va["metric"], json!("live_trades_24h"));
+        assert_eq!(va["current"], json!(4));
+        assert_eq!(va["target"], Value::Null);
+        assert_eq!(va["gap"], Value::Null);
+        assert_eq!(va["trend"], json!("growing"));
+
+        // code lane with a shipped throughput signal, no numeric target -> growing on shipped_24h
+        let dotz = json!({"iterations_24h": 5, "shipped_24h": 2});
+        let vd = velocity_context(&dotz, "Harden dotz-core reliability.");
+        assert_eq!(vd["metric"], json!("shipped_24h"));
+        assert_eq!(vd["current"], json!(2));
+        assert_eq!(vd["trend"], json!("growing"));
+    }
+
+    #[test]
+    fn velocity_context_unknown_when_no_throughput_metric() {
+        // none of posts/live_trades/fills/shipped present -> unknown, all nulls
+        let out = json!({"iterations_24h": 5, "priority": 3});
+        let v = velocity_context(&out, "Harden reliability.");
+        assert_eq!(v["metric"], Value::Null);
+        assert_eq!(v["current"], Value::Null);
+        assert_eq!(v["target"], Value::Null);
+        assert_eq!(v["trend"], json!("unknown"));
+    }
+
+    #[test]
+    fn parse_daily_target_reads_stated_cadence_number() {
+        assert_eq!(parse_daily_target("Post 3 verified reels/day across IG"), Some(3));
+        assert_eq!(parse_daily_target("ship 10 things per day"), Some(10));
+        // no number before the /day anchor -> None (a direction, not a target)
+        assert_eq!(parse_daily_target("more live fills/day"), None);
+        // no daily cadence stated at all -> None
+        assert_eq!(parse_daily_target("Harden dotz-core reliability"), None);
+    }
+
+    // -------- overnight "while you slept" section (pure — deterministic, honest nulls) --------
+    #[test]
+    fn overnight_section_reports_verified_numbers_and_honest_nulls() {
+        let snapshot = json!({"projects": {
+            "asmodeus": {"priority": 1, "iterations_24h": 3, "shipped_24h": 1,
+                          "equity_usd": 168.97, "equity_delta_24h": 12.50,
+                          "live_trades_24h": 4, "fills_24h": 9},
+            "sover": {"priority": 2, "iterations_24h": 2, "shipped_24h": 0, "posts_24h": 0},
+            "maki": {"priority": 3, "iterations_24h": 0, "shipped_24h": 0, "posts_24h": Value::Null},
+        }});
+        let md = overnight_section(&snapshot, &[json!({"probe_id": "x"})]);
+        assert!(md.starts_with("## OVERNIGHT"));
+        // priority order: asmodeus before sover before maki
+        let a = md.find("asmodeus").unwrap();
+        let s = md.find("sover").unwrap();
+        let m = md.find("maki").unwrap();
+        assert!(a < s && s < m);
+        // verified finance numbers surface
+        assert!(md.contains("4 live trades / 9 fills"));
+        assert!(md.contains("equity Δ+12.50"));
+        // a measured zero is stated as a zero, not hidden
+        assert!(md.contains("0 posts"));
+        // a null registry is an honest null, never a fake zero
+        assert!(md.contains("posts unobservable"));
+        // a lane that never fired is called out
+        assert!(md.contains("lane NEVER fired"));
+        // incident count is reported
+        assert!(md.contains("incidents (24h): 1"));
+    }
+
+    #[test]
+    fn overnight_section_empty_ledger_is_honest() {
+        let md = overnight_section(&json!({"projects": {}}), &[]);
+        assert!(md.contains("no projects observed"));
+    }
+
+    // -------- next-watch (pure — the single most important thing) --------
+    #[test]
+    fn next_watch_prioritizes_red_then_zero_then_calm() {
+        let snapshot = json!({"projects": {
+            "asmodeus": {"priority": 1, "iterations_24h": 3, "live_trades_24h": 4},
+            "sover": {"priority": 2, "iterations_24h": 2, "posts_24h": 0},
+        }});
+        // a RED lane wins (engine down is the top risk)
+        let status_red = json!({"projects": {
+            "asmodeus": {"status": "green"},
+            "sover": {"status": "red"},
+        }});
+        assert!(next_watch(&snapshot, &status_red).starts_with("sover is RED"));
+        // no red, but sover has zero posts -> zero-throughput watch
+        let status_green = json!({"projects": {
+            "asmodeus": {"status": "green"},
+            "sover": {"status": "yellow"},
+        }});
+        assert!(next_watch(&snapshot, &status_green).contains("sover has zero measured throughput"));
+        // all engines live -> calm growth note
+        let healthy = json!({"projects": {
+            "asmodeus": {"priority": 1, "iterations_24h": 3, "live_trades_24h": 4},
+        }});
+        let status_ok = json!({"projects": {"asmodeus": {"status": "green"}}});
+        assert!(next_watch(&healthy, &status_ok).starts_with("All engines live"));
     }
 
     // -------- goal-post precedence (pure) --------
