@@ -424,8 +424,10 @@ fn backlog_path(name: &str) -> PathBuf {
 /// posting / trade / app path is broken, not merely the test gate. Internal/support probes
 /// (heartbeat_fresh, binary_current, monitor_fresh, auth_health, cdp_alive, equity_fresh,
 /// outcome_streak, ...) are DELIBERATELY excluded: they measure liveness/plumbing, not the outcome.
-const OPS_OUTCOME_PROBES: [&str; 6] = [
-    "publish_recency",
+const OPS_OUTCOME_PROBES: [&str; 8] = [
+    "publish_recency_instagram",
+    "publish_recency_tiktok",
+    "publish_recency_youtube",
     "produce_recency",
     "fills_recency",
     "lane_freshness_instagram",

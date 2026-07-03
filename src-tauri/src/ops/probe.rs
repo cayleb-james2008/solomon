@@ -370,17 +370,38 @@ fn eval_json_field(cfg: &Value, repo_path: &str) -> ProbeOutcome {
     }
 }
 
-/// Walk `dotted` ("a.b.c"; a `*` segment fans out over object values / array items). Returns every
-/// matched leaf. Missing keys prune silently (empty result = path not found).
+/// Walk `dotted` ("a.b.c"; a segment containing `*` fans out over object values whose KEY matches
+/// the glob, or — for a bare `*` only — over array items too). Returns every matched leaf. Missing
+/// keys prune silently (empty result = path not found).
+///
+/// The glob is deliberately minimal (one `*`, mirrors `file_age`'s filename glob): `prefix*suffix`
+/// matches any object key that starts with `prefix` and ends with `suffix`. A bare `*` is the
+/// existing "every value" behavior (prefix="" suffix="" matches every key; unchanged for callers
+/// like `publish_recency`'s old `*.published_at`). 2026-07-03: added key-suffix matching (e.g.
+/// `*:instagram.published_at`) so a probe can target ONE entry in a composite-keyed registry
+/// (`post_registry.json`'s "id:platform" dict) instead of aggregating across all of them — the
+/// aggregate form let a healthy platform's fresh timestamp mask a different platform being
+/// completely dead (sover's control_tiktok/control_youtube "legacy runner no-op" stubs never
+/// actually published, but `*.published_at` stayed green because Instagram kept publishing).
 pub fn walk_path(root: &Value, dotted: &str) -> Vec<Value> {
     let mut current = vec![root.clone()];
     for seg in dotted.split('.') {
         let mut next = Vec::new();
         for v in current {
-            if seg == "*" {
+            if let Some(star) = seg.find('*') {
+                let (prefix, suffix) = (&seg[..star], &seg[star + 1..]);
                 match v {
-                    Value::Object(o) => next.extend(o.into_iter().map(|(_, x)| x)),
-                    Value::Array(a) => next.extend(a),
+                    Value::Object(o) => {
+                        for (k, x) in o {
+                            if k.starts_with(prefix)
+                                && k.ends_with(suffix)
+                                && k.len() >= prefix.len() + suffix.len()
+                            {
+                                next.push(x);
+                            }
+                        }
+                    }
+                    Value::Array(a) if prefix.is_empty() && suffix.is_empty() => next.extend(a),
                     _ => {}
                 }
             } else if let Some(x) = v.get(seg) {
@@ -1141,6 +1162,54 @@ mod tests {
         assert_eq!(walk_path(&v, "a.b.c"), vec![json!(1)]);
         assert_eq!(walk_path(&v, "list.*.x"), vec![json!(1), json!(2)]);
         assert!(walk_path(&v, "a.zzz").is_empty());
+    }
+
+    // -------- walk_path key-suffix glob: per-platform matching over a composite-keyed registry --------
+    // 2026-07-03: sover's post_registry.json is keyed "id:platform" (e.g. "reel_1:instagram"); a probe
+    // needs to target ONE platform's newest published_at without aggregating across all of them (the
+    // old aggregate `*.published_at` let a healthy platform mask a different, completely dead one).
+    #[test]
+    fn walk_path_key_suffix_glob_matches_only_the_named_platform() {
+        let v = json!({
+            "reel_1:instagram": {"published_at": "2026-07-03T11:41:27"},
+            "reel_2:instagram": {"published_at": "2026-07-03T13:43:27"},
+            "reel_3:tiktok": {"published_at": "2026-06-30T18:36:14"},
+            "reel_4:youtube": {"published_at": "2026-06-30T18:46:49"},
+        });
+        let mut ig = walk_path(&v, "*:instagram.published_at");
+        ig.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+        assert_eq!(
+            ig,
+            vec![json!("2026-07-03T11:41:27"), json!("2026-07-03T13:43:27")]
+        );
+        assert_eq!(
+            walk_path(&v, "*:tiktok.published_at"),
+            vec![json!("2026-06-30T18:36:14")]
+        );
+        assert_eq!(
+            walk_path(&v, "*:youtube.published_at"),
+            vec![json!("2026-06-30T18:46:49")]
+        );
+    }
+
+    #[test]
+    fn walk_path_key_suffix_glob_empty_when_platform_absent() {
+        let v = json!({"reel_1:instagram": {"published_at": "2026-07-03T11:41:27"}});
+        // No tiktok entries at all -> empty, not an error (the caller reports "unobservable").
+        assert!(walk_path(&v, "*:tiktok.published_at").is_empty());
+    }
+
+    #[test]
+    fn walk_path_bare_star_still_matches_every_key_unchanged() {
+        // Regression guard: a plain "*" (prefix="" suffix="") must keep matching EVERY key exactly
+        // like before this glob feature existed — publish_recency's original aggregate form.
+        let v = json!({
+            "reel_1:instagram": {"published_at": "a"},
+            "reel_2:tiktok": {"published_at": "b"},
+        });
+        let mut all = walk_path(&v, "*.published_at");
+        all.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+        assert_eq!(all, vec![json!("a"), json!("b")]);
     }
 
     // -------- jsonl_tail: age + streak --------
