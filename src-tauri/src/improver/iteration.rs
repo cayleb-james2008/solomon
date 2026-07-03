@@ -513,17 +513,22 @@ Then stop."
         ));
     }
 
-    // QUOTA-NOT-NOOP: a 429 / "session usage limit" / rate-limit from the provider is a
-    // TRANSPORT/QUOTA error, NOT a reasoned noop. The 5 lanes share ONE Ollama account; when
-    // concurrent they saturate its session quota and pi returns empty -> the old code counted this
-    // as a noop -> noop_streak escalation -> lane RESET (lost iteration progress) — a fleet-wide
-    // noop storm (CONFIRMED 2026-07-01: all 5 lanes noop'd within a 2-min window). Detect it, drop
-    // the branch WITHOUT escalating (no note_noop, no register_failure, no reset), and let the
-    // loop's natural interval sleep back off so the lanes self-throttle under the shared account cap.
-    if pi::is_quota_error(&p.stderr) {
-        let why = tail_chars(&ctx.redact(p.stderr.trim()), 300);
+    // QUOTA-NOT-NOOP: a 429 / usage-limit / rate-limit from the provider is a TRANSPORT/QUOTA error,
+    // NOT a reasoned noop. The 5 lanes share ONE Ollama account; when concurrent they saturate its
+    // usage cap and pi returns empty -> the old code counted this as a noop -> noop_streak
+    // escalation -> lane RESET (lost iteration progress) — a fleet-wide noop storm (CONFIRMED
+    // 2026-07-01 and again 2026-07-03, the second time on the account's WEEKLY cap). 2026-07-03: pi's
+    // `--mode json` puts this error in stdout's structured `errorMessage` field (a `stopReason:
+    // "error"` assistant message with empty content) — NOT stderr, which is empty — so the check
+    // must inspect BOTH streams (see `pi::is_quota_error_output` / `pi::stream_error_messages`).
+    // Detect it, drop the branch WITHOUT escalating (no note_noop, no register_failure, no reset),
+    // and let the loop's natural interval sleep back off so the lanes self-throttle under the cap.
+    if pi::is_quota_error_output(&p.stdout, &p.stderr) {
+        let stream_err = pi::stream_error_messages(&p.stdout);
+        let source = if pi::is_quota_error(&p.stderr) { p.stderr.trim() } else { stream_err.trim() };
+        let why = tail_chars(&ctx.redact(source), 300);
         ctx.log(&format!(
-            "Pi QUOTA/TRANSPORT ERROR (429 / session usage limit / rate limit — NOT a model no-op; \
+            "Pi QUOTA/TRANSPORT ERROR (429 / usage limit / rate limit — NOT a model no-op; \
 NOT counted toward noop_streak, no reset): {why}"
         ));
         gitops::drop_branch(
@@ -1119,8 +1124,13 @@ fn ideate(ctx: &mut Ctx) -> i64 {
     // the same observable outcome as the Python `except TimeoutExpired -> return 5` branch.
     // QUOTA-NOT-NOOP: a 429 / rate-limit from the provider is a TRANSPORT error, NOT "no parseable
     // ideas" — log it as a quota error and back off this cycle (do NOT mislog as a model failure).
-    if pi::is_quota_error(&p.stderr) {
-        let why = tail_chars(&ctx.redact(p.stderr.trim()), 300);
+    // 2026-07-03: the error can land in stdout's structured errorMessage field with empty stderr
+    // (see pi::is_quota_error_output) — stderr-only detection missed it and misfiled it right here
+    // as "no parseable ideas" across the whole fleet.
+    if pi::is_quota_error_output(&p.stdout, &p.stderr) {
+        let stream_err = pi::stream_error_messages(&p.stdout);
+        let source = if pi::is_quota_error(&p.stderr) { p.stderr.trim() } else { stream_err.trim() };
+        let why = tail_chars(&ctx.redact(source), 300);
         ctx.log(&format!(
             "ideate: provider quota/rate-limit error (429 — NOT 'no parseable ideas'); backing off this cycle: {why}"
         ));

@@ -28,29 +28,80 @@ use std::sync::{
 // is_quota_error — provider 429 / rate-limit / quota detection
 // --------------------------------------------------------------------------- //
 
-/// Detect a provider QUOTA / rate-limit / transport error in pi's stderr.
+/// Detect a provider QUOTA / rate-limit / transport error in a text blob (stderr, or the
+/// structured error text extracted from pi's stdout JSONL stream — see [`stream_error_messages`]).
 ///
 /// When the shared Ollama account's usage cap is saturated (HTTP 429, body e.g. "you have reached
 /// your session usage limit" or "you (cayleb_james) have reached your weekly usage limit, add extra
-/// usage: https://ollama.com/settings"), pi returns empty stdout with the provider's error in
-/// stderr. This is a TRANSPORT/QUOTA error, NOT a reasoned model noop — counting it as a noop caused
-/// a fleet-wide noop storm that escalated and RESET lanes (lost iteration progress) whenever the
-/// shared account's usage cap was hit. 2026-07-03: the pattern list only recognized "session usage
-/// limit" — Ollama's actual weekly-cap message ("weekly usage limit") didn't match, so this exact
-/// storm recurred across every ollama-cloud lane (daedulus/dotz/maki/solomon) once the account's
-/// WEEKLY cap (not just a session/concurrency cap) was hit. Matching the "usage limit" substring
-/// (a superset of "session usage limit") catches session/weekly/daily/any future "<period> usage
-/// limit" wording without needing to enumerate each one.
+/// usage: https://ollama.com/settings"), this is a TRANSPORT/QUOTA error, NOT a reasoned model noop
+/// — counting it as a noop caused a fleet-wide noop storm that escalated and RESET lanes (lost
+/// iteration progress) whenever the shared account's usage cap was hit. Matching the "usage limit"
+/// substring (a superset of "session usage limit") catches session/weekly/daily/any future
+/// "<period> usage limit" wording without needing to enumerate each one.
 ///
-/// Checks stderr only (pi's error channel — the provider HTTP error lands there), NOT stdout (the
-/// agent's output), so a task that legitimately mentions "429" or "rate limit" in its summary
-/// cannot trigger a false positive.
+/// Only ever called on stderr text or extracted `errorMessage` fields — NEVER on the agent's own
+/// assistant-authored text content — so a task that legitimately narrates "429" or "rate limit" in
+/// its summary cannot trigger a false positive.
 pub fn is_quota_error(stderr: &str) -> bool {
     let l = stderr.to_ascii_lowercase();
     ["429", "usage limit", "rate limit", "rate_limit", "rate-limit",
      "too many requests", "quota exceeded"]
         .iter()
         .any(|pat| l.contains(pat))
+}
+
+/// Extract every `errorMessage` from a `stopReason:"error"` assistant message in pi's stdout JSONL
+/// stream (same event-selection as [`final_text`]: an `agent_end`'s `messages[]`, or a streamed bare
+/// `message` dict). 2026-07-03 INCIDENT: pi's `--print --mode json` does NOT put a provider transport
+/// error in stderr (stderr is empty) — it emits an assistant message with empty `content` (so
+/// `final_text` correctly extracts nothing) but `stopReason:"error"` and a human-readable
+/// `errorMessage`, e.g. `errorMessage: "429 \"you (cayleb_james) have reached your weekly usage
+/// limit...\""`. The original `is_quota_error(&stderr)`-only check therefore NEVER matched this real
+/// 429 (verified live: a direct pi invocation against the exhausted account reproduced empty stderr
+/// + this exact JSONL shape), so the fleet-wide noop storm continued even after widening the stderr
+/// pattern list. Concatenated space-separated so [`is_quota_error`] can pattern-match them exactly
+/// like stderr text.
+pub fn stream_error_messages(stdout: &str) -> String {
+    let mut errs: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let ev: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let msgs: Vec<Value> = if ev.get("type").and_then(Value::as_str) == Some("agent_end") {
+            match ev.get("messages") {
+                Some(Value::Array(a)) => a.clone(),
+                _ => Vec::new(),
+            }
+        } else if matches!(ev.get("message"), Some(Value::Object(_))) {
+            vec![ev.get("message").cloned().unwrap_or(Value::Null)]
+        } else {
+            continue;
+        };
+        for m in &msgs {
+            if !m.is_object() {
+                continue;
+            }
+            if m.get("stopReason").and_then(Value::as_str) == Some("error") {
+                if let Some(em) = m.get("errorMessage").and_then(Value::as_str) {
+                    errs.push(em.to_string());
+                }
+            }
+        }
+    }
+    errs.join(" ")
+}
+
+/// True iff EITHER pi's stderr OR a `stopReason:"error"` message in its stdout JSONL stream carries a
+/// quota/rate-limit signature (see [`is_quota_error`] and [`stream_error_messages`]). This is the
+/// check callers should use — stderr alone misses the 2026-07-03 incident class where the provider
+/// error lands in stdout's structured `errorMessage` field instead.
+pub fn is_quota_error_output(stdout: &str, stderr: &str) -> bool {
+    is_quota_error(stderr) || is_quota_error(&stream_error_messages(stdout))
 }
 
 #[cfg(windows)]
@@ -922,6 +973,82 @@ add extra usage: https://ollama.com/settings (ref: c708135e-d4a9-484f-ac43-02478
         // A model summary that happens to mention "429" in a coding context is in STDOUT, not
         // stderr — is_quota_error checks stderr only, so it won't false-positive.
         assert!(!is_quota_error("the agent wrote a retry handler"));
+    }
+
+    // ---- stream_error_messages / is_quota_error_output: 2026-07-03 incident ----
+    // pi's --mode json puts a provider transport error in stdout's structured errorMessage field,
+    // NOT stderr (verified live: a direct pi invocation against the exhausted account reproduced
+    // this exact shape, empty stderr included).
+    #[test]
+    fn stream_error_messages_extracts_from_message_dict_stopreason_error() {
+        // Byte-shape of the actual event pi emitted (trimmed to the fields that matter).
+        let line = serde_json::to_string(&json!({
+            "type": "message_end",
+            "message": {
+                "role": "assistant", "content": [], "provider": "maki-cloud", "model": "glm-5.2",
+                "stopReason": "error",
+                "errorMessage": "429 \"you (cayleb_james) have reached your weekly usage limit, add extra usage: https://ollama.com/settings (ref: 33e5c065-97ae-4aea-b475-60fa926f5ef3)\""
+            }
+        })).unwrap();
+        let extracted = stream_error_messages(&line);
+        assert!(extracted.contains("weekly usage limit"), "{extracted}");
+        assert!(is_quota_error(&extracted));
+    }
+
+    #[test]
+    fn stream_error_messages_extracts_from_agent_end_messages() {
+        let line = serde_json::to_string(&json!({
+            "type": "agent_end",
+            "messages": [{
+                "role": "assistant", "content": [],
+                "stopReason": "error", "errorMessage": "429 rate limit exceeded"
+            }]
+        })).unwrap();
+        assert!(is_quota_error(&stream_error_messages(&line)));
+    }
+
+    #[test]
+    fn stream_error_messages_ignores_non_error_and_missing_fields() {
+        // No stopReason -> nothing extracted, even with content.
+        let ok = serde_json::to_string(&json!({
+            "type": "message_end",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]}
+        })).unwrap();
+        assert_eq!(stream_error_messages(&ok), "");
+        // stopReason present but not "error" -> ignored.
+        let stopped = serde_json::to_string(&json!({
+            "type": "message_end",
+            "message": {"role": "assistant", "content": [], "stopReason": "stop"}
+        })).unwrap();
+        assert_eq!(stream_error_messages(&stopped), "");
+        // Blank/undecodable lines are skipped without panicking.
+        assert_eq!(stream_error_messages("\n   \nnot json\n{ truncated\n"), "");
+    }
+
+    #[test]
+    fn is_quota_error_output_catches_stdout_stream_error_when_stderr_is_empty() {
+        // The full 2026-07-03 incident shape: empty stderr (as pi actually produced), quota error
+        // only reachable via the stdout JSONL stream.
+        let stdout = serde_json::to_string(&json!({
+            "type": "message_end",
+            "message": {
+                "role": "assistant", "content": [], "stopReason": "error",
+                "errorMessage": "429 \"you (cayleb_james) have reached your weekly usage limit, add extra usage: https://ollama.com/settings\""
+            }
+        })).unwrap();
+        assert!(is_quota_error_output(&stdout, ""));
+    }
+
+    #[test]
+    fn is_quota_error_output_false_on_genuine_empty_noop() {
+        // A real "no changes" noop: empty stdout, empty stderr — must NOT be misclassified as quota.
+        assert!(!is_quota_error_output("", ""));
+        // Normal assistant text content, no error field — still not a quota error.
+        let stdout = serde_json::to_string(&json!({
+            "type": "message_end",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "no changes needed"}]}
+        })).unwrap();
+        assert!(!is_quota_error_output(&stdout, ""));
     }
 
     // ---- timeout constant parity with the source ----
