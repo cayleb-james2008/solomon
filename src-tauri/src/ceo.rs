@@ -190,7 +190,12 @@ pub fn morning_plan() -> Value {
             Some(n) if !n.is_empty() => n.to_string(),
             _ => continue,
         };
-        let goal_full = r.get("goal").and_then(Value::as_str).unwrap_or("");
+        // The goal post the CEO plane steers by: the operator's committed one-line
+        // improver/<name>/goal.md, falling back to the repos.json `goal` field when goal.md is
+        // absent. A written-down target is the thing you optimize distance toward.
+        let fallback = r.get("goal").and_then(Value::as_str).unwrap_or("");
+        let goal_md = std::fs::read_to_string(goal_post_path(&name)).ok();
+        let goal_full = pick_goal_post(goal_md.as_deref(), fallback);
         if goal_full.trim().is_empty() {
             continue; // no north star = not a planned lane
         }
@@ -332,6 +337,27 @@ fn ceo_marker(date: &str) -> String {
 /// HERE/improver/<name>/backlog.md — the exact file improver::backlog::top_backlog_item reads.
 fn backlog_path(name: &str) -> PathBuf {
     paths::here().join("improver").join(name).join("backlog.md")
+}
+
+/// HERE/improver/<name>/goal.md — the operator's committed, single-line goal post (the measurable
+/// north star the CEO plane steers by). Tracked in git (unlike the gitignored backlog.md churn) so
+/// retargeting a lane is a one-line edit the whole plane then optimizes distance toward.
+fn goal_post_path(name: &str) -> PathBuf {
+    paths::here().join("improver").join(name).join("goal.md")
+}
+
+/// Pick the authoritative goal post (pure — unit-tested): the first non-blank, non-`#` line of
+/// goal.md (the operator's one-line target), or the repos.json `goal` fallback when goal.md is
+/// absent or holds only headings. You cannot prioritize speed toward an unstated target.
+pub fn pick_goal_post(goal_md: Option<&str>, fallback: &str) -> String {
+    goal_md
+        .and_then(|body| {
+            body.lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| fallback.trim().to_string())
 }
 
 /// Extract the first {...} JSON object from a model reply (pure — tolerates markdown fences and
@@ -807,5 +833,22 @@ mod tests {
     #[test]
     fn ceo_marker_is_dated() {
         assert_eq!(ceo_marker("2026-07-02"), "(ceo 2026-07-02)");
+    }
+
+    // -------- goal-post precedence (pure) --------
+    #[test]
+    fn pick_goal_post_prefers_goal_md_first_line_over_fallback() {
+        // the first non-heading, non-blank line of goal.md wins over the repos.json fallback
+        let md = "# asmodeus goal post (edit this line)\nGrow capital velocity: more live fills/day.\n";
+        assert_eq!(
+            pick_goal_post(Some(md), "old repos.json goal"),
+            "Grow capital velocity: more live fills/day."
+        );
+        // a goal.md with only headings/blank lines falls back
+        assert_eq!(pick_goal_post(Some("# heading only\n\n"), "fallback"), "fallback");
+        // absent goal.md falls back (trimmed)
+        assert_eq!(pick_goal_post(None, "  fallback  "), "fallback");
+        // neither present -> empty (lane stays dormant; the plane never invents work)
+        assert_eq!(pick_goal_post(None, ""), "");
     }
 }
