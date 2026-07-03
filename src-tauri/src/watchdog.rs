@@ -711,8 +711,14 @@ pub fn main() -> i32 {
     // only while Solomon.exe is visibly open; the first sweep after process start writes the
     // blind-window gap into runtime/ops_status.json. catch_unwind mirrors the per-repo guard
     // above: an ops-plane failure must never abort the code-plane crash-recovery sweep.
-    let ops_summary = std::panic::catch_unwind(crate::ops::outcomes::sweep_and_summarize)
-        .unwrap_or_else(|_| "ops sweep panicked".to_string());
+    // Run the ops sweep once and KEEP the payload (not just the summary): the managed-app redeploy
+    // graft below reads the same fresh per-project rollups (deploy-gap + process-down) this sweep
+    // computed, so it never re-runs the probes. catch_unwind isolates an ops-plane panic exactly as
+    // sweep_and_summarize did; on a panic we fall back to an empty payload -> the summary reads
+    // "no probes configured" and the deploy graft no-ops.
+    let ops_payload = std::panic::catch_unwind(crate::ops::outcomes::sweep)
+        .unwrap_or_else(|_| json!({"projects": {}}));
+    let ops_summary = crate::ops::outcomes::payload_summary(&ops_payload);
     let line = format!(
         "{} watchdog: {}/{} running | {} | ops: {}",
         out.get("ts").and_then(Value::as_str).unwrap_or(""),
@@ -737,7 +743,10 @@ pub fn main() -> i32 {
     // older than STANDSTILL_S, deduped by a persisted marker so a standing standstill never re-pages
     // every 2 min. catch_unwind + best-effort marker IO mirror the ops graft — a standstill check must
     // never abort crash-recovery.
-    let _ = std::panic::catch_unwind(|| standstill_alarm(running, snapshots.len(), Utc::now()));
+    let _ = std::panic::catch_unwind(|| {
+        let now = Utc::now();
+        standstill_alarm(newest_lane_age_s(now), running, snapshots.len(), now);
+    });
     // CEO RHYTHM GRAFT (v2 Phase B): after the two-plane sweep, the day-gated morning plan +
     // evening verified-outcome summary (see ceo::tick — cheap no-op on all but two sweeps a day).
     // catch_unwind mirrors the ops graft: a CEO failure must never abort crash-recovery.
@@ -745,6 +754,14 @@ pub fn main() -> i32 {
     // HOUSEKEEPING GRAFT (v2): day-gated (04:00) storage sweep — worktree prune, merged rsi/
     // branches, stale/oversized build dirs (see housekeeping.rs). Same isolation contract.
     let _ = std::panic::catch_unwind(crate::housekeeping::tick);
+    // MANAGED-APP REDEPLOY GRAFT: close the "fix merged but never reaches the running app" deadlock
+    // — rebuild+relaunch a managed repo's LIVE app binary when the deployed binary is stale (a
+    // deploy-gap probe) AND the app is down (a process probe), but ONLY for a repo carrying a
+    // live_deploy config (opt-in; asmodeus/live-money stays human-gated), in a safe drain window,
+    // past its cooldown, and at most ONE per sweep across all repos (a cargo build is heavy). Reads
+    // the fresh ops_payload this sweep already computed. catch_unwind mirrors the ops graft: a
+    // deploy failure must never abort crash-recovery. See deploy::maybe_redeploy_managed_apps.
+    let _ = std::panic::catch_unwind(|| crate::deploy::maybe_redeploy_managed_apps(&ops_payload));
     // SELF-REDEPLOY: the periodic check that swaps Solomon's OWN production binary when the checkout
     // is behind origin/main, but ONLY in a safe drain window (no lane mid-ship, no live-money lane
     // with an open trade). Cheap when there is nothing to do (cooldown + single-flight guards no-op
@@ -844,9 +861,11 @@ fn newest_lane_age_s(now: DateTime<Utc>) -> Option<f64> {
 /// recovers, re-arming the alarm for the next standstill. Never panics (marker IO -> pass), never
 /// fails a sweep — matches the notify::send best-effort contract.
 ///
-/// `running`/`total` come straight from the sweep's own snapshots; `now` is passed for testability.
-fn standstill_alarm(running: usize, total: usize, now: DateTime<Utc>) {
-    let reason = standstill_reason(newest_lane_age_s(now), running, total, STANDSTILL_S);
+/// `running`/`total`/`newest_age_s` come straight from the sweep; `newest_age_s` and `now` are
+/// passed IN (not read from disk here) so the alarm is hermetically testable — recovery requires
+/// running==total AND a fresh lane iteration, and the test controls the latter directly.
+fn standstill_alarm(newest_age_s: Option<f64>, running: usize, total: usize, now: DateTime<Utc>) {
+    let reason = standstill_reason(newest_age_s, running, total, STANDSTILL_S);
     let marker = standstill_marker();
     match reason {
         Some(body) => {
@@ -1144,13 +1163,13 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
         let now = Utc::now();
 
-        // First standstill sweep (fleet down): arms the marker.
-        standstill_alarm(0, 4, now);
+        // First standstill sweep (fleet down): arms the marker. age is irrelevant when running==0.
+        standstill_alarm(None, 0, 4, now);
         assert!(marker.exists(), "first standstill must arm the dedupe marker");
         let armed_at = std::fs::read_to_string(&marker).unwrap_or_default();
 
         // Still down next sweep: marker unchanged (paged once — not re-written, not re-paged).
-        standstill_alarm(0, 4, now + chrono::Duration::seconds(120));
+        standstill_alarm(None, 0, 4, now + chrono::Duration::seconds(120));
         assert!(marker.exists());
         assert_eq!(
             std::fs::read_to_string(&marker).unwrap_or_default(),
@@ -1158,8 +1177,8 @@ mod tests {
             "a persisting standstill must not re-page (marker must not be rewritten)"
         );
 
-        // Recovery (all lanes running, fresh ship): marker cleared, alarm re-armed.
-        standstill_alarm(4, 4, now);
+        // Recovery (all lanes running AND a fresh iteration): marker cleared, alarm re-armed.
+        standstill_alarm(Some(60.0), 4, 4, now);
         assert!(!marker.exists(), "recovery must clear the marker to re-arm the alarm");
 
         let _ = std::fs::remove_file(&marker);

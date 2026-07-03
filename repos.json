@@ -26,6 +26,11 @@
         "branch_prefix": "rsi/",
         "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\sover",
         "public": true,
+        "live_deploy": {
+            "rebuild": ["cargo", "build", "--release"],
+            "launch": ["cmd", "/c", "launch_ggg.bat"],
+            "cooldown_s": 1800
+        },
         "private_paths": [
             "profiles/ggg/",
             "data/ggg/",
