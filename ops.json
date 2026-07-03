@@ -136,7 +136,7 @@
                 "id": "process",
                 "kind": "process",
                 "process_name": "Sover.exe",
-                "path_contains": "projects\\sover\\dist"
+                "path_contains": "projects\\sover"
             }
         ]
     },
