@@ -115,13 +115,29 @@
                 "tail_bytes": 65536
             },
             {
-                "id": "lane_freshness",
+                "id": "lane_freshness_instagram",
                 "kind": "json_field",
                 "file": "%LOCALAPPDATA%\\Sover\\.runtime\\ggg\\lane_state.json",
-                "path": "post.last_run",
+                "path": "control_instagram.last_run",
                 "mode": "age",
                 "red_after_s": 21600,
-                "comment": "The LIVE lane state under %LOCALAPPDATA% — NOT the stale repo copy."
+                "comment": "The LIVE lane state under %LOCALAPPDATA% — NOT the stale repo copy. Split from the old single 'lane_freshness' probe (which watched dead 'post.last_run') after sover's 2026-07-01/02 migration from a single 'post' lane to per-platform control_<platform> lanes — see engine/catalog.rs FULL-REPLACEMENT model. The old field is permanently orphaned (the scheduler never runs a retired lane name), so it read a false 21h+ RED forever."
+            },
+            {
+                "id": "lane_freshness_tiktok",
+                "kind": "json_field",
+                "file": "%LOCALAPPDATA%\\Sover\\.runtime\\ggg\\lane_state.json",
+                "path": "control_tiktok.last_run",
+                "mode": "age",
+                "red_after_s": 21600
+            },
+            {
+                "id": "lane_freshness_youtube",
+                "kind": "json_field",
+                "file": "%LOCALAPPDATA%\\Sover\\.runtime\\ggg\\lane_state.json",
+                "path": "control_youtube.last_run",
+                "mode": "age",
+                "red_after_s": 21600
             },
             {
                 "id": "autopost_gate",

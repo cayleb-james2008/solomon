@@ -18,6 +18,7 @@
 
 use crate::control::{branches, paths, proc};
 use serde_json::Value;
+use std::time::Duration;
 
 /// A single report-only hygiene problem found in a managed repo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +55,13 @@ pub fn classify(current: &str, base: &str, tracked_dirty: bool, running: bool) -
     issues
 }
 
+/// Timeout for the `git status` probe below. This runs once per managed repo on EVERY 2-min
+/// watchdog tick on the tick's own thread — an unbounded call here (a held git index lock, disk
+/// contention from a concurrent cargo build, a stalled credential-helper) freezes the entire fleet
+/// (crash-restart, heartbeat collection, standstill alarm — everything) for as long as it hangs.
+/// 30s is ample for a local `git status --porcelain` and fails safe (see `tracked_dirty_for`).
+const GIT_STATUS_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// `git -C <path> status --porcelain --untracked-files=no` -> any non-empty stdout means
 /// a tracked file is modified. Fail-safe: ANY error (no git, empty path, OSError/timeout)
 /// returns false so hygiene never false-alarms on an unreadable repo.
@@ -75,7 +83,7 @@ fn tracked_dirty_for(repo: &Value) -> bool {
         "--porcelain",
         "--untracked-files=no",
     ];
-    match proc::run(&argv, None, None) {
+    match proc::run(&argv, None, Some(GIT_STATUS_TIMEOUT)) {
         Ok(r) => !r.stdout.trim().is_empty(),
         Err(_) => false,
     }
