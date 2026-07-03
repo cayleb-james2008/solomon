@@ -281,6 +281,17 @@ pub fn debug_roots(repo: &Path) -> Vec<PathBuf> {
 /// bottom-up (the root itself is kept). Per-file `remove_file` is the in-use probe: Windows
 /// refuses to delete an open file (sharing violation), so live artifacts are skipped and
 /// counted — fail-safe. Returns (bytes freed, files skipped as locked/undeletable).
+///
+/// `build/` (a cargo build-script staging dir, `target/debug/build/<pkg>-<hash>/`) is NEVER
+/// enumerated — safety by construction, the same stance already taken for `release/`. 2026-07-03
+/// INCIDENT: a build script's generated output (e.g. bindgen's `out/bindgen.rs`) is written ONCE
+/// and only regenerates if the build script's OWN inputs change — cargo does not re-run it just
+/// because time has passed. Its mtime can legitimately sit well past RETAIN_DAYS in an actively
+/// rebuilt project while sibling files in the same `out/` dir (the compiled .o/.a/.lib) get
+/// refreshed on every build. A pure file-age sweep deleted the generated file but left the crate's
+/// cargo fingerprint believing it still existed, breaking that crate's build until `cargo clean -p
+/// <pkg>` forced a fresh regen — the fleet's own base gate went red from nothing but a housekeeping
+/// sweep. `build/` outputs are cargo's own cache; only `cargo clean` may invalidate them.
 pub fn sweep_old_files(root: &Path, days: i64) -> (u64, usize) {
     let cutoff =
         std::time::SystemTime::now() - std::time::Duration::from_secs((days as u64) * 86_400);
@@ -294,6 +305,9 @@ fn sweep_dir(dir: &Path, cutoff: std::time::SystemTime, remove_self: bool) -> (u
         for e in rd.flatten() {
             let Ok(m) = e.metadata() else { continue };
             if m.is_dir() {
+                if e.file_name() == "build" {
+                    continue; // cargo build-script staging dir — never enumerated, see doc comment
+                }
                 let (f, s) = sweep_dir(&e.path(), cutoff, true);
                 freed += f;
                 skipped += s;
@@ -643,6 +657,38 @@ mod tests {
         );
         assert!(debug.join("deps").exists(), "non-empty dir survives");
         assert!(debug.exists(), "the sweep root itself is kept");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // -------- 2026-07-03 incident: build/ (cargo build-script staging) is never enumerated --------
+    #[test]
+    fn sweep_old_files_never_touches_build_dir_even_when_ancient() {
+        // Regression guard: a build script's generated output (e.g. bindgen's out/bindgen.rs) can
+        // legitimately sit past RETAIN_DAYS without being stale — cargo only regenerates it if the
+        // build script's own inputs change. Deleting it out from under cargo's fingerprint cache
+        // broke the crate's build with no code change at all.
+        let d = temp("sweep_build_guard");
+        let debug = d.join("debug");
+        let out = debug.join("build").join("libsqlite3-sys-abc123").join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("bindgen.rs"), vec![0u8; 200]).unwrap();
+        std::fs::write(out.join("sqlite3.o"), vec![0u8; 300]).unwrap();
+        // Everything ancient — if build/ were swept like any other dir, all of this would go.
+        let ancient =
+            filetime::FileTime::from_unix_time(chrono::Utc::now().timestamp() - 365 * 86_400, 0);
+        for p in [out.join("bindgen.rs"), out.join("sqlite3.o")] {
+            filetime::set_file_mtime(&p, ancient).unwrap();
+        }
+        std::fs::create_dir_all(debug.join("deps")).unwrap();
+        std::fs::write(debug.join("deps").join("old.rlib"), vec![0u8; 40]).unwrap();
+        filetime::set_file_mtime(debug.join("deps").join("old.rlib"), ancient).unwrap();
+
+        let (freed, _skipped) = sweep_old_files(&debug, 7);
+
+        assert!(out.join("bindgen.rs").exists(), "build-script output must survive untouched");
+        assert!(out.join("sqlite3.o").exists(), "build-script output must survive untouched");
+        assert!(!debug.join("deps").join("old.rlib").exists(), "non-build/ ancient files still swept");
+        assert_eq!(freed, 40, "freed count reflects only the swept non-build/ file");
         let _ = std::fs::remove_dir_all(&d);
     }
 
