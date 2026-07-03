@@ -30,7 +30,7 @@
 
 use crate::control::{self, paths};
 use crate::supervisor;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Duration;
@@ -50,6 +50,13 @@ const MAX_LANE_RESTARTS_PER_SWEEP: usize = 2;
 /// watchdog line surfaces the per-lane reason; it never auto-restarts or auto-merges on it.
 const HEALTH_K: usize = 3;
 
+/// STANDSTILL_S — the fleet-standstill threshold (seconds). When the newest lane iteration across
+/// ALL repos is older than this while lanes should be running, the fleet has silently frozen (the
+/// June failure mode: loops "running" but shipping nothing for a day and a half). 3 h is long enough
+/// that a slow pi session or a sleeping lane never trips it, short enough that a real wedge pages the
+/// operator the same day instead of after a multi-day post-mortem.
+const STANDSTILL_S: f64 = 3.0 * 3600.0;
+
 /// monitor.DISABLED — global kill-switch path: HERE/runtime/_watchdog.disabled.
 fn disabled_path() -> std::path::PathBuf {
     paths::here().join("runtime").join("_watchdog.disabled")
@@ -58,6 +65,12 @@ fn disabled_path() -> std::path::PathBuf {
 /// monitor.MON_LOG — HERE/runtime/_monitor.jsonl.
 fn mon_log() -> std::path::PathBuf {
     paths::here().join("runtime").join("_monitor.jsonl")
+}
+
+/// HERE/runtime/_standstill.marker — the once-until-recovery dedup marker for the fleet-standstill
+/// alarm. Present == the operator has already been paged for the current standstill; absent == armed.
+fn standstill_marker() -> std::path::PathBuf {
+    paths::here().join("runtime").join("_standstill.marker")
 }
 
 /// monitor._now: `datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")`.
@@ -717,6 +730,14 @@ pub fn main() -> i32 {
         writeln!(f, "{line}")?;
         Ok(())
     })();
+    // FLEET-STANDSTILL ALARM: the code-plane sweep restarts CRASHED lanes and the ops plane pages on
+    // a dead PRODUCT, but neither pages when every lane is "running" yet the whole fleet has silently
+    // frozen — nothing shipping for hours (the June "running but posted nothing for 37 h" outage that
+    // never reached the operator). One loud page when the fleet is entirely down OR its newest ship is
+    // older than STANDSTILL_S, deduped by a persisted marker so a standing standstill never re-pages
+    // every 2 min. catch_unwind + best-effort marker IO mirror the ops graft — a standstill check must
+    // never abort crash-recovery.
+    let _ = std::panic::catch_unwind(|| standstill_alarm(running, snapshots.len(), Utc::now()));
     // CEO RHYTHM GRAFT (v2 Phase B): after the two-plane sweep, the day-gated morning plan +
     // evening verified-outcome summary (see ceo::tick — cheap no-op on all but two sweeps a day).
     // catch_unwind mirrors the ops graft: a CEO failure must never abort crash-recovery.
@@ -754,6 +775,103 @@ fn py_repr(v: Option<&Value>) -> String {
 /// last_summary are never split mid-character).
 fn py_slice_200(s: &str) -> String {
     s.chars().take(200).collect()
+}
+
+// --------------------------------------------------------------------------- //
+// fleet-standstill alarm
+// --------------------------------------------------------------------------- //
+
+/// The fleet-standstill DECISION (pure — unit-tested). A standstill is either:
+///   - the FLEET IS ENTIRELY DOWN: at least one lane is configured (`total > 0`) yet none are
+///     running (`running == 0`) — nothing can ship at all; or
+///   - the NEWEST lane iteration across the whole fleet is older than `threshold_s` while lanes
+///     are meant to be running (`total > 0`) — loops alive but silently shipping nothing (the June
+///     "running but frozen for 37 h" failure mode).
+///
+/// `newest_age_s` is the age (seconds) of the freshest lane iteration across all repos, or `None`
+/// when NO repo has ever iterated (a fresh install / wiped runtime — treated as a stale fleet, not a
+/// panic). Returns the human page body when a standstill is present, else `None`. An empty fleet
+/// (`total == 0`) is never a standstill — there is nothing to be down.
+fn standstill_reason(newest_age_s: Option<f64>, running: usize, total: usize, threshold_s: f64) -> Option<String> {
+    if total == 0 {
+        return None; // no lanes configured — nothing can stand still
+    }
+    if running == 0 {
+        return Some(format!("fleet entirely DOWN — 0/{total} lanes running"));
+    }
+    match newest_age_s {
+        Some(age) if age > threshold_s => Some(format!(
+            "no lane has iterated in {:.1} h ({running}/{total} running but frozen)",
+            age / 3600.0
+        )),
+        None => Some(format!(
+            "no lane has EVER iterated ({running}/{total} running but no history)"
+        )),
+        _ => None,
+    }
+}
+
+/// The age (seconds) of the freshest lane iteration across every repo, or `None` when no repo has a
+/// parseable `last_iteration_ts`. Reuses the ledger's `lane_activity` reader so the "newest ship"
+/// number is the same one the outcomes ledger reports (one source of truth for lane freshness).
+fn newest_lane_age_s(now: DateTime<Utc>) -> Option<f64> {
+    let mut newest: Option<DateTime<Utc>> = None;
+    for r in control::registry::load_repos() {
+        let name = match r.get("name").and_then(Value::as_str) {
+            Some(n) if !n.is_empty() => n,
+            _ => continue,
+        };
+        let history = paths::here().join("runtime").join(name).join("history.jsonl");
+        let ts_raw = crate::ops::ledger::lane_activity(&history, now)
+            .get("last_iteration_ts")
+            .cloned()
+            .unwrap_or(Value::Null);
+        if let Some(ts) = ts_raw.as_str() {
+            if let Ok(t) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%SZ") {
+                let t = t.and_utc();
+                if newest.map(|p| t > p).unwrap_or(true) {
+                    newest = Some(t);
+                }
+            }
+        }
+    }
+    newest.map(|t| ((now - t).num_milliseconds() as f64 / 1000.0).max(0.0))
+}
+
+/// Fire ONE loud operator page when the fleet has stood still, deduped by a persisted marker so a
+/// PERSISTING standstill never re-pages every 2-min sweep (the same log-once contract as the ops
+/// incident dedupe). The marker is created on the paging sweep and REMOVED the moment the fleet
+/// recovers, re-arming the alarm for the next standstill. Never panics (marker IO -> pass), never
+/// fails a sweep — matches the notify::send best-effort contract.
+///
+/// `running`/`total` come straight from the sweep's own snapshots; `now` is passed for testability.
+fn standstill_alarm(running: usize, total: usize, now: DateTime<Utc>) {
+    let reason = standstill_reason(newest_lane_age_s(now), running, total, STANDSTILL_S);
+    let marker = standstill_marker();
+    match reason {
+        Some(body) => {
+            // Already paged for this standstill? The marker is the dedupe state — page once.
+            if marker.exists() {
+                return;
+            }
+            let _ = crate::notify::send(&crate::notify::Notice::red(
+                "Solomon: fleet STANDSTILL".into(),
+                body,
+            ));
+            // Arm the dedupe marker (create-only; OSError -> pass, best-effort like every notify IO).
+            let _ = (|| -> std::io::Result<()> {
+                if let Some(parent) = marker.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&marker, now.format("%Y-%m-%dT%H:%M:%SZ").to_string())?;
+                Ok(())
+            })();
+        }
+        None => {
+            // Recovered (or never stood still): clear the marker so the next standstill re-pages.
+            let _ = std::fs::remove_file(&marker);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -988,6 +1106,64 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&rt);
         let _ = std::fs::remove_dir_all(&git_dir);
+    }
+
+    // -------- fleet-standstill decision (pure) --------
+    // The alarm must fire on an entirely-down fleet OR a running-but-frozen fleet, and stay silent
+    // on a healthy fleet or an empty registry. Threshold-in-seconds is passed so the test is fast.
+    #[test]
+    fn standstill_reason_fires_on_down_and_frozen_only() {
+        let thresh = 3.0 * 3600.0;
+        // fleet entirely down: at least one lane configured, none running.
+        let r = standstill_reason(Some(60.0), 0, 4, thresh).unwrap();
+        assert!(r.contains("entirely DOWN"), "{r}");
+        assert!(r.contains("0/4"), "{r}");
+        // running but frozen: newest iteration older than the threshold.
+        let r = standstill_reason(Some(4.0 * 3600.0), 4, 4, thresh).unwrap();
+        assert!(r.contains("no lane has iterated"), "{r}");
+        assert!(r.contains("4.0 h"), "{r}");
+        // running but NO history at all -> frozen (fresh install / wiped runtime).
+        let r = standstill_reason(None, 2, 4, thresh).unwrap();
+        assert!(r.contains("no lane has EVER iterated"), "{r}");
+        // healthy: running and a fresh ship inside the window -> no alarm.
+        assert!(standstill_reason(Some(600.0), 4, 4, thresh).is_none());
+        // empty registry: nothing can stand still -> never an alarm.
+        assert!(standstill_reason(None, 0, 0, thresh).is_none());
+        assert!(standstill_reason(Some(9_999_999.0), 0, 0, thresh).is_none());
+    }
+
+    // -------- standstill_alarm dedupe marker: page once, re-arm on recovery (IO round-trip) --------
+    // A standing standstill must page EXACTLY once (marker present -> no re-page), and recovery must
+    // remove the marker so the next standstill re-pages. Kill-switch on so send() is a silent no-op
+    // (no real ntfy/toast) and, post Part-1, does not touch the live _notify.jsonl either.
+    #[test]
+    fn standstill_alarm_pages_once_and_rearms_on_recovery() {
+        let _env = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        let marker = standstill_marker();
+        let _ = std::fs::remove_file(&marker);
+        let now = Utc::now();
+
+        // First standstill sweep (fleet down): arms the marker.
+        standstill_alarm(0, 4, now);
+        assert!(marker.exists(), "first standstill must arm the dedupe marker");
+        let armed_at = std::fs::read_to_string(&marker).unwrap_or_default();
+
+        // Still down next sweep: marker unchanged (paged once — not re-written, not re-paged).
+        standstill_alarm(0, 4, now + chrono::Duration::seconds(120));
+        assert!(marker.exists());
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap_or_default(),
+            armed_at,
+            "a persisting standstill must not re-page (marker must not be rewritten)"
+        );
+
+        // Recovery (all lanes running, fresh ship): marker cleared, alarm re-armed.
+        standstill_alarm(4, 4, now);
+        assert!(!marker.exists(), "recovery must clear the marker to re-arm the alarm");
+
+        let _ = std::fs::remove_file(&marker);
+        std::env::remove_var("SOLOMON_NOTIFY_OFF");
     }
 
     // -------- _auto_push truthiness --------

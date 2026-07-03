@@ -22,6 +22,7 @@
     },
     {
         "name": "sover",
+        "live_app": true,
         "branch_prefix": "rsi/",
         "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\sover",
         "public": true,
@@ -51,6 +52,7 @@
     },
     {
         "name": "asmodeus",
+        "live_app": true,
         "branch_prefix": "rsi/",
         "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\asmodeus",
         "gate": "cargo test --workspace",
