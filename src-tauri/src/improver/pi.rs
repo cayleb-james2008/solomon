@@ -57,10 +57,10 @@ pub fn is_quota_error(stderr: &str) -> bool {
 /// `final_text` correctly extracts nothing) but `stopReason:"error"` and a human-readable
 /// `errorMessage`, e.g. `errorMessage: "429 \"you (cayleb_james) have reached your weekly usage
 /// limit...\""`. The original `is_quota_error(&stderr)`-only check therefore NEVER matched this real
-/// 429 (verified live: a direct pi invocation against the exhausted account reproduced empty stderr
-/// + this exact JSONL shape), so the fleet-wide noop storm continued even after widening the stderr
-/// pattern list. Concatenated space-separated so [`is_quota_error`] can pattern-match them exactly
-/// like stderr text.
+/// 429 error (verified live: a direct pi invocation against the exhausted account reproduced this
+/// exact JSONL shape with empty stderr), so the fleet-wide noop storm continued even after widening
+/// the stderr pattern list. Concatenated space-separated so [`is_quota_error`] can pattern-match them
+/// exactly like stderr text.
 pub fn stream_error_messages(stdout: &str) -> String {
     let mut errs: Vec<String> = Vec::new();
     for line in stdout.lines() {
