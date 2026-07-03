@@ -759,16 +759,30 @@ pub fn main() -> i32 {
     // deploy-gap probe) AND the app is down (a process probe), but ONLY for a repo carrying a
     // live_deploy config (opt-in; asmodeus/live-money stays human-gated), in a safe drain window,
     // past its cooldown, and at most ONE per sweep across all repos (a cargo build is heavy). Reads
-    // the fresh ops_payload this sweep already computed. catch_unwind mirrors the ops graft: a
-    // deploy failure must never abort crash-recovery. See deploy::maybe_redeploy_managed_apps.
-    let _ = std::panic::catch_unwind(|| crate::deploy::maybe_redeploy_managed_apps(&ops_payload));
+    // the fresh ops_payload this sweep already computed. Spawned on its own thread — see the
+    // SELF-REDEPLOY comment below for why a cargo build must never run on the tick thread itself.
+    // catch_unwind mirrors the ops graft: a deploy failure must never abort crash-recovery. See
+    // deploy::maybe_redeploy_managed_apps.
+    let ops_payload_for_deploy = ops_payload.clone();
+    std::thread::spawn(move || {
+        let _ =
+            std::panic::catch_unwind(|| crate::deploy::maybe_redeploy_managed_apps(&ops_payload_for_deploy));
+    });
     // SELF-REDEPLOY: the periodic check that swaps Solomon's OWN production binary when the checkout
     // is behind origin/main, but ONLY in a safe drain window (no lane mid-ship, no live-money lane
     // with an open trade). Cheap when there is nothing to do (cooldown + single-flight guards no-op
     // most sweeps); logs LOUDLY to _watchdog.out.log when a rebuild is staged but no safe window
     // appears, so production running old code is surfaced rather than silent. Never forces an unsafe
     // swap. See `redeploy::maybe_self_redeploy` for the hard invariant.
-    crate::redeploy::maybe_self_redeploy();
+    //
+    // Both this graft and the deploy graft above can run a `cargo build --release` (bounded at 30
+    // min) and, for self-redeploy, an additional busy-wait for a safe drain window (up to
+    // DRAIN_WAIT_MINS) — spawned on their own threads so a rebuild can never freeze the 2-min tick's
+    // crash-recovery / heartbeat collection / standstill alarm for the rest of the fleet (the
+    // 2026-07-03 standstill incidents). Each already single-flights via its own lock-file + cooldown
+    // guard (redeploy_in_progress / deploy's cooldown marker), so spawning a checker thread every
+    // tick is safe — the common case (nothing to do) returns almost immediately.
+    std::thread::spawn(crate::redeploy::maybe_self_redeploy);
     0
 }
 

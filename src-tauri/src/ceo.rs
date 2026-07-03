@@ -424,11 +424,13 @@ fn backlog_path(name: &str) -> PathBuf {
 /// posting / trade / app path is broken, not merely the test gate. Internal/support probes
 /// (heartbeat_fresh, binary_current, monitor_fresh, auth_health, cdp_alive, equity_fresh,
 /// outcome_streak, ...) are DELIBERATELY excluded: they measure liveness/plumbing, not the outcome.
-const OPS_OUTCOME_PROBES: [&str; 4] = [
+const OPS_OUTCOME_PROBES: [&str; 6] = [
     "publish_recency",
     "produce_recency",
     "fills_recency",
-    "lane_freshness",
+    "lane_freshness_instagram",
+    "lane_freshness_tiktok",
+    "lane_freshness_youtube",
 ];
 // `process` (App.exe not running) is DELIBERATELY excluded: an app being down is a restart/redeploy
 // job for the watchdog + deploy plane, not a code-fix the lane agent should chase — filing an
