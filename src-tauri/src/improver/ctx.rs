@@ -133,6 +133,28 @@ fn secret_keyval_pattern() -> &'static regex::Regex {
 /// run_improver._ENV_KEYS — provider API keys (+ OLLAMA_BASE_URL) loaded from Solomon/.env.
 const ENV_KEYS: &[&str] = &["OLLAMA_API_KEY", "OLLAMA_BASE_URL", "OPENROUTER_API_KEY"];
 
+/// True iff `k` should be loaded from `.env` into the process env: an exact `ENV_KEYS` name, or a
+/// numbered per-account key ("OPENROUTER_API_KEY_<n>" / "OLLAMA_API_KEY_<n>") used by the multi-account
+/// key-rotation indirection (`resolved_api_key`, 2026-07-03) — so a repos.json `api_key` of
+/// "OPENROUTER_API_KEY_2" actually resolves to something. 2026-07-03 INCIDENT: `load_env` originally
+/// only loaded the exact ENV_KEYS names, so every numbered key silently never reached the process env
+/// and every openrouter-routed lane immediately errored out (key_shape_mismatch: the raw bare name
+/// doesn't look like an OpenRouter key). Digits-only suffix keeps this from ever matching an unrelated
+/// name; the operator can add more funded accounts to `.env` without another code change.
+fn is_loadable_env_key(k: &str) -> bool {
+    if ENV_KEYS.contains(&k) {
+        return true;
+    }
+    for prefix in ["OPENROUTER_API_KEY_", "OLLAMA_API_KEY_"] {
+        if let Some(suffix) = k.strip_prefix(prefix) {
+            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 // --------------------------------------------------------------------------- #
 // time helpers (run_improver._now / _stamp)
 // --------------------------------------------------------------------------- #
@@ -717,7 +739,7 @@ impl Ctx {
             let v = v.trim();
             let v = v.trim_matches('"');
             let v = v.trim_matches('\'');
-            if ENV_KEYS.contains(&k) && std::env::var(k).map(|e| e.is_empty()).unwrap_or(true) {
+            if is_loadable_env_key(k) && std::env::var(k).map(|e| e.is_empty()).unwrap_or(true) {
                 // Python: `not os.environ.get(k)` is true when unset OR empty-string.
                 std::env::set_var(k, v);
             }
@@ -1443,6 +1465,34 @@ mod tests {
         c.api_key = String::new();
         c.apply_api_key();
         assert_eq!(std::env::var("OPENROUTER_API_KEY").unwrap(), "sk-global");
+    }
+
+    // ---- is_loadable_env_key: numbered per-account keys must actually load from .env ----
+    // 2026-07-03 INCIDENT: load_env() only loaded the exact ENV_KEYS names, so a numbered key like
+    // OPENROUTER_API_KEY_1 never reached the process env at all — every openrouter-routed lane
+    // errored out on key_shape_mismatch (the unresolved bare name doesn't look like an OpenRouter key).
+    #[test]
+    fn is_loadable_env_key_accepts_exact_env_keys() {
+        assert!(is_loadable_env_key("OLLAMA_API_KEY"));
+        assert!(is_loadable_env_key("OLLAMA_BASE_URL"));
+        assert!(is_loadable_env_key("OPENROUTER_API_KEY"));
+    }
+
+    #[test]
+    fn is_loadable_env_key_accepts_numbered_per_account_keys() {
+        assert!(is_loadable_env_key("OPENROUTER_API_KEY_1"));
+        assert!(is_loadable_env_key("OPENROUTER_API_KEY_2"));
+        assert!(is_loadable_env_key("OPENROUTER_API_KEY_42"));
+        assert!(is_loadable_env_key("OLLAMA_API_KEY_1"));
+    }
+
+    #[test]
+    fn is_loadable_env_key_rejects_unrelated_or_malformed_names() {
+        assert!(!is_loadable_env_key("OPENROUTER_API_KEY_")); // empty suffix
+        assert!(!is_loadable_env_key("OPENROUTER_API_KEY_ABC")); // non-digit suffix
+        assert!(!is_loadable_env_key("OPENROUTER_EMBEDDING_API_KEY")); // unrelated var
+        assert!(!is_loadable_env_key("RANDOM_VAR"));
+        assert!(!is_loadable_env_key(""));
     }
 
     // ---- resolved_api_key / apply_api_key: env-var-NAME indirection (2026-07-03) ----
