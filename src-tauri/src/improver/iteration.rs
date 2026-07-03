@@ -283,7 +283,19 @@ push failed ({pu_err}). Reconcile with origin; managed repos change only via gat
     // Anti-gaming baseline: measure the gate on the CLEAN base before Pi touches anything.
     let mut base_tests: Value = Value::Null;
     if !ctx.beautify {
-        let (bgreen, bt, _tail) = gates::run_gate(ctx);
+        let (mut bgreen, mut bt, _tail) = gates::run_gate(ctx);
+        // A RED base is usually a flaky test tripping under host contention (the live trading fleet
+        // + a parallel cargo build), not a real breakage. Re-run the gate ONCE before trusting the
+        // red: a flake passes on the retry; a deterministically-broken base (pytest missing, a
+        // committed syntax error) stays red. Without this, a run of flaky reds trips
+        // base_gate_red_persistent and permanently self-stops a healthy lane (observed 2026-07-02:
+        // dotz self-stopped ~9h on a base that was green on an unloaded box).
+        if !bgreen {
+            ctx.log("base gate RED — re-running once to rule out a flaky failure before a red bail");
+            let (bgreen2, bt2, _tail2) = gates::run_gate(ctx);
+            bgreen = bgreen2;
+            bt = bt2;
+        }
         base_tests = bt;
         if bgreen {
             escalation::note_base_gate_red_bail(ctx, false, ""); // green base resets the persistent-red counter
