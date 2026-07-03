@@ -11,6 +11,7 @@ mod ceo; // CEO rhythm (v2 Phase B): morning plan + evening verified-outcome sum
 mod control; // native port of control.py — repos registry, git/gh, locks, runner (the `bridge` backend)
 mod deploy; // managed-app redeploy: rebuild+relaunch a repo's live app binary when a fix merged but never deployed (deploy gap)
 mod housekeeping; // storage housekeeping (v2): day-gated build-dir/branch/worktree cleanup on the watchdog tick
+mod hygiene; // repo-hygiene detection (report-only): flags off-base / dirty managed trees the CEO grafts surface
 mod improver; // native port of improver/run_improver.py — the per-repo RSI loop (`run-improver` subcommand)
 mod notify; // operator notifications (v2 Phase A): ntfy push + Windows toast, fed by ops incidents + CEO reports
 mod ops; // ops plane (Phase 1): ground-truth probes + honest fleet status (`probe` subcommand + watchdog graft)
