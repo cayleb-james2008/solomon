@@ -161,7 +161,7 @@ fn stamp_last_deploy(name: &str) {
 // --------------------------------------------------------------------------- //
 
 /// The rebuild/launch argv for a repo's `live_deploy`, or None when the field is absent/malformed.
-fn live_deploy_argv<'a>(repo_cfg: &'a Value, field: &str) -> Option<Vec<String>> {
+fn live_deploy_argv(repo_cfg: &Value, field: &str) -> Option<Vec<String>> {
     let arr = repo_cfg
         .get("live_deploy")
         .and_then(|d| d.get(field))

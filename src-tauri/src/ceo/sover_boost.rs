@@ -244,7 +244,7 @@ fn lane_summary(out: &proc::RunOut) -> String {
 }
 
 fn notify_one_line(s: &str) -> String {
-    s.replace('\n', " ").replace('\r', " ").chars().take(240).collect()
+    s.replace(['\n', '\r'], " ").chars().take(240).collect()
 }
 
 /// Run ONE boost for `repo_cfg` (sover): STAMP FIRST (cooldown + daily count), then run the produce
