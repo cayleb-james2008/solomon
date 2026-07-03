@@ -76,6 +76,12 @@ fn notify_off() -> bool {
     env_value("SOLOMON_NOTIFY_OFF").as_deref() == Some("1")
 }
 
+/// Test-only serialization for the process-global `SOLOMON_NOTIFY_OFF` kill-switch + the shared
+/// runtime/_notify.jsonl log. Any test (here OR in watchdog) that flips the env var must hold this,
+/// so parallel tests in the same binary don't race the env / log. Mirrors control::keys ENV_LOCK.
+#[cfg(test)]
+pub(crate) static NOTIFY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// One header/body line must stay a single line for curl `-H`; collapse breaks to " / ".
 fn one_line(s: &str) -> String {
     s.replace("\r\n", " / ").replace(['\r', '\n'], " / ")
@@ -134,10 +140,16 @@ pub fn toast_command(title: &str, body: &str) -> String {
 /// Returns the per-channel delivery record (also appended to runtime/_notify.jsonl).
 pub fn send(n: &Notice) -> Value {
     let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let record = if notify_off() {
-        json!({"ts": ts, "title": n.title, "priority": n.priority,
-               "ntfy": "off", "toast": "off"})
-    } else {
+    if notify_off() {
+        // Kill-switch: deliver nothing AND log nothing. The kill-switch record was pure theater —
+        // ~78% of runtime/_notify.jsonl was `{"title":"t",...,"ntfy":"off","toast":"off"}` from the
+        // send() unit test writing to the live log every `cargo test`, drowning the real red/recovered
+        // pages the GUI's notify_tail surfaces. A suppressed send is not a delivery attempt, so it has
+        // no place in the append-only DELIVERY log. Callers still get the honest off/off record.
+        return json!({"ts": ts, "title": n.title, "priority": n.priority,
+                      "ntfy": "off", "toast": "off"});
+    }
+    let record = {
         // ntfy: only when a topic is configured; a missing topic is an honest "skipped", not an error.
         let ntfy = match env_value("NTFY_TOPIC") {
             Some(topic) => {
@@ -269,13 +281,54 @@ mod tests {
         assert!(incident_notice(&serde_json::json!({})).is_none());
     }
 
-    // -------- kill-switch: send() must be a silent no-op delivery-wise --------
+    // -------- kill-switch: send() must be a silent no-op delivery-wise AND log nothing --------
+    // Pre-fix, this test appended `{"title":"t",...,"ntfy":"off","toast":"off"}` to the LIVE
+    // runtime/_notify.jsonl every `cargo test` run — ~78% of the operator's notify log was this
+    // one probe's theater. Now a suppressed send delivers the honest off/off record to the caller
+    // but writes NOTHING to the delivery log.
     #[test]
-    fn send_honors_kill_switch() {
+    fn send_honors_kill_switch_and_does_not_pollute_the_log() {
+        let _env = super::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        let path = paths::here().join("runtime").join("_notify.jsonl");
+        let lines_before = std::fs::read_to_string(&path).map(|s| s.lines().count()).unwrap_or(0);
+
         let rec = send(&Notice::report("t".into(), "b".into()));
         assert_eq!(rec["ntfy"], "off");
         assert_eq!(rec["toast"], "off");
+
+        let lines_after = std::fs::read_to_string(&path).map(|s| s.lines().count()).unwrap_or(0);
+        assert_eq!(
+            lines_after, lines_before,
+            "a kill-switched send must not append to the live _notify.jsonl"
+        );
         std::env::remove_var("SOLOMON_NOTIFY_OFF");
+    }
+
+    // -------- Part 2: an OUTCOME-probe RED transition pages the operator LOUDLY (urgent) --------
+    // The outcome probes (publish_recency/produce_recency/process/fills_recency/lane_freshness) are
+    // the real-outage signal. A green/yellow->red transition record (as emitted by
+    // ops::outcomes::evolve) must map to an URGENT ntfy page with the rotating_light tag, so the
+    // 37 h sover outage / asmodeus trader death page loudly instead of dying in a log file. The
+    // upstream evolve() log-once dedupe means a persisting red maps once — no re-page every sweep.
+    #[test]
+    fn outcome_red_transition_pages_urgent() {
+        for probe in [
+            "sover/publish_recency",
+            "sover/produce_recency",
+            "asmodeus/fills_recency",
+            "asmodeus/process",
+            "daedalus/lane_freshness",
+        ] {
+            let red = serde_json::json!({
+                "event": "red", "probe_id": probe,
+                "detail": "no output in 133200s > 86400s",
+                "first_red_ts": "2026-07-01T00:00:00Z"
+            });
+            let n = incident_notice(&red).expect("a red incident must map to a notice");
+            assert_eq!(n.priority, "urgent", "{probe} RED must page at urgent priority");
+            assert_eq!(n.tags, "rotating_light", "{probe} RED must carry the loud tag");
+            assert!(n.title.contains(probe), "{probe} title: {}", n.title);
+        }
     }
 }

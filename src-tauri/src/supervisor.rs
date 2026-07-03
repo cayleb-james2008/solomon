@@ -100,6 +100,16 @@ fn provider_has_fallback(repo: &Value) -> bool {
     crate::improver::ctx::fallback_model(&registry::project_provider(repo)).is_some()
 }
 
+/// True when the repos.json entry describes a LIVE-APP repo: one whose running app writes into its own
+/// source tree (sover/asmodeus). Such a dirtied working tree is EXPECTED, not an RSI failure, so the
+/// destructive reset_to_base recovery must be exempted. Keyed off an EXPLICIT `live_app: true` flag —
+/// deliberately NOT `private_paths` (that field means "gitignored paths a PUBLIC repo must never
+/// stage", a distinct concept; overloading it would wrongly exempt any future public repo that adds
+/// one). The two current live apps carry `live_app: true` in repos.json.
+fn is_live_app(repo: &Value) -> bool {
+    matches!(repo.get("live_app"), Some(Value::Bool(true)))
+}
+
 /// solomon._push_base_if_ahead: fast-forward PUBLISH a base merely AHEAD of origin (never --force,
 /// never reset). Returns {pushed, ahead?, diverged, error?}. Diverged (also behind) or any git
 /// failure -> pushed=False so recover() escalates.
@@ -792,6 +802,11 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
 
     // RUNG 2 / revert_failed special path.
     if cat == "revert_failed" {
+        if is_live_app(repo) {
+            return finish(repo, &d, vec!["skipped reset_to_base (live app)".into()], true,
+                "live-app repo: working tree dirtied by the running app (expected) — not resetting; \
+                 pause the lane or restart the app instead");
+        }
         if locks::is_running(repo) {
             return finish(repo, &d, vec![], true,
                 "loop is live — stop it before Solomon resets the un-reverted base");
@@ -946,6 +961,11 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
         }
         actions.push("clear_stop".into());
     } else if cat == "dirty_tree" {
+        if is_live_app(repo) {
+            return finish(repo, &d, vec!["skipped reset_to_base (live app)".into()], true,
+                "live-app repo: working tree dirtied by the running app (expected) — not resetting; \
+                 pause the lane or restart the app instead");
+        }
         let (ok, token) = locks::acquire_supervisor_lock(repo);
         if !ok {
             return finish(repo, &d, actions, true,
@@ -1290,6 +1310,37 @@ mod tests {
                                "reason": "dirty_base_persistent", "last_summary": "base dirty"}));
         assert_eq!(diagnose(&repo)["category"], "unknown_error");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------- is_live_app + live-app dirty_tree exemption ----------------
+    #[test]
+    fn live_app_dirty_tree_skips_reset_to_base() {
+        // An explicit `live_app: true` flag marks a repo whose running app dirties its own tree.
+        assert!(is_live_app(&json!({"name": "x", "live_app": true})));
+        assert!(!is_live_app(&json!({"name": "x"})));
+        // private_paths alone is NOT a live-app marker (distinct concept — gitignored public paths).
+        assert!(!is_live_app(&json!({"name": "x", "private_paths": ["assets/music"]})));
+
+        // Live-app repo: dirty_tree recovery must NOT call reset_to_base; it escalates with the
+        // honest live-app message and records the skip recovery-action.
+        let (dir, mut repo) = tmp_repo("liveapp_dirty");
+        repo["live_app"] = json!(true);
+        write_hb(&dir, &json!({"status": "error", "phase": "preflight", "last_summary": "base tree is DIRTY"}));
+        assert_eq!(diagnose(&repo)["category"], "dirty_tree");
+        let r = recover(&repo, false, false, false);
+        assert_eq!(r["escalate"], true);
+        assert_eq!(r["actions_taken"], json!(["skipped reset_to_base (live app)"]));
+        assert!(!r["actions_taken"].as_array().unwrap().iter().any(|a| a == "reset_to_base"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Plain repo (no path): dirty_tree still routes into reset_to_base (which fails on the
+        // missing path here) — the recovery-action IS "reset_to_base", proving non-live behavior.
+        let (dir2, repo2) = tmp_repo("plain_dirty");
+        write_hb(&dir2, &json!({"status": "error", "phase": "preflight", "last_summary": "base tree is DIRTY"}));
+        assert_eq!(diagnose(&repo2)["category"], "dirty_tree");
+        let r2 = recover(&repo2, false, false, false);
+        assert!(r2["actions_taken"].as_array().unwrap().iter().any(|a| a == "reset_to_base"));
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]

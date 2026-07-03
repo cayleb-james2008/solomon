@@ -114,6 +114,12 @@ pub fn record_attempt(section: &Value, today: &str, ok: bool) -> Value {
 pub fn tick() {
     blind_window_notice_once();
 
+    // DETERMINISTIC ops-RED graft (v2, close-the-loop): every sweep, ensure each project whose
+    // OUTCOME probe is RED carries a targeted [ops-auto:<probe>] fix item atop its backlog —
+    // idempotent, no-LLM, cheap. This is what closes the open loop the LLM morning plan left:
+    // sover can be RED (no posts 37 h) yet, with only a once/day LLM plan, no fix is ever queued.
+    ops_red_backlog_graft();
+
     let now = chrono::Local::now();
     let today = now.format("%Y-%m-%d").to_string();
     let hour = now.hour();
@@ -337,6 +343,125 @@ fn ceo_marker(date: &str) -> String {
 /// HERE/improver/<name>/backlog.md — the exact file improver::backlog::top_backlog_item reads.
 fn backlog_path(name: &str) -> PathBuf {
     paths::here().join("improver").join(name).join("backlog.md")
+}
+
+// --------------------------------------------------------------------------- //
+// deterministic ops-RED backlog graft (close-the-loop)
+// --------------------------------------------------------------------------- //
+
+/// The OUTCOME probes that count as a real failing product signal — a RED here means the actual
+/// posting / trade / app path is broken, not merely the test gate. Internal/support probes
+/// (heartbeat_fresh, binary_current, monitor_fresh, auth_health, cdp_alive, equity_fresh,
+/// outcome_streak, ...) are DELIBERATELY excluded: they measure liveness/plumbing, not the outcome.
+const OPS_OUTCOME_PROBES: [&str; 4] = [
+    "publish_recency",
+    "produce_recency",
+    "fills_recency",
+    "lane_freshness",
+];
+// `process` (App.exe not running) is DELIBERATELY excluded: an app being down is a restart/redeploy
+// job for the watchdog + deploy plane, not a code-fix the lane agent should chase — filing an
+// "ops-auto:process" fix item would mislabel a down process as a code failure (and stack redundantly
+// with publish/produce/lane_freshness, which all go RED together when the app is down).
+
+/// The stable per-(project, probe) idempotence marker embedded in every ops-auto backlog line.
+fn ops_marker(probe: &str) -> String {
+    format!("[ops-auto:{probe}]")
+}
+
+/// Every ops sweep: for each project whose OUTCOME probe is RED (per `OPS_OUTCOME_PROBES`), ensure a
+/// targeted `[ops-auto:<probe>]` fix item sits atop `improver/<name>/backlog.md`, IDEMPOTENTLY —
+/// one OPEN item per (project, probe). Deterministic (no LLM), read fresh from runtime/ops_status.json.
+///
+/// This closes the open loop: the ops plane was OBSERVATION-ONLY — the improver reads backlog.md and
+/// never sees ops, and the once/day LLM morning plan can leave a RED lane with no queued fix. Here a
+/// RED outcome DETERMINISTICALLY forces a fix into the lane backlog every sweep, without flooding it.
+fn ops_red_backlog_graft() {
+    let status: Value = std::fs::read(ops::outcomes::ops_status_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null);
+    let projects = match status.get("projects").and_then(Value::as_object) {
+        Some(p) => p,
+        None => return,
+    };
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    for (name, proj) in projects {
+        // Which OUTCOME probes are RED for this project? (per-probe status map, whitelist-filtered)
+        let probes = match proj.get("probes").and_then(Value::as_object) {
+            Some(p) => p,
+            None => continue,
+        };
+        for probe in OPS_OUTCOME_PROBES {
+            if probes.get(probe).and_then(Value::as_str) != Some("red") {
+                continue;
+            }
+            // The reason/detail for this probe from the rollup reasons list ("<probe>=red (<detail>)").
+            let detail = red_probe_detail(proj, probe);
+            ensure_ops_item(name, probe, &detail, &today);
+        }
+    }
+}
+
+/// Pull the human detail for a RED probe out of a project's `reasons` list (each entry is
+/// `"<id>=<status> (<detail>)"`, produced by ops::outcomes::sweep_project). Falls back to the bare
+/// probe name when no matching reason is present. Pure — unit-tested.
+fn red_probe_detail(proj: &Value, probe: &str) -> String {
+    let prefix = format!("{probe}=");
+    proj.get("reasons")
+        .and_then(Value::as_array)
+        .and_then(|rs| {
+            rs.iter()
+                .filter_map(Value::as_str)
+                .find(|r| r.starts_with(&prefix))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| probe.to_string())
+}
+
+/// Idempotence predicate (pure — unit-tested): true iff the backlog already carries an OPEN
+/// (`- [ ]`) line with this (project, probe) `[ops-auto:<probe>]` marker. When true we prepend
+/// NOTHING — one open item per (project, probe), so a persisting RED never floods the backlog every
+/// 2-min sweep. A `- [x]` (done) line with the marker does NOT count as open — the lane goes RED
+/// again -> a fresh item is queued.
+fn has_open_ops_item(existing: &str, probe: &str) -> bool {
+    let marker = ops_marker(probe);
+    existing
+        .lines()
+        .any(|l| l.trim().starts_with("- [ ]") && l.contains(&marker))
+}
+
+/// The exact backlog line for a RED outcome probe (pure — unit-tested). Carries the stable
+/// `[ops-auto:<probe>]` idempotence marker and a `[reliability]` intent tag (not a known improver
+/// tier, so strip_tier leaves it in the text — deliberate; the item reads as reliability work).
+fn ops_item_line(probe: &str, detail: &str, today: &str) -> String {
+    format!(
+        "- [ ] [reliability]{} {probe} has been RED ({detail}) — the real outcome is failing, \
+         not the test gate; diagnose and fix the actual posting/trade/app path. (ops-auto {today})",
+        ops_marker(probe)
+    )
+}
+
+/// Idempotently prepend ONE `[ops-auto:<probe>]` fix item to a lane's backlog. If an OPEN line
+/// already carries `[ops-auto:<probe>]`, do NOTHING — this MUST NOT flood the backlog every 2-min
+/// sweep. Reuses the same atomic-prepend + read-error safety contract as morning_plan (a READ ERROR
+/// — the improver mid-rewrite / a locked file — skips the lane rather than risk truncating a live
+/// backlog; file-absent starts from empty).
+fn ensure_ops_item(name: &str, probe: &str, detail: &str, today: &str) {
+    let path = backlog_path(name);
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return, // read failed — do NOT risk truncating a live backlog
+    };
+    if has_open_ops_item(&existing, probe) {
+        return;
+    }
+    let line = ops_item_line(probe, detail, today);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = proc::atomic_write_bytes(&path, format!("{line}\n{existing}").as_bytes());
 }
 
 /// HERE/improver/<name>/goal.md — the operator's committed, single-line goal post (the measurable
@@ -833,6 +958,49 @@ mod tests {
     #[test]
     fn ceo_marker_is_dated() {
         assert_eq!(ceo_marker("2026-07-02"), "(ceo 2026-07-02)");
+    }
+
+    // -------- ops-RED backlog graft (deterministic close-the-loop) --------
+    #[test]
+    fn ops_red_graft_marker_line_and_idempotence() {
+        // the stable per-(project, probe) marker + the exact prepended line shape
+        assert_eq!(ops_marker("publish_recency"), "[ops-auto:publish_recency]");
+        let line = ops_item_line("publish_recency", "age 37.2h", "2026-07-03");
+        assert!(line.starts_with("- [ ] [reliability][ops-auto:publish_recency] "));
+        assert!(line.contains("publish_recency has been RED (age 37.2h)"));
+        assert!(line.contains("fix the actual posting/trade/app path"));
+        assert!(line.ends_with("(ops-auto 2026-07-03)"));
+
+        // idempotence: an OPEN item with the marker blocks a re-prepend...
+        let open = "- [ ] [reliability][ops-auto:publish_recency] publish_recency has been RED (x)\n\
+                    - [ ] something else\n";
+        assert!(has_open_ops_item(open, "publish_recency"));
+        // ...a DIFFERENT probe's marker is independent (one open item PER probe)...
+        assert!(!has_open_ops_item(open, "process"));
+        // ...a DONE (- [x]) marker line does NOT count as open (RED again -> re-queue)...
+        let done = "- [x] [reliability][ops-auto:publish_recency] fixed last time\n";
+        assert!(!has_open_ops_item(done, "publish_recency"));
+        // ...and an empty backlog has no open item.
+        assert!(!has_open_ops_item("", "publish_recency"));
+    }
+
+    #[test]
+    fn red_probe_detail_pulls_reason_or_falls_back() {
+        let proj = json!({
+            "reasons": [
+                "publish_recency=red (age 37.2h (*.published_at 2026-07-01T22:58:53Z))",
+                "process=red (Sover.exe NOT running)",
+            ]
+        });
+        // the matching reason line is returned verbatim (id=status (detail))
+        assert_eq!(
+            red_probe_detail(&proj, "publish_recency"),
+            "publish_recency=red (age 37.2h (*.published_at 2026-07-01T22:58:53Z))"
+        );
+        assert_eq!(red_probe_detail(&proj, "process"), "process=red (Sover.exe NOT running)");
+        // no matching reason (or no reasons key) -> the bare probe name
+        assert_eq!(red_probe_detail(&proj, "fills_recency"), "fills_recency");
+        assert_eq!(red_probe_detail(&json!({}), "process"), "process");
     }
 
     // -------- goal-post precedence (pure) --------
