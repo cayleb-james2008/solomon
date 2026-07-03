@@ -18,7 +18,12 @@
         },
         "goal": "Improve maki (a local AI media-library desktop app: natural-language chat -> search/download/convert manga + video -> transfer to Kindle/device; pywebview + pi agent). Each iteration make ONE real, high-leverage improvement: fix a genuine bug, harden the download->KCC-convert->transfer pipeline, improve reliability/error-handling, or add missing test coverage. GROWTH IS IN SCOPE (operator decision 2026-07-01): when the day's backlog item is a growth goal, improve the ORGANIC public surface instead of code \u2014 README (screenshots, quickstart, feature tour), docs, examples, release notes, GitHub description/topics \u2014 free/organic only, no paid services or ad spend, and never degrade the code to do it. Keep all tests green and ruff clean. PONYTAIL STYLE: the laziest solution that fully works -- stdlib over deps, native over custom, delete over add; add no abstraction or dependency you do not need. A truthful 'nothing worth changing this cycle' beats a fabricated or cosmetic change.",
         "interval": 120,
-        "max_iterations": 0
+        "max_iterations": 0,
+        "scale": {
+            "min_interval_s": 90,
+            "step_s": 15,
+            "cooldown_s": 21600
+        }
     },
     {
         "name": "sover",
@@ -53,6 +58,19 @@
             "review": false,
             "ideate": false,
             "reflect": false
+        },
+        "scale": {
+            "min_interval_s": 90,
+            "step_s": 15,
+            "cooldown_s": 21600
+        },
+        "produce_boost": {
+            "bin": ["C:\\Users\\Cayleb\\sover-live\\target\\release\\sover.exe", "--live", "--lane", "post"],
+            "produce": ["C:\\Users\\Cayleb\\sover-live\\target\\release\\sover.exe", "--live", "--lane", "produce"],
+            "cwd": "C:\\Users\\Cayleb\\sover-live",
+            "profile_env": "ggg",
+            "cooldown_s": 3600,
+            "max_extra_per_day": 3
         }
     },
     {
@@ -116,6 +134,11 @@
             "review": false,
             "ideate": false,
             "reflect": false
+        },
+        "scale": {
+            "min_interval_s": 180,
+            "step_s": 30,
+            "cooldown_s": 21600
         }
     },
     {

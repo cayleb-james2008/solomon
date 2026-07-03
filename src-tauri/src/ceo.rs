@@ -23,6 +23,12 @@
 //! operator how long ops was blind.
 #![allow(dead_code)]
 
+// Deterministic growth sub-planes wired into `tick`/`morning_plan`: fleet ROI ranking (allocate),
+// bounded reversible interval tightening (scale), and the sover produce/post profit boost.
+pub mod allocate;
+pub mod scale;
+pub mod sover_boost;
+
 use crate::control::{paths, proc};
 use crate::notify::{self, Notice};
 use crate::ops::{self, ledger};
@@ -119,6 +125,25 @@ pub fn tick() {
     // idempotent, no-LLM, cheap. This is what closes the open loop the LLM morning plan left:
     // sover can be RED (no posts 37 h) yet, with only a once/day LLM plan, no fix is ever queued.
     ops_red_backlog_graft();
+
+    // GROWTH GRAFTS (every sweep, deterministic + bounded): (1) hygiene — report-only off-base/dirty
+    // managed trees grafted into the lane backlog + a loud page on a NEW stranded off-base pair;
+    // (2) scale — one bounded reversible interval tightening across the fleet; (3) sover_boost — one
+    // extra produce/post one-shot to close the posts/day gap. Each is wrapped in its OWN catch_unwind
+    // (mirroring watchdog's per-graft isolation) so one graft's panic can't skip the next, and the
+    // scale/boost decisions read the SAME fresh snapshot+rollup morning_plan/ops_red_backlog_graft use.
+    let snapshot = ledger::snapshot();
+    let status: Value = std::fs::read(ops::outcomes::ops_status_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null);
+    let _ = std::panic::catch_unwind(hygiene_backlog_graft);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        scale::maybe_scale_lanes(&snapshot, &status)
+    }));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sover_boost::maybe_boost(&snapshot, &status)
+    }));
 
     let now = chrono::Local::now();
     let today = now.format("%Y-%m-%d").to_string();
@@ -230,6 +255,15 @@ pub fn morning_plan() -> Value {
         return json!({"ok": true, "note": "already planned today"});
     }
 
+    // Fleet ALLOCATION context (deterministic): the ROI ranking + a DRY-RUN of the scale/boost
+    // decisions (computed here, NEVER executed — execution stays in the tick grafts). Injected into
+    // both each lane's ctx (its leverage score) and a fleet-level object the report renders.
+    let ranking = allocate::rank_lanes(&snapshot, &status);
+    let leverage: std::collections::HashMap<&str, f64> =
+        ranking.iter().map(|(n, s, _)| (n.as_str(), *s)).collect();
+    let (scale_actions, holds) = allocation_dry_run(&snapshot, &status);
+    let top_lane = ranking.first().map(|(n, ..)| n.clone());
+
     // Fleet context for the model: outcomes + probe reasons + current top backlog item per lane.
     let mut ctx = Vec::new();
     for (prio, name, goal) in &lanes {
@@ -254,10 +288,18 @@ pub fn morning_plan() -> Value {
             "north_star": goal,
             "outcomes_24h": outcomes,
             "velocity": velocity,
+            "leverage": leverage.get(name.as_str()).copied().unwrap_or(0.0),
             "probes": probes,
             "current_top_backlog_item": top_item,
         }));
     }
+    // The fleet allocation object handed to the model alongside the per-lane ctx.
+    let allocation = json!({
+        "top_lane": top_lane,
+        "ranking": ranking.iter().map(|(n, s, why)| json!([n, s, why])).collect::<Vec<_>>(),
+        "scale_actions": scale_actions,
+        "holds": holds,
+    });
 
     let system = "You are the CEO planner of Solomon, a growth executive running autonomous \
         improvement lanes over the operator's projects — an AI that grows the company while the \
@@ -278,10 +320,14 @@ pub fn morning_plan() -> Value {
         dead engine can't grow — but a lane with a healthy engine STILL gets pushed forward \
         toward its next growth milestone, not idled. Growth must never become reward-hacking, \
         off-brand, or unbounded. Goals must be implementable by a coding agent in one iteration \
-        and verifiable from files/tests/logs. Reply with STRICT JSON only: \
-        {\"lanes\": {\"<lane>\": {\"tier\": \"chore|feature|refactor|architecture\", \
-        \"goal\": \"<one sentence>\", \"why\": \"<one sentence>\"}}} — one entry per lane given.";
-    let user = serde_json::to_string_pretty(&json!({"date": today, "lanes": ctx}))
+        and verifiable from files/tests/logs. You are ALSO given a deterministic fleet `allocation` \
+        (each lane's leverage score, the ROI ranking, and the dry-run scale/boost actions): write \
+        ONE plain-English sentence naming where the fleet's marginal effort should go today (the \
+        top-ranked lane, the scale/boost move, and what is held and why). Reply with STRICT JSON \
+        only: {\"lanes\": {\"<lane>\": {\"tier\": \"chore|feature|refactor|architecture\", \
+        \"goal\": \"<one sentence>\", \"why\": \"<one sentence>\"}}, \
+        \"fleet\": {\"allocation\": \"<one sentence>\"}} — one lanes entry per lane given.";
+    let user = serde_json::to_string_pretty(&json!({"date": today, "lanes": ctx, "allocation": allocation}))
         .unwrap_or_default();
 
     let reply = match ollama_chat(CEO_MODEL, system, &user) {
@@ -306,6 +352,16 @@ pub fn morning_plan() -> Value {
     let mut applied = Map::new();
     let mut report = format!("# Solomon morning plan — {today}\n\n");
     report.push_str(&overnight_section(&snapshot, &incidents));
+    // (1.5) ALLOCATION — deterministic ROI ranking + dry-run scale/boost moves, then the model's
+    // one-line fleet-allocation sentence (falling back to a deterministic top-lane line, never
+    // fabricated, when the model omits it).
+    report.push_str(&allocation_section(&ranking, &scale_actions, &holds));
+    let fleet_line = fleet_allocation(&parsed)
+        .unwrap_or_else(|| match ranking.iter().find(|(_, s, _)| *s > 0.0) {
+            Some((n, ..)) => format!("Pour marginal effort into {n} (top ROI); hold real-money + non-green lanes."),
+            None => "No scalable lane today — hold the fleet and fix red engines first.".to_string(),
+        });
+    report.push_str(&format!("_{fleet_line}_\n\n"));
     report.push_str("## TODAY'S PLAN\n\n");
     for (lane, tier, goal, why) in &items {
         if !unplanned.iter().any(|(_, n, _)| n == lane) {
@@ -440,10 +496,16 @@ fn red_probe_detail(proj: &Value, probe: &str) -> String {
 /// 2-min sweep. A `- [x]` (done) line with the marker does NOT count as open — the lane goes RED
 /// again -> a fresh item is queued.
 fn has_open_ops_item(existing: &str, probe: &str) -> bool {
-    let marker = ops_marker(probe);
+    has_open_marker(existing, &ops_marker(probe))
+}
+
+/// Shared idempotence predicate (pure — unit-tested): true iff any OPEN (`- [ ]`) backlog line
+/// contains `marker`. A `- [x]` (done) line does NOT count as open — the condition recurs -> a
+/// fresh item is queued. Both the ops-RED graft and the hygiene graft key off this.
+fn has_open_marker(existing: &str, marker: &str) -> bool {
     existing
         .lines()
-        .any(|l| l.trim().starts_with("- [ ]") && l.contains(&marker))
+        .any(|l| l.trim().starts_with("- [ ]") && l.contains(marker))
 }
 
 /// The exact backlog line for a RED outcome probe (pure — unit-tested). Carries the stable
@@ -477,6 +539,137 @@ fn ensure_ops_item(name: &str, probe: &str, detail: &str, today: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = proc::atomic_write_bytes(&path, format!("{line}\n{existing}").as_bytes());
+}
+
+// --------------------------------------------------------------------------- //
+// deterministic repo-HYGIENE backlog graft (report-only; parallels ops-RED graft)
+// --------------------------------------------------------------------------- //
+
+/// The stable per-(repo, hygiene issue) idempotence marker embedded in every hygiene-auto line.
+fn hygiene_marker(issue: crate::hygiene::HygieneIssue) -> String {
+    format!("[hygiene-auto:{}]", issue.slug())
+}
+
+/// The exact backlog line for a hygiene issue (pure — unit-tested). Carries the stable
+/// `[hygiene-auto:<slug>]` marker + the `[reliability]` intent tag (not a known improver tier, so
+/// strip_tier leaves it in the text — deliberate, exactly like the ops-RED line). REPORT-ONLY
+/// wording: the item asks the lane to LAND/return the branch or commit/revert — never to discard.
+fn hygiene_item_line(issue: crate::hygiene::HygieneIssue, hyg: &Value, today: &str) -> String {
+    use crate::hygiene::HygieneIssue;
+    let cur = hyg.get("current").and_then(Value::as_str).unwrap_or("");
+    let base = hyg.get("base").and_then(Value::as_str).unwrap_or("");
+    match issue {
+        HygieneIssue::OffBase => format!(
+            "- [ ] [reliability]{} clean up: repo is off-base on '{cur}' (base '{base}') with no \
+             live loop — land the branch into '{base}' or drop it and return to '{base}'; do NOT \
+             discard uncommitted work without checking. (hygiene-auto {today})",
+            hygiene_marker(issue)
+        ),
+        HygieneIssue::Dirty => format!(
+            "- [ ] [reliability]{} clean up: the worktree has uncommitted changes to TRACKED files \
+             — commit them on a branch or revert them; the tree must be clean between iterations. \
+             (hygiene-auto {today})",
+            hygiene_marker(issue)
+        ),
+    }
+}
+
+/// Idempotently prepend ONE `[hygiene-auto:<slug>]` item to a lane's backlog — one OPEN item per
+/// (repo, issue). Clones ensure_ops_item's atomic-prepend + read-error-skip contract (a READ ERROR
+/// skips the lane rather than risk truncating a live backlog; file-absent starts from empty).
+fn ensure_hygiene_item(name: &str, issue: crate::hygiene::HygieneIssue, hyg: &Value, today: &str) {
+    let path = backlog_path(name);
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return, // read failed — do NOT risk truncating a live backlog
+    };
+    if has_open_marker(&existing, &hygiene_marker(issue)) {
+        return;
+    }
+    let line = hygiene_item_line(issue, hyg, today);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = proc::atomic_write_bytes(&path, format!("{line}\n{existing}").as_bytes());
+}
+
+/// HERE/runtime/hygiene_status.json — the small dedupe + dashboard map for the hygiene graft.
+/// Shape: {"seen": {"<name>:<slug>": "<first_ts>"}, "repos": {"<name>": {"issues":[...], "detail": "..."}}}.
+fn hygiene_status_path() -> PathBuf {
+    paths::here().join("runtime").join("hygiene_status.json")
+}
+
+/// Every ops sweep: for each explicit repos.json repo, scan its git hygiene (report-only) and, for
+/// each issue, ensure a `[hygiene-auto:<slug>]` item sits atop its backlog — IDEMPOTENTLY, one OPEN
+/// item per (repo, issue). Deterministic (no LLM). On a NEWLY-SEEN off_base pair (a stranded branch,
+/// possibly a live-money one), page the operator LOUDLY immediately rather than waiting for the
+/// evening report — deduped via runtime/hygiene_status.json so a standing off_base pages exactly once.
+///
+/// KEYSTONE-safe: hygiene::scan_repo is report-only (imports NO destructive helper); this graft only
+/// WRITES a backlog goal + a status file + a page — it never touches a managed working tree.
+fn hygiene_backlog_graft() {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let now_ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+    // Prior dedupe map ("<name>:<slug>" -> first-seen ts). Absent/garbage -> empty (fail-open: a
+    // first sweep after a wipe simply re-pages, never silently drops a real stranded branch).
+    let prev: Value = std::fs::read(hygiene_status_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null);
+    let prev_seen = prev.get("seen").and_then(Value::as_object).cloned().unwrap_or_default();
+
+    let mut seen = Map::new(); // this sweep's live "<name>:<slug>" -> first_ts (drops resolved keys)
+    let mut repos = Map::new(); // per-repo {issues:[slug...], detail} for the dashboard
+    for r in crate::control::registry::read_repos_json() {
+        let name = crate::control::paths::repo_name(&r);
+        if name.is_empty() {
+            continue;
+        }
+        let (issues, hyg) = crate::hygiene::scan_repo(&r);
+        if issues.is_empty() {
+            continue;
+        }
+        let cur = hyg.get("current").and_then(Value::as_str).unwrap_or("");
+        let base = hyg.get("base").and_then(Value::as_str).unwrap_or("");
+        let slugs: Vec<Value> = issues.iter().map(|i| json!(i.slug())).collect();
+        repos.insert(
+            name.clone(),
+            json!({"issues": slugs, "detail": format!("on '{cur}' (base '{base}')")}),
+        );
+        for issue in &issues {
+            ensure_hygiene_item(&name, *issue, &hyg, &today);
+            // Carry the first-seen ts forward (persist the ORIGINAL timestamp for a standing issue).
+            let key = format!("{name}:{}", issue.slug());
+            let first_ts = prev_seen
+                .get(&key)
+                .and_then(Value::as_str)
+                .unwrap_or(now_ts.as_str())
+                .to_string();
+            let newly_seen = !prev_seen.contains_key(&key);
+            seen.insert(key, json!(first_ts));
+            // LOUD page ONLY on a newly-seen OFF-BASE pair (a stranded, possibly live-money branch
+            // shouldn't wait for the evening report). Dirty-only churn is left to the evening notice.
+            if newly_seen && *issue == crate::hygiene::HygieneIssue::OffBase {
+                let _ = notify::send(&Notice::red(
+                    format!("Solomon: {name} repo off-base"),
+                    format!(
+                        "on '{cur}' (base '{base}') — no live loop; may be deliberate operator work. \
+                         Reported, NOT auto-touched."
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Persist the pruned dedupe + dashboard map (atomic; best-effort — a write failure just re-pages
+    // next sweep, never a false silence).
+    let out = json!({"seen": seen, "repos": repos});
+    if let Some(parent) = hygiene_status_path().parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = proc::atomic_write_json(&hygiene_status_path(), &out);
 }
 
 /// HERE/improver/<name>/goal.md — the operator's committed, single-line goal post (the measurable
@@ -558,6 +751,115 @@ pub fn plan_items(parsed: &Value, known_lanes: &[String]) -> Vec<(String, String
         out.push((name.clone(), tier, goal, why));
     }
     out
+}
+
+/// The model's one-line fleet-allocation sentence from `parsed["fleet"]["allocation"]` (pure —
+/// unit-tested). Flattened + word-boundary capped at 300 (like the other cap helpers). None when
+/// absent/blank so the caller can fall back to a deterministic top-lane line (never fabricated).
+pub fn fleet_allocation(parsed: &Value) -> Option<String> {
+    let s = parsed
+        .get("fleet")
+        .and_then(|f| f.get("allocation"))
+        .and_then(Value::as_str)?;
+    let capped = cap_line(s, 300);
+    if capped.is_empty() {
+        None
+    } else {
+        Some(capped)
+    }
+}
+
+/// Render the deterministic "## ALLOCATION" report block (pure — unit-tested): the ROI ranking as a
+/// small table, then the dry-run SCALE/BOOST actions and HOLD lines. An EMPTY ranking renders an
+/// honest "no scalable lanes" note (never a fabricated row). `scale_actions`/`holds` are already
+/// rendered one-liners (e.g. "SCALE sover 120->90s (behind 1/3 posts, green)", "HOLD asmodeus: real-money").
+pub fn allocation_section(
+    ranking: &[(String, f64, String)],
+    scale_actions: &[String],
+    holds: &[String],
+) -> String {
+    let mut md = String::from("## ALLOCATION\n\n");
+    if ranking.is_empty() {
+        md.push_str("- no scalable lanes (nothing green + behind to pour marginal effort into)\n");
+    } else {
+        md.push_str("| lane | leverage | why |\n|---|---|---|\n");
+        for (name, score, why) in ranking {
+            md.push_str(&format!("| {name} | {score:.2} | {why} |\n"));
+        }
+    }
+    if !scale_actions.is_empty() || !holds.is_empty() {
+        md.push('\n');
+        for a in scale_actions {
+            md.push_str(&format!("- {a}\n"));
+        }
+        for h in holds {
+            md.push_str(&format!("- {h}\n"));
+        }
+    }
+    md.push('\n');
+    md
+}
+
+/// DRY-RUN the scale + boost decisions across the fleet WITHOUT executing (execution stays in the
+/// tick grafts): returns (scale_actions, holds) as rendered one-liners for the ALLOCATION block.
+/// The dry-run assumes the cooldown has elapsed — it previews what health+velocity+config WOULD
+/// permit; the real grafts still gate on the per-lane cooldown marker. A real-money lane (equity in
+/// its outcomes) is always a HOLD; a scale-opt-in lane that is not green is a HOLD; a green+behind
+/// scale-opt-in lane that would tighten is a SCALE; sover additionally previews a produce/post BOOST.
+fn allocation_dry_run(snapshot: &Value, status: &Value) -> (Vec<String>, Vec<String>) {
+    let mut scale_actions: Vec<String> = Vec::new();
+    let mut holds: Vec<String> = Vec::new();
+    for repo in crate::control::registry::read_repos_json() {
+        let name = paths::repo_name(&repo);
+        if name.is_empty() {
+            continue;
+        }
+        let outcomes = snapshot["projects"].get(&name).cloned().unwrap_or(json!({}));
+        let rollup = status
+            .get("projects")
+            .and_then(|p| p.get(&name))
+            .cloned()
+            .unwrap_or(json!({}));
+        let real_money = allocate::is_real_money(&outcomes);
+        if real_money {
+            holds.push(format!("HOLD {name}: real-money"));
+            continue; // never scaled from here — money-out stays human-gated
+        }
+        let north_star = repo.get("goal").and_then(Value::as_str).unwrap_or("");
+        let velocity = velocity_context(&outcomes, north_star);
+        let green = rollup.get("status").and_then(Value::as_str) == Some("green")
+            && rollup.get("healthy").and_then(Value::as_bool) == Some(true);
+
+        // scale dry-run (opt-in lanes only).
+        if let Some(cfg) = scale::scale_cfg(&repo) {
+            let baseline = crate::control::registry::project_interval(&repo);
+            match scale::next_interval(Some(cfg), baseline, baseline, &velocity, green, true) {
+                Some(next) if next < baseline => {
+                    let m = velocity.get("metric").and_then(Value::as_str).unwrap_or("throughput");
+                    let cur = velocity.get("current").and_then(Value::as_i64).unwrap_or(0);
+                    let tgt = velocity.get("target").and_then(Value::as_i64).unwrap_or(0);
+                    scale_actions.push(format!(
+                        "SCALE {name} {baseline}->{next}s (behind {cur}/{tgt} {m}, green)"
+                    ));
+                }
+                _ if !green => holds.push(format!("HOLD {name}: not green")),
+                _ => {} // at floor / not behind / healthy — no move, no hold noise
+            }
+        }
+        // sover produce/post boost dry-run (the profit lever; opt-in via produce_boost).
+        if name == "sover" {
+            if let Some(bcfg) = repo.get("produce_boost") {
+                if sover_boost::should_boost(Some(bcfg), &rollup, &velocity, true, 0) {
+                    let cur = velocity.get("current").and_then(Value::as_i64).unwrap_or(0);
+                    let tgt = velocity.get("target").and_then(Value::as_i64).unwrap_or(0);
+                    scale_actions.push(format!(
+                        "BOOST sover produce/post (behind {cur}/{tgt} posts, green)"
+                    ));
+                }
+            }
+        }
+    }
+    (scale_actions, holds)
 }
 
 /// The compact per-lane VELOCITY object handed to the growth planner (pure — unit-tested). It
@@ -771,7 +1073,46 @@ pub fn recent_incidents(now: chrono::DateTime<Utc>) -> Vec<Value> {
     out.split_off(keep)
 }
 
-/// Render the report (pure — unit-tested). Returns (markdown, flag lines, urgent).
+/// Count lanes whose `runtime/<name>/_last_scale` marker is dated today (each marker holds an
+/// ISO ts; a today-dated marker == one interval tightening this sweep-day). Best-effort: an absent
+/// or unreadable/unparseable marker counts as none. Iterates the explicit repos.json lanes.
+fn scale_tightenings_today() -> i64 {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut n = 0;
+    for repo in crate::control::registry::read_repos_json() {
+        let name = paths::repo_name(&repo);
+        if name.is_empty() {
+            continue;
+        }
+        let marker = paths::here().join("runtime").join(&name).join("_last_scale");
+        if let Ok(raw) = std::fs::read_to_string(&marker) {
+            // marker ts is UTC "%Y-%m-%dT..."; compare its date prefix to local today is close enough
+            // for a once-a-day report line (a boundary hour is not worth a tz-correct parse here).
+            if raw.trim().starts_with(&today) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Today's sover produce/post boost count from `runtime/sover/_boost_count_<today>` (the same
+/// per-date counter sover_boost stamps). Absent/garbage -> 0.
+fn sover_boosts_today() -> i64 {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let path = paths::here()
+        .join("runtime")
+        .join("sover")
+        .join(format!("_boost_count_{today}"));
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| sover_boost::parse_boost_count(&s))
+        .unwrap_or(0)
+}
+
+/// Render the report. Returns (markdown, flag lines, urgent). The core flag rules are pure and
+/// unit-tested; it ALSO does light read-only IO for the repo-hygiene scan + the fleet-action
+/// marker line (both fail-safe to "nothing found" on any read error).
 ///
 /// The flag rules are the post-mortem, encoded:
 ///   - posts_24h == 0                → "ZERO posts" (the 5-day Sover gap)
@@ -779,6 +1120,7 @@ pub fn recent_incidents(now: chrono::DateTime<Utc>) -> Vec<Value> {
 ///   - live_trades_24h == 0          → zero live trades (finance-tracked projects)
 ///   - equity_delta_24h == 0.0       → equity flat (the $168.97 flatline)
 ///   - iterations_24h == 0           → lane never fired (the daedalus-trainer failure mode)
+///   - off-base / dirty tracked tree → repo hygiene flag (escalates urgent, like ops-RED)
 ///   - any project status red        → urgent
 pub fn render_report(
     snapshot: &Value,
@@ -798,6 +1140,17 @@ pub fn render_report(
         .unwrap_or_default();
     let mut items: Vec<(&String, &Value)> = projects.iter().collect();
     items.sort_by_key(|(_, p)| p.get("priority").and_then(Value::as_i64).unwrap_or(i64::MAX));
+
+    // Explicit repos.json entries by name, for the report-only HYGIENE scan below (a discovered dir
+    // with no explicit entry is intentionally excluded — same rule as the ops/hygiene grafts).
+    let repo_by_name: std::collections::HashMap<String, Value> =
+        crate::control::registry::read_repos_json()
+            .into_iter()
+            .filter_map(|r| {
+                let n = paths::repo_name(&r);
+                if n.is_empty() { None } else { Some((n, r)) }
+            })
+            .collect();
 
     for (name, p) in items {
         md.push_str(&format!(
@@ -883,8 +1236,36 @@ pub fn render_report(
                 md.push_str(&format!("- probes: {} — {}\n", pstat.to_uppercase(), reasons));
             }
         }
+        // report-only repo HYGIENE (off-base / dirty tracked tree). A non-empty flag escalates the
+        // evening notice to urgent, exactly like an ops-RED — a stranded managed tree is a real issue.
+        if let Some(repo) = repo_by_name.get(name.as_str()) {
+            let (issues, hyg) = crate::hygiene::scan_repo(repo);
+            for issue in issues {
+                let f = match issue {
+                    crate::hygiene::HygieneIssue::OffBase => format!(
+                        "⚠ {name}: off-base on '{}' (base '{}') — no live loop",
+                        hyg.get("current").and_then(Value::as_str).unwrap_or("?"),
+                        hyg.get("base").and_then(Value::as_str).unwrap_or("?"),
+                    ),
+                    crate::hygiene::HygieneIssue::Dirty => {
+                        format!("⚠ {name}: uncommitted tracked changes")
+                    }
+                };
+                md.push_str(&format!("- {f}\n"));
+                flags.push(f);
+            }
+        }
         md.push('\n');
     }
+
+    // One deterministic line summarizing today's growth-graft actions from the persisted markers
+    // (best-effort: absent markers read as 0). Never fabricated — a quiet day reads "0 tightenings,
+    // 0 sover boosts".
+    md.push_str(&format!(
+        "## fleet actions today\n- scale actions today: {} tightenings, {} sover boosts\n\n",
+        scale_tightenings_today(),
+        sover_boosts_today()
+    ));
 
     if !incidents.is_empty() {
         md.push_str("## incidents (24h)\n");
@@ -1126,10 +1507,14 @@ mod tests {
 
     #[test]
     fn render_report_all_green_is_calm() {
+        // Synthetic lane name NOT in repos.json on purpose: render_report's report-only hygiene scan
+        // (scan_repo) does live git IO for names that match a real repos.json entry, so using e.g.
+        // "dotz" here would make `flags.is_empty()` depend on the live repo's branch/dirty state
+        // (flaky). An unknown name => repo_by_name miss => no git IO => deterministic calm case.
         let snapshot = json!({"projects": {
-            "dotz": {"priority": 4, "iterations_24h": 5, "shipped_24h": 2},
+            "greenlane": {"priority": 4, "iterations_24h": 5, "shipped_24h": 2},
         }});
-        let status = json!({"projects": {"dotz": {"priority": 4, "status": "green"}}});
+        let status = json!({"projects": {"greenlane": {"priority": 4, "status": "green"}}});
         let (md, flags, urgent) = render_report(&snapshot, &status, &[], "2026-07-02");
         assert!(!urgent);
         assert!(flags.is_empty());
@@ -1164,6 +1549,85 @@ mod tests {
         assert!(!has_open_ops_item(done, "publish_recency"));
         // ...and an empty backlog has no open item.
         assert!(!has_open_ops_item("", "publish_recency"));
+    }
+
+    // -------- shared open-marker predicate (the factored core of has_open_ops_item) --------
+    #[test]
+    fn has_open_marker_matches_open_lines_only() {
+        let body = "- [ ] [reliability][hygiene-auto:off_base] clean up ...\n\
+                    - [x] [reliability][hygiene-auto:dirty] done earlier\n\
+                    - [ ] unrelated item\n";
+        assert!(has_open_marker(body, "[hygiene-auto:off_base]"));
+        // a DONE (- [x]) line with the marker does NOT count as open
+        assert!(!has_open_marker(body, "[hygiene-auto:dirty]"));
+        // a marker present nowhere is absent
+        assert!(!has_open_marker(body, "[hygiene-auto:missing]"));
+        assert!(!has_open_marker("", "[hygiene-auto:off_base]"));
+    }
+
+    // -------- hygiene backlog graft: marker + exact report-only line shape + idempotence --------
+    #[test]
+    fn hygiene_graft_marker_line_and_idempotence() {
+        use crate::hygiene::HygieneIssue;
+        assert_eq!(hygiene_marker(HygieneIssue::OffBase), "[hygiene-auto:off_base]");
+        assert_eq!(hygiene_marker(HygieneIssue::Dirty), "[hygiene-auto:dirty]");
+
+        let hyg = json!({"current": "codex/x", "base": "main"});
+        let off = hygiene_item_line(HygieneIssue::OffBase, &hyg, "2026-07-03");
+        assert!(off.starts_with("- [ ] [reliability][hygiene-auto:off_base] clean up: "));
+        assert!(off.contains("repo is off-base on 'codex/x' (base 'main')"));
+        assert!(off.contains("land the branch into 'main' or drop it"));
+        // report-only: never instructs a blind discard
+        assert!(off.contains("do NOT discard uncommitted work without checking"));
+        assert!(off.ends_with("(hygiene-auto 2026-07-03)"));
+
+        let dirty = hygiene_item_line(HygieneIssue::Dirty, &hyg, "2026-07-03");
+        assert!(dirty.starts_with("- [ ] [reliability][hygiene-auto:dirty] clean up: "));
+        assert!(dirty.contains("uncommitted changes to TRACKED files"));
+        assert!(dirty.contains("commit them on a branch or revert them"));
+        assert!(dirty.ends_with("(hygiene-auto 2026-07-03)"));
+
+        // idempotence keys off the shared predicate: one OPEN item per (repo, issue)
+        let existing = format!("{off}\n");
+        assert!(has_open_marker(&existing, &hygiene_marker(HygieneIssue::OffBase)));
+        assert!(!has_open_marker(&existing, &hygiene_marker(HygieneIssue::Dirty)));
+    }
+
+    // -------- fleet_allocation: the model's one-line sentence (or None to fall back) --------
+    #[test]
+    fn fleet_allocation_reads_sentence_or_none() {
+        let with = json!({"fleet": {"allocation": "Pour effort into sover today."}});
+        assert_eq!(
+            fleet_allocation(&with).as_deref(),
+            Some("Pour effort into sover today.")
+        );
+        // absent fleet / allocation -> None (caller uses the deterministic fallback)
+        assert!(fleet_allocation(&json!({"lanes": {}})).is_none());
+        assert!(fleet_allocation(&json!({"fleet": {}})).is_none());
+        // blank string -> None
+        assert!(fleet_allocation(&json!({"fleet": {"allocation": "   "}})).is_none());
+    }
+
+    // -------- allocation_section: deterministic block; empty ranking is honest --------
+    #[test]
+    fn allocation_section_renders_ranking_and_actions() {
+        let ranking = vec![
+            ("sover".to_string(), 0.30, "behind 1/3 posts".to_string()),
+            ("dotz".to_string(), 0.10, "growing".to_string()),
+        ];
+        let scale = vec!["SCALE sover 120->90s (behind 1/3 posts, green)".to_string()];
+        let holds = vec!["HOLD asmodeus: real-money".to_string()];
+        let md = allocation_section(&ranking, &scale, &holds);
+        assert!(md.starts_with("## ALLOCATION"));
+        assert!(md.contains("| sover | 0.30 | behind 1/3 posts |"));
+        assert!(md.contains("| dotz | 0.10 | growing |"));
+        assert!(md.contains("- SCALE sover 120->90s (behind 1/3 posts, green)"));
+        assert!(md.contains("- HOLD asmodeus: real-money"));
+
+        // empty ranking -> honest "no scalable lanes", never a fabricated row
+        let empty = allocation_section(&[], &[], &[]);
+        assert!(empty.contains("no scalable lanes"));
+        assert!(!empty.contains("|")); // no table when there's nothing to rank
     }
 
     #[test]
