@@ -30,18 +30,24 @@ use std::sync::{
 
 /// Detect a provider QUOTA / rate-limit / transport error in pi's stderr.
 ///
-/// When the shared Ollama account's session usage limit is saturated (HTTP 429 "you have reached
-/// your session usage limit"), pi returns empty stdout with the provider's error in stderr. This is
-/// a TRANSPORT/QUOTA error, NOT a reasoned model noop — counting it as a noop caused a fleet-wide
-/// noop storm that escalated and RESET lanes (lost iteration progress) whenever the 5 concurrent
-/// lanes saturated the single shared account's session quota.
+/// When the shared Ollama account's usage cap is saturated (HTTP 429, body e.g. "you have reached
+/// your session usage limit" or "you (cayleb_james) have reached your weekly usage limit, add extra
+/// usage: https://ollama.com/settings"), pi returns empty stdout with the provider's error in
+/// stderr. This is a TRANSPORT/QUOTA error, NOT a reasoned model noop — counting it as a noop caused
+/// a fleet-wide noop storm that escalated and RESET lanes (lost iteration progress) whenever the
+/// shared account's usage cap was hit. 2026-07-03: the pattern list only recognized "session usage
+/// limit" — Ollama's actual weekly-cap message ("weekly usage limit") didn't match, so this exact
+/// storm recurred across every ollama-cloud lane (daedulus/dotz/maki/solomon) once the account's
+/// WEEKLY cap (not just a session/concurrency cap) was hit. Matching the "usage limit" substring
+/// (a superset of "session usage limit") catches session/weekly/daily/any future "<period> usage
+/// limit" wording without needing to enumerate each one.
 ///
 /// Checks stderr only (pi's error channel — the provider HTTP error lands there), NOT stdout (the
 /// agent's output), so a task that legitimately mentions "429" or "rate limit" in its summary
 /// cannot trigger a false positive.
 pub fn is_quota_error(stderr: &str) -> bool {
     let l = stderr.to_ascii_lowercase();
-    ["429", "session usage limit", "rate limit", "rate_limit", "rate-limit",
+    ["429", "usage limit", "rate limit", "rate_limit", "rate-limit",
      "too many requests", "quota exceeded"]
         .iter()
         .any(|pat| l.contains(pat))
@@ -876,6 +882,17 @@ mod tests {
     fn is_quota_error_detects_429_session_usage_limit() {
         // The exact Ollama 429 body that caused the fleet-wide noop storm.
         let stderr = "HTTP 429: you (cayleb_james) have reached your session usage limit";
+        assert!(is_quota_error(stderr));
+    }
+
+    #[test]
+    fn is_quota_error_detects_weekly_usage_limit() {
+        // 2026-07-03: Ollama's actual weekly-cap body (verified live against
+        // https://ollama.com/v1/chat/completions) — "session usage limit" alone missed this wording,
+        // letting the account's WEEKLY quota exhaustion masquerade as a plain model noop across every
+        // ollama-cloud lane (daedulus/dotz/maki/solomon) and thrash into noop_streak escalations.
+        let stderr = "{\"error\":\"you (cayleb_james) have reached your weekly usage limit, \
+add extra usage: https://ollama.com/settings (ref: c708135e-d4a9-484f-ac43-024780b99271)\"}";
         assert!(is_quota_error(stderr));
     }
 
