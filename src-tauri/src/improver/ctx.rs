@@ -65,20 +65,29 @@ fn providers_or_default(name: &str) -> ProviderInfo {
 
 /// run_improver._FALLBACK_MODEL — provider NAME -> the stronger/different model the escalation ladder
 /// switches to (rung 1). Keyed by PROVIDER_NAME, not pi_provider.
+///
+/// 2026-07-03: "openrouter" lanes are funded with $10/account SPECIFICALLY to unlock OpenRouter's
+/// higher free-model rate limit (~1000 req/day vs ~50) — the operator's explicit instruction is that
+/// this credit is NOT to be spent on paid inference. z-ai/glm-4.6 is a PAID model; escalating to it
+/// would silently burn that credit on every 2nd consecutive failure. Fall back to the SAME free model
+/// (no stronger alternative to escalate to, by design) rather than a paid one.
 pub fn fallback_model(provider_name: &str) -> Option<&'static str> {
     match provider_name {
         "ollama-cloud" => Some("kimi-k2.7-code"),
-        "openrouter" => Some("z-ai/glm-4.6"),
+        "openrouter" => Some("nvidia/nemotron-3-ultra-550b-a55b:free"),
         _ => None,
     }
 }
 
 /// run_improver._CHEAP_MODEL — provider NAME -> the cheap worker model the light phases (beautify/e2e)
 /// drop to.
+///
+/// 2026-07-03: same free-model-only constraint as `fallback_model` — qwen/qwen3-coder is a PAID
+/// model on OpenRouter; the operator's openrouter accounts are free-tier-usage-only.
 pub fn cheap_model(provider_name: &str) -> Option<&'static str> {
     match provider_name {
         "ollama-cloud" => Some("minimax-m3"),
-        "openrouter" => Some("qwen/qwen3-coder"),
+        "openrouter" => Some("nvidia/nemotron-3-ultra-550b-a55b:free"),
         _ => None,
     }
 }
@@ -717,6 +726,28 @@ impl Ctx {
         self.apply_api_key();
     }
 
+    /// Resolve `self.api_key` to the literal secret to inject. repos.json is a TRACKED file (unlike
+    /// the gitignored `.env`), so a literal secret pasted into a repo's `api_key` field would enter
+    /// git history. 2026-07-03: when the field looks like a bare env-var NAME (uppercase ASCII
+    /// letters/digits/underscore only, e.g. "OPENROUTER_API_KEY_2") rather than a literal key,
+    /// resolve it by reading THAT env var instead — mirrors how pi's own provider.ts already resolves
+    /// its `apiKey` config field as an env-var name, never a literal. Any value containing a lowercase
+    /// letter or punctuation (a real `sk-or-v1-...` / Ollama `xxxx.yyyy`-shaped key) is left as a
+    /// literal, unchanged — fully backward compatible with an existing literal `api_key`. An
+    /// unresolvable name (the env var isn't set) falls back to the raw field so a misconfiguration
+    /// surfaces as an auth failure rather than silently vanishing.
+    fn resolved_api_key(&self) -> String {
+        let k = &self.api_key;
+        let looks_like_env_name = !k.is_empty()
+            && k.chars().next().map(|c| c.is_ascii_uppercase() || c == '_').unwrap_or(false)
+            && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        if looks_like_env_name {
+            std::env::var(k).unwrap_or_else(|_| k.clone())
+        } else {
+            k.clone()
+        }
+    }
+
     /// Apply this repo's per-repo `api_key` to the process env, overriding the global .env value for
     /// the active provider's env var. A no-op when `api_key` is empty (the global key, if any, is
     /// left in place). Idempotent; called from load_env() and refresh_config_from_registry() so a
@@ -732,7 +763,7 @@ impl Ctx {
         } else {
             "OLLAMA_API_KEY"
         };
-        std::env::set_var(var, &self.api_key);
+        std::env::set_var(var, self.resolved_api_key());
     }
 
     /// run_improver._required_key (~587-589): the env-var name of the API key the active provider needs.
@@ -764,8 +795,10 @@ impl Ctx {
         // Both directions of the mismatch are the same class of silent drift: the per-repo key and
         // the named provider point at DIFFERENT providers, so the model actually served is NOT the
         // one repos.json's provider/model claim (the wrong-shaped key is either rejected by the
-        // wrong endpoint or, worse, silently authenticates against a DIFFERENT provider).
-        let looks_openrouter = self.api_key.starts_with("sk-or-v1-");
+        // wrong endpoint or, worse, silently authenticates against a DIFFERENT provider). Checked
+        // against the RESOLVED key (see resolved_api_key) so an env-var-name reference like
+        // "OPENROUTER_API_KEY_2" is validated by what it actually resolves to, not its bare name.
+        let looks_openrouter = self.resolved_api_key().starts_with("sk-or-v1-");
         if looks_openrouter && self.pi_provider != "openrouter" {
             return Some(format!(
                 "repos.json api_key for '{}' looks like an OpenRouter key (sk-or-v1-...) but \
@@ -1412,6 +1445,48 @@ mod tests {
         assert_eq!(std::env::var("OPENROUTER_API_KEY").unwrap(), "sk-global");
     }
 
+    // ---- resolved_api_key / apply_api_key: env-var-NAME indirection (2026-07-03) ----
+    // repos.json is git-tracked (unlike .env); a bare env-var name in `api_key` (e.g.
+    // "OPENROUTER_API_KEY_2") must resolve to that var's value rather than being injected literally,
+    // so the actual secret only ever lives in the gitignored .env.
+    #[test]
+    fn resolved_api_key_resolves_bare_env_var_name() {
+        let _g = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY_2"]);
+        std::env::set_var("OPENROUTER_API_KEY_2", or_key("resolvedsecret123"));
+        let mut c = Ctx::configure("C:/x/repo", "repo", "openrouter", None);
+        c.api_key = "OPENROUTER_API_KEY_2".to_string();
+        assert_eq!(c.resolved_api_key(), or_key("resolvedsecret123"));
+    }
+
+    #[test]
+    fn resolved_api_key_passes_through_a_literal_key_unchanged() {
+        // A real key contains lowercase letters / hyphens -> never mistaken for an env-var name.
+        let mut c = Ctx::configure("C:/x/repo", "repo", "openrouter", None);
+        c.api_key = or_key("literalkeyvalue456");
+        assert_eq!(c.resolved_api_key(), or_key("literalkeyvalue456"));
+    }
+
+    #[test]
+    fn resolved_api_key_unresolvable_name_falls_back_to_raw_field() {
+        let _g = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY_UNSET_XYZ"]);
+        std::env::remove_var("OPENROUTER_API_KEY_UNSET_XYZ");
+        let mut c = Ctx::configure("C:/x/repo", "repo", "openrouter", None);
+        c.api_key = "OPENROUTER_API_KEY_UNSET_XYZ".to_string();
+        // Unset -> surfaces as an auth failure (the literal bare name), not a silent empty key.
+        assert_eq!(c.resolved_api_key(), "OPENROUTER_API_KEY_UNSET_XYZ");
+    }
+
+    #[test]
+    fn apply_api_key_resolves_env_var_name_before_injecting() {
+        let _g = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY", "OPENROUTER_API_KEY_3"]);
+        std::env::set_var("OPENROUTER_API_KEY_3", or_key("thirdaccountsecret789"));
+        let mut c = Ctx::configure("C:/x/repo", "repo", "openrouter", None);
+        c.api_key = "OPENROUTER_API_KEY_3".to_string();
+        c.apply_api_key();
+        // The RESOLVED secret lands in the provider's env var, not the bare name.
+        assert_eq!(std::env::var("OPENROUTER_API_KEY").unwrap(), or_key("thirdaccountsecret789"));
+    }
+
     // ---- key_shape_mismatch: the owl-alpha-class silent-provider-divergence guard ----
     #[test]
     fn key_shape_mismatch_flags_openrouter_key_on_ollama_cloud_provider() {
@@ -1436,6 +1511,20 @@ mod tests {
         assert_eq!(c.pi_provider, "openrouter");
         c.api_key = or_key("abcdefghijklmnopqrstuvwxyz0123456789");
         assert!(c.key_shape_mismatch().is_none());
+    }
+
+    #[test]
+    fn key_shape_mismatch_checks_the_resolved_value_of_an_env_var_name_reference() {
+        // api_key is a bare env-var NAME (the 2026-07-03 indirection); the shape guard must validate
+        // what it RESOLVES to, not the bare name itself (which would never look like sk-or-v1-...).
+        let _g = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY_SHAPE_TEST"]);
+        std::env::set_var("OPENROUTER_API_KEY_SHAPE_TEST", or_key("shapecheckedsecret"));
+        let mut c = Ctx::configure("C:/x/repo", "repo", "openrouter", None);
+        c.api_key = "OPENROUTER_API_KEY_SHAPE_TEST".to_string();
+        assert!(
+            c.key_shape_mismatch().is_none(),
+            "resolved value is OpenRouter-shaped and provider is openrouter -> no mismatch"
+        );
     }
 
     #[test]
