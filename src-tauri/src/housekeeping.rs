@@ -12,6 +12,13 @@
 //!      -d` — the porcelain refuses unmerged work, so experiments are never lost).
 //!   3. Delete STALE build dirs — `target*` / `build` / `src-tauri/target` whose newest shallow
 //!      mtime is older than [`STALE_DAYS`] (an abandoned build tree is pure dead weight).
+//!   4. Worktree hygiene — enforce the operator rule "<=1 worktree besides main/master": remove
+//!      every NON-main, NON-locked worktree whose `git status --porcelain` is clean (an ignored
+//!      `target/` does NOT show, so orphaned `.claude/worktrees/agent-*` copies — clean modulo
+//!      build output — are reaped, freeing their nested `target/` that [`candidate_build_dirs`]
+//!      never enumerates). A non-empty status (real in-flight work) KEEPS the worktree; git keeps
+//!      the branch ref (no commit lost) and structurally refuses the main tree. Skipped for a lane
+//!      mid-iteration (same [`lane_quiet`] gate as the debug sweep).
 //!
 //! Plus, independent of the 04:00 day gate: a rate-limited **debug sweep** (every
 //! [`SWEEP_EVERY_S`]) that deletes FILES under each candidate's `debug/` subdir older than
@@ -110,6 +117,17 @@ pub fn run() -> Value {
             None,
             Some(Duration::from_secs(60)),
         );
+
+        // 1b. worktree hygiene: enforce <=1 non-main worktree, freeing orphaned copies + their
+        //     nested target/. Skip a lane mid-iteration (a live improver/agent copy must not be
+        //     yanked). Safe by construction: only a clean-modulo-ignored tree is removed.
+        if lane_quiet(&r) {
+            let (n, wfreed) = prune_orphan_worktrees(&r, &path);
+            freed += wfreed;
+            if n > 0 {
+                actions.push(format!("{name}: removed {n} orphan worktree(s) ({})", human(wfreed)));
+            }
+        }
 
         // 2. merged improver branches — `git branch -d` refuses unmerged work by design.
         let base = registry::project_pr_target_branch(&r);
@@ -347,6 +365,79 @@ pub fn candidate_build_dirs(repo: &Path) -> Vec<PathBuf> {
         out.push(tauri_target);
     }
     out
+}
+
+/// Normalize a path for comparison (porcelain emits `/`, repos.json stores `\`; Windows is
+/// case-insensitive): trim, `\`->`/`, drop a trailing `/`, lowercase.
+fn norm_path(p: &str) -> String {
+    p.trim()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_lowercase()
+}
+
+/// Enforce the operator rule "<=1 worktree besides main/master": remove every NON-main, NON-locked
+/// worktree that carries NO real work, freeing the throwaway copy + its nested `target/` (which
+/// [`candidate_build_dirs`] on the repo root never enumerates). Called only for a quiet lane.
+///
+/// SAFETY (why `--force` is safe here): the "real work" test is `git status --porcelain`, which
+/// RESPECTS `.gitignore` — an ignored `target/` does NOT appear, but a modified tracked file or an
+/// untracked SOURCE file DOES. A NON-EMPTY status ⇒ in-flight work ⇒ the worktree is KEPT. Only a
+/// clean-modulo-ignored tree is removed, and `--force` there deletes nothing but the ignored build
+/// output. git keeps the branch ref (no commit is ever lost) and structurally refuses the main tree.
+/// Reuses [`crate::control::branches::list_worktrees`] rather than a second porcelain parser.
+/// Returns (worktrees removed, bytes freed).
+pub fn prune_orphan_worktrees(repo: &Value, main_path: &str) -> (usize, u64) {
+    let root = norm_path(main_path);
+    let mut removed = 0usize;
+    let mut freed = 0u64;
+    for wt in crate::control::branches::list_worktrees(repo) {
+        let p = wt.get("path").and_then(Value::as_str).unwrap_or("");
+        if p.is_empty() || norm_path(p) == root {
+            continue; // never the main checkout
+        }
+        if wt.get("locked").and_then(Value::as_bool).unwrap_or(false) {
+            continue; // git-locked (an active session marked it) — leave it
+        }
+        // Real-work guard. `status --porcelain` respects .gitignore, so an ignored target/ is
+        // invisible; a non-empty result is modified-tracked or untracked-SOURCE work -> KEEP.
+        // Unreadable -> treat as dirty -> keep (fail safe).
+        let clean = match proc::run(
+            &["git", "-C", p, "status", "--porcelain"],
+            None,
+            Some(Duration::from_secs(60)),
+        ) {
+            Ok(r) if r.ok() => r.stdout.trim().is_empty(),
+            _ => false,
+        };
+        if !clean {
+            continue;
+        }
+        // Size the nested build dirs BEFORE removal (they vanish with the working copy).
+        let nested: u64 = candidate_build_dirs(Path::new(p))
+            .iter()
+            .map(|d| dir_size(d))
+            .sum();
+        let ok = proc::run(
+            &["git", "-C", main_path, "worktree", "remove", "--force", p],
+            None,
+            Some(Duration::from_secs(120)),
+        )
+        .map(|r| r.ok())
+        .unwrap_or(false);
+        if ok {
+            removed += 1;
+            freed += nested;
+        }
+    }
+    if removed > 0 {
+        let _ = proc::run(
+            &["git", "-C", main_path, "worktree", "prune"],
+            None,
+            Some(Duration::from_secs(60)),
+        );
+    }
+    (removed, freed)
 }
 
 /// True when the dir's newest SHALLOW mtime (the dir itself + two levels of entries — cheap, no
@@ -690,6 +781,69 @@ mod tests {
         assert!(!debug.join("deps").join("old.rlib").exists(), "non-build/ ancient files still swept");
         assert_eq!(freed, 40, "freed count reflects only the swept non-build/ file");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // -------- worktree hygiene: removes a clean orphan (ignored target/ only), KEEPS a worktree
+    //          with untracked source, KEEPS main, and the removed branch's ref survives --------
+    #[test]
+    fn prune_orphan_worktrees_removes_clean_keeps_dirty() {
+        use std::process::Command;
+        let base = temp("wt");
+        let main = base.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(cwd)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "t@t"]);
+        git(&main, &["config", "user.name", "t"]);
+        std::fs::write(main.join(".gitignore"), "target/\n").unwrap();
+        git(&main, &["add", "."]);
+        git(&main, &["commit", "-q", "-m", "init"]);
+        git(&main, &["branch", "-M", "main"]);
+        // clean orphan: a committed worktree whose ONLY dirt is an ignored target/ (untracked build).
+        let clean = base.join("wt-clean");
+        git(
+            &main,
+            &["worktree", "add", "-q", clean.to_str().unwrap(), "-b", "rsi/iter-clean"],
+        );
+        std::fs::create_dir_all(clean.join("target").join("debug")).unwrap();
+        std::fs::write(clean.join("target").join("debug").join("x.o"), vec![0u8; 2048]).unwrap();
+        // dirty worktree: an UNTRACKED SOURCE file (not ignored) = real in-flight work -> must KEEP.
+        let dirty = base.join("wt-dirty");
+        git(
+            &main,
+            &["worktree", "add", "-q", dirty.to_str().unwrap(), "-b", "rsi/iter-dirty"],
+        );
+        std::fs::write(dirty.join("newwork.rs"), b"fn f() {}").unwrap();
+
+        let repo = serde_json::json!({ "name": "wttest", "path": main.to_string_lossy() });
+        let (removed, freed) = prune_orphan_worktrees(&repo, &main.to_string_lossy());
+
+        assert_eq!(removed, 1, "only the clean orphan removed");
+        assert!(freed >= 2048, "removed orphan's nested target/ counted, got {freed}");
+        assert!(!clean.exists(), "clean orphan gone");
+        assert!(dirty.exists(), "worktree with untracked SOURCE kept");
+        assert!(main.exists(), "main checkout never removed");
+        // the removed worktree's branch ref survives (no commit lost).
+        assert!(
+            Command::new("git")
+                .args(["rev-parse", "--verify", "rsi/iter-clean"])
+                .current_dir(&main)
+                .status()
+                .unwrap()
+                .success(),
+            "removed worktree's branch ref survives"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // -------- dir_size + human --------

@@ -300,6 +300,37 @@ fn rand_hex32() -> String {
     format!("{:016x}{:016x}", next(), next())
 }
 
+/// Public shim so the build semaphore reuses the SAME token generator as the supervisor lock (no
+/// second RNG, no `uuid`/`rand` dep). Not part of the control.py contract — internal reuse only.
+pub fn rand_hex32_pub() -> String {
+    rand_hex32()
+}
+
+/// Read a `<pid>\n<token>` lock-shaped file named `fname` inside `dir`, using `read_lock`'s exact
+/// parse rules. The build semaphore's `slot-<i>` files share the lock format; this lets it reuse the
+/// parser without re-implementing it. (`read_lock` itself is hardcoded to the filename `lock`, so
+/// this points the identical rules at an arbitrary sibling filename.) Returns (pid, run_id).
+pub fn read_lock_dir(dir: &Path, fname: &str) -> (i64, Option<String>) {
+    let raw = match std::fs::read_to_string(dir.join(fname)) {
+        Ok(s) => s,
+        Err(_) => return (0, None),
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return (0, None);
+    }
+    let lines: Vec<&str> = splitlines(raw);
+    let pid = match lines.first().map(|l| l.trim()).and_then(|s| s.parse::<i64>().ok()) {
+        Some(p) => p,
+        None => return (0, None),
+    };
+    let run_id = match lines.get(1).map(|l| l.trim()) {
+        Some(s) if !s.is_empty() => Some(s.to_string()),
+        _ => None,
+    };
+    (pid, run_id)
+}
+
 /// Python str.splitlines() for the lock parser (\n / \r\n / \r boundaries, no trailing empty).
 fn splitlines(s: &str) -> Vec<&str> {
     let mut out = Vec::new();

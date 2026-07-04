@@ -616,13 +616,28 @@ impl Ctx {
     /// run_improver._clean_env (~500-525): the env a pi/git/gh child inherits. Strips
     /// GITHUB_TOKEN/GH_TOKEN/PYTHONPATH/PYTHONHOME and forces UTF-8 stdio. (The Python `_clean_env`
     /// ONLY removes those four keys — the RSI_* vars and the agent-shim PATH prepend live in `run_pi`,
-    /// not here — so this matches the source exactly.) Applies onto a `Command` like
-    /// `crate::control::proc::apply_clean_env` (identical behavior).
+    /// not here.) DIVERGENCE from `crate::control::proc::apply_clean_env`: this also caps cargo build
+    /// and test-runner parallelism, because every gate cargo invocation (the built-in test gate, the
+    /// judge-mirror clippy/fmt gate, and a repos.json `gate` shell command) flows through this method;
+    /// proc's copy is used by gh/redeploy/supervisor which never build cargo, so it is left uncapped.
     pub fn apply_clean_env(&self, cmd: &mut Command) {
         for k in ["GITHUB_TOKEN", "GH_TOKEN", "PYTHONPATH", "PYTHONHOME"] {
             cmd.env_remove(k);
         }
         cmd.env("PYTHONUTF8", "1").env("PYTHONIOENCODING", "utf-8");
+        // Cap cargo build + test-runner parallelism so one lane's gate can't grab all 12 cores.
+        // Up to ~6 lanes gate concurrently on a 12-core host shared with the GUI + live apps; an
+        // uncapped cargo uses all 12 per lane (6×12 = 72-way oversubscription — the ~100% CPU peg).
+        // CAP=3 holds a lone cold build to 3 cores (still brisk under the 3600s gate timeout) and 6
+        // concurrent lanes to 6×3 = 18 jobs. RUST_TEST_THREADS mirrors it so a `cargo test` binary's
+        // own run-time thread pool is bounded too. Only set when unset, so an operator override wins.
+        const CARGO_JOBS_CAP: &str = "3";
+        if std::env::var_os("CARGO_BUILD_JOBS").is_none() {
+            cmd.env("CARGO_BUILD_JOBS", CARGO_JOBS_CAP);
+        }
+        if std::env::var_os("RUST_TEST_THREADS").is_none() {
+            cmd.env("RUST_TEST_THREADS", CARGO_JOBS_CAP);
+        }
     }
 
     /// run_improver._redact_keyval (~526-536): redact a NAME<sep>value credential assignment. The
@@ -1428,6 +1443,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- cargo build/test job cap carries onto the gate Command ----
+    #[test]
+    fn apply_clean_env_caps_cargo_jobs_when_unset() {
+        use std::ffi::OsStr;
+        // Serialize + save/restore via the file's existing env-var guard (these two vars are
+        // process-global; raw remove/set_var would race the multithreaded test runner). capture()
+        // also REMOVES them for the test body, so the "only set when unset" path is exercised.
+        let _g = EnvVarGuard::capture(vec!["CARGO_BUILD_JOBS", "RUST_TEST_THREADS"]);
+        let c = test_ctx();
+        let mut cmd = std::process::Command::new("cargo");
+        c.apply_clean_env(&mut cmd);
+        let overrides: std::collections::HashMap<&OsStr, Option<&OsStr>> = cmd.get_envs().collect();
+        assert_eq!(
+            overrides.get(OsStr::new("CARGO_BUILD_JOBS")).copied().flatten(),
+            Some(OsStr::new("3")),
+            "cargo -j capped at 3 when unset"
+        );
+        assert_eq!(
+            overrides.get(OsStr::new("RUST_TEST_THREADS")).copied().flatten(),
+            Some(OsStr::new("3")),
+            "test-runner threads capped at 3 when unset"
+        );
     }
 
     #[test]

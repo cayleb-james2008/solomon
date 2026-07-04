@@ -17,6 +17,7 @@ pub mod ctx;
 pub mod pi;
 pub mod gitops;
 pub mod gates;
+pub mod build_sem;
 pub mod escalation;
 pub mod backlog;
 pub mod ship;

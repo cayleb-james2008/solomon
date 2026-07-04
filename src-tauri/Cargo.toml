@@ -42,3 +42,12 @@ opt-level = "s"
 codegen-units = 4
 # NB: panic=unwind (the default) is intentional — the watchdog sweep uses catch_unwind to isolate
 # a panicking repo so it cannot abort crash-recovery for the others (matches monitor.py per-repo try/except).
+
+[profile.dev]
+# Build-speed + disk streamlining: keep line tables so panic/backtrace file:line stays readable
+# (the improver reads gate stderr to decide fixes), but drop full variable/type debuginfo — the
+# per-binary .pdb dominated target/debug (~0.88GB). `test` inherits [profile.dev], so `cargo test`
+# (the gate) gets the smaller/faster build too. Only debuginfo emission changes — debug_assertions
+# / overflow-checks are untouched, so no runtime behavior change and the windows_subsystem cfg-gate
+# is unaffected.
+debug = "line-tables-only"
