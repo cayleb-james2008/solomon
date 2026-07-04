@@ -858,12 +858,26 @@ data or a secret to the PUBLIC repo; fix the change to exclude it."
     }
 
     // Adversarial REVIEW / JUDGE phase (the SECOND gate).
-    if ctx.review_enabled
-        && !ctx.beautify
-        && !ctx.solomon
-        && phases::run_review_phase(ctx, &branch, &goal, &summary) == "reject"
-    {
-        return; // branch already reverted inside run_review_phase
+    if ctx.review_enabled && !ctx.beautify && !ctx.solomon {
+        let verdict = phases::run_review_phase(ctx, &branch, &goal, &summary);
+        if verdict == "reject" {
+            return; // branch already reverted inside run_review_phase
+        }
+        if verdict == "block" {
+            // FAIL-CLOSED judge on a push/pr/auto-merge lane: the judge did NOT approve
+            // (timeout/error/no-verdict) and unreviewed AI code must not auto-merge to a
+            // shared, real-money main. Keep the gate-green rsi/* branch LOCAL — do not
+            // ship, do not revert — and record it blocked for the operator to review.
+            ctx.git(&["checkout", base_branch.as_str()], 30);
+            ctx.heartbeat(json!({
+                "phase": "review",
+                "status": "blocked",
+                "state": "local (judge did not approve — not shipped)",
+                "last_summary": summary,
+            }));
+            ctx.record_history("blocked", Some(branch.as_str()), &summary, None);
+            return;
+        }
     }
 
     // Visual E2E review (best-effort; may HARD-gate when visual_gate is on).
