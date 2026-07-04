@@ -78,16 +78,18 @@ and read the changed files. Judge per review.md, then end with EXACTLY one line:
     let review_md = ctx.review_md.clone();
     let p = pi::phase_run_pi(ctx, "review", &task, Some(review_md.as_path()), 600);
     if p.code == 124 {
-        ctx.log("review/judge: pi timed out — fail-open, not blocking ship");
-        return "skip".to_string();
+        return review_fail(ctx, "pi timed out");
+    }
+    if p.code != 0 {
+        // spawn/crash/non-zero: a real approve|reject returns code 0 and is parsed below.
+        return review_fail(ctx, "judge process errored");
     }
     let text = pi::final_text(&p.stdout);
 
     let re = review_re();
     let m = match re.captures(&text) {
         None => {
-            ctx.log("review/judge: no parseable verdict — fail-open, not blocking ship");
-            return "skip".to_string();
+            return review_fail(ctx, "no parseable verdict");
         }
         Some(c) => c,
     };
@@ -115,6 +117,29 @@ and read the changed files. Judge per review.md, then end with EXACTLY one line:
     }
     ctx.log(&format!("review/judge: APPROVE — {reason}"));
     "approve".to_string()
+}
+
+/// The JUDGE failed to render a clear verdict (timeout / process error / no parseable
+/// `REVIEW:` line). Behavior depends on the lane's ship mode:
+///   * `ship == "local"` — FAIL-OPEN (return `"skip"`, which ships): a flaky/slow
+///     reviewer must never discard gate-green work that only ever stays on a LOCAL
+///     branch. This preserves the original deliberate behavior for local-ship lanes.
+///   * any push / pr / auto-merge mode — FAIL-CLOSED (return `"block"`): UNREVIEWED AI
+///     code must NOT auto-merge to a shared (real-money) `main`. The caller keeps the
+///     gate-green branch LOCAL and does not ship or revert it.
+fn review_fail(ctx: &mut Ctx, kind: &str) -> String {
+    if ctx.ship == "local" {
+        ctx.log(&format!(
+            "review/judge: {kind} — fail-open (ship=local), not blocking ship"
+        ));
+        "skip".to_string()
+    } else {
+        ctx.log(&format!(
+            "review/judge: {kind} and ship={} — BLOCKING ship (kept local, not merged)",
+            ctx.ship
+        ));
+        "block".to_string()
+    }
 }
 
 // ---- PLAN phase ------------------------------------------------------------ #
