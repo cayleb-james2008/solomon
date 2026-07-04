@@ -244,7 +244,7 @@ pub fn lane_health(running: bool, history: &[Value], k: usize) -> Option<String>
     Some(reason)
 }
 
-fn sweep_fleet(auto_push_flag: bool) -> Value {
+fn sweep_autopilot(auto_push_flag: bool) -> Value {
     let repos = control::registry::load_repos();
     let snapshots = crate::fleet::sweep_snapshots(&repos);
     let out = crate::fleet::once(auto_push_flag, None);
@@ -264,10 +264,10 @@ fn sweep_fleet(auto_push_flag: bool) -> Value {
             .map(|a| !a.is_empty())
             .unwrap_or(false);
         if queued {
-            actions.push(json!("fleet queue checked"));
+            actions.push(json!("autopilot queue checked"));
         }
     }
-    json!({"ts": now(), "disabled": false, "actions": actions, "snapshots": snapshots, "fleet": out})
+    json!({"ts": now(), "disabled": false, "actions": actions, "snapshots": snapshots, "autopilot": out.clone(), "fleet": out})
 }
 
 fn ops_needs_attention(payload: &Value) -> bool {
@@ -691,8 +691,8 @@ pub fn sweep() -> Value {
         return json!({"ts": now(), "disabled": true, "actions": [], "snapshots": []});
     }
     let auto_push_flag = auto_push();
-    if control::registry::fleet_enabled() {
-        return sweep_fleet(auto_push_flag);
+    if control::registry::autopilot_enabled() {
+        return sweep_autopilot(auto_push_flag);
     }
     let mut actions: Vec<String> = Vec::new();
     let mut snapshots: Vec<Value> = Vec::new();
@@ -808,7 +808,7 @@ pub fn main() -> i32 {
         .unwrap_or_else(|_| json!({"projects": {}}));
     let ops_summary = crate::ops::outcomes::payload_summary(&ops_payload);
     if summary == "all healthy, no action" && ops_needs_attention(&ops_payload) {
-        summary = "ops red/yellow; Fleet Agent proof required".to_string();
+        summary = "ops red/yellow; Solomon Autopilot proof required".to_string();
     }
     let line = format!(
         "{} watchdog: {}/{} running | {} | ops: {}",

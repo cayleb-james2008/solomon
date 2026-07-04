@@ -26,6 +26,8 @@ fn provider_default_model(provider: &str) -> &'static str {
     }
 }
 
+pub const AUTOPILOT_DEFAULT_MISSION: &str = "Autonomously improve, ship, monitor, and grow managed projects toward their stated end goals with one efficient Solomon agent, preserving safety gates and proof.";
+
 /// Python truthiness of a JSON value as used by `(repo or {}).get(k) or default`:
 /// null / "" / false / 0 / 0.0 / [] / {} are falsy.
 fn truthy(v: &Value) -> bool {
@@ -126,24 +128,25 @@ pub fn read_repos_json() -> Vec<Value> {
     read_repos_json_strict().unwrap_or_default()
 }
 
-/// Top-level Fleet Agent config embedded in repos.json as a nameless sentinel entry:
-/// `{ "fleet": { ... } }`. load_repos() skips nameless objects, so the sentinel never becomes a
-/// lane, while repo-config writes still preserve it. Missing fields get conservative single-key
+/// Top-level Autopilot config embedded in repos.json as a nameless sentinel entry:
+/// `{ "autopilot": { ... } }`. load_repos() skips nameless objects, so the sentinel never becomes a
+/// project, while repo-config writes still preserve it. Older `{ "fleet": { ... } }` entries are
+/// accepted as a one-release compatibility fallback. Missing fields get conservative single-key
 /// defaults.
-pub fn fleet_config() -> Value {
-    fleet_config_from_entries(&read_repos_json())
+pub fn autopilot_config() -> Value {
+    autopilot_config_from_entries(&read_repos_json())
 }
 
-pub fn fleet_enabled() -> bool {
-    fleet_config()
+pub fn autopilot_enabled() -> bool {
+    autopilot_config()
         .get("mode")
         .and_then(Value::as_str)
         .unwrap_or("")
-        == "single_fleet"
+        == "single_agent"
 }
 
-pub fn fleet_targets() -> Vec<String> {
-    fleet_config()
+pub fn autopilot_targets() -> Vec<String> {
+    autopilot_config()
         .get("targets")
         .and_then(Value::as_array)
         .map(|a| {
@@ -164,23 +167,49 @@ pub fn fleet_targets() -> Vec<String> {
         })
 }
 
-fn fleet_config_from_entries(entries: &[Value]) -> Value {
-    let mut cfg = match entries.iter().find_map(|v| {
-        v.as_object()
-            .and_then(|o| o.get("fleet"))
-            .and_then(Value::as_object)
-            .cloned()
-    }) {
+pub fn fleet_config() -> Value {
+    autopilot_config()
+}
+
+pub fn fleet_enabled() -> bool {
+    autopilot_enabled()
+}
+
+pub fn fleet_targets() -> Vec<String> {
+    autopilot_targets()
+}
+
+fn autopilot_config_from_entries(entries: &[Value]) -> Value {
+    let mut cfg = match entries
+        .iter()
+        .find_map(|v| {
+            v.as_object()
+                .and_then(|o| o.get("autopilot"))
+                .and_then(Value::as_object)
+                .cloned()
+        })
+        .or_else(|| {
+            entries.iter().find_map(|v| {
+                v.as_object()
+                    .and_then(|o| o.get("fleet"))
+                    .and_then(Value::as_object)
+                    .cloned()
+            })
+        }) {
         Some(o) => o,
         None => Map::new(),
     };
+    if cfg.get("mode").and_then(Value::as_str) == Some("single_fleet") {
+        cfg.insert("mode".to_string(), json!("single_agent"));
+    }
     let mut set_default = |key: &str, value: Value| {
         let missing = cfg.get(key).map(truthy).unwrap_or(false) == false;
         if missing {
             cfg.insert(key.to_string(), value);
         }
     };
-    set_default("mode", json!("single_fleet"));
+    set_default("mode", json!("single_agent"));
+    set_default("mission", json!(AUTOPILOT_DEFAULT_MISSION));
     set_default("provider", json!("openrouter"));
     set_default("api_key", json!("OPENROUTER_API_KEY"));
     set_default("model", json!("nvidia/nemotron-3-ultra-550b-a55b:free"));
@@ -1104,9 +1133,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn fleet_config_defaults_to_single_openrouter_key() {
-        let cfg = fleet_config_from_entries(&[]);
-        assert_eq!(cfg["mode"], json!("single_fleet"));
+    fn autopilot_config_defaults_to_single_openrouter_key() {
+        let cfg = autopilot_config_from_entries(&[]);
+        assert_eq!(cfg["mode"], json!("single_agent"));
+        assert_eq!(cfg["mission"], json!(AUTOPILOT_DEFAULT_MISSION));
         assert_eq!(cfg["provider"], json!("openrouter"));
         assert_eq!(cfg["api_key"], json!("OPENROUTER_API_KEY"));
         assert_eq!(cfg["max_concurrent_agent_calls"], json!(1));
@@ -1117,21 +1147,35 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn fleet_config_sentinel_overrides_defaults_without_becoming_repo() {
+    fn autopilot_config_sentinel_overrides_defaults_without_becoming_repo() {
         let entries = vec![
-            json!({"fleet": {"daily_call_budget": 9, "targets": ["sover"], "model": "free-model"}}),
+            json!({"autopilot": {"daily_call_budget": 9, "targets": ["sover"], "model": "free-model"}}),
             json!({"name": "sover", "path": "/p/sover"}),
         ];
-        let cfg = fleet_config_from_entries(&entries);
+        let cfg = autopilot_config_from_entries(&entries);
         assert_eq!(cfg["daily_call_budget"], json!(9));
         assert_eq!(cfg["targets"], json!(["sover"]));
         assert_eq!(cfg["model"], json!("free-model"));
-        assert_eq!(cfg["mode"], json!("single_fleet"));
+        assert_eq!(cfg["mode"], json!("single_agent"));
         let out = merge(vec![], entries);
         assert_eq!(
             out,
             vec![json!({"name": "sover", "path": "/p/sover", "branch_prefix": "rsi/"})]
         );
+    }
+
+    #[test]
+    fn autopilot_config_falls_back_to_legacy_fleet_sentinel() {
+        let entries = vec![json!({"fleet": {
+            "mode": "single_fleet",
+            "daily_call_budget": 7,
+            "targets": ["maki"]
+        }})];
+        let cfg = autopilot_config_from_entries(&entries);
+        assert_eq!(cfg["mode"], json!("single_agent"));
+        assert_eq!(cfg["daily_call_budget"], json!(7));
+        assert_eq!(cfg["targets"], json!(["maki"]));
+        assert_eq!(cfg["mission"], json!(AUTOPILOT_DEFAULT_MISSION));
     }
 
     // ---- _parse_repo_spec ----

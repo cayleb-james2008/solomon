@@ -275,10 +275,12 @@ fn ops_state() -> Value {
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or(Value::Null);
+    let autopilot = safe(crate::fleet::state, Value::Null);
     let payload = json!({
         "ops": ops,
         "outcomes": safe(crate::ops::ledger::snapshot, Value::Null),
-        "fleet": safe(crate::fleet::state, Value::Null),
+        "autopilot": autopilot.clone(),
+        "fleet": autopilot,
         "ceo": safe(crate::ceo::ceo_status, Value::Null),
         "incidents": safe(
             || Value::Array(crate::ceo::recent_incidents(chrono::Utc::now())),
@@ -322,6 +324,7 @@ fn get_state(st: &AppState) -> Value {
             .collect()
     });
 
+    let autopilot = safe(crate::fleet::state, Value::Null);
     json!({
         "repos": out,
         "gh_ready": gh_ready,
@@ -331,7 +334,8 @@ fn get_state(st: &AppState) -> Value {
         "providers": ["ollama-cloud", "openrouter"],
         "keys": safe(keys::keys_status, json!({})),
         "github": safe(gh::github_status, json!({})),
-        "fleet": safe(crate::fleet::state, Value::Null),
+        "autopilot": autopilot.clone(),
+        "fleet": autopilot,
     })
 }
 
@@ -454,8 +458,11 @@ pub fn dispatch(method: &str, args: &[Value]) -> Result<Value, String> {
 
         // ---- ops / CEO plane (dashboard v2) ------------------------------
         "ops_state" => ops_state(),
-        "fleet_state" => crate::fleet::state(),
-        "fleet_once" => crate::fleet::once(st.get_auto_push(), arg_opt_str(args, 0).as_deref()),
+        "autopilot_state" | "fleet_state" => crate::fleet::state(),
+        "autopilot_wake" | "fleet_once" => {
+            crate::fleet::wake(st.get_auto_push(), arg_opt_str(args, 0).as_deref())
+        }
+        "autopilot_pause" => crate::fleet::pause(),
         "fleet_drain" => {
             crate::fleet::drain(st.get_auto_push(), arg_i64_default(args, 0).max(0) as usize)
         }
@@ -477,12 +484,15 @@ pub fn dispatch(method: &str, args: &[Value]) -> Result<Value, String> {
 
         // ---- control ----------------------------------------------------
         "start" => match find_repo(&arg_str(args, 0)) {
-            Some(r) if registry::fleet_enabled() => crate::fleet::enqueue(&paths::repo_name(&r)),
+            Some(r) if registry::autopilot_enabled() => {
+                let name = paths::repo_name(&r);
+                crate::fleet::wake(st.get_auto_push(), Some(&name))
+            }
             Some(r) => runner::start(&r, st.get_auto_push(), arg_bool(args, 1, false)),
             None => unknown_repo(),
         },
         "stop" => match find_repo(&arg_str(args, 0)) {
-            Some(r) if registry::fleet_enabled() => crate::fleet::stop_name(&r),
+            Some(r) if registry::autopilot_enabled() => crate::fleet::stop_name(&r),
             Some(r) => runner::stop(&r),
             None => unknown_repo(),
         },
@@ -1085,6 +1095,15 @@ mod tests {
         // dispatch only still serves cached_update_status as a benign stub.
         let r = dispatch("cached_update_status", &[]).unwrap();
         assert_eq!(r, json!({"ok": false, "available": false}));
+    }
+
+    #[test]
+    fn dispatch_autopilot_state_and_hidden_fleet_alias_work() {
+        let r = dispatch("autopilot_state", &[]).unwrap();
+        assert_eq!(r["ok"], json!(true));
+        assert_eq!(r["config"]["mode"], json!("single_agent"));
+        let legacy = dispatch("fleet_state", &[]).unwrap();
+        assert_eq!(legacy["config"]["mode"], json!("single_agent"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
-//! Single-agent Fleet runtime.
+//! Single-agent Autopilot runtime.
 //!
-//! This replaces "one long-lived improver process per lane" with one file-backed scheduler that owns
+//! This replaces "one long-lived improver process per project" with one file-backed scheduler that owns
 //! provider quota, job priority, active leases, and proof records. Managed repo mutation still flows
 //! through the existing gated `run-improver --once` executor.
 
@@ -18,10 +18,12 @@ use std::time::Duration;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-const STATE_FILE: &str = "fleet_state.json";
-const EVENTS_FILE: &str = "fleet_events.jsonl";
-const LOCK_FILE: &str = "fleet.lock";
-const PROOF_FILE: &str = "fleet_proof.json";
+const STATE_FILE: &str = "autopilot_state.json";
+const EVENTS_FILE: &str = "autopilot_events.jsonl";
+const LOCK_FILE: &str = "autopilot.lock";
+const PROOF_FILE: &str = "autopilot_proof.json";
+const LEGACY_STATE_FILE: &str = "fleet_state.json";
+const LEGACY_PROOF_FILE: &str = "fleet_proof.json";
 const DEFAULT_RUN_TIMEOUT_S: u64 = 14_400;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,18 +37,18 @@ struct Job {
     next_action: String,
 }
 
-struct FleetLease {
+struct AutopilotLease {
     path: PathBuf,
 }
 
-impl Drop for FleetLease {
+impl Drop for AutopilotLease {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
 }
 
 pub fn state() -> Value {
-    let cfg = registry::fleet_config();
+    let cfg = registry::autopilot_config();
     let mut st = read_state(&cfg);
     let repos = registry::load_repos();
     let ops_payload = read_ops_payload();
@@ -56,32 +58,6 @@ pub fn state() -> Value {
     st["proofs"] = proof_records();
     st["config"] = public_config(&cfg);
     st
-}
-
-pub fn enqueue(name: &str) -> Value {
-    let cfg = registry::fleet_config();
-    let mut st = read_state(&cfg);
-    let mut q = st
-        .get("manual_queue")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    if !q.iter().any(|v| v.as_str() == Some(name)) {
-        q.push(Value::String(name.to_string()));
-    }
-    st["manual_queue"] = Value::Array(q);
-    st["ts"] = json!(now());
-    let _ = write_state(&st);
-    append_event(&json!({"event": "manual_enqueue", "repo": name}));
-    write_proof(
-        name,
-        "queued",
-        "queued",
-        "manual start queued for the single Fleet Agent",
-        None,
-        None,
-    );
-    json!({"ok": true, "queued": true, "repo": name})
 }
 
 pub fn stop_name(repo: &Value) -> Value {
@@ -94,7 +70,7 @@ pub fn stop_name(repo: &Value) -> Value {
     } else {
         json!({"ok": true, "already": true})
     };
-    let cfg = registry::fleet_config();
+    let cfg = registry::autopilot_config();
     let mut st = read_state(&cfg);
     let q: Vec<Value> = st
         .get("manual_queue")
@@ -107,26 +83,26 @@ pub fn stop_name(repo: &Value) -> Value {
     st["manual_queue"] = Value::Array(q);
     st["ts"] = json!(now());
     let _ = write_state(&st);
-    append_event(&json!({"event": "manual_stop", "repo": name}));
+    append_event(&json!({"event": "autopilot_dequeue", "repo": name}));
     if let Value::Object(ref mut o) = out {
         o.insert("dequeued".to_string(), Value::Bool(true));
-        o.insert("fleet".to_string(), Value::Bool(true));
+        o.insert("autopilot".to_string(), Value::Bool(true));
     }
     out
 }
 
 pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
-    let cfg = registry::fleet_config();
-    if cfg.get("mode").and_then(Value::as_str) != Some("single_fleet") {
-        return json!({"ok": false, "error": "fleet mode is not single_fleet"});
+    let cfg = registry::autopilot_config();
+    if cfg.get("mode").and_then(Value::as_str) != Some("single_agent") {
+        return json!({"ok": false, "error": "autopilot mode is not single_agent"});
     }
     if max_concurrent(&cfg) != 1 {
-        return json!({"ok": false, "error": "single_fleet requires max_concurrent_agent_calls=1"});
+        return json!({"ok": false, "error": "single_agent requires max_concurrent_agent_calls=1"});
     }
     let _lease = match acquire_lock() {
         Ok(Some(l)) => l,
         Ok(None) => {
-            return json!({"ok": true, "leased": false, "summary": "Fleet Agent already active"})
+            return json!({"ok": true, "leased": false, "summary": "Solomon Autopilot already active"})
         }
         Err(e) => return json!({"ok": false, "error": e}),
     };
@@ -134,6 +110,21 @@ pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
     let repos = registry::load_repos();
     let ops_payload = read_ops_payload();
     let mut st = read_state(&cfg);
+    if autopilot_paused(&st) {
+        st["active"] = Value::Null;
+        st["ts"] = json!(now());
+        st["config"] = public_config(&cfg);
+        let jobs = plan_jobs(&repos, &cfg, &ops_payload, &st, only_name);
+        st["queue"] = Value::Array(jobs.iter().map(job_value).collect());
+        let _ = write_state(&st);
+        append_event(&json!({"event": "autopilot_paused"}));
+        return json!({
+            "ok": true,
+            "paused": true,
+            "actions": ["autopilot paused; no new AI work started"],
+            "state": st,
+        });
+    }
     let jobs = plan_jobs(&repos, &cfg, &ops_payload, &st, only_name);
     let mut actions = Vec::<String>::new();
     st["ts"] = json!(now());
@@ -175,7 +166,7 @@ pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
     let Some(job) = jobs.first().cloned() else {
         st["active"] = Value::Null;
         st["last_result"] =
-            json!({"ts": now(), "outcome": "complete", "summary": "no queued fleet work"});
+            json!({"ts": now(), "outcome": "complete", "summary": "no queued autopilot work"});
         let _ = write_state(&st);
         return json!({"ok": true, "actions": [], "queue": []});
     };
@@ -226,9 +217,16 @@ pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
 }
 
 pub fn drain(auto_push: bool, limit: usize) -> Value {
-    let cfg = registry::fleet_config();
+    let cfg = registry::autopilot_config();
+    let mut st = read_state(&cfg);
+    if autopilot_paused(&st) {
+        st["paused"] = Value::Bool(false);
+        st["ts"] = json!(now());
+        st["config"] = public_config(&cfg);
+        let _ = write_state(&st);
+    }
     let cap = if limit == 0 {
-        registry::fleet_targets().len().max(1)
+        registry::autopilot_targets().len().max(1)
     } else {
         limit
     };
@@ -253,6 +251,29 @@ pub fn drain(auto_push: bool, limit: usize) -> Value {
     json!({"ok": true, "runs": runs, "state": state()})
 }
 
+pub fn wake(auto_push: bool, only_name: Option<&str>) -> Value {
+    let cfg = registry::autopilot_config();
+    let mut st = read_state(&cfg);
+    st["paused"] = Value::Bool(false);
+    st["ts"] = json!(now());
+    st["config"] = public_config(&cfg);
+    let _ = write_state(&st);
+    append_event(&json!({"event": "autopilot_wake", "repo": only_name.unwrap_or("")}));
+    once(auto_push, only_name)
+}
+
+pub fn pause() -> Value {
+    let cfg = registry::autopilot_config();
+    let mut st = read_state(&cfg);
+    st["paused"] = Value::Bool(true);
+    st["active"] = Value::Null;
+    st["ts"] = json!(now());
+    st["config"] = public_config(&cfg);
+    let _ = write_state(&st);
+    append_event(&json!({"event": "autopilot_pause"}));
+    json!({"ok": true, "paused": true, "state": state()})
+}
+
 pub fn sweep_snapshots(repos: &[Value]) -> Vec<Value> {
     repos
         .iter()
@@ -274,7 +295,7 @@ pub fn sweep_snapshots(repos: &[Value]) -> Vec<Value> {
                 "iteration": hb.get("iteration").cloned().unwrap_or(Value::Null),
                 "last_status": last.get("status").cloned().unwrap_or(Value::Null),
                 "diagnosis": diag.get("category").cloned().unwrap_or(Value::Null),
-                "fleet": true,
+                "autopilot": true,
             }))
         })
         .collect()
@@ -295,7 +316,7 @@ fn run_ai_job(job: &Job, repos: &[Value], cfg: &Value, auto_push: bool, st: &mut
         return proof(
             job,
             "blocked",
-            "OPENROUTER_API_KEY is not set for the Fleet Agent",
+            "OPENROUTER_API_KEY is not set for Solomon Autopilot",
             None,
             None,
         );
@@ -328,7 +349,7 @@ fn run_ai_job(job: &Job, repos: &[Value], cfg: &Value, auto_push: bool, st: &mut
         "blocked"
     };
     let summary = if quota {
-        "provider quota hit; Fleet Agent cooled down instead of retrying".to_string()
+        "provider quota hit; Solomon Autopilot cooled down instead of retrying".to_string()
     } else {
         latest
             .get("summary")
@@ -389,7 +410,7 @@ fn finish_non_ai_job(job: &Job, repos: &[Value], ops_payload: &Value) -> Value {
         "cooldown" => proof(
             job,
             "cooldown",
-            "last lane heartbeat was quota_error; provider cooldown owns retry timing",
+            "last project heartbeat was quota_error; provider cooldown owns retry timing",
             repo.map(|r| json!({"diagnosis": supervisor::diagnose(r)})),
             repo,
         ),
@@ -433,7 +454,7 @@ fn plan_jobs(
                 state: "blocked".into(),
                 priority: 5,
                 requires_ai: false,
-                reason: "repo is listed in fleet targets but missing from registry".into(),
+                reason: "repo is listed in autopilot targets but missing from registry".into(),
                 next_action: "fix repos.json target/path".into(),
             });
             continue;
@@ -490,7 +511,7 @@ fn plan_jobs(
                 false,
                 diag.get("evidence")
                     .and_then(Value::as_str)
-                    .unwrap_or("lane is unhealthy"),
+                    .unwrap_or("project is unhealthy"),
                 "surface blocker and avoid retry theater",
             )
         } else if ops_status == "red" || ops_status == "yellow" || manual_hit || !proof_fresh {
@@ -501,7 +522,7 @@ fn plan_jobs(
                 if ops_status == "red" || ops_status == "yellow" {
                     "ops outcome needs improvement"
                 } else if manual_hit {
-                    "manual fleet start request"
+                    "manual autopilot wake request"
                 } else {
                     "proof record is stale or missing"
                 },
@@ -603,7 +624,7 @@ fn run_with_env(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("SOLOMON_FLEET_MODE", "single_fleet")
+        .env("SOLOMON_AUTOPILOT_MODE", "single_agent")
         .env("OPENROUTER_API_KEY", openrouter_key);
     proc::apply_clean_env(&mut cmd);
     #[cfg(windows)]
@@ -655,7 +676,7 @@ fn run_prepared(mut cmd: Command, timeout: Duration) -> std::io::Result<proc::Ru
             drop(err_h);
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                "fleet job timed out",
+                "autopilot job timed out",
             ))
         }
     }
@@ -697,37 +718,6 @@ fn proof(
     v
 }
 
-fn write_proof(
-    name: &str,
-    job: &str,
-    outcome: &str,
-    summary: &str,
-    extra: Option<Value>,
-    repo: Option<&Value>,
-) {
-    let mut v = json!({
-        "ts": now(),
-        "repo": name,
-        "job": job,
-        "outcome": outcome,
-        "summary": summary,
-    });
-    if let Some(r) = repo {
-        v["diagnosis"] = supervisor::diagnose(r);
-        v["heartbeat"] = heartbeat::read_heartbeat(r).unwrap_or(Value::Null);
-        v["latest_history"] = heartbeat::read_history(r, 1)
-            .last()
-            .cloned()
-            .unwrap_or(Value::Null);
-    }
-    if let Some(e) = extra {
-        v["extra"] = e;
-    }
-    if let Some(rt) = paths::runtime_dir(&json!({"name": name})) {
-        write_proof_value_at(&rt, &v);
-    }
-}
-
 fn write_proof_value(name: &str, v: &Value) {
     if let Some(rt) = paths::runtime_dir(&json!({"name": name})) {
         write_proof_value_at(&rt, v);
@@ -742,13 +732,14 @@ fn write_proof_value_at(rt: &Path, v: &Value) {
 fn read_proof(name: &str) -> Option<Value> {
     let rt = paths::runtime_dir(&json!({"name": name}))?;
     std::fs::read(rt.join(PROOF_FILE))
+        .or_else(|_| std::fs::read(rt.join(LEGACY_PROOF_FILE)))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
 }
 
 fn proof_records() -> Value {
     let mut out = Map::new();
-    for name in registry::fleet_targets() {
+    for name in registry::autopilot_targets() {
         if let Some(v) = read_proof(&name) {
             out.insert(name, v);
         }
@@ -756,13 +747,13 @@ fn proof_records() -> Value {
     Value::Object(out)
 }
 
-fn acquire_lock() -> Result<Option<FleetLease>, String> {
+fn acquire_lock() -> Result<Option<AutopilotLease>, String> {
     let dir = paths::here().join("runtime");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     acquire_lock_at(dir.join(LOCK_FILE))
 }
 
-fn acquire_lock_at(path: PathBuf) -> Result<Option<FleetLease>, String> {
+fn acquire_lock_at(path: PathBuf) -> Result<Option<AutopilotLease>, String> {
     if let Ok(raw) = std::fs::read_to_string(&path) {
         let pid = raw.trim().parse::<i64>().unwrap_or(0);
         if pid != 0 && locks::pid_alive(pid) {
@@ -778,7 +769,7 @@ fn acquire_lock_at(path: PathBuf) -> Result<Option<FleetLease>, String> {
         Ok(mut f) => {
             f.write_all(std::process::id().to_string().as_bytes())
                 .map_err(|e| e.to_string())?;
-            Ok(Some(FleetLease { path }))
+            Ok(Some(AutopilotLease { path }))
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
         Err(e) => Err(e.to_string()),
@@ -787,17 +778,24 @@ fn acquire_lock_at(path: PathBuf) -> Result<Option<FleetLease>, String> {
 
 fn read_state(cfg: &Value) -> Value {
     std::fs::read(state_path())
+        .or_else(|_| std::fs::read(legacy_state_path()))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
+        .map(|mut st: Value| {
+            st["mode"] = json!("single_agent");
+            st["config"] = public_config(cfg);
+            st
+        })
         .unwrap_or_else(|| {
             json!({
                 "ts": now(),
-                "mode": "single_fleet",
+                "mode": "single_agent",
                 "active": null,
                 "queue": [],
                 "manual_queue": [],
                 "cooldown": null,
                 "daily": {"date": today(), "calls": 0},
+                "paused": false,
                 "config": public_config(cfg),
             })
         })
@@ -846,13 +844,18 @@ fn state_path() -> PathBuf {
     paths::here().join("runtime").join(STATE_FILE)
 }
 
+fn legacy_state_path() -> PathBuf {
+    paths::here().join("runtime").join(LEGACY_STATE_FILE)
+}
+
 fn events_path() -> PathBuf {
     paths::here().join("runtime").join(EVENTS_FILE)
 }
 
 fn public_config(cfg: &Value) -> Value {
     json!({
-        "mode": cfg.get("mode").cloned().unwrap_or(json!("single_fleet")),
+        "mode": cfg.get("mode").cloned().unwrap_or(json!("single_agent")),
+        "mission": cfg.get("mission").cloned().unwrap_or(json!(registry::AUTOPILOT_DEFAULT_MISSION)),
         "provider": cfg.get("provider").cloned().unwrap_or(json!("openrouter")),
         "api_key": cfg.get("api_key").cloned().unwrap_or(json!("OPENROUTER_API_KEY")),
         "model": cfg.get("model").cloned().unwrap_or(json!("nvidia/nemotron-3-ultra-550b-a55b:free")),
@@ -881,6 +884,10 @@ fn cooldown_until(st: &Value) -> Option<DateTime<Utc>> {
         .and_then(|c| c.get("until"))
         .and_then(Value::as_str)
         .and_then(parse_ts)
+}
+
+fn autopilot_paused(st: &Value) -> bool {
+    st.get("paused").and_then(Value::as_bool) == Some(true)
 }
 
 fn cooldown_value(st: &Value) -> Value {
@@ -947,7 +954,7 @@ fn cfg_targets(cfg: &Value) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(registry::fleet_targets)
+        .unwrap_or_else(registry::autopilot_targets)
 }
 
 fn resolve_key(key_ref: &str) -> Option<String> {
@@ -999,8 +1006,8 @@ mod tests {
 
     #[test]
     fn plan_jobs_prioritizes_ops_red_before_stale_proof() {
-        let a = format!("fleet_red_{}", std::process::id());
-        let b = format!("fleet_green_{}", std::process::id());
+        let a = format!("autopilot_red_{}", std::process::id());
+        let b = format!("autopilot_green_{}", std::process::id());
         let repos = vec![repo(&a), repo(&b)];
         let cfg = json!({"provider": "openrouter", "targets": [a.clone(), b.clone()]});
         let mut projects = Map::new();
@@ -1019,7 +1026,7 @@ mod tests {
 
     #[test]
     fn plan_jobs_turns_quota_heartbeat_into_cooldown_job() {
-        let name = format!("fleet_quota_{}", std::process::id());
+        let name = format!("autopilot_quota_{}", std::process::id());
         let repo = json!({"name": name, "path": "C:/p/q"});
         let rt = paths::runtime_dir(&repo).unwrap();
         let _ = std::fs::create_dir_all(&rt);
@@ -1062,14 +1069,48 @@ mod tests {
         let pubc = public_config(&cfg);
         assert_eq!(pubc["api_key"], json!("OPENROUTER_API_KEY"));
         assert_eq!(pubc["model"], json!("m"));
+        assert_eq!(pubc["mode"], json!("single_agent"));
+        assert!(pubc["mission"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Autonomously improve"));
     }
 
     #[test]
-    fn acquire_lock_allows_only_one_active_fleet_agent() {
-        let dir = std::env::temp_dir().join(format!("solomon_fleet_lock_{}", std::process::id()));
+    fn read_proof_falls_back_to_legacy_fleet_file() {
+        let name = format!("autopilot_legacy_proof_{}", std::process::id());
+        let repo = json!({"name": name});
+        let rt = paths::runtime_dir(&repo).unwrap();
+        let _ = std::fs::remove_dir_all(&rt);
+        std::fs::create_dir_all(&rt).unwrap();
+        std::fs::write(
+            rt.join(LEGACY_PROOF_FILE),
+            serde_json::to_vec(&json!({"repo": name, "outcome": "blocked"})).unwrap(),
+        )
+        .unwrap();
+        let proof = read_proof(repo["name"].as_str().unwrap()).unwrap();
+        assert_eq!(proof["outcome"], json!("blocked"));
+        let _ = std::fs::remove_dir_all(rt);
+    }
+
+    #[test]
+    fn paused_state_prevents_new_work_without_erasing_queue() {
+        let cfg = json!({"mode": "single_agent", "targets": ["x"]});
+        let mut st = json!({"paused": true, "queue": [{"repo": "x"}], "manual_queue": ["x"]});
+        st["mode"] = json!("single_agent");
+        st["config"] = public_config(&cfg);
+        assert!(autopilot_paused(&st));
+        assert_eq!(st["queue"][0]["repo"], json!("x"));
+        assert_eq!(st["manual_queue"][0], json!("x"));
+    }
+
+    #[test]
+    fn acquire_lock_allows_only_one_active_autopilot_agent() {
+        let dir =
+            std::env::temp_dir().join(format!("solomon_autopilot_lock_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("fleet.lock");
+        let path = dir.join("autopilot.lock");
 
         let first = acquire_lock_at(path.clone()).unwrap();
         assert!(first.is_some());
