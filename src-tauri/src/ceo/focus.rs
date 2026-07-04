@@ -94,13 +94,20 @@ pub fn campaign_lines(slug: &str, steps: &[String], tier: &str, today: &str) -> 
         .collect()
 }
 
-/// Count OPEN (`- [ ]`) backlog lines belonging to `slug` (PURE — unit-tested). Zero == the campaign
-/// is drained, the trigger to plan the next milestone.
-pub fn open_campaign_steps(existing: &str, slug: &str) -> usize {
-    let marker = format!("[campaign:{slug}]");
+/// Count OPEN, non-deferred `[campaign:...]` steps in a backlog (PURE — unit-tested; ANY slug). Zero
+/// == no active campaign work remains, the trigger to plan the next milestone. TWO exclusions matter:
+///   - DEFERRED steps (escalation::defer_backlog_item appends a "(deferred" note and moves the line to
+///     the bottom, but KEEPS its "- [ ]" and marker) do NOT count — they are un-runnable, so a
+///     campaign stalled entirely on deferred steps reads as drained and re-plans (else the focus lane
+///     freezes forever on a dead campaign — the picker/unchecked_backlog_count skip deferred too).
+///   - ANY slug (not just the tracked one): leftover steps from a PRIOR campaign on a re-adopted focus
+///     lane still block a NEW decomposition until they drain, so we never stack two campaigns.
+pub fn open_campaign_steps(existing: &str) -> usize {
     existing
         .lines()
-        .filter(|l| l.trim().starts_with("- [ ]") && l.contains(&marker))
+        .filter(|l| {
+            l.trim().starts_with("- [ ]") && l.contains("[campaign:") && !l.contains("(deferred")
+        })
         .count()
 }
 
@@ -181,11 +188,10 @@ pub fn maybe_focus(snapshot: &Value, status: &Value) {
     //    planned today, decompose the next milestone into ordered steps and prepend them.
     let backlog_path = super::backlog_path(&focus);
     let existing = std::fs::read_to_string(&backlog_path).unwrap_or_default();
-    let open = if slug.is_empty() {
-        0
-    } else {
-        open_campaign_steps(&existing, &slug)
-    };
+    // ANY open non-deferred campaign step (from THIS or a leftover prior campaign) blocks a new
+    // decomposition — so we never stack two campaigns, and a campaign stalled entirely on deferred
+    // steps correctly reads as drained and re-plans.
+    let open = open_campaign_steps(&existing);
     if open == 0 && planned != today {
         // ONE decomposition attempt per day (success or fail) so a persistent LLM failure never
         // hammers the endpoint every 2-min sweep — the lane just works its normal backlog that day.
@@ -347,13 +353,21 @@ mod tests {
     }
 
     #[test]
-    fn open_campaign_steps_counts_open_matching_slug_only() {
+    fn open_campaign_steps_counts_open_non_deferred_any_slug() {
         let bl = "- [ ] [feature] [campaign:sc] (step 1) a\n\
                   - [x] [feature] [campaign:sc] (step 2) done\n\
                   - [ ] [feature] [campaign:other] (step 1) b\n\
+                  - [ ] [feature] [campaign:sc] (step 3) c  (deferred: gave up)\n\
                   - [ ] plain\n";
-        assert_eq!(open_campaign_steps(bl, "sc"), 1); // only the OPEN sc step
-        assert_eq!(open_campaign_steps(bl, "none"), 0);
+        // OPEN + non-deferred campaign steps across ANY slug: step1(sc) + step1(other) = 2.
+        // the [x] done step, the (deferred) step, and the plain line do NOT count.
+        assert_eq!(open_campaign_steps(bl), 2);
+        assert_eq!(open_campaign_steps("- [ ] plain\n- [x] [campaign:x] done\n"), 0);
+        // a campaign fully stalled on a deferred step reads as DRAINED (re-plans) — the high-sev fix.
+        assert_eq!(
+            open_campaign_steps("- [ ] [feature] [campaign:z] (step 1) x  (deferred: y)\n"),
+            0
+        );
     }
 
     #[test]
