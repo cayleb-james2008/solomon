@@ -24,7 +24,7 @@
 use serde_json::{json, Value};
 
 use crate::improver::ctx::{self, Ctx};
-use crate::improver::{backlog, escalation, gates, gitops, phases, pi, ship, visual};
+use crate::improver::{backlog, build_sem, escalation, gates, gitops, phases, pi, ship, visual};
 
 use regex::Regex;
 use std::collections::HashSet;
@@ -584,6 +584,12 @@ hallucinated its file edits; counting as a no-op",
         ctx.log("beautify: gate skipped (docs-only)");
         tests = Value::Null;
     } else {
+        // BUILD SEMAPHORE: cap how many lanes run their cargo gate at once (each build is separately
+        // --jobs-capped; this bounds the AGGREGATE across separate lane processes). RAII — `_slot`
+        // releases on EVERY exit of this else block: the test/lint/anti-gaming/cross-repo/eval
+        // reverts (early returns), a panic, or the fall-through to commit. Scope encloses run_gate,
+        // the judge-mirror lint (clippy) gate, and the cross-repo gates — the entire cargo load.
+        let _slot = build_sem::acquire_build_slot(ctx);
         ctx.heartbeat(json!({"phase": "test", "last_summary": summary}));
         let (green, t, tail) = gates::run_gate(ctx);
         tests = t;
