@@ -451,6 +451,20 @@ fn ops_marker(probe: &str) -> String {
 /// This closes the open loop: the ops plane was OBSERVATION-ONLY — the improver reads backlog.md and
 /// never sees ops, and the once/day LLM morning plan can leave a RED lane with no queued fix. Here a
 /// RED outcome DETERMINISTICALLY forces a fix into the lane backlog every sweep, without flooding it.
+/// HERE/runtime/_dead_red.json — the dedupe map for the dead-lane-RED operator page.
+/// Shape: {"seen": {"<name>:<probe>": "<first_ts>"}} — one page per (lane, probe) while it persists.
+fn dead_red_status_path() -> PathBuf {
+    paths::here().join("runtime").join("_dead_red.json")
+}
+
+/// Pure (unit-tested): page the operator about a RED outcome on a STOPPED lane iff the lane is NOT
+/// running AND the probe is RED AND we have not already paged for this (lane, probe). A stopped lane
+/// consumes NO backlog, so the ops-auto fix we still file is theater until the operator Starts it —
+/// this turns that silent rot into ONE deduped, actionable page.
+pub fn should_page_dead_red(running: bool, probe_red: bool, already_paged: bool) -> bool {
+    !running && probe_red && !already_paged
+}
+
 fn ops_red_backlog_graft() {
     let status: Value = std::fs::read(ops::outcomes::ops_status_path())
         .ok()
@@ -461,21 +475,87 @@ fn ops_red_backlog_graft() {
         None => return,
     };
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let now_ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+    // repos.json entries by name — needed to test lane liveness (is_running) for the dead-red page.
+    let repo_by_name: std::collections::HashMap<String, Value> =
+        crate::control::registry::read_repos_json()
+            .into_iter()
+            .filter_map(|r| {
+                let n = paths::repo_name(&r);
+                if n.is_empty() { None } else { Some((n, r)) }
+            })
+            .collect();
+
+    // Prior dead-red dedupe map ("<name>:<probe>" -> first-seen ts). Absent/garbage -> empty
+    // (fail-open: re-page rather than ever silently drop a real stopped+RED lane).
+    let prev: Value = std::fs::read(dead_red_status_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null);
+    let prev_seen = prev.get("seen").and_then(Value::as_object).cloned().unwrap_or_default();
+    let mut seen = Map::new(); // this sweep's live "<name>:<probe>" -> first_ts (drops resolved keys)
+
     for (name, proj) in projects {
         // Which OUTCOME probes are RED for this project? (per-probe status map, whitelist-filtered)
         let probes = match proj.get("probes").and_then(Value::as_object) {
             Some(p) => p,
             None => continue,
         };
+        // Is this project's improver lane actually running? A stopped lane consumes NO backlog, so
+        // an ops-auto item filed into it is never worked (theater) — that case must PAGE, loudly.
+        // No repos.json entry (discovered-only) -> can't manage it -> treat as running -> no page.
+        let running = repo_by_name
+            .get(name)
+            .map(crate::control::locks::is_running)
+            .unwrap_or(true);
         for probe in OPS_OUTCOME_PROBES {
             if probes.get(probe).and_then(Value::as_str) != Some("red") {
                 continue;
             }
             // The reason/detail for this probe from the rollup reasons list ("<probe>=red (<detail>)").
             let detail = red_probe_detail(proj, probe);
+            // Still file the queued fix item — it will be worked the moment the lane resumes.
             ensure_ops_item(name, probe, &detail, &today);
+
+            // DEAD-LANE-RED: a RED outcome on a STOPPED lane is silent rot. Page once per
+            // (lane, probe) while it persists (deduped via _dead_red.json).
+            let key = format!("{name}:{probe}");
+            let already_paged = prev_seen.contains_key(&key);
+            if should_page_dead_red(running, true, already_paged) {
+                let held_note = match repo_by_name.get(name) {
+                    Some(r) if r.get("live_app").and_then(Value::as_bool) == Some(true) => {
+                        " (live app — held)"
+                    }
+                    _ => "",
+                };
+                let _ = notify::send(&Notice::red(
+                    format!("Solomon: {name} RED but lane STOPPED"),
+                    format!(
+                        "{detail} — the {name} improver lane is STOPPED{held_note}, so this queued \
+                         fix will NOT run. Start the lane (or fix it manually); Solomon does not \
+                         auto-restart a Stopped lane."
+                    ),
+                ));
+            }
+            // Carry the dead-red key forward ONLY while still dead-red (stopped + red). A key that
+            // drops out (lane resumed OR probe cleared) re-pages if the condition later recurs.
+            if !running {
+                let first_ts = prev_seen
+                    .get(&key)
+                    .and_then(Value::as_str)
+                    .unwrap_or(now_ts.as_str())
+                    .to_string();
+                seen.insert(key, json!(first_ts));
+            }
         }
     }
+
+    // Persist the pruned dedupe map (atomic; best-effort — a write failure just re-pages next sweep).
+    if let Some(parent) = dead_red_status_path().parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = proc::atomic_write_json(&dead_red_status_path(), &json!({"seen": seen}));
 }
 
 /// Pull the human detail for a RED probe out of a project's `reasons` list (each entry is
@@ -1632,6 +1712,18 @@ mod tests {
         let empty = allocation_section(&[], &[], &[]);
         assert!(empty.contains("no scalable lanes"));
         assert!(!empty.contains("|")); // no table when there's nothing to rank
+    }
+
+    #[test]
+    fn should_page_dead_red_only_when_stopped_red_and_unpaged() {
+        // stopped + red + not-yet-paged -> page (the sover-stopped-with-RED case).
+        assert!(should_page_dead_red(false, true, false));
+        // a running lane is actually consuming its backlog -> never a dead-red page.
+        assert!(!should_page_dead_red(true, true, false));
+        // probe not red -> never.
+        assert!(!should_page_dead_red(false, false, false));
+        // already paged this (lane, probe) -> suppressed (one deduped page while it persists).
+        assert!(!should_page_dead_red(false, true, true));
     }
 
     #[test]
