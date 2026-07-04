@@ -715,7 +715,8 @@ pub fn defer_backlog_item(ctx: &mut Ctx, goal: &str) -> bool {
                 }
                 lines.push(item);
                 let out = format!("{}\n", lines.join("\n"));
-                return std::fs::write(&ctx.backlog, out).is_ok();
+                // atomic temp+rename (same RMW-race narrowing as backlog::mark_backlog_done).
+                return crate::control::proc::atomic_write_bytes(&ctx.backlog, out.as_bytes()).is_ok();
             }
         }
     }
