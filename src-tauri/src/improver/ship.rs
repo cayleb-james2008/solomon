@@ -92,24 +92,49 @@ fn truncate_chars(s: &str, n: usize) -> String {
 // _pr_checks / _await_pr_checks
 // --------------------------------------------------------------------------- #
 
+/// The three DISTINGUISHABLE outcomes of probing a PR's CI, so a merge decision can tell a repo with
+/// NO CI configured (safe to merge) apart from a repo whose CI status could not be read (gh failed /
+/// unparseable — must NOT be treated as merge-eligible). `pr_checks` collapses this to Option for the
+/// display callers; the merge gate uses the richer form.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChecksProbe {
+    /// gh succeeded and the rollup reduced to a state.
+    State(String),
+    /// gh succeeded and the statusCheckRollup is CONFIRMED empty/absent — no CI configured.
+    NoChecks,
+    /// gh failed, was unparseable, or the PR number was falsy — the CI status is UNKNOWN.
+    Unavailable,
+}
+
 /// run_improver._pr_checks (~1895-1918): reduce a PR's statusCheckRollup to
 /// `Some("success"|"pending"|"failure")` or `None` (no checks / gh failure / unparseable / empty
-/// rollup). `number` is the PR number; a falsy number returns None.
+/// rollup). `number` is the PR number; a falsy number returns None. Thin wrapper over `pr_checks_probe`
+/// that collapses NoChecks/Unavailable to None (unchanged behavior for the display callers).
 pub fn pr_checks(c: &Ctx, number: Option<i64>) -> Option<String> {
-    // `if not number:` — None or 0 is falsy.
+    match pr_checks_probe(c, number) {
+        ChecksProbe::State(s) => Some(s),
+        ChecksProbe::NoChecks | ChecksProbe::Unavailable => None,
+    }
+}
+
+/// Like `pr_checks` but distinguishes 'no CI configured' (`NoChecks`) from 'gh call failed / status
+/// unknown' (`Unavailable`) — a gh outage during the poll window must NOT be folded into the
+/// safe-to-merge 'no CI' branch (that would merge an un-CI'd PR).
+pub fn pr_checks_probe(c: &Ctx, number: Option<i64>) -> ChecksProbe {
+    // `if not number:` — None or 0 is falsy. A falsy number is not a confirmed 'no CI'; unknown.
     let num = match number {
         Some(n) if n != 0 => n,
-        _ => return None,
+        _ => return ChecksProbe::Unavailable,
     };
     let p = c.gh(&["pr", "view", &num.to_string(), "--json", "statusCheckRollup"], 120);
     if p.code != 0 {
-        return None;
+        return ChecksProbe::Unavailable; // gh failed (nonzero exit, incl. 124 timeout) -> unknown
     }
     // rollup = (json.loads(p.stdout or "{}") or {}).get("statusCheckRollup") or []
     let raw = if p.stdout.is_empty() { "{}" } else { &p.stdout };
     let parsed: Value = match serde_json::from_str(raw) {
         Ok(v) => v,
-        Err(_) => return None, // JSONDecodeError -> None
+        Err(_) => return ChecksProbe::Unavailable, // JSONDecodeError -> unknown (NOT 'no CI')
     };
     let rollup = parsed
         .get("statusCheckRollup")
@@ -117,7 +142,7 @@ pub fn pr_checks(c: &Ctx, number: Option<i64>) -> Option<String> {
         .cloned()
         .unwrap_or_default();
     if rollup.is_empty() {
-        return None;
+        return ChecksProbe::NoChecks; // gh succeeded + rollup CONFIRMED empty -> genuinely no CI
     }
     let mut bad = false;
     let mut pend = false;
@@ -137,7 +162,7 @@ pub fn pr_checks(c: &Ctx, number: Option<i64>) -> Option<String> {
             bad = true;
         }
     }
-    Some(if bad {
+    ChecksProbe::State(if bad {
         "failure".to_string()
     } else if pend {
         "pending".to_string()
@@ -157,6 +182,25 @@ pub fn await_pr_checks(c: &Ctx, number: Option<i64>, attempts: i64, delay: f64) 
         last = pr_checks(c, number);
         if last.is_some() {
             return last;
+        }
+        if stop_exists(c) || i >= n - 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs_f64(delay));
+    }
+    last
+}
+
+/// Probe variant of `await_pr_checks`: poll up to `attempts` times, returning the first CONCLUSIVE
+/// probe (a `State`, or a confirmed `NoChecks`). Only `Unavailable` (gh failed / unknown) is retried;
+/// if every attempt is `Unavailable`, returns `Unavailable` — the caller must NOT merge on that.
+fn await_pr_checks_probe(c: &Ctx, number: Option<i64>, attempts: i64, delay: f64) -> ChecksProbe {
+    let mut last = ChecksProbe::Unavailable;
+    let n = attempts.max(1);
+    for i in 0..n {
+        last = pr_checks_probe(c, number);
+        if last != ChecksProbe::Unavailable {
+            return last; // a conclusive State or a confirmed NoChecks — stop polling
         }
         if stop_exists(c) || i >= n - 1 {
             break;
@@ -512,8 +556,10 @@ pub fn auto_merge(c: &mut Ctx, pr: &Value) -> Value {
 /// finishes — poll CI up to CI_WAIT_CEILING_S, then MERGE on green (squash+delete) or REVERT on red
 /// (close PR + delete branch). The CI-red revert is checked BEFORE the STOP halt, so a mid-wait stop
 /// can't strand a known-red PR; a STOP on green/pending leaves the PR open ("open (stopped before
-/// merge)"). No CI configured (None) is merge-eligible. If CI stays pending past the ceiling, hand
-/// off to GitHub native auto-merge.
+/// merge)"). A CONFIRMED 'no CI configured' (empty rollup, gh succeeded) is merge-eligible, but a gh
+/// outage that leaves CI status UNKNOWN is NOT — it leaves the PR open ("open (CI unverifiable)")
+/// rather than merging without verification. If CI stays pending past the ceiling, hand off to
+/// GitHub native auto-merge.
 pub fn wait_for_ci_then_merge(c: &mut Ctx, pr: &Value) -> Value {
     let num = match pr.get("number").and_then(Value::as_i64) {
         Some(n) if n != 0 => n,
@@ -522,12 +568,13 @@ pub fn wait_for_ci_then_merge(c: &mut Ctx, pr: &Value) -> Value {
     c.heartbeat(json!({"phase": "merge"}));
     let deadline = std::time::Instant::now() + Duration::from_secs(CI_WAIT_CEILING_S);
     loop {
-        let mut checks = pr_checks(c, Some(num));
-        if checks.is_none() {
-            // disambiguate 'no CI' from a transient gh blip across a short window.
-            checks = await_pr_checks(c, Some(num), 6, 8.0);
+        let mut probe = pr_checks_probe(c, Some(num));
+        if probe == ChecksProbe::Unavailable {
+            // gh status unknown — re-poll a short window to disambiguate a transient gh blip from a
+            // real 'no CI configured'. Only Unavailable is retried; a State/NoChecks is conclusive.
+            probe = await_pr_checks_probe(c, Some(num), 6, 8.0);
         }
-        if checks.as_deref() == Some("failure") {
+        if probe == ChecksProbe::State("failure".to_string()) {
             // CI RED: ALWAYS auto-revert, even with a pending STOP (checked before the STOP halt).
             c.gh(&["pr", "close", &num.to_string(), "--delete-branch"], 120);
             c.log(&format!("CI RED on PR {num} — closed PR + deleted branch (auto-revert)"));
@@ -537,8 +584,18 @@ pub fn wait_for_ci_then_merge(c: &mut Ctx, pr: &Value) -> Value {
             // a live operator STOP leaves a green/pending PR OPEN (does not ship).
             return with_state(pr, "open (stopped before merge)");
         }
-        // checks in ("success", None)
-        if checks.is_none() || checks.as_deref() == Some("success") {
+        // gh status could not be read across the whole poll window: DO NOT merge an un-CI'd PR (a gh
+        // outage must not be folded into the safe-to-merge 'no CI' branch). Leave the PR open so a
+        // real required check can't be bypassed; the operator/next iteration reconciles it.
+        if probe == ChecksProbe::Unavailable {
+            c.log(&format!(
+                "CI status unverifiable for PR {num} (gh unreachable across the poll window) — \
+                 leaving PR open rather than merging without CI"
+            ));
+            return with_state(pr, "open (CI unverifiable)");
+        }
+        // Merge-eligible ONLY on a CONFIRMED empty rollup (NoChecks) or a green State("success").
+        if probe == ChecksProbe::NoChecks || probe == ChecksProbe::State("success".to_string()) {
             let m = try_squash_merge(c, num);
             if m.code == 0 && confirm_merged(c, num) {
                 // Post-merge ship-gate: verify the MERGED RESULT on origin/main, not just this
@@ -845,6 +902,56 @@ mod tests {
         assert_eq!(ship_outcome(&pr("open (awaiting CI)"), "auto-merge"), "blocked");
     }
 
+    // rsi-supervisor-watchdog-2: the backlog-advance predicate (now ship_outcome=="shipped") and the
+    // history predicate (ship_outcome) must AGREE on an auto-merge-QUEUED PR — it is NOT landed.
+    // ship_succeeded alone (the old advance predicate) wrongly returns true for the queued state.
+    #[test]
+    fn auto_merge_queued_is_not_landed_but_ship_succeeded_disagrees() {
+        let queued = json!({"number": 1, "state": "auto-merge queued (awaiting CI)"});
+        // The OLD advance predicate is wrong here (this is the bug):
+        assert!(
+            ship_succeeded(&queued),
+            "ship_succeeded wrongly treats a queued PR as landed"
+        );
+        // The predicate iteration.rs now uses agrees with history — NOT landed:
+        assert_eq!(ship_outcome(&queued, "auto-merge"), "blocked");
+        assert_ne!(ship_outcome(&queued, "auto-merge"), "shipped");
+        // A confirmed merge IS landed under the same predicate.
+        let merged = json!({"number": 1, "state": "merged"});
+        assert_eq!(ship_outcome(&merged, "auto-merge"), "shipped");
+    }
+
+    // rsi-supervisor-watchdog-3: the ChecksProbe classifier must keep 'no CI configured' (confirmed
+    // empty rollup) distinct from 'gh status unknown', so a gh outage is never merged as safe-no-CI.
+    #[test]
+    fn checks_probe_distinguishes_no_ci_from_unknown() {
+        // An empty rollup is a CONFIRMED no-CI (merge-eligible).
+        assert_eq!(probe_reduce_ok(&json!([])), ChecksProbe::NoChecks);
+        // A green rollup is State("success").
+        let success = json!([{"state": "SUCCESS", "status": "COMPLETED", "conclusion": "SUCCESS"}]);
+        assert_eq!(
+            probe_reduce_ok(&success),
+            ChecksProbe::State("success".to_string())
+        );
+        // Only NoChecks or State("success") are merge-eligible; Unavailable (gh unknown) is NOT.
+        for p in [
+            ChecksProbe::NoChecks,
+            ChecksProbe::State("success".to_string()),
+        ] {
+            assert!(is_merge_eligible(&p), "{p:?} should be merge-eligible");
+        }
+        assert!(
+            !is_merge_eligible(&ChecksProbe::Unavailable),
+            "gh-unknown must NOT be merge-eligible"
+        );
+        assert!(!is_merge_eligible(&ChecksProbe::State(
+            "pending".to_string()
+        )));
+        assert!(!is_merge_eligible(&ChecksProbe::State(
+            "failure".to_string()
+        )));
+    }
+
     #[test]
     fn outcome_pr_mode_defers_to_succeeded() {
         assert_eq!(ship_outcome(&json!({"number": 1, "state": "open"}), "pr"), "shipped");
@@ -941,6 +1048,22 @@ mod tests {
         } else {
             "success".to_string()
         })
+    }
+
+    // Test mirror of pr_checks_probe's SUCCESS-path reduction (gh succeeded): empty rollup ->
+    // NoChecks (confirmed no CI); non-empty -> State(reduced). Mirrors the real reduction so the
+    // NoChecks-vs-State boundary is pinned without a live gh.
+    fn probe_reduce_ok(rollup: &Value) -> ChecksProbe {
+        match reduce_rollup(rollup) {
+            None => ChecksProbe::NoChecks, // gh succeeded + empty rollup == confirmed no CI
+            Some(s) => ChecksProbe::State(s),
+        }
+    }
+
+    // The merge-eligibility rule used by wait_for_ci_then_merge: only a confirmed NoChecks or a green
+    // State("success") may merge; Unavailable (gh unknown), pending, and failure may NOT.
+    fn is_merge_eligible(p: &ChecksProbe) -> bool {
+        *p == ChecksProbe::NoChecks || *p == ChecksProbe::State("success".to_string())
     }
 
     // ---- parse_merged_at: the merge-verification gate (ship-bug fix) ----

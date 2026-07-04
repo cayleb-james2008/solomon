@@ -41,6 +41,46 @@ use std::os::windows::process::CommandExt;
 /// diagnose() stamps `auto_safe` per-category.)
 const AUTO_SAFE: &[&str] = &["stale_lock", "stop_lingering", "dirty_tree", "stuck"];
 
+// Per-sweep heavy-spawn budget, shared across every repo in ONE sweep loop. recover()'s restart /
+// solomon_fix_session paths each spawn a heavy cargo-gated process; without a shared cap, a sweep
+// where N lanes diagnose as `stuck` (etc.) fires N simultaneous restarts and can re-trigger the
+// multi-lane disk-meltdown class the crash-restart path is already capped against. A sweep loop
+// arms this budget once via `with_restart_budget`; each heavy spawn calls `spend_restart_budget`.
+// Unset (tests, non-sweep callers) => unlimited (None), preserving existing behavior.
+thread_local! {
+    static RESTART_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Arm the per-sweep restart budget for the duration of `f` (a sweep loop over repos), then restore
+/// the prior value. All recover() heavy spawns invoked inside `f` share and decrement this budget.
+pub fn with_restart_budget<T>(budget: usize, f: impl FnOnce() -> T) -> T {
+    let prev = RESTART_BUDGET.with(|b| b.replace(Some(budget)));
+    let out = f();
+    RESTART_BUDGET.with(|b| b.set(prev));
+    out
+}
+
+/// The current armed budget remaining (0 when exhausted or unset). Lets a sweep bridge the shared
+/// crash-restart Cell with recover()'s spends: arm from the Cell, run recover(), read the remainder
+/// back into the Cell so both paths draw from ONE per-sweep pool.
+pub fn restart_budget_remaining() -> usize {
+    RESTART_BUDGET.with(|b| b.get().unwrap_or(0))
+}
+
+/// Reserve one heavy-spawn slot from the per-sweep budget. Returns true (and decrements) when a spawn
+/// is permitted; false when the budget is exhausted (caller must defer to a later sweep). When no
+/// budget is armed (None), always permits — non-sweep callers and tests are uncapped as before.
+fn spend_restart_budget() -> bool {
+    RESTART_BUDGET.with(|b| match b.get() {
+        None => true,
+        Some(0) => false,
+        Some(n) => {
+            b.set(Some(n - 1));
+            true
+        }
+    })
+}
+
 /// solomon._now: `datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")`.
 fn now() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
@@ -122,13 +162,18 @@ fn push_base_if_ahead(repo: &Value) -> Value {
         _ => return json!({"pushed": false, "diverged": false, "error": "git/path unavailable"}),
     };
     let git_s = git.to_string_lossy().into_owned();
+    // BOUNDED timeout: this runs on the watchdog SWEEP thread. An unreachable/prompting remote must
+    // not wedge the whole in-app tick forever (a `git fetch` against a hung remote or a credential
+    // prompt on the null stdin would block a None-timeout cmd.output() indefinitely). On timeout,
+    // proc::run returns Err(TimedOut) which the outer match maps to {pushed:false, ...} so recover()
+    // escalates rather than hanging the sweep.
     let g = |args: &[&str]| -> std::io::Result<proc::RunOut> {
         let mut full: Vec<&str> = Vec::with_capacity(args.len() + 3);
         full.push(git_s.as_str());
         full.push("-C");
         full.push(&path);
         full.extend_from_slice(args);
-        proc::run(&full, None, None)
+        proc::run(&full, None, Some(Duration::from_secs(30)))
     };
 
     // Whole try-block: any OSError/ValueError -> {pushed:false, diverged:false, error:str(e)}.
@@ -853,9 +898,16 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
             format!("recovered: reset_to_base, cleanup_worktrees (removed {removed} rsi/* branch(es))")
         };
         if allow_restart {
-            runner::start(repo, auto_push, false);
-            actions.push("restart".into());
-            msg.push_str(", restart");
+            if spend_restart_budget() {
+                runner::start(repo, auto_push, false);
+                actions.push("restart".into());
+                msg.push_str(", restart");
+            } else {
+                actions.push("restart_deferred".into());
+                msg.push_str(
+                    ", restart DEFERRED (per-sweep restart budget spent — retries next sweep)",
+                );
+            }
         }
         return finish(repo, &d, actions, false, &msg);
     }
@@ -910,7 +962,19 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
                             .unwrap_or(false)
                 })
                 .count();
-            if prior_heals < 3 {
+            // A non-restartable sweep (allow_restart=false, e.g. auto_push OFF) must NOT stop a lane
+            // it cannot bring back: the stop would write status="stopped", the next sweep's
+            // should_restart() returns false for "stopped", and the lane is euthanized forever with a
+            // fresh backlog and nothing running — masked as escalate=false "recovered". Only run the
+            // stop+ideate+restart cycle when we CAN restart; otherwise fall through to escalate (page).
+            if allow_restart && prior_heals < 3 {
+                // Reserve the restart slot BEFORE stopping — this cycle stops the lane, so if the
+                // per-sweep restart budget is spent we must NOT stop (a stop we cannot follow with a
+                // restart euthanizes the lane). Defer the whole action to a later sweep instead.
+                if !spend_restart_budget() {
+                    return finish(repo, &d, vec!["restart_deferred".into()], false,
+                        "noop_streak recovery deferred (per-sweep restart budget spent — retries next sweep)");
+                }
                 runner::stop(repo);
                 actions.push("stop".into());
                 for _ in 0..10 {
@@ -926,10 +990,8 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
                 }
                 let ir = runner::ideate(repo);
                 actions.push("ideate".into());
-                if allow_restart {
-                    runner::start(repo, auto_push, false);
-                    actions.push("restart".into());
-                }
+                runner::start(repo, auto_push, false);
+                actions.push("restart".into());
                 if !ir.get("ok").and_then(Value::as_bool).unwrap_or(false) {
                     let err = ir.get("error").and_then(Value::as_str).unwrap_or("?");
                     let m = format!("backlog refill failed ({err}) — escalating");
@@ -981,6 +1043,18 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
             return finish(repo, &d, actions, true, &m);
         }
     } else if cat == "stuck" {
+        // Reserve the restart slot BEFORE stopping: this branch stops then restarts, so if the
+        // per-sweep restart budget is spent (N lanes already restarted this sweep) we must NOT stop
+        // (a stop we cannot follow with a restart leaves the lane down). Defer to a later sweep.
+        if !spend_restart_budget() {
+            return finish(
+                repo,
+                &d,
+                vec!["restart_deferred".into()],
+                false,
+                "stuck recovery deferred (per-sweep restart budget spent — retries next sweep)",
+            );
+        }
         runner::stop(repo);
         actions.push("stop".into());
         for _ in 0..10 {
@@ -1006,6 +1080,13 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
         if locks::is_running(repo) {
             return finish(repo, &d, actions, true,
                 "loop is live — stop it before running a Solomon fix-session");
+        }
+        // A fix-session spawns a whole run-improver process doing a cargo build — the heaviest spawn
+        // in recover(). Respect the same per-sweep budget so N gate-red lanes can't fire N builds at
+        // once. Defer to a later sweep when the budget is spent.
+        if !spend_restart_budget() {
+            return finish(repo, &d, actions, false,
+                "Solomon fix-session deferred (per-sweep restart budget spent — retries next sweep)");
         }
         let r = solomon_fix_session(repo, auto_push);
         actions.push("solomon_fix_session".into());
@@ -2172,5 +2253,36 @@ mod tests {
         // also for the ollama-cloud provider shape
         let repo2 = json!({ "name": "kpr_2", "provider": "ollama-cloud", "api_key": "oc-key-abc" });
         assert!(keys_provider_ready(&repo2), "per-repo api_key must count as ready for any provider");
+    }
+
+    // ---------------- per-sweep restart budget (rsi-supervisor-watchdog-1) ----------------
+    // recover()'s restart / fix-session paths must respect a shared per-sweep heavy-spawn cap so a
+    // sweep touching several unhealthy lanes can't fire N simultaneous cargo-gated processes.
+    #[test]
+    fn restart_budget_caps_heavy_spawns_across_a_sweep() {
+        // Unset (no sweep armed) -> uncapped: every spend permits (tests / non-sweep callers).
+        assert!(spend_restart_budget(), "unset budget must permit");
+        assert!(spend_restart_budget(), "unset budget must permit again");
+
+        // Armed with 2 -> exactly two spends permitted, the third deferred; the remainder is readable
+        // so a multi-repo sweep can carry ONE pool across repos.
+        with_restart_budget(2, || {
+            assert_eq!(restart_budget_remaining(), 2);
+            assert!(spend_restart_budget(), "1st heavy spawn permitted");
+            assert_eq!(restart_budget_remaining(), 1);
+            assert!(spend_restart_budget(), "2nd heavy spawn permitted");
+            assert_eq!(restart_budget_remaining(), 0);
+            assert!(
+                !spend_restart_budget(),
+                "3rd heavy spawn must be DEFERRED (budget spent)"
+            );
+            assert!(!spend_restart_budget(), "still deferred while exhausted");
+        });
+
+        // Budget is restored to the prior (unset) state after the sweep scope exits.
+        assert!(
+            spend_restart_budget(),
+            "budget unset again after with_restart_budget scope"
+        );
     }
 }
