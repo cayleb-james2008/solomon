@@ -26,6 +26,7 @@
 // Deterministic growth sub-planes wired into `tick`/`morning_plan`: fleet ROI ranking (allocate),
 // bounded reversible interval tightening (scale), and the sover produce/post profit boost.
 pub mod allocate;
+pub mod focus;
 pub mod scale;
 pub mod sover_boost;
 
@@ -143,6 +144,11 @@ pub fn tick() {
     }));
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         sover_boost::maybe_boost(&snapshot, &status)
+    }));
+    // DEEP-WORK FOCUS (Polsia): concentrate one top-leverage lane's next milestone into ordered
+    // [campaign] steps; the other lanes keep their health-only baseline above. Same fresh snapshot.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        focus::maybe_focus(&snapshot, &status)
     }));
 
     let now = chrono::Local::now();
