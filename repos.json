@@ -1,7 +1,8 @@
 [
     {
-        "fleet": {
-            "mode": "single_fleet",
+        "autopilot": {
+            "mode": "single_agent",
+            "mission": "Autonomously improve, ship, monitor, and grow managed projects toward their stated end goals with one efficient Solomon agent, preserving safety gates and proof.",
             "provider": "openrouter",
             "api_key": "OPENROUTER_API_KEY",
             "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
