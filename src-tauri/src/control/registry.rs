@@ -506,10 +506,13 @@ pub fn add_project(spec: &str) -> Value {
     let dest = projects.join(&name);
     let gh_s = gh_exe.to_string_lossy().into_owned();
     let dest_s = dest.to_string_lossy().into_owned();
+    // Bounded timeout (network clone on a UI handler thread) — a hung/unreachable GitHub or a
+    // credential prompt on the null stdin must not block the handler forever. 5 min is generous for
+    // a large repo; on timeout the Err branch returns {ok:false,error} instead of hanging.
     let r = match proc::run(
         &[gh_s.as_str(), "repo", "clone", spec.trim(), dest_s.as_str()],
         Some(&projects),
-        None,
+        Some(std::time::Duration::from_secs(300)),
     ) {
         Ok(r) => r,
         Err(e) => return json!({"ok": false, "error": e.to_string()}),

@@ -91,7 +91,34 @@ pub fn run<S: AsRef<OsStr>>(
     cwd: Option<&Path>,
     timeout: Option<Duration>,
 ) -> std::io::Result<RunOut> {
-    let mut cmd = build(args, cwd);
+    run_prepared(build(args, cwd), timeout)
+}
+
+/// Windows-only: run the operator's custom base-gate command via `cmd /C <gate>` with the gate string
+/// passed through `raw_arg` so cmd.exe receives it BYTE-FOR-BYTE. Rust's normal arg quoting is NOT
+/// cmd.exe's parsing algorithm, so a gate command containing a quoted path-with-spaces (or other
+/// cmd metachars) would be re-split/mangled by cmd.exe and spuriously fail the gate — a silent
+/// false-RED that pins recovery. raw_arg bypasses Rust's quoting for the payload. Same scrubbed env
+/// + hidden window + bounded timeout as `run`.
+#[cfg(windows)]
+pub fn run_win_shell(
+    gate_cmd: &str,
+    cwd: Option<&Path>,
+    timeout: Option<Duration>,
+) -> std::io::Result<RunOut> {
+    let mut cmd = Command::new("cmd");
+    // `/C` is a normal token; the gate payload is raw so cmd.exe parses it, not Rust.
+    cmd.arg("/C").raw_arg(gate_cmd);
+    if let Some(c) = cwd {
+        cmd.current_dir(c);
+    }
+    apply_clean_env(&mut cmd);
+    apply_hidden(&mut cmd);
+    run_prepared(cmd, timeout)
+}
+
+/// Shared spawn + (optional) bounded-timeout capture for a fully-prepared Command.
+fn run_prepared(mut cmd: Command, timeout: Option<Duration>) -> std::io::Result<RunOut> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

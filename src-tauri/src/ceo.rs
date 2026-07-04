@@ -168,7 +168,9 @@ pub fn tick() {
                 "Solomon: morning plan FAILED".into(),
                 format!("{MAX_ATTEMPTS} attempts failed — lanes continue on standing goals today"),
             ));
-            st["plan"] = json!({"done": today});
+            // Distinguishable give-up sentinel (NOT a plain success): the dashboard renders this as
+            // 'gave up', not a green 'done', so an unplanned day is never shown as planned.
+            st["plan"] = json!({"done": today, "gave_up": true});
         } else {
             st["plan"] = new_sec;
         }
@@ -518,7 +520,7 @@ fn ops_red_backlog_graft() {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or(Value::Null);
-        let verdict_probes = verdict.get("probes").and_then(Value::as_object).cloned().unwrap_or(Value::Null);
+        let verdict_probes = verdict.get("probes").cloned().unwrap_or(Value::Null);
 
         // Which OUTCOME probes are RED for this project? (per-probe status map, whitelist-filtered)
         let probes = match proj.get("probes").and_then(Value::as_object) {
@@ -595,7 +597,7 @@ fn ops_red_backlog_graft() {
                 .and_then(|v| v.get("detail"))
                 .and_then(Value::as_str)
                 .unwrap_or("pre-red (consecutive_red >= 2)");
-            ensure_ops_item(name, probe, detail, &today);
+            ensure_ops_item(name, probe, detail, &today, "pre_red");
         }
 
         // --- Deploy-gap gate: binary_current (git_sha_match) probe YELLOW with "deploy gap" ---
@@ -607,7 +609,7 @@ fn ops_red_backlog_graft() {
                 .and_then(Value::as_str)
                 .unwrap_or("");
             if detail.contains("deploy gap") {
-                ensure_ops_item(name, "binary_current", detail, &today);
+                ensure_ops_item(name, "binary_current", detail, &today, "deploy_gap");
             }
         }
     }
@@ -1699,7 +1701,7 @@ mod tests {
     fn ops_red_graft_marker_line_and_idempotence() {
         // the stable per-(project, probe) marker + the exact prepended line shape
         assert_eq!(ops_marker("publish_recency"), "[ops-auto:publish_recency]");
-        let line = ops_item_line("publish_recency", "age 37.2h", "2026-07-03");
+        let line = ops_item_line("publish_recency", "age 37.2h", "2026-07-03", "red");
         assert!(line.starts_with("- [ ] [reliability][ops-auto:publish_recency] "));
         assert!(line.contains("publish_recency has been RED (age 37.2h)"));
         assert!(line.contains("fix the actual posting/trade/app path"));

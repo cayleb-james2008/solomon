@@ -76,13 +76,23 @@ pub fn tree_dirty(ctx: &Ctx) -> bool {
 /// in the working tree, each stripped of the leading `"?? "` and trailing whitespace. Pure
 /// (delegates to git()) so the guard rule is unit-testable.
 pub fn untracked_non_ignored_files(ctx: &Ctx) -> Vec<String> {
+    // `-z` gives NUL-terminated entries with the path VERBATIM (never git-quoted/octal-escaped).
+    // Without it, git's default core.quotePath double-quotes + octal-escapes non-ASCII/space names
+    // (e.g. `?? "w\303\251ird.txt"`), so the stored string would carry literal surrounding quotes
+    // and \NNN escapes — mis-classifying a genuine agent artifact with such a name as operator work.
     let out = ctx
-        .git(&["status", "--porcelain", "--untracked-files=normal"], 120)
+        .git(
+            &["status", "--porcelain", "-z", "--untracked-files=normal"],
+            120,
+        )
         .stdout;
     let mut files = Vec::new();
-    for line in out.lines() {
-        if let Some(rest) = line.strip_prefix("?? ") {
-            files.push(rest.trim().to_string());
+    for entry in out.split('\0') {
+        // Each `??` entry is exactly `?? <path>` (2 status chars + 1 space, then the literal path).
+        if let Some(rest) = entry.strip_prefix("?? ") {
+            if !rest.is_empty() {
+                files.push(rest.to_string());
+            }
         }
     }
     files
@@ -406,10 +416,16 @@ pub fn reconcile_preflight_stashes(ctx: &mut Ctx) {
 /// purposes and may be safely dropped. Pure over `ctx.git` results + `is_agent_artifact`.
 fn stash_has_real_content(ctx: &Ctx, ref_str: &str, extra: &[Regex]) -> bool {
     // Tracked changes (git stash show --name-only lists modified tracked files only).
-    let tracked = ctx
-        .git(&["stash", "show", "--name-only", ref_str], 120)
-        .stdout;
-    for line in tracked.lines() {
+    // If the inspection itself FAILS (timeout -> code=124 under CPU contention, or any error),
+    // stdout is empty and we cannot know the stash is empty. Treat a failed inspection as
+    // "unknown -> assume real content" (retain), mirroring the conservative `code == 0` guard on
+    // the untracked `^3` path below. Collapsing a failed inspection to "empty -> drop" would let a
+    // tracked-only stash be permanently dropped, violating the HARD INVARIANT at line ~357.
+    let tracked = ctx.git(&["stash", "show", "--name-only", ref_str], 120);
+    if tracked.code != 0 {
+        return true;
+    }
+    for line in tracked.stdout.lines() {
         let f = line.trim();
         if !f.is_empty() && !is_agent_artifact(f, Some(extra)) {
             return true;
@@ -423,6 +439,13 @@ fn stash_has_real_content(ctx: &Ctx, ref_str: &str, extra: &[Regex]) -> bool {
         &["ls-tree", "--name-only", &format!("{ref_str}^3")],
         120,
     );
+    // A missing `^3` parent (no --include-untracked) legitimately fails with git's code 128 -> the
+    // stash simply has no untracked content, fall through to droppable. But a TRANSIENT timeout
+    // (code 124) means we could NOT inspect it, so we must NOT conclude "empty -> drop": retain,
+    // mirroring the tracked path's fail-safe. (Only 124 -> unknown; 128 -> genuinely no untracked.)
+    if untracked.code == 124 {
+        return true;
+    }
     if untracked.code == 0 {
         for line in untracked.stdout.lines() {
             let f = line.trim();
@@ -606,12 +629,15 @@ pub fn prune_stale_rsi_branches(ctx: &Ctx) -> i64 {
         if b.is_empty() || b == cur {
             continue;
         }
-        let unmerged = ctx
-            .git(&["rev-list", &format!("{}..{}", ctx.base_branch, b)], 120)
-            .stdout
-            .trim()
-            .to_string();
-        if unmerged.is_empty() && ctx.git(&["branch", "-D", b], 120).code == 0 {
+        // `git rev-list <base>..<b>` writes commits to STDOUT only on SUCCESS; on ANY failure
+        // (misconfigured base, timeout -> code=124, etc.) it exits non-zero with EMPTY stdout.
+        // A failed rev-list must NOT be trusted as "merged" — that would force-delete a branch
+        // carrying unmerged commits, breaking this function's NEVER-force-delete invariant.
+        let rl = ctx.git(&["rev-list", &format!("{}..{}", ctx.base_branch, b)], 120);
+        if rl.code == 0
+            && rl.stdout.trim().is_empty()
+            && ctx.git(&["branch", "-D", b], 120).code == 0
+        {
             pruned += 1;
         }
     }
@@ -1085,6 +1111,101 @@ mod tests {
         );
 
         // Cleanup.
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    // ---- prune_stale_rsi_branches: a FAILED rev-list must not force-delete an unmerged branch ----
+
+    /// git-worktree-0: when `git rev-list <base>..<b>` FAILS (here: a misconfigured/renamed
+    /// base_branch that does not exist), it exits non-zero with EMPTY stdout. The pruner must NOT
+    /// treat that empty stdout as "merged" and force-delete the branch — the rsi/* branch carries an
+    /// unmerged commit and must be RETAINED.
+    #[test]
+    fn prune_skips_branch_when_rev_list_fails() {
+        let (mut c, dir) = real_repo_ctx();
+
+        // Create an rsi/* branch carrying an UNMERGED commit (unreachable from base).
+        c.git(&["checkout", "-b", "rsi/iter-keep"], 10);
+        std::fs::write(dir.join("ship.py"), "print('gate-green ship')\n").unwrap();
+        c.git(&["add", "-A"], 10);
+        c.git(&["commit", "--quiet", "-m", "unmerged local-ship work"], 10);
+        // Back to base so the pruner won't skip it as the current branch.
+        c.git(&["checkout", "--force", &c.base_branch], 10);
+
+        // Misconfigure the base so `git rev-list <BOGUS>..rsi/iter-keep` exits 128 with empty stdout.
+        c.base_branch = "does-not-exist-base".to_string();
+
+        let pruned = prune_stale_rsi_branches(&c);
+
+        assert_eq!(
+            pruned, 0,
+            "a branch whose merged-ness could not be verified must NOT be pruned"
+        );
+        let branches = c.git(&["branch", "--list", "rsi/*"], 10).stdout;
+        assert!(
+            branches.contains("rsi/iter-keep"),
+            "the unmerged rsi/* branch must be RETAINED when rev-list fails, not force-deleted"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    /// git-worktree-2/5 (conservative retention): a preflight stash carrying REAL tracked-only
+    /// content (a modified tracked operator file, no untracked `^3` files) is recognized as having
+    /// real content and is recovered to a branch, never silently dropped.
+    #[test]
+    fn stash_tracked_only_real_content_is_retained() {
+        let (mut c, dir) = real_repo_ctx();
+
+        // A tracked operator file (not an agent artifact), modified but NOT committed -> the stash
+        // will have tracked changes and NO untracked `^3` parent.
+        std::fs::write(dir.join("operator.py"), "print('v1')\n").unwrap();
+        c.git(&["add", "-A"], 10);
+        c.git(&["commit", "--quiet", "-m", "add operator file"], 10);
+        std::fs::write(dir.join("operator.py"), "print('v2 real work')\n").unwrap();
+
+        assert!(auto_stash_base(&mut c, "rsi/iter-test"));
+        let ref0 = "stash@{0}";
+        let extra = repo_artifact_patterns(&c, &c.name.clone());
+        assert!(
+            stash_has_real_content(&c, ref0, &extra),
+            "a tracked-only real-content stash must be recognized as having real content"
+        );
+
+        reconcile_preflight_stashes(&mut c);
+
+        let branches = c
+            .git(&["branch", "--list", "solomon-recovered/*"], 10)
+            .stdout;
+        assert!(
+            !branches.trim().is_empty(),
+            "tracked-only real work must be recovered to a branch, never dropped"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    /// git-worktree-3: an untracked file whose name contains a space is returned as the LITERAL
+    /// path (no surrounding quotes / octal escapes), so start-anchored artifact patterns still match.
+    #[test]
+    fn untracked_space_name_is_unquoted() {
+        let (c, dir) = real_repo_ctx();
+
+        std::fs::write(dir.join("a file with spaces.txt"), "x\n").unwrap();
+        let files = untracked_non_ignored_files(&c);
+
+        assert!(
+            files.iter().any(|f| f == "a file with spaces.txt"),
+            "space-containing untracked path must be the literal name, not git-quoted; got {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.starts_with('"')),
+            "no entry should carry a leading git quote character; got {files:?}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&c.runtime);
     }
