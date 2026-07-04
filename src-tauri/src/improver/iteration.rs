@@ -367,6 +367,9 @@ Have the gate print a pytest-style 'N passed' or unittest 'Ran N tests' summary.
     let task: String;
     let system_md: Option<std::path::PathBuf>;
     let mut item_deviated = false;
+    // TIER -> BUDGET: the per-item implement timeout, defaulting to the standard wall; the normal
+    // (non-beautify/non-solomon) path may raise it to TIMEOUT_DEEP for an architecture/[campaign] item.
+    let mut item_timeout: i64 = pi::TIMEOUT_IMPLEMENT;
 
     if ctx.solomon {
         goal = "supervise: diagnose and fix the persistent gate failure".to_string();
@@ -407,6 +410,13 @@ Then stop."
             return;
         }
         escalation::apply_fallback_model(ctx, &g); // escalation rung 1
+        // TIER -> BUDGET: top reasoning for deeper tiers + a longer wall for the deepest, so an
+        // ambitious [feature]/[architecture]/[campaign] slice isn't guillotined and reverted to a
+        // noop. Runs AFTER apply_fallback_model (never touches the model — the escalation ladder owns
+        // that) and BEFORE the plan phase, whose phase_run_pi save/restore preserves this reasoning.
+        let (tier_reasoning, tier_timeout) = tier_budget(&tier, &ctx.reasoning, pi::TIMEOUT_IMPLEMENT);
+        ctx.reasoning = tier_reasoning;
+        item_timeout = tier_timeout;
         let mut t = escalation::build_task(ctx, &g, &tier);
         // PLAN phase.
         if ctx.plan_enabled && !g.is_empty() {
@@ -446,7 +456,7 @@ Then stop."
     let implement_timeout = if ctx.beautify {
         pi::TIMEOUT_BEAUTIFY
     } else {
-        pi::TIMEOUT_IMPLEMENT
+        item_timeout // TIER -> BUDGET: TIMEOUT_DEEP for an architecture/[campaign] item, else standard
     };
     let p = pi::run_pi(ctx, &task, implement_timeout, system_md.as_deref());
     // pi::run_pi never panics: a timeout returns rc=124, a spawn failure rc<0 with empty stdout.
@@ -1604,9 +1614,54 @@ fn fmt_float(x: f64) -> String {
 // the loop's integration tests; here we pin the byte-exact parser behavior.
 // --------------------------------------------------------------------------- #
 
+/// (reasoning, implement-timeout) budget for a backlog item by its tier — pure, unit-tested. A
+/// `chore` keeps the loop's configured reasoning and the standard implement wall (its smallest-change
+/// ceiling is unchanged). `feature`/`refactor` are guaranteed top reasoning. `architecture` (the
+/// deepest tier — also what ordered `[campaign]` steps carry) additionally gets `pi::TIMEOUT_DEEP` so
+/// a genuinely large, multi-file slice is not killed at the 3600s wall and reverted to a noop. Model
+/// is deliberately NOT decided here: the implement phase already runs the lane's main model, and the
+/// failure-escalation ladder (`apply_fallback_model`, run just before this) owns model swaps — so
+/// tier_budget never clobbers an in-flight fallback escalation.
+pub fn tier_budget(tier: &str, base_reasoning: &str, base_timeout: i64) -> (String, i64) {
+    match tier {
+        "feature" | "refactor" => ("xhigh".to_string(), base_timeout),
+        "architecture" => ("xhigh".to_string(), pi::TIMEOUT_DEEP),
+        // chore (and any unrecognized tag, e.g. the [reliability] intent tag) unchanged.
+        _ => (base_reasoning.to_string(), base_timeout),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tier_budget_lifts_reasoning_and_deep_timeout() {
+        // chore: untouched (byte-identical to before) — keeps the loop's reasoning + standard wall.
+        assert_eq!(
+            tier_budget("chore", "medium", pi::TIMEOUT_IMPLEMENT),
+            ("medium".to_string(), pi::TIMEOUT_IMPLEMENT)
+        );
+        // feature/refactor: top reasoning, standard wall.
+        assert_eq!(
+            tier_budget("feature", "low", pi::TIMEOUT_IMPLEMENT),
+            ("xhigh".to_string(), pi::TIMEOUT_IMPLEMENT)
+        );
+        assert_eq!(
+            tier_budget("refactor", "medium", pi::TIMEOUT_IMPLEMENT),
+            ("xhigh".to_string(), pi::TIMEOUT_IMPLEMENT)
+        );
+        // architecture (deepest; also what [campaign] steps carry): top reasoning + deep wall.
+        assert_eq!(
+            tier_budget("architecture", "xhigh", pi::TIMEOUT_IMPLEMENT),
+            ("xhigh".to_string(), pi::TIMEOUT_DEEP)
+        );
+        // an unrecognized tag (e.g. the [reliability] intent tag ops/hygiene items carry) is unchanged.
+        assert_eq!(
+            tier_budget("reliability", "xhigh", pi::TIMEOUT_IMPLEMENT),
+            ("xhigh".to_string(), pi::TIMEOUT_IMPLEMENT)
+        );
+    }
 
     fn ctx() -> Ctx {
         use std::sync::atomic::{AtomicU64, Ordering};

@@ -801,6 +801,10 @@ pub fn phase_run_pi(
 /// OpenRouter models (owl-alpha, nemotron free tier) have enough time to complete a real coding
 /// task. The prior 30-min ceiling timed out every free-tier model before it could finish.
 pub const TIMEOUT_IMPLEMENT: i64 = 3600;
+/// deep-tier (architecture / ordered [campaign]) implement timeout — a genuinely large, multi-file
+/// slice needs more than the standard wall before it is killed and reverted to a noop (the 3600s
+/// guillotine). run_improver had no equivalent; this is Solomon's deep-work budget lever.
+pub const TIMEOUT_DEEP: i64 = 5400;
 /// beautify pass timeout. run_improver: `run_pi(..., timeout=900)` (skips the gate).
 pub const TIMEOUT_BEAUTIFY: i64 = 900;
 /// decompose/review/ideate/provision one-off timeout. run_improver: `timeout=600`.
