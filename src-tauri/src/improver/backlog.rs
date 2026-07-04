@@ -114,25 +114,67 @@ pub fn unchecked_backlog_count(ctx: &Ctx) -> i64 {
         .count() as i64
 }
 
-/// run_improver._top_backlog_item (~1713-1722): `(text, tier)` of the FIRST unchecked `- [ ]` item,
-/// tier from its leading tag (default `"chore"`). When the file is unreadable (OSError) or has no
-/// unchecked item, returns the placeholder `("model-chosen improvement", "chore")`.
+/// Priority bucket for an unchecked backlog item's body text (LOWER = picked first). This is the
+/// Polsia priority contract: a real broken-product fix (`[ops-auto:<probe>]` — a RED outcome) is
+/// worked BEFORE an ordered deep-work `[campaign:<slug>]` step, which is worked before the CEO's
+/// daily growth goal (`(ceo <date>)`), which is worked before everything else (hygiene items, plain
+/// chores) in file order. So a graft prepended anywhere, or a campaign step, wins the picker no
+/// matter where in the file it landed — a RED can never sit buried behind an unresolvable
+/// `[hygiene-auto:...]` item. Pure — unit-tested. Markers match the exact strings the CEO grafts
+/// write (`ceo::ops_marker` -> `[ops-auto:`, `ceo::ceo_marker` -> `(ceo `, and the Phase-5
+/// `[campaign:` slug marker).
+pub fn backlog_item_rank(body: &str) -> u8 {
+    if body.contains("[ops-auto:") {
+        0
+    } else if body.contains("[campaign:") {
+        1
+    } else if body.contains("(ceo ") {
+        2
+    } else {
+        3
+    }
+}
+
+/// `(text, tier)` of the highest-PRIORITY actionable backlog item, then its leading-tag tier
+/// (default `"chore"`). "Actionable" == an unchecked `- [ ]` line that is NOT already deferred (a
+/// `(deferred` note — `escalation::defer_backlog_item` moves those to the bottom precisely so they
+/// are never re-picked, the infinite-loop the escalation ladder exists to prevent). Among the
+/// actionable items the lowest `backlog_item_rank` wins; ties keep file order (top-down). When the
+/// file is unreadable (OSError) or has no actionable item, returns the placeholder
+/// `("model-chosen improvement", "chore")`.
 ///
-/// Bug-for-bug: iterate lines top-down; first line whose STRIPPED form starts with `- [ ]` ->
-/// `strip_tier(s[5:].strip())`. `s[5:]` slices the 5-byte `- [ ]` prefix off (the line was matched on
-/// its stripped form, so byte 5 is always just past the prefix), then `.strip()` before tier parsing.
+/// This REPLACES the former "first `- [ ]` line" pick with a priority scan. For a backlog whose
+/// unchecked items are all the same rank (the common case) it is byte-identical to top-down order.
+/// One intentional behavior change vs the old pick: an all-deferred backlog now returns the
+/// placeholder (not a deferred item), so a known-failing item is never re-run.
 pub fn top_backlog_item(ctx: &Ctx) -> Option<(String, String)> {
     if let Ok(content) = std::fs::read_to_string(&ctx.backlog) {
+        let mut best: Option<(u8, String)> = None; // (rank, body); first item of the min rank wins
         for line in content.lines() {
             let s = line.trim();
             if let Some(after) = s.strip_prefix("- [ ]") {
-                // s[5:].strip() — slice past "- [ ]" (5 bytes, all ASCII) then strip.
-                let rest = after.trim();
-                return Some(strip_tier(rest));
+                // actionable == not deferred (tested on the RAW line, mirroring the source's
+                // `"(deferred" not in ln` in unchecked_backlog_count).
+                if line.contains("(deferred") {
+                    continue;
+                }
+                let body = after.trim();
+                let rank = backlog_item_rank(body);
+                // Strictly-lower rank replaces; an equal rank keeps the earlier (already-stored)
+                // item, so ties break by file order with no index bookkeeping.
+                if best.as_ref().map(|(r, _)| rank < *r).unwrap_or(true) {
+                    best = Some((rank, body.to_string()));
+                    if rank == 0 {
+                        break; // rank 0 is the ceiling — nothing later can outrank it.
+                    }
+                }
             }
         }
+        if let Some((_, body)) = best {
+            return Some(strip_tier(&body));
+        }
     }
-    // OSError pass OR loop fell through with no match -> the placeholder default.
+    // OSError pass OR no actionable item -> the placeholder default.
     Some(("model-chosen improvement".to_string(), "chore".to_string()))
 }
 
@@ -167,7 +209,9 @@ pub fn mark_backlog_done(ctx: &Ctx, goal: &str) {
             lines[i] = replace_first(&lines[i], "- [ ]", "- [x]");
             // "\n".join(lines) + "\n"
             let out = format!("{}\n", lines.join("\n"));
-            let _ = std::fs::write(&ctx.backlog, out.as_bytes()); // OSError -> pass
+            // atomic temp+rename: narrows the read-modify-write race with the CEO grafts / focus
+            // allocator that also prepend to this file (a plain write can be observed half-written).
+            let _ = crate::control::proc::atomic_write_bytes(&ctx.backlog, out.as_bytes()); // OSError -> pass
             return;
         }
     }
@@ -370,6 +414,80 @@ mod tests {
         );
         // missing file -> same placeholder
         let c2 = test_ctx("top_missing");
+        assert_eq!(
+            top_backlog_item(&c2),
+            Some(("model-chosen improvement".to_string(), "chore".to_string()))
+        );
+    }
+
+    // ---- backlog_item_rank + priority picker (the Polsia priority contract) ----
+    #[test]
+    fn backlog_item_rank_buckets() {
+        // ops-auto RED is the top bucket, then a campaign step, then the daily ceo goal, then rest.
+        assert_eq!(
+            backlog_item_rank("[reliability][ops-auto:publish_recency_tiktok] fix it"),
+            0
+        );
+        assert_eq!(backlog_item_rank("[feature] [campaign:harden-auth] step 1"), 1);
+        assert_eq!(backlog_item_rank("[feature] grow followers (ceo 2026-07-04)"), 2);
+        assert_eq!(backlog_item_rank("[reliability][hygiene-auto:dirty] clean up"), 3);
+        assert_eq!(backlog_item_rank("plain chore"), 3);
+    }
+
+    #[test]
+    fn top_item_ops_auto_outranks_hygiene_and_ceo_regardless_of_position() {
+        let c = test_ctx("rank_ops");
+        // hygiene sits ABOVE the ops-auto RED — the exact "reds buried behind hygiene" case.
+        write_backlog(
+            &c,
+            "- [ ] [reliability][hygiene-auto:dirty] clean up the tree\n\
+             - [ ] grow followers (ceo 2026-07-04)\n\
+             - [ ] [reliability][ops-auto:publish_recency_tiktok] tiktok RED — fix posting\n",
+        );
+        let (goal, _tier) = top_backlog_item(&c).unwrap();
+        assert!(goal.contains("[ops-auto:publish_recency_tiktok]"), "ops-auto wins: {goal}");
+    }
+
+    #[test]
+    fn top_item_campaign_outranks_ceo_and_plain_and_keeps_real_tier() {
+        let c = test_ctx("rank_campaign");
+        write_backlog(
+            &c,
+            "- [ ] plain chore\n\
+             - [ ] daily goal (ceo 2026-07-04)\n\
+             - [ ] [feature] [campaign:scale-x] first ordered step\n",
+        );
+        let (goal, tier) = top_backlog_item(&c).unwrap();
+        assert!(goal.contains("[campaign:scale-x]"), "campaign wins: {goal}");
+        // the leading [feature] tag is parsed as the (deep) tier; the campaign marker stays in text.
+        assert_eq!(tier, "feature");
+    }
+
+    #[test]
+    fn top_item_ties_break_by_file_order() {
+        let c = test_ctx("rank_ties");
+        write_backlog(&c, "- [ ] first plain\n- [ ] second plain\n");
+        assert_eq!(top_backlog_item(&c).unwrap().0, "first plain");
+        // two ops-auto items -> the earlier one wins (rank-0 tie, file order).
+        let c2 = test_ctx("rank_ties2");
+        write_backlog(&c2, "- [ ] [ops-auto:a] first red\n- [ ] [ops-auto:b] second red\n");
+        assert!(top_backlog_item(&c2).unwrap().0.contains("[ops-auto:a]"));
+    }
+
+    #[test]
+    fn top_item_skips_deferred_even_when_high_rank() {
+        let c = test_ctx("rank_deferred");
+        // a DEFERRED ops-auto item must NOT be re-picked over a live plain item (else the loop churns
+        // on a known-failing goal forever — the thing the escalation ladder exists to prevent).
+        write_backlog(
+            &c,
+            "- [ ] real plain item\n\
+             - [ ] [ops-auto:x] red thing  (deferred: agent could not implement after repeated tries)\n",
+        );
+        assert_eq!(top_backlog_item(&c).unwrap().0, "real plain item");
+        // all actionable items deferred -> placeholder (never a deferred item).
+        let c2 = test_ctx("rank_all_deferred");
+        write_backlog(&c2, "- [ ] a  (deferred: x)\n- [ ] b  (deferred: y)\n");
         assert_eq!(
             top_backlog_item(&c2),
             Some(("model-chosen improvement".to_string(), "chore".to_string()))
