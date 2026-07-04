@@ -459,6 +459,14 @@ fn ops_marker(probe: &str) -> String {
 /// This closes the open loop: the ops plane was OBSERVATION-ONLY — the improver reads backlog.md and
 /// never sees ops, and the once/day LLM morning plan can leave a RED lane with no queued fix. Here a
 /// RED outcome DETERMINISTICALLY forces a fix into the lane backlog every sweep, without flooding it.
+///
+/// YELLOW pre-red gate (v2): also fire on YELLOW outcome probes with `consecutive_red >= 2` — the
+/// probe is failing but held at yellow by the consecutive-red gate (e.g. cdp_alive with
+/// `red_after_consecutive: 3`). This catches degrading outcomes BEFORE they flip red.
+///
+/// Deploy-gap gate (v2): also fire on the `binary_current` (git_sha_match) probe when YELLOW with
+/// a "deploy gap" detail — the running binary was built from an old commit. This is a process-level
+/// drift signal that the watchdog/deploy plane should act on, but the lane agent must also see.
 /// HERE/runtime/_dead_red.json — the dedupe map for the dead-lane-RED operator page.
 /// Shape: {"seen": {"<name>:<probe>": "<first_ts>"}} — one page per (lane, probe) while it persists.
 fn dead_red_status_path() -> PathBuf {
@@ -505,6 +513,13 @@ fn ops_red_backlog_graft() {
     let mut seen = Map::new(); // this sweep's live "<name>:<probe>" -> first_ts (drops resolved keys)
 
     for (name, proj) in projects {
+        // Load the full verdict file for this project to get consecutive_red and detail per probe.
+        let verdict: Value = std::fs::read(ops::outcomes::verdict_path(name))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or(Value::Null);
+        let verdict_probes = verdict.get("probes").and_then(Value::as_object).cloned().unwrap_or(Value::Null);
+
         // Which OUTCOME probes are RED for this project? (per-probe status map, whitelist-filtered)
         let probes = match proj.get("probes").and_then(Value::as_object) {
             Some(p) => p,
@@ -517,6 +532,8 @@ fn ops_red_backlog_graft() {
             .get(name)
             .map(crate::control::locks::is_running)
             .unwrap_or(true);
+
+        // --- RED outcome probes (existing behavior) ---
         for probe in OPS_OUTCOME_PROBES {
             if probes.get(probe).and_then(Value::as_str) != Some("red") {
                 continue;
@@ -524,7 +541,7 @@ fn ops_red_backlog_graft() {
             // The reason/detail for this probe from the rollup reasons list ("<probe>=red (<detail>)").
             let detail = red_probe_detail(proj, probe);
             // Still file the queued fix item — it will be worked the moment the lane resumes.
-            ensure_ops_item(name, probe, &detail, &today);
+            ensure_ops_item(name, probe, &detail, &today, "red");
 
             // DEAD-LANE-RED: a RED outcome on a STOPPED lane is silent rot. Page once per
             // (lane, probe) while it persists (deduped via _dead_red.json).
@@ -555,6 +572,42 @@ fn ops_red_backlog_graft() {
                     .unwrap_or(now_ts.as_str())
                     .to_string();
                 seen.insert(key, json!(first_ts));
+            }
+        }
+
+        // --- YELLOW pre-red gate: outcome probes with consecutive_red >= 2 ---
+        // These probes are failing but held at yellow by the consecutive-red gate (e.g. cdp_alive
+        // with red_after_consecutive: 3). Fire an investigate item BEFORE they flip red.
+        for probe in OPS_OUTCOME_PROBES {
+            if probes.get(probe).and_then(Value::as_str) != Some("yellow") {
+                continue;
+            }
+            let consec = verdict_probes
+                .get(probe)
+                .and_then(|v| v.get("consecutive_red"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            if consec < 2 {
+                continue;
+            }
+            let detail = verdict_probes
+                .get(probe)
+                .and_then(|v| v.get("detail"))
+                .and_then(Value::as_str)
+                .unwrap_or("pre-red (consecutive_red >= 2)");
+            ensure_ops_item(name, probe, detail, &today);
+        }
+
+        // --- Deploy-gap gate: binary_current (git_sha_match) probe YELLOW with "deploy gap" ---
+        // The running binary was built from an old commit; this is a process-level drift signal.
+        if probes.get("binary_current").and_then(Value::as_str) == Some("yellow") {
+            let detail = verdict_probes
+                .get("binary_current")
+                .and_then(|v| v.get("detail"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if detail.contains("deploy gap") {
+                ensure_ops_item(name, "binary_current", detail, &today);
             }
         }
     }
@@ -600,13 +653,29 @@ fn has_open_marker(existing: &str, marker: &str) -> bool {
         .any(|l| l.trim().starts_with("- [ ]") && l.contains(marker))
 }
 
-/// The exact backlog line for a RED outcome probe (pure — unit-tested). Carries the stable
+/// The exact backlog line for an ops-auto probe (pure — unit-tested). Carries the stable
 /// `[ops-auto:<probe>]` idempotence marker and a `[reliability]` intent tag (not a known improver
 /// tier, so strip_tier leaves it in the text — deliberate; the item reads as reliability work).
-fn ops_item_line(probe: &str, detail: &str, today: &str) -> String {
+/// `kind` distinguishes: "red" = outcome probe is RED; "pre_red" = YELLOW with consecutive_red >= 2;
+/// "deploy_gap" = binary_current YELLOW with "deploy gap" detail.
+fn ops_item_line(probe: &str, detail: &str, today: &str, kind: &str) -> String {
+    let (prefix, suffix) = match kind {
+        "red" => (
+            "has been RED",
+            "— the real outcome is failing, not the test gate; diagnose and fix the actual posting/trade/app path.",
+        ),
+        "pre_red" => (
+            "is YELLOW with consecutive_red >= 2 (pre-red)",
+            "— the probe is failing but held at yellow by the consecutive-red gate; investigate before it flips red.",
+        ),
+        "deploy_gap" => (
+            "is YELLOW with deploy gap",
+            "— the running binary was built from an old commit; redeploy or investigate the deploy pipeline.",
+        ),
+        _ => ("is failing", "— investigate."),
+    };
     format!(
-        "- [ ] [reliability]{} {probe} has been RED ({detail}) — the real outcome is failing, \
-         not the test gate; diagnose and fix the actual posting/trade/app path. (ops-auto {today})",
+        "- [ ] [reliability]{} {probe} {prefix} ({detail}) {suffix} (ops-auto {today})",
         ops_marker(probe)
     )
 }
@@ -616,7 +685,7 @@ fn ops_item_line(probe: &str, detail: &str, today: &str) -> String {
 /// sweep. Reuses the same atomic-prepend + read-error safety contract as morning_plan (a READ ERROR
 /// — the improver mid-rewrite / a locked file — skips the lane rather than risk truncating a live
 /// backlog; file-absent starts from empty).
-fn ensure_ops_item(name: &str, probe: &str, detail: &str, today: &str) {
+fn ensure_ops_item(name: &str, probe: &str, detail: &str, today: &str, kind: &str) {
     let path = backlog_path(name);
     let existing = match std::fs::read_to_string(&path) {
         Ok(s) => s,
@@ -626,7 +695,7 @@ fn ensure_ops_item(name: &str, probe: &str, detail: &str, today: &str) {
     if has_open_ops_item(&existing, probe) {
         return;
     }
-    let line = ops_item_line(probe, detail, today);
+    let line = ops_item_line(probe, detail, today, kind);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
