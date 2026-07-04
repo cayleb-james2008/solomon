@@ -208,7 +208,8 @@ fn push_base_if_ahead(repo: &Value) -> Value {
             return Ok(json!({"pushed": false, "ahead": ahead, "diverged": false}));
         }
         if behind > 0 {
-            return Ok(json!({"pushed": false, "ahead": ahead, "diverged": true})); // not a fast-forward
+            return Ok(json!({"pushed": false, "ahead": ahead, "diverged": true}));
+            // not a fast-forward
         }
         let refspec = format!("{base}:{base}");
         let pu = g(&["push", "origin", &refspec])?; // FF-only; never --force
@@ -235,17 +236,23 @@ fn push_base_if_ahead(repo: &Value) -> Value {
 /// solomon.diagnose: deterministic, file-only health classification (no git shell-out — cheap on
 /// every poll). Returns {name, healthy, category, evidence, recommended:[...], auto_safe, running}.
 ///
-/// The 16-category cascade ORDER is load-bearing:
+/// The 17-category cascade ORDER is load-bearing:
 ///   ok / needs_goal / no_key / key_shape_mismatch / gh_not_ready / revert_failed / dirty_tree / base_out_of_band /
 ///   untracked_refusal / persistent_self_stop / stale_lock / stop_lingering / stuck / gate_red_streak /
-///   ci_red_streak / noop_streak / unknown_error.
+///   ci_red_streak / quota_error / noop_streak / unknown_error.
 pub fn diagnose(repo: &Value) -> Value {
     let name = paths::repo_name(repo);
     let hb = heartbeat::read_heartbeat(repo).unwrap_or_else(|| json!({}));
     let running = locks::is_running(repo);
     let rtd = rt(repo);
-    let has_lock = rtd.as_ref().map(|d| d.join("lock").exists()).unwrap_or(false);
-    let has_stop = rtd.as_ref().map(|d| d.join("stop").exists()).unwrap_or(false);
+    let has_lock = rtd
+        .as_ref()
+        .map(|d| d.join("lock").exists())
+        .unwrap_or(false);
+    let has_stop = rtd
+        .as_ref()
+        .map(|d| d.join("stop").exists())
+        .unwrap_or(false);
     // The lock's PID, read once so both the stale_lock branch and downstream logic see the same value.
     // Used to distinguish a truly-dead lock (PID gone -> safe to clear) from a HUNG loop (PID alive
     // but heartbeat stale -> must NOT auto-clear; the hung process would keep running and a new
@@ -268,14 +275,24 @@ pub fn diagnose(repo: &Value) -> Value {
     // `summary[:N] or <fallback>`: the truncated summary if non-empty else the fallback.
     let trunc_or = |s: &str, n: usize, fallback: &str| -> String {
         let t = trunc(s, n);
-        if t.is_empty() { fallback.to_string() } else { t }
+        if t.is_empty() {
+            fallback.to_string()
+        } else {
+            t
+        }
     };
 
     // cat, ev, rec, safe = "ok", (status or ("running" if running else "idle")), [], True
     let mut cat = "ok".to_string();
     let mut ev: String = match status {
         Some(s) if !s.is_empty() => s.to_string(),
-        _ => if running { "running".to_string() } else { "idle".to_string() },
+        _ => {
+            if running {
+                "running".to_string()
+            } else {
+                "idle".to_string()
+            }
+        }
     };
     let mut rec: Vec<String> = Vec::new();
     let mut safe = true;
@@ -285,7 +302,9 @@ pub fn diagnose(repo: &Value) -> Value {
         ev = trunc_or(summary, 200, "no north-star GOAL and no actionable backlog");
         rec = vec!["set this repo's GOAL in Config so the loop has an objective".into()];
         safe = false;
-    } else if status == Some("error") && (summary.contains("not set") || summary.contains("API key")) {
+    } else if status == Some("error")
+        && (summary.contains("not set") || summary.contains("API key"))
+    {
         cat = "no_key".into();
         ev = trunc(summary, 160);
         rec = vec!["add the provider API key in Settings".into()];
@@ -302,6 +321,17 @@ pub fn diagnose(repo: &Value) -> Value {
         rec = vec![
             "fix repos.json: the per-repo api_key does not match the configured provider \
              — set provider back to the key's provider, or clear/replace api_key"
+                .into(),
+        ];
+        safe = false;
+    } else if reason == Some("quota_error")
+        || phase == Some("quota_error")
+        || crate::improver::pi::is_quota_error(summary)
+    {
+        cat = "quota_error".into();
+        ev = trunc_or(summary, 200, "provider quota/rate limit hit");
+        rec = vec![
+            "wait for the shared Fleet Agent provider cooldown; do not restart or retry this lane"
                 .into(),
         ];
         safe = false;
@@ -363,7 +393,8 @@ pub fn diagnose(repo: &Value) -> Value {
                 .into(),
         ];
         safe = false;
-    } else if has_stop && !running
+    } else if has_stop
+        && !running
         && matches!(
             reason,
             Some("dirty_base_persistent" | "unpushed_base_persistent" | "base_gate_red_persistent")
@@ -380,7 +411,11 @@ pub fn diagnose(repo: &Value) -> Value {
         // git-state reasons and clears the sentinel once healed, and the operator presses Start
         // for base_gate_red_persistent (running the gate from the sweep is too costly / cmd-specific).
         cat = "persistent_self_stop".into();
-        ev = trunc_or(summary, 200, "loop self-stopped after a persistent preflight failure");
+        ev = trunc_or(
+            summary,
+            200,
+            "loop self-stopped after a persistent preflight failure",
+        );
         rec = vec![
             "the loop deliberately self-stopped after a persistent preflight failure — fix the \
              underlying cause described above (dirty / un-pushed / gate-RED base), then press Start \
@@ -438,9 +473,12 @@ pub fn diagnose(repo: &Value) -> Value {
         rec = vec!["stop and restart the loop".into()];
         safe = true;
     } else if hist.len() >= 3
-        && hist[hist.len() - 3..]
-            .iter()
-            .all(|r| matches!(r.get("status").and_then(Value::as_str), Some("reverted") | Some("error")))
+        && hist[hist.len() - 3..].iter().all(|r| {
+            matches!(
+                r.get("status").and_then(Value::as_str),
+                Some("reverted") | Some("error")
+            )
+        })
     {
         cat = "gate_red_streak".into();
         ev = "last 3 iterations reverted/errored — the gate keeps failing".into();
@@ -527,7 +565,11 @@ fn supervisor_log_count_same(repo: &Value, cat: &str) -> usize {
 fn suggested_steps(repo: &Value, cat: &str) -> Vec<String> {
     let path = {
         let p = paths::repo_path(repo);
-        if p.is_empty() { "<repo>".to_string() } else { p }
+        if p.is_empty() {
+            "<repo>".to_string()
+        } else {
+            p
+        }
     };
     let base = registry::project_pr_target_branch(repo);
     let cd = format!("cd \"{path}\"");
@@ -579,6 +621,10 @@ fn suggested_steps(repo: &Value, cat: &str) -> Vec<String> {
             "Open Solomon → this repo → Ideate to refill the backlog with fresh items,".into(),
             "or edit improver/<name>/backlog.md to add/simplify items,".into(),
             "or raise the repo's model in Config (the current one keeps failing to implement)".into(),
+        ],
+        "quota_error" => vec![
+            "Open Solomon -> Fleet: confirm the shared provider cooldown is active".into(),
+            "Do not restart every lane; the single Fleet Agent resumes after cooldown".into(),
         ],
         "persistent_self_stop" => vec![
             "The loop deliberately self-stopped after a persistent preflight failure — the loop's".into(),
@@ -652,7 +698,10 @@ fn finish(repo: &Value, d: &Value, actions: Vec<String>, escalate: bool, msg: &s
     if escalate && actions.is_empty() {
         let prior = heartbeat::read_supervisor_log(repo, 1);
         if let Some(last) = prior.last() {
-            if last.get("escalate").and_then(Value::as_bool).unwrap_or(false)
+            if last
+                .get("escalate")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
                 && last.get("category").and_then(Value::as_str) == Some(category)
             {
                 return json!({
@@ -830,7 +879,11 @@ pub fn note_healthy(repo: &Value) {
 
 pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: bool) -> Value {
     let d = diagnose(repo);
-    let cat = d.get("category").and_then(Value::as_str).unwrap_or("").to_string();
+    let cat = d
+        .get("category")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     if cat == "ok" {
         // healthy — clear any STALE escalation.json a prior transient error left behind AND stamp
         // a healthy supervisor.jsonl record when transitioning from a non-healthy state (see
@@ -853,8 +906,13 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
                  pause the lane or restart the app instead");
         }
         if locks::is_running(repo) {
-            return finish(repo, &d, vec![], true,
-                "loop is live — stop it before Solomon resets the un-reverted base");
+            return finish(
+                repo,
+                &d,
+                vec![],
+                true,
+                "loop is live — stop it before Solomon resets the un-reverted base",
+            );
         }
         // anti-thrash: cap recurring auto-resets.
         let prior_resets = heartbeat::read_supervisor_log(repo, 6)
@@ -868,15 +926,25 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
             })
             .count();
         if prior_resets >= 3 {
-            return finish(repo, &d, vec![], true,
+            return finish(
+                repo,
+                &d,
+                vec![],
+                true,
                 "revert-failure recurs after repeated auto-resets — escalating \
-                 (a deterministic cause keeps re-wedging the base)");
+                 (a deterministic cause keeps re-wedging the base)",
+            );
         }
         let (ok, token) = locks::acquire_supervisor_lock(repo);
         if !ok {
-            return finish(repo, &d, vec![], true,
+            return finish(
+                repo,
+                &d,
+                vec![],
+                true,
                 "loop lock could not be acquired — stop it before Solomon resets the \
-                 un-reverted base");
+                 un-reverted base",
+            );
         }
         let r = branches::reset_to_base(repo);
         if let Some(tok) = token {
@@ -884,7 +952,11 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
         }
         actions.push("reset_to_base".into());
         if !r.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            let m = r.get("error").and_then(Value::as_str).unwrap_or("reset_to_base failed — escalate").to_string();
+            let m = r
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("reset_to_base failed — escalate")
+                .to_string();
             return finish(repo, &d, actions, true, &m);
         }
         // the reset succeeded: clean up the lingering rsi/* branches.
@@ -894,8 +966,14 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
             let err = cw.get("error").and_then(Value::as_str).unwrap_or("?");
             format!("recovered: reset_to_base (cleanup_worktrees: {err})")
         } else {
-            let removed = cw.get("removed").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
-            format!("recovered: reset_to_base, cleanup_worktrees (removed {removed} rsi/* branch(es))")
+            let removed = cw
+                .get("removed")
+                .and_then(Value::as_array)
+                .map(|a| a.len())
+                .unwrap_or(0);
+            format!(
+                "recovered: reset_to_base, cleanup_worktrees (removed {removed} rsi/* branch(es))"
+            )
         };
         if allow_restart {
             if spend_restart_budget() {
@@ -923,12 +1001,23 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
                 return finish(repo, &d, actions, false, &m);
             }
             if pr.get("diverged").and_then(Value::as_bool).unwrap_or(false) {
-                return finish(repo, &d, vec![], true,
+                return finish(
+                    repo,
+                    &d,
+                    vec![],
+                    true,
                     "base diverged from origin (not a fast-forward) — operator must \
-                     reconcile (push/rebase or revert)");
+                     reconcile (push/rebase or revert)",
+                );
             }
         }
-        return finish(repo, &d, vec![], true, "escalated — operator action required");
+        return finish(
+            repo,
+            &d,
+            vec![],
+            true,
+            "escalated — operator action required",
+        );
     }
 
     // RUNG-0.5 noop_streak auto-heal.
@@ -985,8 +1074,13 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
                     std::thread::sleep(Duration::from_secs(1));
                 }
                 if locks::is_running(repo) {
-                    return finish(repo, &d, actions, true,
-                        "loop would not stop for backlog refill — manual kill required");
+                    return finish(
+                        repo,
+                        &d,
+                        actions,
+                        true,
+                        "loop would not stop for backlog refill — manual kill required",
+                    );
                 }
                 let ir = runner::ideate(repo);
                 actions.push("ideate".into());
@@ -1002,19 +1096,35 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
                 return finish(repo, &d, actions, false, &m);
             }
         }
-        return finish(repo, &d, vec![], true, "escalated — operator action required");
+        return finish(
+            repo,
+            &d,
+            vec![],
+            true,
+            "escalated — operator action required",
+        );
     }
 
     let auto_safe = d.get("auto_safe").and_then(Value::as_bool).unwrap_or(false);
     if !auto_safe && cat != "gate_red_streak" {
-        return finish(repo, &d, vec![], true, "escalated — operator action required");
+        return finish(
+            repo,
+            &d,
+            vec![],
+            true,
+            "escalated — operator action required",
+        );
     }
 
     if cat == "stale_lock" {
         let r = locks::clear_lock(repo);
         actions.push("clear_lock".into());
         if !r.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            let m = r.get("error").and_then(Value::as_str).unwrap_or("").to_string();
+            let m = r
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             return finish(repo, &d, actions, true, &m);
         }
     } else if cat == "stop_lingering" {
@@ -1030,8 +1140,13 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
         }
         let (ok, token) = locks::acquire_supervisor_lock(repo);
         if !ok {
-            return finish(repo, &d, actions, true,
-                "loop is live — stop it before Solomon resets the working tree");
+            return finish(
+                repo,
+                &d,
+                actions,
+                true,
+                "loop is live — stop it before Solomon resets the working tree",
+            );
         }
         let r = branches::reset_to_base(repo);
         if let Some(tok) = token {
@@ -1039,7 +1154,11 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
         }
         actions.push("reset_to_base".into());
         if !r.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            let m = r.get("error").and_then(Value::as_str).unwrap_or("").to_string();
+            let m = r
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             return finish(repo, &d, actions, true, &m);
         }
     } else if cat == "stuck" {
@@ -1065,8 +1184,13 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
             std::thread::sleep(Duration::from_secs(1));
         }
         if locks::is_running(repo) {
-            return finish(repo, &d, actions, true,
-                "loop would not stop — manual kill required (Solomon will not force-kill)");
+            return finish(
+                repo,
+                &d,
+                actions,
+                true,
+                "loop would not stop — manual kill required (Solomon will not force-kill)",
+            );
         }
         // Restart UNCONDITIONALLY (not gated by allow_restart) — see source comment.
         runner::start(repo, auto_push, false);
@@ -1074,12 +1198,22 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
     } else if cat == "gate_red_streak" {
         let provider_keyed = keys_provider_ready(repo);
         if !(allow_pi && provider_keyed) {
-            return finish(repo, &d, actions, true,
-                "persistent gate failure — tick 'Allow AI fix' to run a Solomon fix-session");
+            return finish(
+                repo,
+                &d,
+                actions,
+                true,
+                "persistent gate failure — tick 'Allow AI fix' to run a Solomon fix-session",
+            );
         }
         if locks::is_running(repo) {
-            return finish(repo, &d, actions, true,
-                "loop is live — stop it before running a Solomon fix-session");
+            return finish(
+                repo,
+                &d,
+                actions,
+                true,
+                "loop is live — stop it before running a Solomon fix-session",
+            );
         }
         // A fix-session spawns a whole run-improver process doing a cargo build — the heaviest spawn
         // in recover(). Respect the same per-sweep budget so N gate-red lanes can't fire N builds at
@@ -1094,7 +1228,10 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
         let msg = if ok {
             "launched Solomon fix-session".to_string()
         } else {
-            r.get("error").and_then(Value::as_str).unwrap_or("").to_string()
+            r.get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
         };
         return finish(repo, &d, actions, !ok, &msg);
     }
@@ -1110,7 +1247,13 @@ fn py_repr_scalar(v: Option<&Value>) -> String {
     match v {
         Some(Value::Number(n)) => n.to_string(),
         Some(Value::String(s)) => s.clone(),
-        Some(Value::Bool(b)) => if *b { "True".into() } else { "False".into() },
+        Some(Value::Bool(b)) => {
+            if *b {
+                "True".into()
+            } else {
+                "False".into()
+            }
+        }
         // None/null -> the f-string fallback. For `pr.get('ahead')` (no default) Python would print
         // "None"; for `ir.get('added', '?')` it prints "?". The push-base path always has an int
         // `ahead`, so this fallback is only reachable for `added`, whose source default is '?'.
@@ -1152,7 +1295,11 @@ mod tests {
     }
 
     fn write_hb(dir: &Path, hb: &Value) {
-        std::fs::write(dir.join("heartbeat.json"), serde_json::to_string(hb).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("heartbeat.json"),
+            serde_json::to_string(hb).unwrap(),
+        )
+        .unwrap();
     }
 
     fn write_hist(dir: &Path, lines: &[Value]) {
@@ -1206,10 +1353,16 @@ mod tests {
     #[test]
     fn diagnose_needs_goal_precedence() {
         let (dir, repo) = tmp_repo("needsgoal");
-        write_hb(&dir, &json!({"status": "error", "reason": "needs_goal", "last_summary": ""}));
+        write_hb(
+            &dir,
+            &json!({"status": "error", "reason": "needs_goal", "last_summary": ""}),
+        );
         let d = diagnose(&repo);
         assert_eq!(d["category"], "needs_goal");
-        assert_eq!(d["evidence"], "no north-star GOAL and no actionable backlog");
+        assert_eq!(
+            d["evidence"],
+            "no north-star GOAL and no actionable backlog"
+        );
         assert_eq!(d["auto_safe"], false);
         assert_eq!(
             d["recommended"],
@@ -1221,9 +1374,31 @@ mod tests {
     #[test]
     fn diagnose_no_key() {
         let (dir, repo) = tmp_repo("nokey");
-        write_hb(&dir, &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}));
+        write_hb(
+            &dir,
+            &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}),
+        );
         let d = diagnose(&repo);
         assert_eq!(d["category"], "no_key");
+        assert_eq!(d["auto_safe"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnose_quota_error_is_not_healthy() {
+        let (dir, repo) = tmp_repo("quota");
+        write_hb(
+            &dir,
+            &json!({
+                "status": "sleeping",
+                "phase": "quota_error",
+                "reason": "quota_error",
+                "last_summary": "429 Rate limit exceeded: free-models-per-day-high-balance"
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], "quota_error");
+        assert_eq!(d["healthy"], false);
         assert_eq!(d["auto_safe"], false);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1251,7 +1426,10 @@ mod tests {
         assert_eq!(d["auto_safe"], false);
         assert_eq!(d["healthy"], false);
         // evidence is the truncated summary (first 200 chars).
-        assert!(d["evidence"].as_str().unwrap().starts_with("repos.json api_key for 'demo'"));
+        assert!(d["evidence"]
+            .as_str()
+            .unwrap()
+            .starts_with("repos.json api_key for 'demo'"));
         // targeted recommendation, not the generic git-status fallback.
         assert_eq!(
             d["recommended"],
@@ -1290,11 +1468,16 @@ mod tests {
             }),
         );
         let d = diagnose(&repo);
-        assert_eq!(d["category"], "key_shape_mismatch",
-            "mirror-image drift must classify as key_shape_mismatch, not no_key or unknown_error");
+        assert_eq!(
+            d["category"], "key_shape_mismatch",
+            "mirror-image drift must classify as key_shape_mismatch, not no_key or unknown_error"
+        );
         assert_eq!(d["auto_safe"], false);
         assert_eq!(d["healthy"], false);
-        assert!(d["evidence"].as_str().unwrap().starts_with("repos.json api_key for 'demo'"));
+        assert!(d["evidence"]
+            .as_str()
+            .unwrap()
+            .starts_with("repos.json api_key for 'demo'"));
         // Same targeted recommendation as the first direction.
         assert_eq!(
             d["recommended"],
@@ -1364,7 +1547,10 @@ mod tests {
     #[test]
     fn diagnose_gh_not_ready() {
         let (dir, repo) = tmp_repo("ghnr");
-        write_hb(&dir, &json!({"status": "error", "last_summary": "GitHub not ready (gh auth)"}));
+        write_hb(
+            &dir,
+            &json!({"status": "error", "last_summary": "GitHub not ready (gh auth)"}),
+        );
         assert_eq!(diagnose(&repo)["category"], "gh_not_ready");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1372,7 +1558,10 @@ mod tests {
     #[test]
     fn diagnose_revert_failed() {
         let (dir, repo) = tmp_repo("revert");
-        write_hb(&dir, &json!({"status": "error", "phase": "reverted", "last_summary": "boom"}));
+        write_hb(
+            &dir,
+            &json!({"status": "error", "phase": "reverted", "last_summary": "boom"}),
+        );
         let d = diagnose(&repo);
         assert_eq!(d["category"], "revert_failed");
         assert_eq!(d["evidence"], "boom");
@@ -1383,12 +1572,18 @@ mod tests {
     #[test]
     fn diagnose_dirty_tree_vs_persistent() {
         let (dir, repo) = tmp_repo("dirty");
-        write_hb(&dir, &json!({"status": "error", "phase": "preflight", "last_summary": "base tree is DIRTY"}));
+        write_hb(
+            &dir,
+            &json!({"status": "error", "phase": "preflight", "last_summary": "base tree is DIRTY"}),
+        );
         assert_eq!(diagnose(&repo)["category"], "dirty_tree");
         assert_eq!(diagnose(&repo)["auto_safe"], true);
         // dirty_base_persistent reason -> NOT dirty_tree; falls through to unknown_error (status=error).
-        write_hb(&dir, &json!({"status": "error", "phase": "preflight",
-                               "reason": "dirty_base_persistent", "last_summary": "base dirty"}));
+        write_hb(
+            &dir,
+            &json!({"status": "error", "phase": "preflight",
+                               "reason": "dirty_base_persistent", "last_summary": "base dirty"}),
+        );
         assert_eq!(diagnose(&repo)["category"], "unknown_error");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1400,38 +1595,63 @@ mod tests {
         assert!(is_live_app(&json!({"name": "x", "live_app": true})));
         assert!(!is_live_app(&json!({"name": "x"})));
         // private_paths alone is NOT a live-app marker (distinct concept — gitignored public paths).
-        assert!(!is_live_app(&json!({"name": "x", "private_paths": ["assets/music"]})));
+        assert!(!is_live_app(
+            &json!({"name": "x", "private_paths": ["assets/music"]})
+        ));
 
         // Live-app repo: dirty_tree recovery must NOT call reset_to_base; it escalates with the
         // honest live-app message and records the skip recovery-action.
         let (dir, mut repo) = tmp_repo("liveapp_dirty");
         repo["live_app"] = json!(true);
-        write_hb(&dir, &json!({"status": "error", "phase": "preflight", "last_summary": "base tree is DIRTY"}));
+        write_hb(
+            &dir,
+            &json!({"status": "error", "phase": "preflight", "last_summary": "base tree is DIRTY"}),
+        );
         assert_eq!(diagnose(&repo)["category"], "dirty_tree");
         let r = recover(&repo, false, false, false);
         assert_eq!(r["escalate"], true);
-        assert_eq!(r["actions_taken"], json!(["skipped reset_to_base (live app)"]));
-        assert!(!r["actions_taken"].as_array().unwrap().iter().any(|a| a == "reset_to_base"));
+        assert_eq!(
+            r["actions_taken"],
+            json!(["skipped reset_to_base (live app)"])
+        );
+        assert!(!r["actions_taken"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a == "reset_to_base"));
         let _ = std::fs::remove_dir_all(&dir);
 
         // Plain repo (no path): dirty_tree still routes into reset_to_base (which fails on the
         // missing path here) — the recovery-action IS "reset_to_base", proving non-live behavior.
         let (dir2, repo2) = tmp_repo("plain_dirty");
-        write_hb(&dir2, &json!({"status": "error", "phase": "preflight", "last_summary": "base tree is DIRTY"}));
+        write_hb(
+            &dir2,
+            &json!({"status": "error", "phase": "preflight", "last_summary": "base tree is DIRTY"}),
+        );
         assert_eq!(diagnose(&repo2)["category"], "dirty_tree");
         let r2 = recover(&repo2, false, false, false);
-        assert!(r2["actions_taken"].as_array().unwrap().iter().any(|a| a == "reset_to_base"));
+        assert!(r2["actions_taken"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a == "reset_to_base"));
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]
     fn diagnose_base_out_of_band() {
         let (dir, repo) = tmp_repo("oob");
-        write_hb(&dir, &json!({"status": "error", "phase": "preflight",
-                               "last_summary": "refusing to hard-reset a base ahead of origin"}));
+        write_hb(
+            &dir,
+            &json!({"status": "error", "phase": "preflight",
+                               "last_summary": "refusing to hard-reset a base ahead of origin"}),
+        );
         assert_eq!(diagnose(&repo)["category"], "base_out_of_band");
-        write_hb(&dir, &json!({"status": "error", "phase": "preflight",
-                               "last_summary": "base has out-of-band commits"}));
+        write_hb(
+            &dir,
+            &json!({"status": "error", "phase": "preflight",
+                               "last_summary": "base has out-of-band commits"}),
+        );
         assert_eq!(diagnose(&repo)["category"], "base_out_of_band");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1446,20 +1666,29 @@ mod tests {
     #[test]
     fn diagnose_base_out_of_band_matches_unpushed_base_reason() {
         let (dir, repo) = tmp_repo("oob_reason");
-        write_hb(&dir, &json!({
-            "status": "error",
-            "phase": "preflight",
-            "reason": "unpushed_base",
-            "last_summary": "main has 3 commit(s) not on origin and the fast-forward push failed (denied). Reconcile with origin; managed repos change only via gated PRs. Commits: abc123 def456"
-        }));
+        write_hb(
+            &dir,
+            &json!({
+                "status": "error",
+                "phase": "preflight",
+                "reason": "unpushed_base",
+                "last_summary": "main has 3 commit(s) not on origin and the fast-forward push failed (denied). Reconcile with origin; managed repos change only via gated PRs. Commits: abc123 def456"
+            }),
+        );
         let d = diagnose(&repo);
-        assert_eq!(d["category"], "base_out_of_band", "unpushed_base reason must classify as base_out_of_band, not unknown_error");
+        assert_eq!(
+            d["category"], "base_out_of_band",
+            "unpushed_base reason must classify as base_out_of_band, not unknown_error"
+        );
         assert_eq!(d["auto_safe"], false);
         assert_eq!(d["healthy"], false);
         // The targeted recommendation, not the generic unknown_error fallback.
         let rec = d["recommended"].as_array().unwrap();
-        assert!(rec.iter().any(|s| s.as_str().unwrap().contains("out-of-band")),
-                "recommendation must name the out-of-band class: {rec:?}");
+        assert!(
+            rec.iter()
+                .any(|s| s.as_str().unwrap().contains("out-of-band")),
+            "recommendation must name the out-of-band class: {rec:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1470,22 +1699,31 @@ mod tests {
         // the `reason == Some("unpushed_base")` guard must not over-trigger on the persistent marker.
         let (dir, repo) = tmp_repo("oob_persistent");
         std::fs::write(dir.join("stop"), "unpushed_base_persistent\n").unwrap();
-        write_hb(&dir, &json!({
-            "status": "error",
-            "phase": "preflight",
-            "reason": "unpushed_base_persistent",
-            "last_summary": "Base has 3 un-pushed commit(s) and the fast-forward push to origin keeps failing — the loop self-stops so it doesn't spin forever."
-        }));
+        write_hb(
+            &dir,
+            &json!({
+                "status": "error",
+                "phase": "preflight",
+                "reason": "unpushed_base_persistent",
+                "last_summary": "Base has 3 un-pushed commit(s) and the fast-forward push to origin keeps failing — the loop self-stops so it doesn't spin forever."
+            }),
+        );
         let d = diagnose(&repo);
-        assert_eq!(d["category"], "persistent_self_stop", "persistent variant must stay persistent_self_stop");
+        assert_eq!(
+            d["category"], "persistent_self_stop",
+            "persistent variant must stay persistent_self_stop"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn diagnose_untracked_refusal() {
         let (dir, repo) = tmp_repo("untracked");
-        write_hb(&dir, &json!({"status": "error", "phase": "preflight",
-                               "last_summary": "files would be deleted by the preflight clean"}));
+        write_hb(
+            &dir,
+            &json!({"status": "error", "phase": "preflight",
+                               "last_summary": "files would be deleted by the preflight clean"}),
+        );
         assert_eq!(diagnose(&repo)["category"], "untracked_refusal");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1516,8 +1754,14 @@ mod tests {
         assert_eq!(d["healthy"], false);
         assert_eq!(d["auto_safe"], false);
         // evidence is the REAL summary (truncated to 200 chars), NOT the misleading crash/kill text.
-        assert!(d["evidence"].as_str().unwrap().starts_with("Base branch 'main' has been dirty"));
-        assert!(!d["evidence"].as_str().unwrap().contains("crash/kill mid-stop"));
+        assert!(d["evidence"]
+            .as_str()
+            .unwrap()
+            .starts_with("Base branch 'main' has been dirty"));
+        assert!(!d["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("crash/kill mid-stop"));
         let _ = std::fs::remove_dir_all(&dir);
 
         // base_gate_red_persistent — the third reason the watchdog does NOT auto-clear; must still
@@ -1537,8 +1781,14 @@ mod tests {
         );
         let d = diagnose(&repo);
         assert_eq!(d["category"], "persistent_self_stop");
-        assert!(d["evidence"].as_str().unwrap().starts_with("Base gate has been RED"));
-        assert!(!d["evidence"].as_str().unwrap().contains("crash/kill mid-stop"));
+        assert!(d["evidence"]
+            .as_str()
+            .unwrap()
+            .starts_with("Base gate has been RED"));
+        assert!(!d["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("crash/kill mid-stop"));
         let _ = std::fs::remove_dir_all(&dir);
 
         // unpushed_base_persistent too.
@@ -1555,7 +1805,10 @@ mod tests {
         );
         let d = diagnose(&repo);
         assert_eq!(d["category"], "persistent_self_stop");
-        assert!(d["evidence"].as_str().unwrap().starts_with("Base is ahead of origin"));
+        assert!(d["evidence"]
+            .as_str()
+            .unwrap()
+            .starts_with("Base is ahead of origin"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1566,11 +1819,17 @@ mod tests {
         // mid-stop (or an operator stop of a crashed loop) — that stays stop_lingering, NOT
         // persistent_self_stop. The branch must not over-trigger and erase the crash signal.
         std::fs::write(dir.join("stop"), "").unwrap();
-        write_hb(&dir, &json!({"status": "error", "phase": "crashed", "last_summary": "boom"}));
+        write_hb(
+            &dir,
+            &json!({"status": "error", "phase": "crashed", "last_summary": "boom"}),
+        );
         let d = diagnose(&repo);
         assert_eq!(d["category"], "stop_lingering");
         assert_eq!(d["auto_safe"], false);
-        assert!(d["evidence"].as_str().unwrap().contains("crash/kill mid-stop"));
+        assert!(d["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("crash/kill mid-stop"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1598,8 +1857,12 @@ mod tests {
         let read = read_escalation(&repo).expect("escalation.json written");
         assert_eq!(read["category"], "persistent_self_stop");
         let steps = read["suggested_manual_steps"].as_array().unwrap();
-        assert!(steps.iter().any(|s| s.as_str().unwrap().contains("base_gate_red_persistent")));
-        assert!(steps.iter().any(|s| s.as_str().unwrap().contains("dirty_base_persistent")));
+        assert!(steps
+            .iter()
+            .any(|s| s.as_str().unwrap().contains("base_gate_red_persistent")));
+        assert!(steps
+            .iter()
+            .any(|s| s.as_str().unwrap().contains("dirty_base_persistent")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1651,13 +1914,21 @@ mod tests {
         );
         let d = diagnose(&repo);
         assert_eq!(d["category"], "stale_lock");
-        assert_eq!(d["auto_safe"], false, "alive PID + stale heartbeat must NOT be auto-safe");
+        assert_eq!(
+            d["auto_safe"], false,
+            "alive PID + stale heartbeat must NOT be auto-safe"
+        );
         let ev = d["evidence"].as_str().unwrap();
-        assert!(ev.contains("hung"), "evidence must say the loop is hung: {ev}");
+        assert!(
+            ev.contains("hung"),
+            "evidence must say the loop is hung: {ev}"
+        );
         assert!(ev.contains(&my_pid), "evidence must name the PID: {ev}");
         let rec = d["recommended"].as_array().unwrap();
-        assert!(rec.iter().any(|s| s.as_str().unwrap().contains("kill")),
-                "recommendation must say to kill the hung PID: {rec:?}");
+        assert!(
+            rec.iter().any(|s| s.as_str().unwrap().contains("kill")),
+            "recommendation must say to kill the hung PID: {rec:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1682,19 +1953,28 @@ mod tests {
         assert_eq!(out["escalate"], true);
         assert_eq!(out["actions_taken"], json!([]));
         // The lock must NOT have been cleared (the hung PID still holds it).
-        assert!(dir.join("lock").exists(), "lock must not be auto-cleared for a live PID");
-        assert!(dir.join("escalation.json").exists(), "escalation.json must be written");
+        assert!(
+            dir.join("lock").exists(),
+            "lock must not be auto-cleared for a live PID"
+        );
+        assert!(
+            dir.join("escalation.json").exists(),
+            "escalation.json must be written"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn diagnose_gate_red_streak() {
         let (dir, repo) = tmp_repo("gatered");
-        write_hist(&dir, &[
-            json!({"status": "reverted"}),
-            json!({"status": "error"}),
-            json!({"status": "reverted"}),
-        ]);
+        write_hist(
+            &dir,
+            &[
+                json!({"status": "reverted"}),
+                json!({"status": "error"}),
+                json!({"status": "reverted"}),
+            ],
+        );
         let d = diagnose(&repo);
         assert_eq!(d["category"], "gate_red_streak");
         assert_eq!(d["auto_safe"], false);
@@ -1704,11 +1984,14 @@ mod tests {
     #[test]
     fn diagnose_ci_red_streak_requires_auto_merge() {
         let (dir, repo_plain) = tmp_repo("cired");
-        write_hist(&dir, &[
-            json!({"status": "blocked"}),
-            json!({"status": "blocked"}),
-            json!({"status": "blocked"}),
-        ]);
+        write_hist(
+            &dir,
+            &[
+                json!({"status": "blocked"}),
+                json!({"status": "blocked"}),
+                json!({"status": "blocked"}),
+            ],
+        );
         // without ship=auto-merge: 3 blocked is not reverted/error and not 5 noop -> ok
         assert_eq!(diagnose(&repo_plain)["category"], "ok");
         // with ship=auto-merge -> ci_red_streak
@@ -1720,7 +2003,8 @@ mod tests {
     #[test]
     fn diagnose_noop_streak_needs_five() {
         let (dir, repo) = tmp_repo("noop");
-        let noops = |n: usize| -> Vec<Value> { (0..n).map(|_| json!({"status": "noop"})).collect() };
+        let noops =
+            |n: usize| -> Vec<Value> { (0..n).map(|_| json!({"status": "noop"})).collect() };
         write_hist(&dir, &noops(4));
         assert_eq!(diagnose(&repo)["category"], "ok"); // only 4 -> ok
         write_hist(&dir, &noops(5));
@@ -1733,7 +2017,10 @@ mod tests {
     #[test]
     fn diagnose_unknown_error_catchall() {
         let (dir, repo) = tmp_repo("unknown");
-        write_hb(&dir, &json!({"status": "error", "last_summary": "weird thing"}));
+        write_hb(
+            &dir,
+            &json!({"status": "error", "last_summary": "weird thing"}),
+        );
         let d = diagnose(&repo);
         assert_eq!(d["category"], "unknown_error");
         assert_eq!(d["evidence"], "weird thing");
@@ -1754,20 +2041,32 @@ mod tests {
     fn recover_noop_streak_defers_when_iteration_in_flight() {
         let (dir, repo) = tmp_repo("noop_inflight");
         // 5 consecutive noops in history → diagnose() returns noop_streak.
-        write_hist(&dir, &(0..5).map(|_| json!({"status": "noop"})).collect::<Vec<_>>());
+        write_hist(
+            &dir,
+            &(0..5)
+                .map(|_| json!({"status": "noop"}))
+                .collect::<Vec<_>>(),
+        );
         // A LIVE lock (this process's PID) + a FRESH heartbeat with status=iterating,
         // phase=implement → the lane is actively mid-iteration.
         let run_id = "tok-inflight";
-        std::fs::write(dir.join("lock"), format!("{}\n{}", std::process::id(), run_id)).unwrap();
+        std::fs::write(
+            dir.join("lock"),
+            format!("{}\n{}", std::process::id(), run_id),
+        )
+        .unwrap();
         let fresh = (Utc::now() - chrono::Duration::seconds(1))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
-        write_hb(&dir, &json!({
-            "status": "iterating",
-            "phase": "implement",
-            "run_id": run_id,
-            "updated_at": fresh,
-        }));
+        write_hb(
+            &dir,
+            &json!({
+                "status": "iterating",
+                "phase": "implement",
+                "run_id": run_id,
+                "updated_at": fresh,
+            }),
+        );
         // diagnose must still see noop_streak (the history is stale, the heartbeat is fresh).
         assert_eq!(diagnose(&repo)["category"], "noop_streak");
         // recover must NOT stop the in-flight iteration — no "stop" action, no escalation.
@@ -1775,9 +2074,15 @@ mod tests {
         assert_eq!(out["category"], "noop_streak");
         assert_eq!(out["escalate"], false);
         assert_eq!(out["actions_taken"], json!([]));
-        assert!(out["message"].as_str().unwrap().contains("in-flight iteration"));
+        assert!(out["message"]
+            .as_str()
+            .unwrap()
+            .contains("in-flight iteration"));
         // No stop sentinel was written (the in-flight iteration was not killed).
-        assert!(!dir.join("stop").exists(), "recover wrote a stop sentinel against an in-flight iteration");
+        assert!(
+            !dir.join("stop").exists(),
+            "recover wrote a stop sentinel against an in-flight iteration"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1788,18 +2093,30 @@ mod tests {
         // stop-recovery must still fire (here: the default provider has a fallback, so the heal
         // path runs; the stop sentinel is written).
         let (dir, repo) = tmp_repo("noop_sleeping");
-        write_hist(&dir, &(0..5).map(|_| json!({"status": "noop"})).collect::<Vec<_>>());
+        write_hist(
+            &dir,
+            &(0..5)
+                .map(|_| json!({"status": "noop"}))
+                .collect::<Vec<_>>(),
+        );
         let run_id = "tok-sleeping";
-        std::fs::write(dir.join("lock"), format!("{}\n{}", std::process::id(), run_id)).unwrap();
+        std::fs::write(
+            dir.join("lock"),
+            format!("{}\n{}", std::process::id(), run_id),
+        )
+        .unwrap();
         let fresh = (Utc::now() - chrono::Duration::seconds(1))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
-        write_hb(&dir, &json!({
-            "status": "sleeping",
-            "phase": "sleep",
-            "run_id": run_id,
-            "updated_at": fresh,
-        }));
+        write_hb(
+            &dir,
+            &json!({
+                "status": "sleeping",
+                "phase": "sleep",
+                "run_id": run_id,
+                "updated_at": fresh,
+            }),
+        );
         // diagnose: the sleeping heartbeat is not an error/stuck → the 5-noop history makes it
         // noop_streak.
         assert_eq!(diagnose(&repo)["category"], "noop_streak");
@@ -1807,8 +2124,14 @@ mod tests {
         // The stop-recovery fired (the lane was NOT in-flight). A "stop" action was taken — the
         // sentinel was written, and the heal path attempted the ideate+restart (best-effort in
         // this test; the key assertion is that the in-flight guard did NOT defer).
-        assert!(out["actions_taken"].as_array().unwrap().iter().any(|a| a.as_str() == Some("stop")),
-                "a sleeping lane with a noop streak must be stop-recovered, not deferred: {out}");
+        assert!(
+            out["actions_taken"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a.as_str() == Some("stop")),
+            "a sleeping lane with a noop streak must be stop-recovered, not deferred: {out}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1819,13 +2142,20 @@ mod tests {
         let sup: Vec<Value> = (0..3)
             .map(|_| json!({"category": "stale_lock", "rung": 0, "escalate": false, "actions": ["clear_lock"]}))
             .collect();
-        let body: String = sup.iter().map(|l| serde_json::to_string(l).unwrap()).collect::<Vec<_>>().join("\n");
+        let body: String = sup
+            .iter()
+            .map(|l| serde_json::to_string(l).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(dir.join("supervisor.jsonl"), body).unwrap();
         std::fs::write(dir.join("lock"), "2147483646\ntok").unwrap(); // stale lock present
         let d = diagnose(&repo);
         assert_eq!(d["category"], "stale_lock");
         assert_eq!(d["auto_safe"], false); // anti-thrash demoted
-        assert!(d["evidence"].as_str().unwrap().contains("escalating instead of looping"));
+        assert!(d["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("escalating instead of looping"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1846,13 +2176,20 @@ mod tests {
             json!({"category": "ok", "rung": 0, "escalate": false, "actions": []}),
             json!({"category": "stale_lock", "rung": 0, "escalate": false, "actions": ["clear_lock"]}),
         ];
-        let body: String = sup.iter().map(|l| serde_json::to_string(l).unwrap()).collect::<Vec<_>>().join("\n");
+        let body: String = sup
+            .iter()
+            .map(|l| serde_json::to_string(l).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(dir.join("supervisor.jsonl"), body).unwrap();
         std::fs::write(dir.join("lock"), "2147483646\ntok").unwrap(); // stale lock present
         let d = diagnose(&repo);
         assert_eq!(d["category"], "stale_lock");
         assert_eq!(d["auto_safe"], false); // anti-thrash demoted despite ok records interleaving
-        assert!(d["evidence"].as_str().unwrap().contains("escalating instead of looping"));
+        assert!(d["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("escalating instead of looping"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1867,7 +2204,11 @@ mod tests {
             json!({"category": "stale_lock", "rung": 0, "escalate": false, "actions": ["clear_lock"]}),
             json!({"category": "ok", "rung": 0, "escalate": false, "actions": []}),
         ];
-        let body: String = sup.iter().map(|l| serde_json::to_string(l).unwrap()).collect::<Vec<_>>().join("\n");
+        let body: String = sup
+            .iter()
+            .map(|l| serde_json::to_string(l).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(dir.join("supervisor.jsonl"), body).unwrap();
         std::fs::write(dir.join("lock"), "2147483646\ntok").unwrap();
         let d = diagnose(&repo);
@@ -1882,19 +2223,37 @@ mod tests {
         let (dir, repo) = tmp_repo("finish");
         // gate_red_streak -> rung 1
         let d = json!({"category": "gate_red_streak", "evidence": "x"});
-        let out = finish(&repo, &d, vec!["solomon_fix_session".into()], false, "launched");
+        let out = finish(
+            &repo,
+            &d,
+            vec!["solomon_fix_session".into()],
+            false,
+            "launched",
+        );
         assert_eq!(out["category"], "gate_red_streak");
         assert_eq!(out["escalate"], false);
 
         // pure escalation (no actions) -> rung 2 + writes escalation.json + supervisor line
         let d2 = json!({"category": "unknown_error", "evidence": "boom"});
-        let out2 = finish(&repo, &d2, vec![], true, "escalated — operator action required");
+        let out2 = finish(
+            &repo,
+            &d2,
+            vec![],
+            true,
+            "escalated — operator action required",
+        );
         assert_eq!(out2["escalate"], true);
         assert_eq!(out2["ok"], false);
         assert!(dir.join("escalation.json").exists());
 
         // a SECOND identical pure escalation is deduped -> escalate=false, escalate_deduped=true.
-        let out3 = finish(&repo, &d2, vec![], true, "escalated — operator action required");
+        let out3 = finish(
+            &repo,
+            &d2,
+            vec![],
+            true,
+            "escalated — operator action required",
+        );
         assert_eq!(out3["escalate"], false);
         assert_eq!(out3["escalate_deduped"], true);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1922,7 +2281,10 @@ mod tests {
     #[test]
     fn escalation_no_runtime_dir() {
         assert_eq!(read_escalation(&json!({})), None);
-        assert_eq!(clear_escalation(&json!({})), json!({"ok": false, "error": "repo has no 'path'"}));
+        assert_eq!(
+            clear_escalation(&json!({})),
+            json!({"ok": false, "error": "repo has no 'path'"})
+        );
     }
 
     // ---------------- recover: healthy clears escalation ----------------
@@ -1948,7 +2310,10 @@ mod tests {
         let (dir, repo) = tmp_repo("dedupe_recur");
 
         // 1. Escalate a no_key problem.
-        write_hb(&dir, &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}));
+        write_hb(
+            &dir,
+            &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}),
+        );
         let out1 = recover(&repo, false, true, true);
         assert_eq!(out1["category"], "no_key");
         assert_eq!(out1["escalate"], true);
@@ -1961,11 +2326,17 @@ mod tests {
         assert!(!dir.join("escalation.json").exists());
 
         // 3. The same problem recurs (key removed again). MUST re-escalate, NOT be deduped.
-        write_hb(&dir, &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}));
+        write_hb(
+            &dir,
+            &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}),
+        );
         let out3 = recover(&repo, false, true, true);
         assert_eq!(out3["category"], "no_key");
         assert_eq!(out3["escalate"], true);
-        assert!(!out3.get("escalate_deduped").map(|v| v.as_bool().unwrap_or(false)).unwrap_or(false));
+        assert!(!out3
+            .get("escalate_deduped")
+            .map(|v| v.as_bool().unwrap_or(false))
+            .unwrap_or(false));
         assert!(dir.join("escalation.json").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1986,8 +2357,14 @@ mod tests {
         let _out2 = recover(&repo, false, true, true); // still healthy -> no new record
 
         let sup = std::fs::read_to_string(dir.join("supervisor.jsonl")).unwrap();
-        let ok_count = sup.lines().filter(|l| l.contains("\"category\":\"ok\"")).count();
-        assert_eq!(ok_count, 1, "only one ok record per transition, not one per poll");
+        let ok_count = sup
+            .lines()
+            .filter(|l| l.contains("\"category\":\"ok\""))
+            .count();
+        assert_eq!(
+            ok_count, 1,
+            "only one ok record per transition, not one per poll"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2004,9 +2381,18 @@ mod tests {
         let (dir, repo) = tmp_repo("note_healthy_recur");
 
         // 1. Simulate a prior escalation: a no_key diagnosis escalated through finish().
-        write_hb(&dir, &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}));
+        write_hb(
+            &dir,
+            &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}),
+        );
         let d = diagnose(&repo);
-        let out1 = finish(&repo, &d, vec![], true, "escalated — operator action required");
+        let out1 = finish(
+            &repo,
+            &d,
+            vec![],
+            true,
+            "escalated — operator action required",
+        );
         assert_eq!(out1["category"], "no_key");
         assert_eq!(out1["escalate"], true);
         assert!(dir.join("escalation.json").exists());
@@ -2016,9 +2402,16 @@ mod tests {
         write_hb(&dir, &json!({"status": "idle"}));
         assert_eq!(diagnose(&repo).get("category"), Some(&json!("ok")));
         note_healthy(&repo);
-        assert!(!dir.join("escalation.json").exists(), "escalation.json cleared");
+        assert!(
+            !dir.join("escalation.json").exists(),
+            "escalation.json cleared"
+        );
         let sup = std::fs::read_to_string(dir.join("supervisor.jsonl")).unwrap();
-        let last = sup.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).next_back().unwrap();
+        let last = sup
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .next_back()
+            .unwrap();
         assert_eq!(last["category"], "ok");
         assert_eq!(last["escalate"], false);
 
@@ -2026,12 +2419,27 @@ mod tests {
         //    escalate=false, so the dedupe guard does NOT fire). Without note_healthy stamping the
         //    "ok" record, the stale escalate=true no_key record would still be last and this would
         //    be silently deduped — the operator never re-notified.
-        write_hb(&dir, &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}));
+        write_hb(
+            &dir,
+            &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}),
+        );
         let d2 = diagnose(&repo);
-        let out3 = finish(&repo, &d2, vec![], true, "escalated — operator action required");
+        let out3 = finish(
+            &repo,
+            &d2,
+            vec![],
+            true,
+            "escalated — operator action required",
+        );
         assert_eq!(out3["category"], "no_key");
-        assert_eq!(out3["escalate"], true, "recurrence must re-escalate, not be deduped");
-        assert!(dir.join("escalation.json").exists(), "escalation.json re-written on recurrence");
+        assert_eq!(
+            out3["escalate"], true,
+            "recurrence must re-escalate, not be deduped"
+        );
+        assert!(
+            dir.join("escalation.json").exists(),
+            "escalation.json re-written on recurrence"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2040,7 +2448,10 @@ mod tests {
     #[test]
     fn recover_no_key_escalates() {
         let (dir, repo) = tmp_repo("recnokey");
-        write_hb(&dir, &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}));
+        write_hb(
+            &dir,
+            &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}),
+        );
         let out = recover(&repo, false, true, true);
         assert_eq!(out["category"], "no_key");
         assert_eq!(out["escalate"], true);
@@ -2080,11 +2491,14 @@ mod tests {
     #[test]
     fn recover_gate_red_streak_requires_allow_pi() {
         let (dir, repo) = tmp_repo("recgate");
-        write_hist(&dir, &[
-            json!({"status": "reverted"}),
-            json!({"status": "reverted"}),
-            json!({"status": "error"}),
-        ]);
+        write_hist(
+            &dir,
+            &[
+                json!({"status": "reverted"}),
+                json!({"status": "reverted"}),
+                json!({"status": "error"}),
+            ],
+        );
         // allow_pi=false -> escalate with the tick-Allow-AI-fix message.
         let out = recover(&repo, false, true, true);
         assert_eq!(out["category"], "gate_red_streak");
@@ -2140,8 +2554,14 @@ mod tests {
             }),
         );
         let d = diagnose(&repo);
-        assert_eq!(d["category"], "stale_lock", "a stale heartbeat makes is_running false, so the lane is stale_lock not stuck");
-        assert_eq!(d["auto_safe"], false, "a live lock PID + stale heartbeat is a hung loop — not auto-safe");
+        assert_eq!(
+            d["category"], "stale_lock",
+            "a stale heartbeat makes is_running false, so the lane is stale_lock not stuck"
+        );
+        assert_eq!(
+            d["auto_safe"], false,
+            "a live lock PID + stale heartbeat is a hung loop — not auto-safe"
+        );
         assert_eq!(d["running"], false);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2205,18 +2625,28 @@ mod tests {
     #[test]
     fn suggested_steps_per_category() {
         let repo = json!({"name": "x", "path": "C:/p/x", "pr_target_branch": "main"});
-        assert_eq!(suggested_steps(&repo, "no_key"),
-                   vec!["Open Solomon → Settings and add the provider's API key, then retry"]);
+        assert_eq!(
+            suggested_steps(&repo, "no_key"),
+            vec!["Open Solomon → Settings and add the provider's API key, then retry"]
+        );
         let ksm = suggested_steps(&repo, "key_shape_mismatch");
-        assert_eq!(ksm[0], "Open Solomon → this repo → Config (or edit repos.json directly):");
+        assert_eq!(
+            ksm[0],
+            "Open Solomon → this repo → Config (or edit repos.json directly):"
+        );
         assert!(ksm.iter().any(|s| s.contains("sk-or-v1-")));
-        assert_eq!(suggested_steps(&repo, "gh_not_ready"),
-                   vec!["gh auth login   # authenticate, then retry"]);
+        assert_eq!(
+            suggested_steps(&repo, "gh_not_ready"),
+            vec!["gh auth login   # authenticate, then retry"]
+        );
         let rv = suggested_steps(&repo, "revert_failed");
         assert_eq!(rv[0], "cd \"C:/p/x\"");
         assert_eq!(rv[1], "git checkout --force main");
         // default fall-through
-        assert_eq!(suggested_steps(&repo, "stale_lock"), vec!["cd \"C:/p/x\"".to_string(), "git status".into()]);
+        assert_eq!(
+            suggested_steps(&repo, "stale_lock"),
+            vec!["cd \"C:/p/x\"".to_string(), "git status".into()]
+        );
         // persistent_self_stop names the three persistent-bail reasons (operator-action guidance)
         let pss = suggested_steps(&repo, "persistent_self_stop");
         assert!(pss.iter().any(|s| s.contains("dirty_base_persistent")));
@@ -2235,7 +2665,10 @@ mod tests {
 
     #[test]
     fn auto_safe_constant_matches_source() {
-        assert_eq!(AUTO_SAFE, &["stale_lock", "stop_lingering", "dirty_tree", "stuck"]);
+        assert_eq!(
+            AUTO_SAFE,
+            &["stale_lock", "stop_lingering", "dirty_tree", "stuck"]
+        );
     }
 
     // ---------------- keys_provider_ready: per-repo api_key counts ----------------
@@ -2248,11 +2681,17 @@ mod tests {
     #[test]
     fn keys_provider_ready_per_repo_key_counts_even_without_global() {
         let repo = json!({ "name": "kpr_1", "provider": "openrouter", "api_key": "sk-or-v1-xyz" });
-        assert!(keys_provider_ready(&repo), "per-repo api_key must count as ready");
+        assert!(
+            keys_provider_ready(&repo),
+            "per-repo api_key must count as ready"
+        );
 
         // also for the ollama-cloud provider shape
         let repo2 = json!({ "name": "kpr_2", "provider": "ollama-cloud", "api_key": "oc-key-abc" });
-        assert!(keys_provider_ready(&repo2), "per-repo api_key must count as ready for any provider");
+        assert!(
+            keys_provider_ready(&repo2),
+            "per-repo api_key must count as ready for any provider"
+        );
     }
 
     // ---------------- per-sweep restart budget (rsi-supervisor-watchdog-1) ----------------

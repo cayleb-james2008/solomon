@@ -188,6 +188,23 @@ select option { background: var(--bg-0); color: var(--ink); }
 .switch.on .knob { left: 20px; background: var(--bg-0); }
 
 /* ---------- FLEET panel (v2) ---------- */
+.fleet-agent {
+  display: grid; grid-template-columns: repeat(5, minmax(96px, 1fr)) auto;
+  gap: 8px; align-items: stretch; margin-bottom: 10px;
+  border: 2px solid var(--stroke); background: var(--bg-3); padding: 8px;
+  border-radius: var(--r-lg);
+}
+.agent-kv {
+  min-width: 0; display: flex; flex-direction: column; gap: 2px;
+  border: 1px solid var(--stroke); background: var(--bg-2); padding: 5px 7px;
+  border-radius: var(--r);
+}
+.agent-kv span { font-size: 9px; text-transform: uppercase; letter-spacing: .8px; color: var(--ink-3); font-weight: 700; }
+.agent-kv b { font-family: var(--mono); font-size: 11px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.agent-kv em { font-family: var(--mono); font-size: 9px; color: var(--ink-3); font-style: normal; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.agent-kv.ok b { color: var(--ok); }
+.agent-kv.warn b { color: var(--warn); }
+.fleet-agent-actions { display: flex; align-items: center; gap: 7px; justify-content: flex-end; }
 .fleet-note { display: flex; align-items: center; gap: 8px; margin-bottom: 12px;
   font-family: var(--mono); font-size: 11px; color: var(--ink-3); letter-spacing: .4px; }
 .fleet-note .blind { color: var(--warn); }
@@ -225,11 +242,27 @@ select option { background: var(--bg-0); color: var(--ink); }
 .fcard-reasons { font-family: var(--mono); font-size: 10.5px; color: var(--warn); margin-bottom: 8px;
   white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
 .fcard-reasons.red { color: var(--err); }
+.fleet-job, .fcard-proof {
+  display: grid; grid-template-columns: auto auto 1fr; gap: 7px; align-items: center;
+  font-family: var(--mono); font-size: 10px; border-top: 1px solid var(--stroke);
+  padding-top: 7px; margin-top: 7px; color: var(--ink-3); min-width: 0;
+}
+.fleet-job b, .fcard-proof b { color: var(--prim); text-transform: uppercase; letter-spacing: .7px; }
+.fleet-job span, .fcard-proof span { color: var(--ink-3); white-space: nowrap; }
+.fleet-job em, .fcard-proof em { font-style: normal; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.fcard-proof.shipped b, .fcard-proof.complete b { color: var(--ok); }
+.fcard-proof.blocked b, .fcard-proof.cooldown b { color: var(--warn); }
+.fcard-proof.proof_required b { color: var(--err); }
 .fcard-lane { display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--stroke); padding-top: 8px; }
 .fcard-lane .lane-meta { font-family: var(--mono); font-size: 10.5px; color: var(--ink-3); }
 .fcard-lane .spacer { margin-left: auto; }
 .restart-forbidden { font-family: var(--mono); font-size: 9.5px; color: var(--err); font-weight: 700;
   letter-spacing: 1px; text-transform: uppercase; }
+
+@media (max-width: 860px) {
+  .fleet-agent { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .fleet-agent-actions { justify-content: flex-start; }
+}
 
 /* ---------- CEO panel (v2) ---------- */
 .ceo-day { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
