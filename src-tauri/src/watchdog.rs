@@ -42,7 +42,7 @@ const STALL_SWEEPS: usize = 3;
 /// are (re)started in one 2-min sweep; the rest defer to later sweeps so their cargo build gates
 /// never stack. 2 allows a little parallelism while staying far under the 6-at-once that melted the
 /// disk on 2026-07-02.
-const MAX_LANE_RESTARTS_PER_SWEEP: usize = 2;
+pub const MAX_LANE_RESTARTS_PER_SWEEP: usize = 2;
 
 /// HEALTH_K — the iteration window the degraded-health classifier inspects. A lane whose last
 /// `HEALTH_K` iterations all failed to ship AND were every one a timeout or a gate-RED is
@@ -324,13 +324,15 @@ fn base_gate_green(path: &str, gate_cmd: Option<&str>) -> bool {
     let timeout = Duration::from_secs(120);
     // Custom GATE_CMD: run via shell (compound syntax), cwd=path. Default: python -m pytest.
     let result = if let Some(cmd) = gate_cmd.filter(|s| !s.is_empty()) {
-        if cfg!(windows) {
-            control::proc::run(
-                &["cmd", "/C", cmd],
-                Some(Path::new(path)),
-                Some(timeout),
-            )
-        } else {
+        #[cfg(windows)]
+        {
+            // Pass the gate string to cmd.exe VERBATIM (raw_arg) — Rust's own arg quoting is not
+            // cmd.exe's parser, so a gate with an embedded quoted path-with-spaces would be mangled
+            // and spuriously fail (a silent false-RED that pins recovery).
+            control::proc::run_win_shell(cmd, Some(Path::new(path)), Some(timeout))
+        }
+        #[cfg(not(windows))]
+        {
             control::proc::run(
                 &["/bin/sh", "-c", cmd],
                 Some(Path::new(path)),
@@ -507,7 +509,16 @@ fn sweep_repo(
         // solomon.recover(r, allow_pi=False, allow_restart=auto_push, auto_push=auto_push).
         // catch Exception -> a watchdog must never die on one bad repo. recover() is total (no panics
         // expected); the catch is reproduced as a guard around the Value field reads.
-        let rec = supervisor::recover(r, false, auto_push_flag, auto_push_flag);
+        //
+        // recover()'s restart / fix-session paths spawn heavy cargo-gated processes. Run them under
+        // the SAME per-sweep budget the crash-restart path uses (share the one Cell) so a sweep where
+        // several lanes diagnose as stuck/noop can't fire more than MAX_LANE_RESTARTS_PER_SWEEP heavy
+        // spawns total. Arm the thread-local from the shared budget, then write the remainder back.
+        let rec = supervisor::with_restart_budget(restart_budget.get(), || {
+            let out = supervisor::recover(r, false, auto_push_flag, auto_push_flag);
+            restart_budget.set(supervisor::restart_budget_remaining());
+            out
+        });
         if let Some(taken) = rec.get("actions_taken").and_then(Value::as_array) {
             if !taken.is_empty() {
                 let joined = taken

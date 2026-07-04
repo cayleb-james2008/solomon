@@ -745,15 +745,24 @@ fn supervise(st: &AppState, args: &[Value]) -> Value {
     }
 
     let mut results: Vec<Value> = Vec::new();
+    // Cap recover()'s heavy spawns (restart / fix-session) ACROSS this multi-repo sweep to the same
+    // per-sweep budget the watchdog uses, so a sweep touching several unhealthy lanes can't fire more
+    // than MAX_LANE_RESTARTS_PER_SWEEP heavy cargo-gated processes at once (disk-meltdown guard).
+    let restart_budget = std::cell::Cell::new(crate::watchdog::MAX_LANE_RESTARTS_PER_SWEEP);
     for r in &targets {
         let repo_name = r.get("name").cloned().unwrap_or(Value::Null);
         let r2 = r.clone();
+        let budget_now = restart_budget.get();
         // Per-repo guard: a panicking recover() must not abort the sweep — surface it per-repo.
         let recovered = std::panic::catch_unwind(move || {
-            supervisor::recover(&r2, allow, auto_push, auto_push)
+            supervisor::with_restart_budget(budget_now, || {
+                let out = supervisor::recover(&r2, allow, auto_push, auto_push);
+                (out, supervisor::restart_budget_remaining())
+            })
         });
         match recovered {
-            Ok(rec) => {
+            Ok((rec, remaining)) => {
+                restart_budget.set(remaining); // carry the shared budget to the next repo
                 // {"name": name, **recover(...)}
                 let mut obj = Map::new();
                 obj.insert("name".to_string(), repo_name);
