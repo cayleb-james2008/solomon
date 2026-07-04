@@ -43,8 +43,10 @@ const PLAN_HOUR: u32 = 7;
 const SUMMARY_HOUR: u32 = 20;
 /// Attempts per day before giving up (a failing LLM endpoint must not be hammered every 2 min).
 const MAX_ATTEMPTS: i64 = 3;
-/// The CEO planner model — minimax-m3 on Ollama Cloud (operator decision, 2026-07-01).
-const CEO_MODEL: &str = "minimax-m3";
+/// The CEO planner model — the FREE OpenRouter model (moved off Ollama 2026-07-04 after the shared
+/// Ollama account hit its WEEKLY usage limit, which killed every CEO plan + asmodeus; the lanes were
+/// already migrated the same way — free model ONLY, never a paid fallback).
+const CEO_MODEL: &str = "nvidia/nemotron-3-ultra-550b-a55b:free";
 /// A reopened app that was blind longer than this notifies the gap (seconds).
 const BLIND_NOTICE_S: f64 = 21_600.0;
 
@@ -1024,7 +1026,13 @@ fn parse_daily_target(north_star: &str) -> Option<i64> {
 /// the OS curl, same guarded-spawn contract as every other subprocess). The API key rides a
 /// curl `-H @file` headers file under runtime/ (gitignored) — never argv, never a log line.
 fn ollama_chat(model: &str, system: &str, user: &str) -> Result<String, String> {
-    let key = notify::env_value("OLLAMA_API_KEY").ok_or("no OLLAMA_API_KEY in .env")?;
+    // Moved off Ollama (weekly-usage-limited) onto the funded OpenRouter free-model accounts, same as
+    // the lanes. Try each numbered key so a per-account rate limit falls through to the next.
+    let key = notify::env_value("OPENROUTER_API_KEY_1")
+        .or_else(|| notify::env_value("OPENROUTER_API_KEY_2"))
+        .or_else(|| notify::env_value("OPENROUTER_API_KEY_3"))
+        .or_else(|| notify::env_value("OPENROUTER_API_KEY"))
+        .ok_or("no OPENROUTER_API_KEY_[1-3] in .env")?;
     let rt = paths::here().join("runtime");
     let _ = std::fs::create_dir_all(&rt);
     let req_path = rt.join("_ceo_request.json");
@@ -1055,7 +1063,7 @@ fn ollama_chat(model: &str, system: &str, user: &str) -> Result<String, String> 
         hdr_arg.as_str(),
         "-d",
         body_arg.as_str(),
-        "https://ollama.com/api/chat",
+        "https://openrouter.ai/api/v1/chat/completions",
     ];
     let r = proc::run(&args, None, Some(Duration::from_secs(250))).map_err(|e| e.to_string())?;
     if !r.ok() {
