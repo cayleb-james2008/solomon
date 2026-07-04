@@ -106,7 +106,7 @@ fn apply_visible_console(cmd: &mut std::process::Command) {
 fn apply_visible_console(_cmd: &mut std::process::Command) {}
 
 /// control._gh_repo_visibility: Some(true)=PUBLIC, Some(false)=PRIVATE, None=anything else.
-/// No timeout. gh missing / OSError / nonzero exit / other value → None.
+/// Bounded timeout (network op) — gh missing / OSError / TimedOut / nonzero exit / other value → None.
 pub fn gh_repo_visibility(path: &str) -> Option<bool> {
     let gh = proc::which_gh()?;
     let gh = gh.as_os_str();
@@ -122,10 +122,10 @@ pub fn gh_repo_visibility(path: &str) -> Option<bool> {
             ".visibility".as_ref(),
         ],
         Some(cwd),
-        None,
+        Some(Duration::from_secs(30)),
     ) {
         Ok(r) => r,
-        Err(_) => return None, // OSError branch (no timeout passed → can't be Timeout)
+        Err(_) => return None, // OSError | TimedOut branch
     };
     if r.code != 0 {
         return None;
@@ -286,7 +286,14 @@ fn pr_action(repo: &Value, sub: &str, number: i64, flags: &[&str], default_err: 
         argv.push(f.as_ref());
     }
     let path = paths::repo_path(repo);
-    let r = match proc::run(&argv, Some(std::path::Path::new(&path)), None) {
+    // Bounded timeout: this network op runs on a Tauri IPC handler thread. A hung/rate-limited
+    // GitHub API must not block the handler forever — on timeout proc::run returns Err(TimedOut),
+    // which the existing Err branch maps to {ok:false, error} so the UI action returns.
+    let r = match proc::run(
+        &argv,
+        Some(std::path::Path::new(&path)),
+        Some(Duration::from_secs(60)),
+    ) {
         Ok(r) => r,
         Err(e) => return json!({ "ok": false, "error": e.to_string() }),
     };
@@ -322,10 +329,12 @@ fn pr_diff_capped(repo: &Value, number: i64, max_bytes: usize) -> Value {
     let gh = gh.as_os_str();
     let num = number.to_string();
     let path = paths::repo_path(repo);
+    // Bounded timeout (network op on a UI handler thread) — on timeout the Err branch below returns
+    // {ok:false, error} rather than hanging the handler on a slow/unreachable GitHub API.
     let r = match proc::run(
         &[gh, "pr".as_ref(), "diff".as_ref(), num.as_ref()],
         Some(std::path::Path::new(&path)),
-        None,
+        Some(Duration::from_secs(30)),
     ) {
         Ok(r) => r,
         Err(e) => return json!({ "ok": false, "error": e.to_string() }),

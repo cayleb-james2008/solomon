@@ -312,8 +312,11 @@ function approvalsPanel(body) {
       const sp = h("span", "spacer");
       const merge = h("button", "btn sm primary", ic("merge", 13) + "Merge");
       const close = h("button", "btn sm danger", ic("x", 13) + "Close");
-      merge.onclick = async () => { merge.disabled = true; const x = await act("merge", repo, pr.number); toast(x && x.ok ? `${repo} #${pr.number} merged` : `Merge failed: ${(x && x.error) || "?"}`, x && x.ok ? "ok" : "err"); setTimeout(refresh, 700); };
-      close.onclick = async () => { close.disabled = true; const x = await act("close", repo, pr.number); toast(x && x.ok ? `${repo} #${pr.number} closed` : `Close failed: ${(x && x.error) || "?"}`, x && x.ok ? "ok" : "err"); setTimeout(refresh, 700); };
+      // Re-enable in a finally so a FAILED merge/close (PR stays open, unchanged signature -> no
+      // rebuild) can be retried from the UI instead of being stuck disabled until an unrelated
+      // PR-set change.
+      merge.onclick = async () => { merge.disabled = true; try { const x = await act("merge", repo, pr.number); toast(x && x.ok ? `${repo} #${pr.number} merged` : `Merge failed: ${(x && x.error) || "?"}`, x && x.ok ? "ok" : "err"); } finally { merge.disabled = false; } setTimeout(refresh, 700); };
+      close.onclick = async () => { close.disabled = true; try { const x = await act("close", repo, pr.number); toast(x && x.ok ? `${repo} #${pr.number} closed` : `Close failed: ${(x && x.error) || "?"}`, x && x.ok ? "ok" : "err"); } finally { close.disabled = false; } setTimeout(refresh, 700); };
       row.append(main, sp, merge, close);
       body.appendChild(row);
     });
@@ -460,6 +463,9 @@ function ceoPanel(body) {
   let tab = "report";
   function gateState(sec, today) {
     if (!sec) return ["pending", "pending"];
+    // A give-up sentinel ({done, gave_up}) is stamped when the plan LLM call failed all attempts —
+    // it must NOT render as a green 'done' (the day was never actually planned).
+    if (sec.gave_up && sec.done === today) return ["failed", "gave up"];
     if (sec.done === today) return ["done", "done"];
     if ((sec.attempts || 0) > 0) return ["failed", `${sec.attempts} failed`];
     return ["pending", "pending"];
@@ -669,7 +675,7 @@ function openSettings() {
   const glob = h("div", "sect", `<h4>Global</h4>`);
   const apRow = h("div", "row");
   const sw = h("button", "switch" + (state.auto_push ? " on" : ""), '<span class="knob"></span>');
-  sw.onclick = async () => { const v = !state.auto_push; const x = await act("set_auto_push", v); if (x && x.ok) { state.auto_push = v; sw.classList.toggle("on", v); } };
+  sw.onclick = async () => { const v = !state.auto_push; const x = await act("set_auto_push", v); if (x && x.ok) { state.auto_push = v; sw.classList.toggle("on", v); } else { toast(`Auto-push change failed: ${(x && x.error) || "?"}`, "err"); } };
   apRow.append(h("span", "lbl", "Auto-push<small>push/PR finished work automatically</small>"), h("span", "spacer"), sw);
   glob.appendChild(apRow); d.appendChild(glob);
 
