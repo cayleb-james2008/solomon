@@ -147,10 +147,84 @@ found no safe change."
             .to_string()
     };
 
+    // Bounded campaign memory: for a [campaign:<slug>] step, append the prior shipped steps of the
+    // same milestone so a cold agent builds ON them instead of re-deriving (and possibly
+    // contradicting) earlier decisions. "" for any non-campaign item.
+    let campaign_block = campaign_context_block(
+        goal,
+        &std::fs::read_to_string(ctx.runtime.join("history.jsonl")).unwrap_or_default(),
+        CAMPAIGN_CONTEXT_STEPS,
+    );
+
     format!(
         "{north_star}{item_intro} {sizing} {gate_instr} \
 Do NOT run git or gh — the runner commits and opens the pull request. If that item is already done or \
-unclear, instead fix one clear small bug or cleanup you find. {status_instr}{feedback_block}"
+unclear, instead fix one clear small bug or cleanup you find. {status_instr}{feedback_block}{campaign_block}"
+    )
+}
+
+/// Number of prior campaign steps to inject as bounded context — the ~80% of session memory that
+/// keeps chained one-shot iterations coherent without a live multi-turn session.
+const CAMPAIGN_CONTEXT_STEPS: usize = 3;
+
+/// Extract `<slug>` from the first `[campaign:<slug>]` marker in the item text, or None when the item
+/// is not a campaign step (the marker Phase-5 campaign steps carry, surviving strip_tier). Pure.
+pub fn campaign_slug(goal: &str) -> Option<String> {
+    let start = goal.find("[campaign:")? + "[campaign:".len();
+    let rest = &goal[start..];
+    let end = rest.find(']')?;
+    let slug = rest[..end].trim();
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug.to_string())
+    }
+}
+
+/// Compact "campaign context" block for a `[campaign:<slug>]` step — the last `n` prior SHIPPED step
+/// summaries for THIS slug (oldest→newest), so a cold one-shot agent inherits the intent + decisions
+/// of earlier steps without a live session. Pure — reads the `history` (history.jsonl text). Returns
+/// "" when the item is not a campaign step, or no prior same-slug shipped record exists.
+pub fn campaign_context_block(goal: &str, history: &str, n: usize) -> String {
+    let slug = match campaign_slug(goal) {
+        Some(s) => s,
+        None => return String::new(),
+    };
+    let marker = format!("[campaign:{slug}]");
+    let mut steps: Vec<String> = Vec::new();
+    for line in history.lines() {
+        let rec: serde_json::Value = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // only this campaign's SHIPPED steps inform the next step's context (landed, coherent work).
+        if rec.get("status").and_then(|v| v.as_str()) != Some("shipped") {
+            continue;
+        }
+        if !rec
+            .get("goal")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains(&marker)
+        {
+            continue;
+        }
+        let summary = rec.get("summary").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if summary.is_empty() {
+            continue;
+        }
+        let head: String = summary.chars().take(240).collect();
+        steps.push(format!("- {}", head.trim()));
+    }
+    if steps.is_empty() {
+        return String::new();
+    }
+    let start = steps.len().saturating_sub(n); // keep only the last n (oldest→newest preserved)
+    format!(
+        "\n\n## Campaign context — prior shipped steps of this milestone ([campaign:{slug}])\n\
+         These already-landed steps are part of the SAME milestone as the item above; build ON them \
+         and keep their decisions coherent — do NOT redo or contradict them:\n{}\n",
+        steps[start..].join("\n")
     )
 }
 
@@ -956,6 +1030,57 @@ mod tests {
     }
 
     // ---- register_failure ladder ----
+    // ---- bounded campaign context (Phase 4: the depth lever) ----
+    #[test]
+    fn campaign_slug_extracts_or_none() {
+        assert_eq!(
+            campaign_slug("[campaign:harden-auth] step 1"),
+            Some("harden-auth".to_string())
+        );
+        assert_eq!(campaign_slug("plain goal, no marker"), None);
+        assert_eq!(campaign_slug("[campaign:] empty slug"), None);
+        // the marker survives mid-string (strip_tier removed a leading [feature] tag first).
+        assert_eq!(
+            campaign_slug("do X [campaign:scale-y] more"),
+            Some("scale-y".to_string())
+        );
+    }
+
+    #[test]
+    fn campaign_context_block_lists_prior_shipped_same_slug_only() {
+        let hist = concat!(
+            r#"{"status":"shipped","goal":"[campaign:sc] step one","summary":"added the fetch layer"}"#, "\n",
+            r#"{"status":"reverted","goal":"[campaign:sc] step two","summary":"tried but failed"}"#, "\n",
+            r#"{"status":"shipped","goal":"[campaign:other] x","summary":"unrelated campaign"}"#, "\n",
+            r#"{"status":"shipped","goal":"[campaign:sc] step three","summary":"wired the cache"}"#, "\n",
+        );
+        let block = campaign_context_block("[campaign:sc] step four", hist, 3);
+        assert!(block.contains("Campaign context"));
+        assert!(block.contains("added the fetch layer")); // shipped, same slug
+        assert!(block.contains("wired the cache")); // shipped, same slug
+        assert!(!block.contains("tried but failed")); // reverted -> excluded
+        assert!(!block.contains("unrelated campaign")); // different slug -> excluded
+        // a non-campaign item -> empty; a campaign with no prior same-slug shipped -> empty.
+        assert_eq!(campaign_context_block("plain item", hist, 3), "");
+        assert_eq!(campaign_context_block("[campaign:none] x", hist, 3), "");
+    }
+
+    #[test]
+    fn campaign_context_block_caps_to_last_n() {
+        let mut hist = String::new();
+        for i in 0..5 {
+            hist.push_str(&format!(
+                r#"{{"status":"shipped","goal":"[campaign:c] s{i}","summary":"summary {i}"}}"#
+            ));
+            hist.push('\n');
+        }
+        let block = campaign_context_block("[campaign:c] s5", &hist, 2);
+        assert!(block.contains("summary 3"));
+        assert!(block.contains("summary 4"));
+        assert!(!block.contains("summary 0"));
+        assert!(!block.contains("summary 2"));
+    }
+
     #[test]
     fn register_failure_skips_guarded_goals() {
         let mut c = ctx();

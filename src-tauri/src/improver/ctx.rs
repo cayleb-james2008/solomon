@@ -1010,6 +1010,9 @@ impl Ctx {
         );
         // (summary or "")[:500] — slice by Python chars (code points), not bytes.
         rec.insert("summary".to_string(), json!(truncate_chars(summary, 500)));
+        // Carry the current backlog item's goal (already on the heartbeat) so downstream consumers —
+        // escalation::campaign_context_block — can group prior steps by their [campaign:<slug>] marker.
+        rec.insert("goal".to_string(), self.hb.get("goal").cloned().unwrap_or(Value::Null));
         if let Some(Value::Object(e)) = extra {
             for (k, v) in e {
                 rec.insert(k.clone(), v.clone());
