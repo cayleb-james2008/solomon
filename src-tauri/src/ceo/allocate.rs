@@ -122,6 +122,18 @@ pub fn rank_lanes(snapshot: &Value, status: &Value) -> Vec<(String, f64, String)
     ranked
 }
 
+/// The single deep-work FOCUS lane: the highest-leverage lane worth concentrating sustained work on.
+/// Returns the first lane in the (already leverage-DESC) ranking with a POSITIVE score — by
+/// construction that lane is non-real-money, green + healthy, and behind/growing (`leverage_score`
+/// zeroes every other lane). None when no lane is a scaling candidate (hold the fleet; a red engine is
+/// fixed by the ops-RED graft, never "focused" into deep growth work). Pure — unit-tested.
+pub fn pick_focus(ranking: &[(String, f64, String)]) -> Option<String> {
+    ranking
+        .iter()
+        .find(|(_, score, _)| *score > 0.0)
+        .map(|(name, _, _)| name.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +141,29 @@ mod tests {
 
     fn vel(trend: &str) -> Value {
         json!({ "trend": trend })
+    }
+
+    #[test]
+    fn pick_focus_takes_top_positive_or_none() {
+        // top positive leverage wins; a leading zero-score lane is skipped.
+        let ranking = vec![
+            ("sover".to_string(), 0.30, "behind".to_string()),
+            ("dotz".to_string(), 0.10, "growing".to_string()),
+        ];
+        assert_eq!(pick_focus(&ranking).as_deref(), Some("sover"));
+        // all zero (nothing scalable / real-money only) -> None (hold the fleet).
+        let zeros = vec![
+            ("asmodeus".to_string(), 0.0, "real-money".to_string()),
+            ("maki".to_string(), 0.0, "not scalable".to_string()),
+        ];
+        assert_eq!(pick_focus(&zeros), None);
+        // a zero-score lane ahead of a positive one (shouldn't happen after DESC sort, but be safe).
+        let mixed = vec![
+            ("a".to_string(), 0.0, "x".to_string()),
+            ("b".to_string(), 0.20, "behind".to_string()),
+        ];
+        assert_eq!(pick_focus(&mixed).as_deref(), Some("b"));
+        assert_eq!(pick_focus(&[]), None);
     }
 
     // -------- leverage_score: trend ordering behind > growing > healthy > stalled(=0) --------
