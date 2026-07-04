@@ -57,7 +57,7 @@ function ago(iso) {
 }
 
 /* ---------- app state ---------- */
-const state = { repos: [], providers: ["ollama-cloud", "openrouter"], gh_ready: false, keys: {}, github: {}, auto_push: true, ops: null };
+const state = { repos: [], providers: ["ollama-cloud", "openrouter"], gh_ready: false, keys: {}, github: {}, auto_push: true, ops: null, fleet: null };
 let layout = [];
 const panels = new Map();   // id -> { el, update }
 
@@ -334,7 +334,7 @@ function fmtDelta(d) {
   const s = (d >= 0 ? "+" : "") + Number(d).toFixed(2);
   return s;
 }
-function fleetCard(name, p, oc) {
+function fleetCard(name, p, oc, proof, job) {
   const cls = p.status || "grey";
   const card = h("div", "fcard " + cls);
 
@@ -383,6 +383,18 @@ function fleetCard(name, p, oc) {
     card.appendChild(h("div", "fcard-reasons" + (cls === "red" ? " red" : ""), esc(p.reasons.join("\n"))));
   }
 
+  if (job) {
+    const j = h("div", "fleet-job");
+    j.innerHTML = `<b>${esc(job.job || "job")}</b><span>${esc(job.state || "queued")} | P${esc(job.priority ?? "?")}</span><em>${esc(job.next_action || job.reason || "")}</em>`;
+    card.appendChild(j);
+  }
+  if (proof) {
+    const outcome = proof.outcome || "proof";
+    const pr = h("div", "fcard-proof " + esc(outcome));
+    pr.innerHTML = `<b>${esc(outcome)}</b><span>${esc(ago(proof.ts) || "fresh")}</span><em title="${esc(proof.summary || "")}">${esc(proof.summary || "")}</em>`;
+    card.appendChild(pr);
+  }
+
   // lane row: live status + start/stop (reuses the loops panel actions)
   const lane = h("div", "fcard-lane");
   const r = repoByName(name);
@@ -411,17 +423,58 @@ function fleetCard(name, p, oc) {
 function fleetPanel(body) {
   let sig = "";
   let cards = [];
+  function agentBar(fleet) {
+    const active = fleet.active || null;
+    const cfg = fleet.config || {};
+    const cooldown = fleet.cooldown || null;
+    const daily = fleet.daily || {};
+    const bar = h("div", "fleet-agent");
+    const activeTxt = active ? `${active.repo} | ${active.job}` : "idle";
+    const coolTxt = cooldown && cooldown.until ? cooldown.until : "ready";
+    const q = (fleet.queue || []).length;
+    bar.innerHTML = `<div class="agent-kv"><span>agent</span><b>${esc(activeTxt)}</b></div>`
+      + `<div class="agent-kv"><span>provider</span><b>${esc(cfg.provider || "openrouter")}</b><em>${esc(cfg.model || "")}</em></div>`
+      + `<div class="agent-kv"><span>budget</span><b>${esc(daily.calls || 0)}/${esc(cfg.daily_call_budget || "?")}</b></div>`
+      + `<div class="agent-kv ${cooldown ? "warn" : "ok"}"><span>quota</span><b>${esc(coolTxt)}</b></div>`
+      + `<div class="agent-kv"><span>queue</span><b>${esc(q)}</b></div>`;
+    const actions = h("div", "fleet-agent-actions");
+    const once = h("button", "btn sm primary", "Run once");
+    once.onclick = async () => {
+      once.disabled = true;
+      const x = await act("fleet_once");
+      toast(x && x.ok ? "Fleet cycle recorded" : `Fleet failed: ${(x && x.error) || "?"}`, x && x.ok ? "ok" : "err");
+      once.disabled = false;
+      refresh();
+    };
+    const drain = h("button", "btn sm", "Drain 1");
+    drain.onclick = async () => {
+      drain.disabled = true;
+      const x = await act("fleet_drain", 1);
+      toast(x && x.ok ? "Fleet drain recorded" : `Drain failed: ${(x && x.error) || "?"}`, x && x.ok ? "ok" : "err");
+      drain.disabled = false;
+      refresh();
+    };
+    actions.append(once, drain);
+    bar.appendChild(actions);
+    return bar;
+  }
   function build() {
     body.innerHTML = "";
     cards = [];
     const o = state.ops || {};
+    const fleet = o.fleet || state.fleet || {};
     const opsProjects = (o.ops && o.ops.projects) || {};
     const outProjects = (o.outcomes && o.outcomes.projects) || {};
-    const names = [...new Set([...Object.keys(opsProjects), ...Object.keys(outProjects)])];
+    const proofs = fleet.proofs || {};
+    const jobs = {};
+    (fleet.queue || []).forEach(j => { if (j && j.repo) jobs[j.repo] = j; });
+    if (fleet.active && fleet.active.repo) jobs[fleet.active.repo] = fleet.active;
+    const names = [...new Set([...Object.keys(opsProjects), ...Object.keys(outProjects), ...Object.keys(proofs), ...Object.keys(jobs)])];
     if (!names.length) {
       body.appendChild(h("p", "muted", "No fleet data yet — the watchdog tick writes probe verdicts within ~2 minutes of launch."));
       return;
     }
+    body.appendChild(agentBar(fleet));
     const note = h("div", "fleet-note");
     const bw = o.ops && o.ops.blind_window_s;
     note.innerHTML = `<span>probes checked ${esc(ago(o.ops && o.ops.checked_at) || "—")}</span>`
@@ -429,9 +482,9 @@ function fleetPanel(body) {
     body.appendChild(note);
     const grid = h("div", "fleet-grid");
     names
-      .map(n => [n, opsProjects[n] || {}, outProjects[n] || {}])
+      .map(n => [n, opsProjects[n] || {}, outProjects[n] || {}, proofs[n] || null, jobs[n] || null])
       .sort((a, b) => (a[1].priority ?? a[2].priority ?? 99) - (b[1].priority ?? b[2].priority ?? 99))
-      .forEach(([n, p, oc]) => { const c = fleetCard(n, p, oc); cards.push(c); grid.appendChild(c); });
+      .forEach(([n, p, oc, proof, job]) => { const c = fleetCard(n, p, oc, proof, job); cards.push(c); grid.appendChild(c); });
     body.appendChild(grid);
   }
   function updateLaneRows() {
@@ -451,7 +504,7 @@ function fleetPanel(body) {
   build(); updateLaneRows();
   return { update() {
     const o = state.ops || {};
-    const s = JSON.stringify([o.ops, o.outcomes]);
+    const s = JSON.stringify([o.ops, o.outcomes, o.fleet, state.fleet]);
     if (s !== sig) { sig = s; build(); }
     updateLaneRows();
   } };
@@ -749,7 +802,14 @@ const mock = (() => {
   ];
   let lay = null;
   return {
-    get_state: () => ({ repos, providers: ["ollama-cloud", "openrouter"], gh_ready: true, keys: { "ollama-cloud": true }, github: { user: "cayleb" }, auto_push: true }),
+    get_state: () => ({ repos, providers: ["ollama-cloud", "openrouter"], gh_ready: true, keys: { "ollama-cloud": true }, github: { user: "cayleb" }, auto_push: true, fleet: {
+      config: { mode: "single_fleet", provider: "openrouter", model: "nvidia/nemotron-3-ultra-550b-a55b:free", daily_call_budget: 40 },
+      active: { repo: "sover", job: "implement", priority: 10 },
+      queue: [{ repo: "asmodeus", job: "proof_required", state: "proof_required", priority: 5, next_action: "surface blocker" }],
+      cooldown: null,
+      daily: { date: "2026-07-04", calls: 3 },
+      proofs: { sover: { ts: new Date(Date.now() - 600000).toISOString(), outcome: "proof_required", summary: "posting blocker captured without retry storm" } },
+    } }),
     get_layout: () => lay, set_layout: (l) => { lay = l; return { ok: true }; },
     current_sha: () => ({ sha: "efd7ba2" }),
     // v2 fleet payload (shape byte-identical to api::ops_state).
@@ -770,6 +830,17 @@ const mock = (() => {
         daedulus: { priority: 3, iterations_24h: 0, shipped_24h: 0 },
         dotz: { priority: 4, iterations_24h: 68, shipped_24h: 41 },
       } },
+      fleet: {
+        config: { mode: "single_fleet", provider: "openrouter", model: "nvidia/nemotron-3-ultra-550b-a55b:free", daily_call_budget: 40 },
+        active: { repo: "sover", job: "implement", priority: 10 },
+        queue: [{ repo: "asmodeus", job: "proof_required", state: "proof_required", priority: 5, next_action: "surface blocker" }],
+        cooldown: null,
+        daily: { date: "2026-07-04", calls: 3 },
+        proofs: {
+          sover: { ts: new Date(Date.now() - 600000).toISOString(), outcome: "proof_required", summary: "posting blocker captured without retry storm" },
+          asmodeus: { ts: new Date(Date.now() - 3600000).toISOString(), outcome: "blocked", summary: "restart forbidden by live-money probes" },
+        },
+      },
       ceo: {
         today: "2026-07-02", plan_hour: 7, summary_hour: 20,
         plan: { done: "2026-07-02" }, summary: {},

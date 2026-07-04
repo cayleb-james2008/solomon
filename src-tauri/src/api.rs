@@ -209,7 +209,10 @@ fn arg_opt_str(args: &[Value], i: usize) -> Option<String> {
 /// stringify). Defaults to 0 when absent/invalid.
 fn arg_i64(args: &[Value], i: usize) -> i64 {
     match args.get(i) {
-        Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)).unwrap_or(0),
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .or_else(|| n.as_f64().map(|f| f as i64))
+            .unwrap_or(0),
         Some(Value::String(s)) => s.trim().parse::<i64>().unwrap_or(0),
         _ => 0,
     }
@@ -275,6 +278,7 @@ fn ops_state() -> Value {
     let payload = json!({
         "ops": ops,
         "outcomes": safe(crate::ops::ledger::snapshot, Value::Null),
+        "fleet": safe(crate::fleet::state, Value::Null),
         "ceo": safe(crate::ceo::ceo_status, Value::Null),
         "incidents": safe(
             || Value::Array(crate::ceo::recent_incidents(chrono::Utc::now())),
@@ -327,6 +331,7 @@ fn get_state(st: &AppState) -> Value {
         "providers": ["ollama-cloud", "openrouter"],
         "keys": safe(keys::keys_status, json!({})),
         "github": safe(gh::github_status, json!({})),
+        "fleet": safe(crate::fleet::state, Value::Null),
     })
 }
 
@@ -367,7 +372,10 @@ fn repo_state(r: &Value, gh_ready: bool) -> Value {
     if diagnosis.get("category").and_then(Value::as_str) == Some("ok") {
         safe(|| supervisor::note_healthy(r), ());
     }
-    let escalation = safe(|| supervisor::read_escalation(r).unwrap_or(Value::Null), Value::Null);
+    let escalation = safe(
+        || supervisor::read_escalation(r).unwrap_or(Value::Null),
+        Value::Null,
+    );
     json!({
         "name": r.get("name").cloned().unwrap_or(Value::Null),
         "path": r.get("path").cloned().unwrap_or(Value::Null),
@@ -437,13 +445,20 @@ pub fn dispatch(method: &str, args: &[Value]) -> Result<Value, String> {
         // update_status / apply_update are handled in the `bridge` command (they need the AppHandle for
         // tauri-plugin-updater). cached_update_status stays a benign stub: there is no native cache to read.
         "cached_update_status" => json!({"ok": false, "available": false}),
-        "current_sha" => apptest_health::current_sha().map(Value::String).unwrap_or(Value::Null),
+        "current_sha" => apptest_health::current_sha()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
 
         // ---- combined dashboard state -----------------------------------
         "get_state" => get_state(&st),
 
         // ---- ops / CEO plane (dashboard v2) ------------------------------
         "ops_state" => ops_state(),
+        "fleet_state" => crate::fleet::state(),
+        "fleet_once" => crate::fleet::once(st.get_auto_push(), arg_opt_str(args, 0).as_deref()),
+        "fleet_drain" => {
+            crate::fleet::drain(st.get_auto_push(), arg_i64_default(args, 0).max(0) as usize)
+        }
         // Fire-and-forget: the morning plan blocks minutes on an LLM call — a bridge call must
         // return immediately; the dashboard sees the result on a later ops_state poll.
         // catch_unwind mirrors the watchdog's CEO graft.
@@ -462,10 +477,12 @@ pub fn dispatch(method: &str, args: &[Value]) -> Result<Value, String> {
 
         // ---- control ----------------------------------------------------
         "start" => match find_repo(&arg_str(args, 0)) {
+            Some(r) if registry::fleet_enabled() => crate::fleet::enqueue(&paths::repo_name(&r)),
             Some(r) => runner::start(&r, st.get_auto_push(), arg_bool(args, 1, false)),
             None => unknown_repo(),
         },
         "stop" => match find_repo(&arg_str(args, 0)) {
+            Some(r) if registry::fleet_enabled() => crate::fleet::stop_name(&r),
             Some(r) => runner::stop(&r),
             None => unknown_repo(),
         },
@@ -656,14 +673,25 @@ fn add_project(args: &[Value]) -> Value {
     if !r.get("ok").and_then(Value::as_bool).unwrap_or(false) {
         return r;
     }
-    let name = r.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let name = r
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     // set the north-star goal FIRST so the enrichment is steered by it.
     if let Some(g) = &goal {
         let trimmed = g.trim();
         if !trimmed.is_empty() {
             registry::set_repo_config(
                 &name,
-                None, None, None, None, None, None, None, None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
                 Some(trimmed),
                 None,
                 None,
@@ -763,7 +791,7 @@ fn supervise(st: &AppState, args: &[Value]) -> Value {
         match recovered {
             Ok((rec, remaining)) => {
                 restart_budget.set(remaining); // carry the shared budget to the next repo
-                // {"name": name, **recover(...)}
+                                               // {"name": name, **recover(...)}
                 let mut obj = Map::new();
                 obj.insert("name".to_string(), repo_name);
                 if let Value::Object(o) = rec {
@@ -841,7 +869,11 @@ fn open_in_browser(url: &str) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
         Command::new(opener)
             .arg(url)
             .spawn()
@@ -910,7 +942,10 @@ mod tests {
         // n larger than available -> all
         assert_eq!(jsonl_tail(&p, 50), json!([{"a":1},{"a":2},{"a":3}]));
         // missing file -> []
-        assert_eq!(jsonl_tail(std::path::Path::new("Z:/absent.jsonl"), 5), json!([]));
+        assert_eq!(
+            jsonl_tail(std::path::Path::new("Z:/absent.jsonl"), 5),
+            json!([])
+        );
         let _ = std::fs::remove_file(&p);
     }
 
@@ -937,7 +972,13 @@ mod tests {
             let saved_legacy = std::fs::read(&legacy).ok();
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(&legacy);
-            StateGuard { path, legacy, saved, saved_legacy, _lock: lock }
+            StateGuard {
+                path,
+                legacy,
+                saved,
+                saved_legacy,
+                _lock: lock,
+            }
         }
     }
     impl Drop for StateGuard {
@@ -976,15 +1017,27 @@ mod tests {
         let _g = StateGuard::capture();
         let mut st = AppState::load();
         assert_eq!(st.set_theme("light"), json!({"ok": true, "theme": "light"}));
-        assert_eq!(st.set_auto_push(false), json!({"ok": true, "auto_push": false}));
-        assert_eq!(st.set_auto_ai_fix(true), json!({"ok": true, "auto_ai_fix": true}));
-        assert_eq!(st.set_layout(json!([{"id": "p1", "type": "card", "repo": "x"}])), json!({"ok": true}));
+        assert_eq!(
+            st.set_auto_push(false),
+            json!({"ok": true, "auto_push": false})
+        );
+        assert_eq!(
+            st.set_auto_ai_fix(true),
+            json!({"ok": true, "auto_ai_fix": true})
+        );
+        assert_eq!(
+            st.set_layout(json!([{"id": "p1", "type": "card", "repo": "x"}])),
+            json!({"ok": true})
+        );
         // a fresh load (next dispatch) sees the persisted values — disk is the source of truth.
         let st2 = AppState::load();
         assert_eq!(st2.get_theme(), "light");
         assert!(!st2.get_auto_push());
         assert!(st2.get_auto_ai_fix());
-        assert_eq!(st2.get_layout(), json!([{"id": "p1", "type": "card", "repo": "x"}]));
+        assert_eq!(
+            st2.get_layout(),
+            json!([{"id": "p1", "type": "card", "repo": "x"}])
+        );
     }
 
     #[test]
@@ -1039,23 +1092,58 @@ mod tests {
         let none = json!("definitely-not-a-registered-repo-xyz");
         // ok-dict sentinel methods.
         for m in [
-            "start", "stop", "beautify", "merge", "close", "pr_diff", "read_log", "read_contract",
-            "write_contract", "cleanup_worktrees", "clean_branch", "start_app_test", "stop_app_test",
-            "app_test_state", "app_test_frame", "read_app_test_report", "ensure_contracts",
-            "enrich_contract", "ideate", "clear_escalation",
+            "start",
+            "stop",
+            "beautify",
+            "merge",
+            "close",
+            "pr_diff",
+            "read_log",
+            "read_contract",
+            "write_contract",
+            "cleanup_worktrees",
+            "clean_branch",
+            "start_app_test",
+            "stop_app_test",
+            "app_test_state",
+            "app_test_frame",
+            "read_app_test_report",
+            "ensure_contracts",
+            "enrich_contract",
+            "ideate",
+            "clear_escalation",
         ] {
             let r = dispatch(m, std::slice::from_ref(&none)).unwrap();
-            assert_eq!(r, unknown_repo(), "method {m} should return the unknown-repo sentinel");
+            assert_eq!(
+                r,
+                unknown_repo(),
+                "method {m} should return the unknown-repo sentinel"
+            );
         }
         // list-default methods.
-        assert_eq!(dispatch("read_history", std::slice::from_ref(&none)).unwrap(), json!([]));
-        assert_eq!(dispatch("read_supervisor_log", std::slice::from_ref(&none)).unwrap(), json!([]));
+        assert_eq!(
+            dispatch("read_history", std::slice::from_ref(&none)).unwrap(),
+            json!([])
+        );
+        assert_eq!(
+            dispatch("read_supervisor_log", std::slice::from_ref(&none)).unwrap(),
+            json!([])
+        );
         // dict-default metrics.
-        assert_eq!(dispatch("metrics", std::slice::from_ref(&none)).unwrap(), json!({}));
+        assert_eq!(
+            dispatch("metrics", std::slice::from_ref(&none)).unwrap(),
+            json!({})
+        );
         // null-default escalation read.
-        assert_eq!(dispatch("read_escalation", std::slice::from_ref(&none)).unwrap(), Value::Null);
+        assert_eq!(
+            dispatch("read_escalation", std::slice::from_ref(&none)).unwrap(),
+            Value::Null
+        );
         // supervise(name) with no matching repo -> unknown repo.
-        assert_eq!(dispatch("supervise", std::slice::from_ref(&none)).unwrap(), unknown_repo());
+        assert_eq!(
+            dispatch("supervise", std::slice::from_ref(&none)).unwrap(),
+            unknown_repo()
+        );
     }
 
     #[test]
@@ -1113,14 +1201,24 @@ mod tests {
 
         // Seed a stale escalation from a prior (now-resolved) issue.
         supervisor::write_escalation(&repo, &json!({"category": "no_key", "evidence": "stale"}));
-        assert!(rt.join("escalation.json").exists(), "escalation.json seeded");
+        assert!(
+            rt.join("escalation.json").exists(),
+            "escalation.json seeded"
+        );
 
         // repo_state with gh_ready=false (no gh probes). No heartbeat/lock/stop/history ->
         // diagnose() returns "ok" -> the stale escalation must be cleared.
         let state = repo_state(&repo, false);
         assert_eq!(state["diagnosis"]["category"], "ok");
-        assert_eq!(state["escalation"], Value::Null, "stale escalation must not leak to the dashboard");
-        assert!(!rt.join("escalation.json").exists(), "escalation.json must be removed");
+        assert_eq!(
+            state["escalation"],
+            Value::Null,
+            "stale escalation must not leak to the dashboard"
+        );
+        assert!(
+            !rt.join("escalation.json").exists(),
+            "escalation.json must be removed"
+        );
         // The fix: repo_state must ALSO stamp an "ok" supervisor.jsonl record so the finish()
         // log-once dedupe (which compares against the LAST supervisor record) is broken — else a
         // recurrence of the SAME problem is silently suppressed (the stale escalate=true record
@@ -1131,10 +1229,15 @@ mod tests {
             .lines()
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
             .next_back()
-            .map(|r| r.get("category").and_then(Value::as_str) == Some("ok")
-                && r.get("escalate").and_then(Value::as_bool) == Some(false))
+            .map(|r| {
+                r.get("category").and_then(Value::as_str) == Some("ok")
+                    && r.get("escalate").and_then(Value::as_bool) == Some(false)
+            })
             .unwrap_or(false);
-        assert!(last_ok, "a healthy dashboard poll must stamp an ok supervisor.jsonl record to break the dedupe");
+        assert!(
+            last_ok,
+            "a healthy dashboard poll must stamp an ok supervisor.jsonl record to break the dedupe"
+        );
 
         let _ = std::fs::remove_dir_all(&rt);
     }
@@ -1152,7 +1255,10 @@ mod tests {
         // Seed an escalation AND an error heartbeat so the diagnosis is NOT "ok".
         std::fs::write(
             rt.join("heartbeat.json"),
-            serde_json::to_string(&json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"})).unwrap(),
+            serde_json::to_string(
+                &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}),
+            )
+            .unwrap(),
         )
         .unwrap();
         supervisor::write_escalation(&repo, &json!({"category": "no_key", "evidence": "live"}));
@@ -1162,7 +1268,10 @@ mod tests {
         assert_eq!(state["diagnosis"]["category"], "no_key");
         // escalation is live (not stale) — must still be present.
         assert_eq!(state["escalation"]["category"], "no_key");
-        assert!(rt.join("escalation.json").exists(), "live escalation must NOT be cleared");
+        assert!(
+            rt.join("escalation.json").exists(),
+            "live escalation must NOT be cleared"
+        );
 
         let _ = std::fs::remove_dir_all(&rt);
     }
@@ -1191,17 +1300,29 @@ mod tests {
     fn dispatch_theme_setters_roundtrip() {
         let _g = StateGuard::capture();
         assert_eq!(dispatch("get_theme", &[]).unwrap(), json!("dark"));
-        assert_eq!(dispatch("set_theme", &[json!("light")]).unwrap(), json!({"ok": true, "theme": "light"}));
+        assert_eq!(
+            dispatch("set_theme", &[json!("light")]).unwrap(),
+            json!({"ok": true, "theme": "light"})
+        );
         assert_eq!(dispatch("get_theme", &[]).unwrap(), json!("light"));
         assert_eq!(dispatch("get_auto_push", &[]).unwrap(), json!(true));
-        assert_eq!(dispatch("set_auto_push", &[json!(false)]).unwrap(), json!({"ok": true, "auto_push": false}));
+        assert_eq!(
+            dispatch("set_auto_push", &[json!(false)]).unwrap(),
+            json!({"ok": true, "auto_push": false})
+        );
         assert_eq!(dispatch("get_auto_push", &[]).unwrap(), json!(false));
         assert_eq!(dispatch("get_auto_ai_fix", &[]).unwrap(), json!(false));
-        assert_eq!(dispatch("set_auto_ai_fix", &[json!(true)]).unwrap(), json!({"ok": true, "auto_ai_fix": true}));
+        assert_eq!(
+            dispatch("set_auto_ai_fix", &[json!(true)]).unwrap(),
+            json!({"ok": true, "auto_ai_fix": true})
+        );
         assert_eq!(dispatch("get_layout", &[]).unwrap(), Value::Null); // unset default
-        // round-trip layout
+                                                                       // round-trip layout
         let layout = json!([{"id": "a", "type": "card", "repo": "r"}]);
-        assert_eq!(dispatch("set_layout", std::slice::from_ref(&layout)).unwrap(), json!({"ok": true}));
+        assert_eq!(
+            dispatch("set_layout", std::slice::from_ref(&layout)).unwrap(),
+            json!({"ok": true})
+        );
         assert_eq!(dispatch("get_layout", &[]).unwrap(), layout);
     }
 }

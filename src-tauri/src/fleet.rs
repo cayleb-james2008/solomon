@@ -1,0 +1,1085 @@
+//! Single-agent Fleet runtime.
+//!
+//! This replaces "one long-lived improver process per lane" with one file-backed scheduler that owns
+//! provider quota, job priority, active leases, and proof records. Managed repo mutation still flows
+//! through the existing gated `run-improver --once` executor.
+
+use crate::control::{heartbeat, locks, paths, proc, registry};
+use crate::improver::pi;
+use crate::ops;
+use crate::supervisor;
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
+use serde_json::{json, Map, Value};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+const STATE_FILE: &str = "fleet_state.json";
+const EVENTS_FILE: &str = "fleet_events.jsonl";
+const LOCK_FILE: &str = "fleet.lock";
+const PROOF_FILE: &str = "fleet_proof.json";
+const DEFAULT_RUN_TIMEOUT_S: u64 = 14_400;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Job {
+    name: String,
+    kind: String,
+    state: String,
+    priority: i64,
+    requires_ai: bool,
+    reason: String,
+    next_action: String,
+}
+
+struct FleetLease {
+    path: PathBuf,
+}
+
+impl Drop for FleetLease {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+pub fn state() -> Value {
+    let cfg = registry::fleet_config();
+    let mut st = read_state(&cfg);
+    let repos = registry::load_repos();
+    let ops_payload = read_ops_payload();
+    let jobs = plan_jobs(&repos, &cfg, &ops_payload, &st, None);
+    st["ok"] = Value::Bool(true);
+    st["queue"] = Value::Array(jobs.iter().map(job_value).collect());
+    st["proofs"] = proof_records();
+    st["config"] = public_config(&cfg);
+    st
+}
+
+pub fn enqueue(name: &str) -> Value {
+    let cfg = registry::fleet_config();
+    let mut st = read_state(&cfg);
+    let mut q = st
+        .get("manual_queue")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !q.iter().any(|v| v.as_str() == Some(name)) {
+        q.push(Value::String(name.to_string()));
+    }
+    st["manual_queue"] = Value::Array(q);
+    st["ts"] = json!(now());
+    let _ = write_state(&st);
+    append_event(&json!({"event": "manual_enqueue", "repo": name}));
+    write_proof(
+        name,
+        "queued",
+        "queued",
+        "manual start queued for the single Fleet Agent",
+        None,
+        None,
+    );
+    json!({"ok": true, "queued": true, "repo": name})
+}
+
+pub fn stop_name(repo: &Value) -> Value {
+    let name = paths::repo_name(repo);
+    if name.is_empty() {
+        return json!({"ok": false, "error": "unknown repo"});
+    }
+    let mut out = if locks::is_running(repo) {
+        crate::control::runner::stop(repo)
+    } else {
+        json!({"ok": true, "already": true})
+    };
+    let cfg = registry::fleet_config();
+    let mut st = read_state(&cfg);
+    let q: Vec<Value> = st
+        .get("manual_queue")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|v| v.as_str() != Some(name.as_str()))
+        .collect();
+    st["manual_queue"] = Value::Array(q);
+    st["ts"] = json!(now());
+    let _ = write_state(&st);
+    append_event(&json!({"event": "manual_stop", "repo": name}));
+    if let Value::Object(ref mut o) = out {
+        o.insert("dequeued".to_string(), Value::Bool(true));
+        o.insert("fleet".to_string(), Value::Bool(true));
+    }
+    out
+}
+
+pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
+    let cfg = registry::fleet_config();
+    if cfg.get("mode").and_then(Value::as_str) != Some("single_fleet") {
+        return json!({"ok": false, "error": "fleet mode is not single_fleet"});
+    }
+    if max_concurrent(&cfg) != 1 {
+        return json!({"ok": false, "error": "single_fleet requires max_concurrent_agent_calls=1"});
+    }
+    let _lease = match acquire_lock() {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            return json!({"ok": true, "leased": false, "summary": "Fleet Agent already active"})
+        }
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+
+    let repos = registry::load_repos();
+    let ops_payload = read_ops_payload();
+    let mut st = read_state(&cfg);
+    let jobs = plan_jobs(&repos, &cfg, &ops_payload, &st, only_name);
+    let mut actions = Vec::<String>::new();
+    st["ts"] = json!(now());
+    st["queue"] = Value::Array(jobs.iter().map(job_value).collect());
+    st["config"] = public_config(&cfg);
+
+    if let Some(until) = cooldown_until(&st) {
+        if until > Utc::now() {
+            let maintenance = jobs
+                .iter()
+                .find(|j| !j.requires_ai && j.kind != "cooldown")
+                .cloned();
+            if let Some(job) = maintenance {
+                let out = finish_non_ai_job(&job, &repos, &ops_payload);
+                actions.push(format!("{} {}", job.name, job.kind));
+                st["last_result"] = out.clone();
+                st["active"] = Value::Null;
+                let _ = write_state(&st);
+                return json!({"ok": true, "cooldown": cooldown_value(&st), "actions": actions, "result": out});
+            }
+            st["active"] = Value::Null;
+            let _ = write_state(&st);
+            return json!({
+                "ok": true,
+                "cooldown": cooldown_value(&st),
+                "actions": ["provider cooldown active; no AI job started"],
+                "queue": st["queue"].clone(),
+            });
+        }
+    }
+
+    if daily_used(&st) >= daily_budget(&cfg) {
+        set_cooldown(&mut st, &cfg, "daily call budget reached");
+        let _ = write_state(&st);
+        append_event(&json!({"event": "provider_cooldown", "reason": "daily call budget reached"}));
+        return json!({"ok": true, "actions": ["daily call budget reached; provider cooling down"], "cooldown": cooldown_value(&st)});
+    }
+
+    let Some(job) = jobs.first().cloned() else {
+        st["active"] = Value::Null;
+        st["last_result"] =
+            json!({"ts": now(), "outcome": "complete", "summary": "no queued fleet work"});
+        let _ = write_state(&st);
+        return json!({"ok": true, "actions": [], "queue": []});
+    };
+
+    st["active"] = job_value(&job);
+    let _ = write_state(&st);
+    append_event(
+        &json!({"event": "job_started", "repo": job.name, "kind": job.kind, "requires_ai": job.requires_ai}),
+    );
+
+    let result = if job.requires_ai {
+        run_ai_job(&job, &repos, &cfg, auto_push, &mut st)
+    } else {
+        finish_non_ai_job(&job, &repos, &ops_payload)
+    };
+    if job.kind == "cooldown" {
+        set_cooldown(&mut st, &cfg, "provider quota/rate limit");
+        append_event(
+            &json!({"event": "provider_cooldown", "repo": job.name, "reason": "quota_error heartbeat"}),
+        );
+        for q in jobs
+            .iter()
+            .filter(|j| j.kind == "cooldown" && j.name != job.name)
+        {
+            let _ = finish_non_ai_job(q, &repos, &ops_payload);
+        }
+    }
+    actions.push(format!(
+        "{} {} -> {}",
+        job.name,
+        job.kind,
+        result
+            .get("outcome")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    ));
+    st["active"] = Value::Null;
+    st["last_result"] = result.clone();
+    st["queue"] = Value::Array(
+        plan_jobs(&repos, &cfg, &read_ops_payload(), &st, only_name)
+            .iter()
+            .map(job_value)
+            .collect(),
+    );
+    st["ts"] = json!(now());
+    let _ = write_state(&st);
+    json!({"ok": true, "actions": actions, "result": result, "state": state()})
+}
+
+pub fn drain(auto_push: bool, limit: usize) -> Value {
+    let cfg = registry::fleet_config();
+    let cap = if limit == 0 {
+        registry::fleet_targets().len().max(1)
+    } else {
+        limit
+    };
+    let mut runs = Vec::new();
+    for _ in 0..cap {
+        let out = once(auto_push, None);
+        let active_elsewhere = out.get("leased").and_then(Value::as_bool) == Some(false);
+        let cooled = out.get("cooldown").map(json_truthy).unwrap_or(false);
+        let no_actions = out
+            .get("actions")
+            .and_then(Value::as_array)
+            .map(|a| a.is_empty())
+            .unwrap_or(false);
+        runs.push(out);
+        if active_elsewhere || cooled || no_actions {
+            break;
+        }
+        if daily_used(&read_state(&cfg)) >= daily_budget(&cfg) {
+            break;
+        }
+    }
+    json!({"ok": true, "runs": runs, "state": state()})
+}
+
+pub fn sweep_snapshots(repos: &[Value]) -> Vec<Value> {
+    repos
+        .iter()
+        .filter(|r| r.is_object())
+        .filter_map(|r| {
+            let name = r.get("name").and_then(Value::as_str)?.to_string();
+            let hb = heartbeat::read_heartbeat(r).unwrap_or_else(|| json!({}));
+            let hist = heartbeat::read_history(r, 1);
+            let last = hist.last().cloned().unwrap_or_else(|| json!({}));
+            let diag = supervisor::diagnose(r);
+            Some(json!({
+                "ts": now(),
+                "repo": name,
+                "running": locks::is_running(r),
+                "restarted": false,
+                "paused": paths::runtime_dir(r).map(|d| d.join("paused").exists()).unwrap_or(false),
+                "status": hb.get("status").cloned().unwrap_or(Value::Null),
+                "phase": hb.get("phase").cloned().unwrap_or(Value::Null),
+                "iteration": hb.get("iteration").cloned().unwrap_or(Value::Null),
+                "last_status": last.get("status").cloned().unwrap_or(Value::Null),
+                "diagnosis": diag.get("category").cloned().unwrap_or(Value::Null),
+                "fleet": true,
+            }))
+        })
+        .collect()
+}
+
+fn run_ai_job(job: &Job, repos: &[Value], cfg: &Value, auto_push: bool, st: &mut Value) -> Value {
+    let Some(repo) = repos
+        .iter()
+        .find(|r| r.get("name").and_then(Value::as_str) == Some(job.name.as_str()))
+    else {
+        return proof(job, "blocked", "repo not found", None, None);
+    };
+    let key_ref = cfg
+        .get("api_key")
+        .and_then(Value::as_str)
+        .unwrap_or("OPENROUTER_API_KEY");
+    let Some(key_value) = resolve_key(key_ref) else {
+        return proof(
+            job,
+            "blocked",
+            "OPENROUTER_API_KEY is not set for the Fleet Agent",
+            None,
+            None,
+        );
+    };
+    increment_daily(st);
+    append_event(
+        &json!({"event": "agent_call_started", "repo": job.name, "provider": cfg["provider"], "model": cfg["model"]}),
+    );
+    let out = run_repo_once(repo, cfg, auto_push, &key_value);
+    let quota = pi::is_quota_error_output(&out.stdout, &out.stderr)
+        || out.stdout.contains("\"reason\":\"quota_error\"")
+        || out.stderr.contains("quota_error");
+    if quota {
+        set_cooldown(st, cfg, "provider quota/rate limit");
+    }
+    let diag = supervisor::diagnose(repo);
+    let hist = heartbeat::read_history(repo, 1);
+    let latest = hist.last().cloned().unwrap_or_else(|| json!({}));
+    let outcome = if quota {
+        "cooldown"
+    } else if latest.get("status").and_then(Value::as_str) == Some("shipped") {
+        "shipped"
+    } else if latest.get("status").and_then(Value::as_str) == Some("blocked") {
+        "blocked"
+    } else if latest.get("status").and_then(Value::as_str) == Some("reverted") {
+        "proof_required"
+    } else if out.code == 0 {
+        "proof_required"
+    } else {
+        "blocked"
+    };
+    let summary = if quota {
+        "provider quota hit; Fleet Agent cooled down instead of retrying".to_string()
+    } else {
+        latest
+            .get("summary")
+            .or_else(|| latest.get("last_summary"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                diag.get("evidence")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| format!("run-improver exited {}", out.code))
+    };
+    let extra = json!({
+        "command_code": out.code,
+        "diagnosis": diag,
+        "latest_history": latest,
+        "stdout_tail": tail_chars(&out.stdout, 1200),
+        "stderr_tail": tail_chars(&out.stderr, 1200),
+        "cooldown": cooldown_value(st),
+    });
+    proof(job, outcome, &summary, Some(extra), Some(repo))
+}
+
+fn finish_non_ai_job(job: &Job, repos: &[Value], ops_payload: &Value) -> Value {
+    let repo = repos
+        .iter()
+        .find(|r| r.get("name").and_then(Value::as_str) == Some(job.name.as_str()));
+    match job.kind.as_str() {
+        "maintenance" => {
+            if let Some(r) = repo {
+                let diag = supervisor::diagnose(r);
+                if diag.get("category").and_then(Value::as_str) == Some("stale_lock")
+                    && diag.get("auto_safe").and_then(Value::as_bool) == Some(true)
+                {
+                    let cleared = locks::clear_lock(r);
+                    return proof(
+                        job,
+                        if cleared.get("ok").and_then(Value::as_bool) == Some(true) {
+                            "complete"
+                        } else {
+                            "blocked"
+                        },
+                        "stale lock maintenance ran",
+                        Some(json!({"diagnosis": diag, "clear_lock": cleared})),
+                        Some(r),
+                    );
+                }
+            }
+            proof(
+                job,
+                "complete",
+                "non-LLM maintenance checked; no unsafe action taken",
+                None,
+                repo,
+            )
+        }
+        "cooldown" => proof(
+            job,
+            "cooldown",
+            "last lane heartbeat was quota_error; provider cooldown owns retry timing",
+            repo.map(|r| json!({"diagnosis": supervisor::diagnose(r)})),
+            repo,
+        ),
+        "proof_required" | "blocked" => proof(
+            job,
+            job.kind.as_str(),
+            &job.reason,
+            Some(
+                json!({"ops": ops_payload.get("projects").and_then(|p| p.get(&job.name)).cloned().unwrap_or(Value::Null)}),
+            ),
+            repo,
+        ),
+        _ => proof(job, "complete", &job.reason, None, repo),
+    }
+}
+
+fn plan_jobs(
+    repos: &[Value],
+    cfg: &Value,
+    ops_payload: &Value,
+    st: &Value,
+    only_name: Option<&str>,
+) -> Vec<Job> {
+    let targets: Vec<String> = only_name
+        .map(|n| vec![n.to_string()])
+        .unwrap_or_else(|| cfg_targets(cfg));
+    let manual = st
+        .get("manual_queue")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut jobs = Vec::new();
+    for name in targets {
+        let Some(repo) = repos
+            .iter()
+            .find(|r| r.get("name").and_then(Value::as_str) == Some(name.as_str()))
+        else {
+            jobs.push(Job {
+                name,
+                kind: "blocked".into(),
+                state: "blocked".into(),
+                priority: 5,
+                requires_ai: false,
+                reason: "repo is listed in fleet targets but missing from registry".into(),
+                next_action: "fix repos.json target/path".into(),
+            });
+            continue;
+        };
+        let diag = supervisor::diagnose(repo);
+        let diag_cat = diag.get("category").and_then(Value::as_str).unwrap_or("ok");
+        let ops_project = ops_payload
+            .get("projects")
+            .and_then(|p| p.get(&name))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let ops_status = ops_project
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("grey");
+        let manual_hit = manual.iter().any(|v| v.as_str() == Some(name.as_str()));
+        let last_proof = read_proof(&name);
+        let proof_fresh = last_proof
+            .as_ref()
+            .and_then(|p| p.get("ts").and_then(Value::as_str))
+            .and_then(parse_ts)
+            .map(|t| Utc::now() - t < ChronoDuration::hours(12))
+            .unwrap_or(false);
+        let mut priority = match ops_status {
+            "red" => 10,
+            "yellow" => 30,
+            _ => 70,
+        };
+        if manual_hit {
+            priority = 1;
+        }
+        let (kind, state, requires_ai, reason, next_action) = if diag_cat == "quota_error" {
+            (
+                "cooldown",
+                "cooldown",
+                false,
+                "provider quota/rate-limit heartbeat",
+                "wait for cooldown; run non-LLM probes and cleanup",
+            )
+        } else if diag_cat == "stale_lock"
+            && diag.get("auto_safe").and_then(Value::as_bool) == Some(true)
+        {
+            (
+                "maintenance",
+                "queued",
+                false,
+                "dead stale lock can be cleared without AI",
+                "clear stale lock",
+            )
+        } else if diag_cat != "ok" && diag.get("auto_safe").and_then(Value::as_bool) != Some(true) {
+            (
+                "proof_required",
+                "proof_required",
+                false,
+                diag.get("evidence")
+                    .and_then(Value::as_str)
+                    .unwrap_or("lane is unhealthy"),
+                "surface blocker and avoid retry theater",
+            )
+        } else if ops_status == "red" || ops_status == "yellow" || manual_hit || !proof_fresh {
+            (
+                "implement",
+                "queued",
+                true,
+                if ops_status == "red" || ops_status == "yellow" {
+                    "ops outcome needs improvement"
+                } else if manual_hit {
+                    "manual fleet start request"
+                } else {
+                    "proof record is stale or missing"
+                },
+                "run one gated RSI iteration",
+            )
+        } else {
+            (
+                "complete",
+                "complete",
+                false,
+                "fresh proof exists and ops are not red/yellow",
+                "hold",
+            )
+        };
+        if kind == "complete" {
+            continue;
+        }
+        if kind == "cooldown" {
+            priority = 3;
+        }
+        if cfg.get("provider").and_then(Value::as_str) != Some("openrouter") && requires_ai {
+            priority += 20;
+        }
+        jobs.push(Job {
+            name,
+            kind: kind.into(),
+            state: state.into(),
+            priority,
+            requires_ai,
+            reason: reason.into(),
+            next_action: next_action.into(),
+        });
+    }
+    jobs.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then_with(|| a.requires_ai.cmp(&b.requires_ai))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    jobs
+}
+
+fn run_repo_once(repo: &Value, cfg: &Value, auto_push: bool, key_value: &str) -> proc::RunOut {
+    let program = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "solomon.exe".to_string());
+    let provider = cfg
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("openrouter");
+    let model = cfg
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("nvidia/nemotron-3-ultra-550b-a55b:free");
+    let argv = vec![
+        program,
+        "run-improver".into(),
+        "--repo".into(),
+        paths::repo_path(repo),
+        "--name".into(),
+        paths::repo_name(repo),
+        "--provider".into(),
+        provider.into(),
+        "--model".into(),
+        model.into(),
+        "--ship".into(),
+        registry::effective_ship(repo, auto_push),
+        "--gate".into(),
+        registry::project_gate(repo).unwrap_or_default(),
+        "--pr-target-branch".into(),
+        registry::project_pr_target_branch(repo),
+        "--reasoning".into(),
+        registry::project_reasoning(repo),
+        "--interval".into(),
+        "1".into(),
+        "--max-iterations".into(),
+        "1".into(),
+        "--goal".into(),
+        registry::project_goal(repo),
+        "--once".into(),
+    ];
+    run_with_env(
+        &argv,
+        Path::new(&paths::repo_path(repo)),
+        key_value,
+        Duration::from_secs(DEFAULT_RUN_TIMEOUT_S),
+    )
+}
+
+fn run_with_env(
+    argv: &[String],
+    cwd: &Path,
+    openrouter_key: &str,
+    timeout: Duration,
+) -> proc::RunOut {
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("SOLOMON_FLEET_MODE", "single_fleet")
+        .env("OPENROUTER_API_KEY", openrouter_key);
+    proc::apply_clean_env(&mut cmd);
+    #[cfg(windows)]
+    cmd.creation_flags(proc::hidden_flags(false, false));
+    match run_prepared(cmd, timeout) {
+        Ok(o) => o,
+        Err(e) => proc::RunOut {
+            code: if e.kind() == std::io::ErrorKind::TimedOut {
+                124
+            } else {
+                -1
+            },
+            stdout: String::new(),
+            stderr: e.to_string(),
+        },
+    }
+}
+
+fn run_prepared(mut cmd: Command, timeout: Duration) -> std::io::Result<proc::RunOut> {
+    use wait_timeout::ChildExt;
+    let mut child = cmd.spawn()?;
+    let out_h = child.stdout.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+    });
+    let err_h = child.stderr.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+    });
+    let join = |h: Option<std::thread::JoinHandle<String>>| -> String {
+        h.and_then(|h| h.join().ok()).unwrap_or_default()
+    };
+    match child.wait_timeout(timeout)? {
+        Some(status) => Ok(proc::RunOut {
+            code: status.code().unwrap_or(-1),
+            stdout: join(out_h),
+            stderr: join(err_h),
+        }),
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(out_h);
+            drop(err_h);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "fleet job timed out",
+            ))
+        }
+    }
+}
+
+fn proof(
+    job: &Job,
+    outcome: &str,
+    summary: &str,
+    extra: Option<Value>,
+    repo: Option<&Value>,
+) -> Value {
+    let mut v = json!({
+        "ts": now(),
+        "repo": job.name,
+        "job": job.kind,
+        "state": job.state,
+        "outcome": outcome,
+        "summary": summary,
+        "requires_ai": job.requires_ai,
+        "priority": job.priority,
+        "next_action": job.next_action,
+        "extra": extra.unwrap_or(Value::Null),
+    });
+    if let Some(r) = repo {
+        v["diagnosis"] = supervisor::diagnose(r);
+        v["heartbeat"] = heartbeat::read_heartbeat(r).unwrap_or(Value::Null);
+        v["latest_history"] = heartbeat::read_history(r, 1)
+            .last()
+            .cloned()
+            .unwrap_or(Value::Null);
+    } else {
+        v["diagnosis"] = Value::Null;
+    }
+    write_proof_value(&job.name, &v);
+    append_event(
+        &json!({"event": "job_finished", "repo": job.name, "job": job.kind, "outcome": outcome}),
+    );
+    v
+}
+
+fn write_proof(
+    name: &str,
+    job: &str,
+    outcome: &str,
+    summary: &str,
+    extra: Option<Value>,
+    repo: Option<&Value>,
+) {
+    let mut v = json!({
+        "ts": now(),
+        "repo": name,
+        "job": job,
+        "outcome": outcome,
+        "summary": summary,
+    });
+    if let Some(r) = repo {
+        v["diagnosis"] = supervisor::diagnose(r);
+        v["heartbeat"] = heartbeat::read_heartbeat(r).unwrap_or(Value::Null);
+        v["latest_history"] = heartbeat::read_history(r, 1)
+            .last()
+            .cloned()
+            .unwrap_or(Value::Null);
+    }
+    if let Some(e) = extra {
+        v["extra"] = e;
+    }
+    if let Some(rt) = paths::runtime_dir(&json!({"name": name})) {
+        write_proof_value_at(&rt, &v);
+    }
+}
+
+fn write_proof_value(name: &str, v: &Value) {
+    if let Some(rt) = paths::runtime_dir(&json!({"name": name})) {
+        write_proof_value_at(&rt, v);
+    }
+}
+
+fn write_proof_value_at(rt: &Path, v: &Value) {
+    let _ = std::fs::create_dir_all(rt);
+    let _ = proc::atomic_write_json(&rt.join(PROOF_FILE), v);
+}
+
+fn read_proof(name: &str) -> Option<Value> {
+    let rt = paths::runtime_dir(&json!({"name": name}))?;
+    std::fs::read(rt.join(PROOF_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+fn proof_records() -> Value {
+    let mut out = Map::new();
+    for name in registry::fleet_targets() {
+        if let Some(v) = read_proof(&name) {
+            out.insert(name, v);
+        }
+    }
+    Value::Object(out)
+}
+
+fn acquire_lock() -> Result<Option<FleetLease>, String> {
+    let dir = paths::here().join("runtime");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    acquire_lock_at(dir.join(LOCK_FILE))
+}
+
+fn acquire_lock_at(path: PathBuf) -> Result<Option<FleetLease>, String> {
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        let pid = raw.trim().parse::<i64>().unwrap_or(0);
+        if pid != 0 && locks::pid_alive(pid) {
+            return Ok(None);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            f.write_all(std::process::id().to_string().as_bytes())
+                .map_err(|e| e.to_string())?;
+            Ok(Some(FleetLease { path }))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn read_state(cfg: &Value) -> Value {
+    std::fs::read(state_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_else(|| {
+            json!({
+                "ts": now(),
+                "mode": "single_fleet",
+                "active": null,
+                "queue": [],
+                "manual_queue": [],
+                "cooldown": null,
+                "daily": {"date": today(), "calls": 0},
+                "config": public_config(cfg),
+            })
+        })
+}
+
+fn write_state(st: &Value) -> std::io::Result<()> {
+    let p = state_path();
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    proc::atomic_write_json(&p, st)
+}
+
+fn append_event(event: &Value) {
+    let mut obj = match event {
+        Value::Object(o) => o.clone(),
+        _ => Map::new(),
+    };
+    obj.insert("ts".to_string(), json!(now()));
+    let p = events_path();
+    let _ = (|| -> std::io::Result<()> {
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)?;
+        writeln!(
+            f,
+            "{}",
+            serde_json::to_string(&Value::Object(obj)).unwrap_or_default()
+        )?;
+        Ok(())
+    })();
+}
+
+fn read_ops_payload() -> Value {
+    std::fs::read(ops::outcomes::ops_status_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_else(|| json!({"projects": {}}))
+}
+
+fn state_path() -> PathBuf {
+    paths::here().join("runtime").join(STATE_FILE)
+}
+
+fn events_path() -> PathBuf {
+    paths::here().join("runtime").join(EVENTS_FILE)
+}
+
+fn public_config(cfg: &Value) -> Value {
+    json!({
+        "mode": cfg.get("mode").cloned().unwrap_or(json!("single_fleet")),
+        "provider": cfg.get("provider").cloned().unwrap_or(json!("openrouter")),
+        "api_key": cfg.get("api_key").cloned().unwrap_or(json!("OPENROUTER_API_KEY")),
+        "model": cfg.get("model").cloned().unwrap_or(json!("nvidia/nemotron-3-ultra-550b-a55b:free")),
+        "max_concurrent_agent_calls": cfg.get("max_concurrent_agent_calls").cloned().unwrap_or(json!(1)),
+        "cooldown_s": cfg.get("cooldown_s").cloned().unwrap_or(json!(86400)),
+        "daily_call_budget": cfg.get("daily_call_budget").cloned().unwrap_or(json!(40)),
+        "adaptive_phase_policy": cfg.get("adaptive_phase_policy").cloned().unwrap_or(json!("cheap_by_default_deep_on_red_noop_critical_or_campaign")),
+        "targets": cfg.get("targets").cloned().unwrap_or(json!(["sover", "dotz", "asmodeus", "maki", "solomon"])),
+    })
+}
+
+fn job_value(j: &Job) -> Value {
+    json!({
+        "repo": j.name,
+        "job": j.kind,
+        "state": j.state,
+        "priority": j.priority,
+        "requires_ai": j.requires_ai,
+        "reason": j.reason,
+        "next_action": j.next_action,
+    })
+}
+
+fn cooldown_until(st: &Value) -> Option<DateTime<Utc>> {
+    st.get("cooldown")
+        .and_then(|c| c.get("until"))
+        .and_then(Value::as_str)
+        .and_then(parse_ts)
+}
+
+fn cooldown_value(st: &Value) -> Value {
+    st.get("cooldown").cloned().unwrap_or(Value::Null)
+}
+
+fn set_cooldown(st: &mut Value, cfg: &Value, reason: &str) {
+    let seconds = cfg
+        .get("cooldown_s")
+        .and_then(Value::as_i64)
+        .unwrap_or(86_400)
+        .max(60);
+    let until = Utc::now() + ChronoDuration::seconds(seconds);
+    st["cooldown"] = json!({
+        "since": now(),
+        "until": until.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        "reason": reason,
+        "provider": cfg.get("provider").cloned().unwrap_or(json!("openrouter")),
+    });
+}
+
+fn daily_budget(cfg: &Value) -> i64 {
+    cfg.get("daily_call_budget")
+        .and_then(Value::as_i64)
+        .unwrap_or(40)
+        .max(1)
+}
+
+fn daily_used(st: &Value) -> i64 {
+    if st
+        .get("daily")
+        .and_then(|d| d.get("date"))
+        .and_then(Value::as_str)
+        == Some(today().as_str())
+    {
+        st.get("daily")
+            .and_then(|d| d.get("calls"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+fn increment_daily(st: &mut Value) {
+    let calls = daily_used(st) + 1;
+    st["daily"] = json!({"date": today(), "calls": calls});
+}
+
+fn max_concurrent(cfg: &Value) -> i64 {
+    cfg.get("max_concurrent_agent_calls")
+        .and_then(Value::as_i64)
+        .unwrap_or(1)
+}
+
+fn cfg_targets(cfg: &Value) -> Vec<String> {
+    cfg.get("targets")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(registry::fleet_targets)
+}
+
+fn resolve_key(key_ref: &str) -> Option<String> {
+    if key_ref.starts_with("sk-or-v1-") {
+        return Some(key_ref.to_string());
+    }
+    std::env::var(key_ref).ok().filter(|s| !s.trim().is_empty())
+}
+
+fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
+    NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%SZ")
+        .ok()
+        .map(|n| n.and_utc())
+}
+
+fn tail_chars(s: &str, n: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let start = chars.len().saturating_sub(n);
+    chars[start..].iter().collect()
+}
+
+fn json_truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+    }
+}
+
+fn now() -> String {
+    Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+fn today() -> String {
+    Utc::now().format("%Y-%m-%d").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn repo(name: &str) -> Value {
+        json!({"name": name, "path": format!("C:/p/{name}")})
+    }
+
+    #[test]
+    fn plan_jobs_prioritizes_ops_red_before_stale_proof() {
+        let a = format!("fleet_red_{}", std::process::id());
+        let b = format!("fleet_green_{}", std::process::id());
+        let repos = vec![repo(&a), repo(&b)];
+        let cfg = json!({"provider": "openrouter", "targets": [a.clone(), b.clone()]});
+        let mut projects = Map::new();
+        projects.insert(b.clone(), json!({"status": "green"}));
+        projects.insert(
+            a.clone(),
+            json!({"status": "red", "reasons": ["publish_recency=red"]}),
+        );
+        let ops = json!({"projects": Value::Object(projects)});
+        let st = json!({"manual_queue": []});
+        let jobs = plan_jobs(&repos, &cfg, &ops, &st, None);
+        assert_eq!(jobs[0].name, a);
+        assert_eq!(jobs[0].kind, "implement");
+        assert!(jobs[0].requires_ai);
+    }
+
+    #[test]
+    fn plan_jobs_turns_quota_heartbeat_into_cooldown_job() {
+        let name = format!("fleet_quota_{}", std::process::id());
+        let repo = json!({"name": name, "path": "C:/p/q"});
+        let rt = paths::runtime_dir(&repo).unwrap();
+        let _ = std::fs::create_dir_all(&rt);
+        std::fs::write(
+            rt.join("heartbeat.json"),
+            serde_json::to_string(&json!({
+                "status": "sleeping",
+                "phase": "quota_error",
+                "reason": "quota_error",
+                "last_summary": "429 Rate limit exceeded"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let cfg = json!({"provider": "openrouter", "targets": [name.clone()]});
+        let jobs = plan_jobs(
+            &[repo.clone()],
+            &cfg,
+            &json!({"projects": {}}),
+            &json!({}),
+            None,
+        );
+        assert_eq!(jobs[0].kind, "cooldown");
+        assert!(!jobs[0].requires_ai);
+        let _ = std::fs::remove_dir_all(rt);
+    }
+
+    #[test]
+    fn daily_budget_resets_by_date() {
+        let st = json!({"daily": {"date": "1999-01-01", "calls": 99}});
+        assert_eq!(daily_used(&st), 0);
+        let mut st2 = json!({});
+        increment_daily(&mut st2);
+        assert_eq!(daily_used(&st2), 1);
+    }
+
+    #[test]
+    fn public_config_never_exposes_resolved_secret() {
+        let cfg = json!({"api_key": "OPENROUTER_API_KEY", "model": "m"});
+        let pubc = public_config(&cfg);
+        assert_eq!(pubc["api_key"], json!("OPENROUTER_API_KEY"));
+        assert_eq!(pubc["model"], json!("m"));
+    }
+
+    #[test]
+    fn acquire_lock_allows_only_one_active_fleet_agent() {
+        let dir = std::env::temp_dir().join(format!("solomon_fleet_lock_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fleet.lock");
+
+        let first = acquire_lock_at(path.clone()).unwrap();
+        assert!(first.is_some());
+        let second = acquire_lock_at(path.clone()).unwrap();
+        assert!(second.is_none());
+        drop(first);
+        let third = acquire_lock_at(path).unwrap();
+        assert!(third.is_some());
+        drop(third);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
