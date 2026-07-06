@@ -1009,8 +1009,14 @@ data or a secret to the PUBLIC repo; fix the change to exclude it."
     if gitops::tree_dirty(ctx) {
         ctx.git(&["reset", "--hard"], 120);
     }
-    // Advance the backlog ONLY on a real LANDED ship of the NAMED item.
-    let landed = ship::ship_succeeded(&pr);
+    // Advance the backlog ONLY on a real LANDED ship of the NAMED item. Use the SAME predicate
+    // history records (ship_outcome == "shipped") so the two can never disagree on the identical PR
+    // state: in auto-merge mode ship_outcome demands a CONFIRMED merge, so an "auto-merge queued
+    // (awaiting CI)" PR — which ship_succeeded alone would treat as landed (no "open (" marker) — is
+    // NOT advanced. A queued-but-unmerged PR that later goes CI-RED would otherwise silently drop the
+    // backlog item; requiring a confirmed merge keeps the loop revisiting it.
+    let ship_mode = ctx.ship.clone();
+    let landed = ship::ship_outcome(&pr, &ship_mode) == "shipped";
     if !ctx.beautify && !ctx.solomon && landed {
         if item_deviated {
             escalation::note_deviation(ctx, &goal, NOTE_LIMIT);
@@ -1025,7 +1031,6 @@ data or a secret to the PUBLIC repo; fix the change to exclude it."
         "last_pr": pr,
         "last_summary": summary,
     }));
-    let ship_mode = ctx.ship.clone();
     ctx.record_history(
         &ship::ship_outcome(&pr, &ship_mode),
         Some(&branch),

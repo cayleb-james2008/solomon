@@ -43,10 +43,9 @@ const PLAN_HOUR: u32 = 7;
 const SUMMARY_HOUR: u32 = 20;
 /// Attempts per day before giving up (a failing LLM endpoint must not be hammered every 2 min).
 const MAX_ATTEMPTS: i64 = 3;
-/// The CEO planner model — the FREE OpenRouter model (moved off Ollama 2026-07-04 after the shared
-/// Ollama account hit its WEEKLY usage limit, which killed every CEO plan + asmodeus; the lanes were
-/// already migrated the same way — free model ONLY, never a paid fallback).
-const CEO_MODEL: &str = "nvidia/nemotron-3-ultra-550b-a55b:free";
+/// The CEO planner model over Ollama Cloud. Keep it distinct from the per-repo coder model so the
+/// morning plan stays cheap and broad while Autopilot can spend GLM on implementation.
+const CEO_MODEL: &str = "minimax-m3";
 /// A reopened app that was blind longer than this notifies the gap (seconds).
 const BLIND_NOTICE_S: f64 = 21_600.0;
 
@@ -160,7 +159,10 @@ pub fn tick() {
 
     let plan_sec = st.get("plan").cloned().unwrap_or_else(|| json!({}));
     if should_attempt(&plan_sec, &today, hour, PLAN_HOUR) {
-        let ok = morning_plan().get("ok").and_then(Value::as_bool).unwrap_or(false);
+        let ok = morning_plan()
+            .get("ok")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let new_sec = record_attempt(&plan_sec, &today, ok);
         // Third strike: give up for the day, loudly — an unplanned day must be a KNOWN unplanned day.
         if !ok && attempts_today(&new_sec, &today) >= MAX_ATTEMPTS {
@@ -168,7 +170,9 @@ pub fn tick() {
                 "Solomon: morning plan FAILED".into(),
                 format!("{MAX_ATTEMPTS} attempts failed — lanes continue on standing goals today"),
             ));
-            st["plan"] = json!({"done": today});
+            // Distinguishable give-up sentinel (NOT a plain success): the dashboard renders this as
+            // 'gave up', not a green 'done', so an unplanned day is never shown as planned.
+            st["plan"] = json!({"done": today, "gave_up": true});
         } else {
             st["plan"] = new_sec;
         }
@@ -177,7 +181,10 @@ pub fn tick() {
 
     let sum_sec = st.get("summary").cloned().unwrap_or_else(|| json!({}));
     if should_attempt(&sum_sec, &today, hour, SUMMARY_HOUR) {
-        let ok = evening_summary().get("ok").and_then(Value::as_bool).unwrap_or(false);
+        let ok = evening_summary()
+            .get("ok")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         st["summary"] = record_attempt(&sum_sec, &today, ok);
         write_state(&st);
     }
@@ -288,7 +295,11 @@ pub fn morning_plan() -> Value {
             .unwrap_or(json!({}));
         let top_item = std::fs::read_to_string(backlog_path(name))
             .ok()
-            .and_then(|c| c.lines().find(|l| l.trim().starts_with("- [ ]")).map(str::to_string));
+            .and_then(|c| {
+                c.lines()
+                    .find(|l| l.trim().starts_with("- [ ]"))
+                    .map(str::to_string)
+            });
         let velocity = velocity_context(&outcomes, goal);
         ctx.push(json!({
             "lane": name,
@@ -335,8 +346,10 @@ pub fn morning_plan() -> Value {
         only: {\"lanes\": {\"<lane>\": {\"tier\": \"chore|feature|refactor|architecture\", \
         \"goal\": \"<one sentence>\", \"why\": \"<one sentence>\"}}, \
         \"fleet\": {\"allocation\": \"<one sentence>\"}} — one lanes entry per lane given.";
-    let user = serde_json::to_string_pretty(&json!({"date": today, "lanes": ctx, "allocation": allocation}))
-        .unwrap_or_default();
+    let user = serde_json::to_string_pretty(
+        &json!({"date": today, "lanes": ctx, "allocation": allocation}),
+    )
+    .unwrap_or_default();
 
     let reply = match ollama_chat(CEO_MODEL, system, &user) {
         Ok(r) => r,
@@ -364,11 +377,16 @@ pub fn morning_plan() -> Value {
     // one-line fleet-allocation sentence (falling back to a deterministic top-lane line, never
     // fabricated, when the model omits it).
     report.push_str(&allocation_section(&ranking, &scale_actions, &holds));
-    let fleet_line = fleet_allocation(&parsed)
-        .unwrap_or_else(|| match ranking.iter().find(|(_, s, _)| *s > 0.0) {
-            Some((n, ..)) => format!("Pour marginal effort into {n} (top ROI); hold real-money + non-green lanes."),
-            None => "No scalable lane today — hold the fleet and fix red engines first.".to_string(),
-        });
+    let fleet_line = fleet_allocation(&parsed).unwrap_or_else(|| {
+        match ranking.iter().find(|(_, s, _)| *s > 0.0) {
+            Some((n, ..)) => format!(
+                "Pour marginal effort into {n} (top ROI); hold real-money + non-green lanes."
+            ),
+            None => {
+                "No scalable lane today — hold the fleet and fix red engines first.".to_string()
+            }
+        }
+    });
     report.push_str(&format!("_{fleet_line}_\n\n"));
     report.push_str("## TODAY'S PLAN\n\n");
     for (lane, tier, goal, why) in &items {
@@ -392,7 +410,9 @@ pub fn morning_plan() -> Value {
             let _ = std::fs::create_dir_all(parent);
         }
         if proc::atomic_write_bytes(&path, format!("{line}\n{existing}").as_bytes()).is_ok() {
-            report.push_str(&format!("## {lane}\n- **goal** [{tier}]: {goal}\n- **why**: {why}\n\n"));
+            report.push_str(&format!(
+                "## {lane}\n- **goal** [{tier}]: {goal}\n- **why**: {why}\n\n"
+            ));
             applied.insert(lane.clone(), json!({"tier": tier, "goal": goal}));
         }
     }
@@ -499,7 +519,11 @@ fn ops_red_backlog_graft() {
             .into_iter()
             .filter_map(|r| {
                 let n = paths::repo_name(&r);
-                if n.is_empty() { None } else { Some((n, r)) }
+                if n.is_empty() {
+                    None
+                } else {
+                    Some((n, r))
+                }
             })
             .collect();
 
@@ -509,7 +533,11 @@ fn ops_red_backlog_graft() {
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or(Value::Null);
-    let prev_seen = prev.get("seen").and_then(Value::as_object).cloned().unwrap_or_default();
+    let prev_seen = prev
+        .get("seen")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     let mut seen = Map::new(); // this sweep's live "<name>:<probe>" -> first_ts (drops resolved keys)
 
     for (name, proj) in projects {
@@ -518,7 +546,7 @@ fn ops_red_backlog_graft() {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or(Value::Null);
-        let verdict_probes = verdict.get("probes").and_then(Value::as_object).cloned().unwrap_or(Value::Null);
+        let verdict_probes = verdict.get("probes").cloned().unwrap_or(Value::Null);
 
         // Which OUTCOME probes are RED for this project? (per-probe status map, whitelist-filtered)
         let probes = match proj.get("probes").and_then(Value::as_object) {
@@ -595,7 +623,7 @@ fn ops_red_backlog_graft() {
                 .and_then(|v| v.get("detail"))
                 .and_then(Value::as_str)
                 .unwrap_or("pre-red (consecutive_red >= 2)");
-            ensure_ops_item(name, probe, detail, &today);
+            ensure_ops_item(name, probe, detail, &today, "pre_red");
         }
 
         // --- Deploy-gap gate: binary_current (git_sha_match) probe YELLOW with "deploy gap" ---
@@ -607,7 +635,7 @@ fn ops_red_backlog_graft() {
                 .and_then(Value::as_str)
                 .unwrap_or("");
             if detail.contains("deploy gap") {
-                ensure_ops_item(name, "binary_current", detail, &today);
+                ensure_ops_item(name, "binary_current", detail, &today, "deploy_gap");
             }
         }
     }
@@ -779,7 +807,11 @@ fn hygiene_backlog_graft() {
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or(Value::Null);
-    let prev_seen = prev.get("seen").and_then(Value::as_object).cloned().unwrap_or_default();
+    let prev_seen = prev
+        .get("seen")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
 
     let mut seen = Map::new(); // this sweep's live "<name>:<slug>" -> first_ts (drops resolved keys)
     let mut repos = Map::new(); // per-repo {issues:[slug...], detail} for the dashboard
@@ -870,7 +902,11 @@ pub fn extract_json(reply: &str) -> Option<Value> {
 /// 2026-07-01: "...records per-class c").
 pub fn cap_line(s: &str, max: usize) -> String {
     // \r\n collapses to ONE space (a naive per-char replace would make two).
-    let flat: String = s.replace("\r\n", " ").replace(['\r', '\n'], " ").trim().to_string();
+    let flat: String = s
+        .replace("\r\n", " ")
+        .replace(['\r', '\n'], " ")
+        .trim()
+        .to_string();
     if flat.chars().count() <= max {
         return flat;
     }
@@ -975,7 +1011,10 @@ fn allocation_dry_run(snapshot: &Value, status: &Value) -> (Vec<String>, Vec<Str
         if name.is_empty() {
             continue;
         }
-        let outcomes = snapshot["projects"].get(&name).cloned().unwrap_or(json!({}));
+        let outcomes = snapshot["projects"]
+            .get(&name)
+            .cloned()
+            .unwrap_or(json!({}));
         let rollup = status
             .get("projects")
             .and_then(|p| p.get(&name))
@@ -996,7 +1035,10 @@ fn allocation_dry_run(snapshot: &Value, status: &Value) -> (Vec<String>, Vec<Str
             let baseline = crate::control::registry::project_interval(&repo);
             match scale::next_interval(Some(cfg), baseline, baseline, &velocity, green, true) {
                 Some(next) if next < baseline => {
-                    let m = velocity.get("metric").and_then(Value::as_str).unwrap_or("throughput");
+                    let m = velocity
+                        .get("metric")
+                        .and_then(Value::as_str)
+                        .unwrap_or("throughput");
                     let cur = velocity.get("current").and_then(Value::as_i64).unwrap_or(0);
                     let tgt = velocity.get("target").and_then(Value::as_i64).unwrap_or(0);
                     scale_actions.push(format!(
@@ -1039,16 +1081,11 @@ pub fn velocity_context(outcomes: &Value, north_star: &str) -> Value {
     // The primary throughput metric, in north-star priority order: posts (public reach), then live
     // trades / venue fills (capital velocity), then shipped iterations (code lanes). First present
     // non-null wins — matches which collector actually ran for this lane.
-    let (metric, current) = [
-        "posts_24h",
-        "live_trades_24h",
-        "fills_24h",
-        "shipped_24h",
-    ]
-    .iter()
-    .find_map(|k| outcomes.get(*k).and_then(Value::as_i64).map(|n| (*k, n)))
-    .map(|(k, n)| (Some(k), Some(n)))
-    .unwrap_or((None, None));
+    let (metric, current) = ["posts_24h", "live_trades_24h", "fills_24h", "shipped_24h"]
+        .iter()
+        .find_map(|k| outcomes.get(*k).and_then(Value::as_i64).map(|n| (*k, n)))
+        .map(|(k, n)| (Some(k), Some(n)))
+        .unwrap_or((None, None));
 
     let target = parse_daily_target(north_star);
     let gap = match (current, target) {
@@ -1095,13 +1132,7 @@ fn parse_daily_target(north_star: &str) -> Option<i64> {
 /// the OS curl, same guarded-spawn contract as every other subprocess). The API key rides a
 /// curl `-H @file` headers file under runtime/ (gitignored) — never argv, never a log line.
 fn ollama_chat(model: &str, system: &str, user: &str) -> Result<String, String> {
-    // Moved off Ollama (weekly-usage-limited) onto the funded OpenRouter free-model accounts, same as
-    // the lanes. Try each numbered key so a per-account rate limit falls through to the next.
-    let key = notify::env_value("OPENROUTER_API_KEY_1")
-        .or_else(|| notify::env_value("OPENROUTER_API_KEY_2"))
-        .or_else(|| notify::env_value("OPENROUTER_API_KEY_3"))
-        .or_else(|| notify::env_value("OPENROUTER_API_KEY"))
-        .ok_or("no OPENROUTER_API_KEY_[1-3] in .env")?;
+    let key = notify::env_value("OLLAMA_API_KEY").ok_or("no OLLAMA_API_KEY in .env")?;
     let rt = paths::here().join("runtime");
     let _ = std::fs::create_dir_all(&rt);
     let req_path = rt.join("_ceo_request.json");
@@ -1114,8 +1145,11 @@ fn ollama_chat(model: &str, system: &str, user: &str) -> Result<String, String> 
         ],
         "stream": false,
     });
-    std::fs::write(&req_path, serde_json::to_vec(&body).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        &req_path,
+        serde_json::to_vec(&body).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     std::fs::write(
         &hdr_path,
         format!("Authorization: Bearer {key}\nContent-Type: application/json\n"),
@@ -1132,16 +1166,24 @@ fn ollama_chat(model: &str, system: &str, user: &str) -> Result<String, String> 
         hdr_arg.as_str(),
         "-d",
         body_arg.as_str(),
-        "https://openrouter.ai/api/v1/chat/completions",
+        "https://ollama.com/v1/chat/completions",
     ];
     let r = proc::run(&args, None, Some(Duration::from_secs(250))).map_err(|e| e.to_string())?;
     if !r.ok() {
         return Err(format!("curl exit {}: {}", r.code, r.stderr.trim()));
     }
-    let v: Value = serde_json::from_str(r.stdout.trim())
-        .map_err(|_| format!("non-JSON response: {}", r.stdout.chars().take(200).collect::<String>()))?;
+    let v: Value = serde_json::from_str(r.stdout.trim()).map_err(|_| {
+        format!(
+            "non-JSON response: {}",
+            r.stdout.chars().take(200).collect::<String>()
+        )
+    })?;
     // Ollama native shape first, OpenAI-compatible shape second.
-    if let Some(c) = v.get("message").and_then(|m| m.get("content")).and_then(Value::as_str) {
+    if let Some(c) = v
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)
+    {
         if !c.trim().is_empty() {
             return Ok(c.to_string());
         }
@@ -1251,7 +1293,10 @@ fn scale_tightenings_today() -> i64 {
         if name.is_empty() {
             continue;
         }
-        let marker = paths::here().join("runtime").join(&name).join("_last_scale");
+        let marker = paths::here()
+            .join("runtime")
+            .join(&name)
+            .join("_last_scale");
         if let Ok(raw) = std::fs::read_to_string(&marker) {
             // marker ts is UTC "%Y-%m-%dT..."; compare its date prefix to local today is close enough
             // for a once-a-day report line (a boundary hour is not worth a tz-correct parse here).
@@ -1296,7 +1341,10 @@ pub fn render_report(
     date: &str,
 ) -> (String, Vec<String>, bool) {
     let mut md = format!("# Solomon evening report — {date}\n\n");
-    md.push_str(&format!("fleet: {}\n\n", ops::outcomes::payload_summary(status)));
+    md.push_str(&format!(
+        "fleet: {}\n\n",
+        ops::outcomes::payload_summary(status)
+    ));
     let mut flags: Vec<String> = Vec::new();
     let mut urgent = false;
 
@@ -1306,7 +1354,11 @@ pub fn render_report(
         .cloned()
         .unwrap_or_default();
     let mut items: Vec<(&String, &Value)> = projects.iter().collect();
-    items.sort_by_key(|(_, p)| p.get("priority").and_then(Value::as_i64).unwrap_or(i64::MAX));
+    items.sort_by_key(|(_, p)| {
+        p.get("priority")
+            .and_then(Value::as_i64)
+            .unwrap_or(i64::MAX)
+    });
 
     // Explicit repos.json entries by name, for the report-only HYGIENE scan below (a discovered dir
     // with no explicit entry is intentionally excluded — same rule as the ops/hygiene grafts).
@@ -1315,7 +1367,11 @@ pub fn render_report(
             .into_iter()
             .filter_map(|r| {
                 let n = paths::repo_name(&r);
-                if n.is_empty() { None } else { Some((n, r)) }
+                if n.is_empty() {
+                    None
+                } else {
+                    Some((n, r))
+                }
             })
             .collect();
 
@@ -1327,7 +1383,9 @@ pub fn render_report(
         // lane activity — every project has this
         let iters = p.get("iterations_24h").and_then(Value::as_i64).unwrap_or(0);
         let shipped = p.get("shipped_24h").and_then(Value::as_i64).unwrap_or(0);
-        md.push_str(&format!("- lane: {iters} iterations / {shipped} shipped (24h)\n"));
+        md.push_str(&format!(
+            "- lane: {iters} iterations / {shipped} shipped (24h)\n"
+        ));
         if iters == 0 {
             let f = format!("⚠ {name}: lane never fired in 24h");
             md.push_str(&format!("- {f}\n"));
@@ -1338,14 +1396,19 @@ pub fn render_report(
             if let Some(n) = posts.as_i64() {
                 md.push_str(&format!(
                     "- posts: {n} published (24h), last at {}\n",
-                    p.get("last_post_at").and_then(Value::as_str).unwrap_or("never")
+                    p.get("last_post_at")
+                        .and_then(Value::as_str)
+                        .unwrap_or("never")
                 ));
                 if n == 0 {
                     let f = format!("⚠ {name}: ZERO posts in 24h");
                     md.push_str(&format!("- {f}\n"));
                     flags.push(f);
                 }
-                let missing = p.get("posts_missing_url_24h").and_then(Value::as_i64).unwrap_or(0);
+                let missing = p
+                    .get("posts_missing_url_24h")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
                 if missing > 0 {
                     let f = format!("⚠ {name}: {missing} publish claim(s) without a URL");
                     md.push_str(&format!("- {f}\n"));
@@ -1363,7 +1426,9 @@ pub fn render_report(
             md.push_str(&format!(
                 "- equity: ${} (Δ24h: {})\n",
                 eq,
-                delta.map(|d| format!("{d:+.2}")).unwrap_or_else(|| "?".into())
+                delta
+                    .map(|d| format!("{d:+.2}"))
+                    .unwrap_or_else(|| "?".into())
             ));
             let trades = p.get("live_trades_24h").and_then(Value::as_i64);
             let fills = p.get("fills_24h").and_then(Value::as_i64);
@@ -1400,7 +1465,11 @@ pub fn render_report(
                             .join("; ")
                     })
                     .unwrap_or_default();
-                md.push_str(&format!("- probes: {} — {}\n", pstat.to_uppercase(), reasons));
+                md.push_str(&format!(
+                    "- probes: {} — {}\n",
+                    pstat.to_uppercase(),
+                    reasons
+                ));
             }
         }
         // report-only repo HYGIENE (off-base / dirty tracked tree). A non-empty flag escalates the
@@ -1464,7 +1533,9 @@ pub fn render_report(
 /// and a lane that never fired is called out by name. Priority-ordered, one line per lane.
 pub fn overnight_section(snapshot: &Value, incidents: &[Value]) -> String {
     let mut md = String::from("## OVERNIGHT\n\n");
-    md.push_str("What VERIFIABLY happened since the last report (from the ledger — honest nulls):\n\n");
+    md.push_str(
+        "What VERIFIABLY happened since the last report (from the ledger — honest nulls):\n\n",
+    );
     let projects = snapshot
         .get("projects")
         .and_then(Value::as_object)
@@ -1475,7 +1546,11 @@ pub fn overnight_section(snapshot: &Value, incidents: &[Value]) -> String {
         return md;
     }
     let mut items: Vec<(&String, &Value)> = projects.iter().collect();
-    items.sort_by_key(|(_, p)| p.get("priority").and_then(Value::as_i64).unwrap_or(i64::MAX));
+    items.sort_by_key(|(_, p)| {
+        p.get("priority")
+            .and_then(Value::as_i64)
+            .unwrap_or(i64::MAX)
+    });
 
     for (name, p) in items {
         let iters = p.get("iterations_24h").and_then(Value::as_i64).unwrap_or(0);
@@ -1505,7 +1580,9 @@ pub fn overnight_section(snapshot: &Value, incidents: &[Value]) -> String {
             let delta = p.get("equity_delta_24h").and_then(Value::as_f64);
             parts.push(format!(
                 "equity Δ{}",
-                delta.map(|d| format!("{d:+.2}")).unwrap_or_else(|| "?".into())
+                delta
+                    .map(|d| format!("{d:+.2}"))
+                    .unwrap_or_else(|| "?".into())
             ));
         }
         md.push_str(&format!("- **{name}**: {}\n", parts.join(", ")));
@@ -1526,7 +1603,11 @@ pub fn next_watch(snapshot: &Value, status: &Value) -> String {
         .cloned()
         .unwrap_or_default();
     let mut items: Vec<(&String, &Value)> = projects.iter().collect();
-    items.sort_by_key(|(_, p)| p.get("priority").and_then(Value::as_i64).unwrap_or(i64::MAX));
+    items.sort_by_key(|(_, p)| {
+        p.get("priority")
+            .and_then(Value::as_i64)
+            .unwrap_or(i64::MAX)
+    });
 
     // 1) highest-priority RED probe status
     for (name, _) in &items {
@@ -1537,7 +1618,9 @@ pub fn next_watch(snapshot: &Value, status: &Value) -> String {
             .and_then(Value::as_str)
             == Some("red");
         if red {
-            return format!("{name} is RED — restore the engine before any growth work can compound.");
+            return format!(
+                "{name} is RED — restore the engine before any growth work can compound."
+            );
         }
     }
     // 2) highest-priority measured zero-throughput lane
@@ -1582,7 +1665,10 @@ mod tests {
     fn record_attempt_success_and_failure() {
         let sec = json!({"attempts_date": "2026-07-02", "attempts": 1});
         // success stamps done (attempts irrelevant afterwards)
-        assert_eq!(record_attempt(&sec, "2026-07-02", true), json!({"done": "2026-07-02"}));
+        assert_eq!(
+            record_attempt(&sec, "2026-07-02", true),
+            json!({"done": "2026-07-02"})
+        );
         // failure increments today's count
         let f = record_attempt(&sec, "2026-07-02", false);
         assert_eq!(f["attempts"], json!(2));
@@ -1595,7 +1681,8 @@ mod tests {
     // -------- extract_json (pure) --------
     #[test]
     fn extract_json_tolerates_fences_and_prose() {
-        let fenced = "Here is the plan:\n```json\n{\"lanes\": {\"a\": {\"goal\": \"x\"}}}\n```\nDone.";
+        let fenced =
+            "Here is the plan:\n```json\n{\"lanes\": {\"a\": {\"goal\": \"x\"}}}\n```\nDone.";
         assert_eq!(
             extract_json(fenced).unwrap()["lanes"]["a"]["goal"],
             json!("x")
@@ -1629,7 +1716,15 @@ mod tests {
         let items = plan_items(&parsed, &known);
         assert_eq!(items.len(), 2);
         // tier lowercased; newlines flattened
-        assert_eq!(items[0], ("asmodeus".into(), "feature".into(), "line1 line2".into(), "because".into()));
+        assert_eq!(
+            items[0],
+            (
+                "asmodeus".into(),
+                "feature".into(),
+                "line1 line2".into(),
+                "because".into()
+            )
+        );
         // bad tier degrades to chore; goal trimmed; missing why is ""
         assert_eq!(items[1].1, "chore");
         assert_eq!(items[1].2, "post more");
@@ -1659,9 +1754,13 @@ mod tests {
         assert!(urgent);
         // every post-mortem failure mode gets its loud flag:
         assert!(flags.iter().any(|f| f.contains("sover: ZERO posts")));
-        assert!(flags.iter().any(|f| f.contains("asmodeus: zero live trades")));
+        assert!(flags
+            .iter()
+            .any(|f| f.contains("asmodeus: zero live trades")));
         assert!(flags.iter().any(|f| f.contains("asmodeus: equity flat")));
-        assert!(flags.iter().any(|f| f.contains("daedulus: lane never fired")));
+        assert!(flags
+            .iter()
+            .any(|f| f.contains("daedulus: lane never fired")));
         // sections render priority-ordered with the fleet line up top
         assert!(md.starts_with("# Solomon evening report — 2026-07-02"));
         let a = md.find("## asmodeus").unwrap();
@@ -1699,14 +1798,15 @@ mod tests {
     fn ops_red_graft_marker_line_and_idempotence() {
         // the stable per-(project, probe) marker + the exact prepended line shape
         assert_eq!(ops_marker("publish_recency"), "[ops-auto:publish_recency]");
-        let line = ops_item_line("publish_recency", "age 37.2h", "2026-07-03");
+        let line = ops_item_line("publish_recency", "age 37.2h", "2026-07-03", "red");
         assert!(line.starts_with("- [ ] [reliability][ops-auto:publish_recency] "));
         assert!(line.contains("publish_recency has been RED (age 37.2h)"));
         assert!(line.contains("fix the actual posting/trade/app path"));
         assert!(line.ends_with("(ops-auto 2026-07-03)"));
 
         // idempotence: an OPEN item with the marker blocks a re-prepend...
-        let open = "- [ ] [reliability][ops-auto:publish_recency] publish_recency has been RED (x)\n\
+        let open =
+            "- [ ] [reliability][ops-auto:publish_recency] publish_recency has been RED (x)\n\
                     - [ ] something else\n";
         assert!(has_open_ops_item(open, "publish_recency"));
         // ...a DIFFERENT probe's marker is independent (one open item PER probe)...
@@ -1736,7 +1836,10 @@ mod tests {
     #[test]
     fn hygiene_graft_marker_line_and_idempotence() {
         use crate::hygiene::HygieneIssue;
-        assert_eq!(hygiene_marker(HygieneIssue::OffBase), "[hygiene-auto:off_base]");
+        assert_eq!(
+            hygiene_marker(HygieneIssue::OffBase),
+            "[hygiene-auto:off_base]"
+        );
         assert_eq!(hygiene_marker(HygieneIssue::Dirty), "[hygiene-auto:dirty]");
 
         let hyg = json!({"current": "codex/x", "base": "main"});
@@ -1756,8 +1859,14 @@ mod tests {
 
         // idempotence keys off the shared predicate: one OPEN item per (repo, issue)
         let existing = format!("{off}\n");
-        assert!(has_open_marker(&existing, &hygiene_marker(HygieneIssue::OffBase)));
-        assert!(!has_open_marker(&existing, &hygiene_marker(HygieneIssue::Dirty)));
+        assert!(has_open_marker(
+            &existing,
+            &hygiene_marker(HygieneIssue::OffBase)
+        ));
+        assert!(!has_open_marker(
+            &existing,
+            &hygiene_marker(HygieneIssue::Dirty)
+        ));
     }
 
     // -------- fleet_allocation: the model's one-line sentence (or None to fall back) --------
@@ -1822,7 +1931,10 @@ mod tests {
             red_probe_detail(&proj, "publish_recency"),
             "publish_recency=red (age 37.2h (*.published_at 2026-07-01T22:58:53Z))"
         );
-        assert_eq!(red_probe_detail(&proj, "process"), "process=red (Sover.exe NOT running)");
+        assert_eq!(
+            red_probe_detail(&proj, "process"),
+            "process=red (Sover.exe NOT running)"
+        );
         // no matching reason (or no reasons key) -> the bare probe name
         assert_eq!(red_probe_detail(&proj, "fills_recency"), "fills_recency");
         assert_eq!(red_probe_detail(&json!({}), "process"), "process");
@@ -1833,7 +1945,10 @@ mod tests {
     fn velocity_context_anchors_the_growth_number() {
         // sover: posts throughput, a stated "3 reels/day" target -> behind, gap 1
         let sover = json!({"posts_24h": 2, "shipped_24h": 0, "iterations_24h": 2});
-        let v = velocity_context(&sover, "Post 3 verified reels/day across IG/TikTok/YT; grow followers.");
+        let v = velocity_context(
+            &sover,
+            "Post 3 verified reels/day across IG/TikTok/YT; grow followers.",
+        );
         assert_eq!(v["metric"], json!("posts_24h"));
         assert_eq!(v["current"], json!(2));
         assert_eq!(v["target"], json!(3));
@@ -1842,7 +1957,10 @@ mod tests {
 
         // healthy: current meets the target -> push to next milestone
         let healthy = json!({"posts_24h": 3});
-        assert_eq!(velocity_context(&healthy, "Post 3 reels/day")["trend"], json!("healthy"));
+        assert_eq!(
+            velocity_context(&healthy, "Post 3 reels/day")["trend"],
+            json!("healthy")
+        );
 
         // measured zero -> stalled (a dead engine, regardless of target)
         let zero = json!({"posts_24h": 0});
@@ -1881,7 +1999,10 @@ mod tests {
 
     #[test]
     fn parse_daily_target_reads_stated_cadence_number() {
-        assert_eq!(parse_daily_target("Post 3 verified reels/day across IG"), Some(3));
+        assert_eq!(
+            parse_daily_target("Post 3 verified reels/day across IG"),
+            Some(3)
+        );
         assert_eq!(parse_daily_target("ship 10 things per day"), Some(10));
         // no number before the /day anchor -> None (a direction, not a target)
         assert_eq!(parse_daily_target("more live fills/day"), None);
@@ -1956,13 +2077,17 @@ mod tests {
     #[test]
     fn pick_goal_post_prefers_goal_md_first_line_over_fallback() {
         // the first non-heading, non-blank line of goal.md wins over the repos.json fallback
-        let md = "# asmodeus goal post (edit this line)\nGrow capital velocity: more live fills/day.\n";
+        let md =
+            "# asmodeus goal post (edit this line)\nGrow capital velocity: more live fills/day.\n";
         assert_eq!(
             pick_goal_post(Some(md), "old repos.json goal"),
             "Grow capital velocity: more live fills/day."
         );
         // a goal.md with only headings/blank lines falls back
-        assert_eq!(pick_goal_post(Some("# heading only\n\n"), "fallback"), "fallback");
+        assert_eq!(
+            pick_goal_post(Some("# heading only\n\n"), "fallback"),
+            "fallback"
+        );
         // absent goal.md falls back (trimmed)
         assert_eq!(pick_goal_post(None, "  fallback  "), "fallback");
         // neither present -> empty (lane stays dormant; the plane never invents work)

@@ -33,6 +33,7 @@ use crate::supervisor;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// monitor.STALL_SWEEPS — consecutive error/preflight sweeps (incl. this one) that mark a lane STALLED.
@@ -42,7 +43,7 @@ const STALL_SWEEPS: usize = 3;
 /// are (re)started in one 2-min sweep; the rest defer to later sweeps so their cargo build gates
 /// never stack. 2 allows a little parallelism while staying far under the 6-at-once that melted the
 /// disk on 2026-07-02.
-const MAX_LANE_RESTARTS_PER_SWEEP: usize = 2;
+pub const MAX_LANE_RESTARTS_PER_SWEEP: usize = 2;
 
 /// HEALTH_K — the iteration window the degraded-health classifier inspects. A lane whose last
 /// `HEALTH_K` iterations all failed to ship AND were every one a timeout or a gate-RED is
@@ -56,6 +57,9 @@ const HEALTH_K: usize = 3;
 /// that a slow pi session or a sleeping lane never trips it, short enough that a real wedge pages the
 /// operator the same day instead of after a multi-day post-mortem.
 const STANDSTILL_S: f64 = 3.0 * 3600.0;
+
+static CEO_GRAFT_RUNNING: AtomicBool = AtomicBool::new(false);
+static HOUSEKEEPING_GRAFT_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// monitor.DISABLED — global kill-switch path: HERE/runtime/_watchdog.disabled.
 fn disabled_path() -> std::path::PathBuf {
@@ -244,6 +248,47 @@ pub fn lane_health(running: bool, history: &[Value], k: usize) -> Option<String>
     Some(reason)
 }
 
+fn sweep_autopilot(auto_push_flag: bool) -> Value {
+    let repos = control::registry::load_repos();
+    let snapshots = crate::fleet::sweep_snapshots(&repos);
+    let out = crate::fleet::once(auto_push_flag, None);
+    let mut actions: Vec<Value> = out
+        .get("actions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if actions.is_empty() {
+        let state = out
+            .get("state")
+            .cloned()
+            .unwrap_or_else(crate::fleet::state);
+        let queued = state
+            .get("queue")
+            .and_then(Value::as_array)
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        if queued {
+            actions.push(json!("autopilot queue checked"));
+        }
+    }
+    json!({"ts": now(), "disabled": false, "actions": actions, "snapshots": snapshots, "autopilot": out.clone(), "fleet": out})
+}
+
+fn ops_needs_attention(payload: &Value) -> bool {
+    payload
+        .get("projects")
+        .and_then(Value::as_object)
+        .map(|projects| {
+            projects.values().any(|p| {
+                matches!(
+                    p.get("status").and_then(Value::as_str),
+                    Some("red" | "yellow")
+                )
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// monitor._auto_push: read `.solomon.json`'s `auto_push` (default True; True on missing/corrupt).
 fn auto_push() -> bool {
     let p = paths::here().join(".solomon.json");
@@ -324,13 +369,15 @@ fn base_gate_green(path: &str, gate_cmd: Option<&str>) -> bool {
     let timeout = Duration::from_secs(120);
     // Custom GATE_CMD: run via shell (compound syntax), cwd=path. Default: python -m pytest.
     let result = if let Some(cmd) = gate_cmd.filter(|s| !s.is_empty()) {
-        if cfg!(windows) {
-            control::proc::run(
-                &["cmd", "/C", cmd],
-                Some(Path::new(path)),
-                Some(timeout),
-            )
-        } else {
+        #[cfg(windows)]
+        {
+            // Pass the gate string to cmd.exe VERBATIM (raw_arg) — Rust's own arg quoting is not
+            // cmd.exe's parser, so a gate with an embedded quoted path-with-spaces would be mangled
+            // and spuriously fail (a silent false-RED that pins recovery).
+            control::proc::run_win_shell(cmd, Some(Path::new(path)), Some(timeout))
+        }
+        #[cfg(not(windows))]
+        {
             control::proc::run(
                 &["/bin/sh", "-c", cmd],
                 Some(Path::new(path)),
@@ -363,7 +410,12 @@ fn base_gate_green(path: &str, gate_cmd: Option<&str>) -> bool {
 /// are passed in as bools — so the policy is unit-tested. Only fires on the runner's own reason
 /// markers AND a verified-healed condition, so it never thrashes and never touches a true operator
 /// Stop (status="stopped", no reason).
-fn persistent_stop_cleared(reason: &str, base_clean: bool, base_pushed: bool, base_gate_green: bool) -> Option<&'static str> {
+fn persistent_stop_cleared(
+    reason: &str,
+    base_clean: bool,
+    base_pushed: bool,
+    base_gate_green: bool,
+) -> Option<&'static str> {
     match reason {
         "dirty_base_persistent" if base_clean => {
             Some("base clean again — cleared dirty_base_persistent stop")
@@ -395,7 +447,11 @@ fn sweep_repo(
 ) -> (Vec<String>, Value) {
     let mut actions: Vec<String> = Vec::new();
     // name = r["name"] — the caller guarantees a truthy name before calling.
-    let name = r.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let name = r
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let rt = paths::runtime_dir(r);
     let paused = rt
         .as_ref()
@@ -432,10 +488,7 @@ fn sweep_repo(
             // landed; for dirty/unpushed, the cheap git checks suffice. Only run the gate when the
             // reason is base_gate_red_persistent (the gate is expensive, ~120 s worst case).
             let gate_green = if reason == "base_gate_red_persistent" {
-                base_gate_green(
-                    &path,
-                    control::registry::project_gate(r).as_deref(),
-                )
+                base_gate_green(&path, control::registry::project_gate(r).as_deref())
             } else {
                 false
             };
@@ -475,9 +528,15 @@ fn sweep_repo(
                 // Only a REAL start (spawned a new process) spends budget — an "already running"
                 // no-op or a failed start must not consume a slot.
                 restart_budget.set(restart_budget.get().saturating_sub(1));
-                actions.push(format!("restarted {name} (pid {})", py_repr(res.get("pid"))));
+                actions.push(format!(
+                    "restarted {name} (pid {})",
+                    py_repr(res.get("pid"))
+                ));
             } else {
-                actions.push(format!("restart {name} FAILED: {}", py_repr(res.get("error"))));
+                actions.push(format!(
+                    "restart {name} FAILED: {}",
+                    py_repr(res.get("error"))
+                ));
             }
         }
     }
@@ -500,26 +559,46 @@ fn sweep_repo(
     // on a previous sweep — defeating the stall detector's anti-thrash check (it would re-emit the
     // "STALLED" action and re-write the escalation every sweep instead of escalating once).
     let pre_recover_escalation_cat = supervisor::read_escalation(r)
-        .and_then(|e| e.get("category").and_then(Value::as_str).map(str::to_string))
+        .and_then(|e| {
+            e.get("category")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .unwrap_or_default();
 
     if !paused && !healed {
         // solomon.recover(r, allow_pi=False, allow_restart=auto_push, auto_push=auto_push).
         // catch Exception -> a watchdog must never die on one bad repo. recover() is total (no panics
         // expected); the catch is reproduced as a guard around the Value field reads.
-        let rec = supervisor::recover(r, false, auto_push_flag, auto_push_flag);
+        //
+        // recover()'s restart / fix-session paths spawn heavy cargo-gated processes. Run them under
+        // the SAME per-sweep budget the crash-restart path uses (share the one Cell) so a sweep where
+        // several lanes diagnose as stuck/noop can't fire more than MAX_LANE_RESTARTS_PER_SWEEP heavy
+        // spawns total. Arm the thread-local from the shared budget, then write the remainder back.
+        let rec = supervisor::with_restart_budget(restart_budget.get(), || {
+            let out = supervisor::recover(r, false, auto_push_flag, auto_push_flag);
+            restart_budget.set(supervisor::restart_budget_remaining());
+            out
+        });
         if let Some(taken) = rec.get("actions_taken").and_then(Value::as_array) {
             if !taken.is_empty() {
                 let joined = taken
                     .iter()
-                    .map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| py_repr(Some(v))))
+                    .map(|v| {
+                        v.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| py_repr(Some(v)))
+                    })
                     .collect::<Vec<_>>()
                     .join(",");
                 actions.push(format!("{name} recover: {joined}"));
             }
         }
         if json_truthy(rec.get("escalate").unwrap_or(&Value::Null)) {
-            actions.push(format!("{name} ESCALATED: {}", py_repr(rec.get("category"))));
+            actions.push(format!(
+                "{name} ESCALATED: {}",
+                py_repr(rec.get("category"))
+            ));
         }
     }
 
@@ -558,11 +637,8 @@ fn sweep_repo(
         && snap.get("phase").and_then(Value::as_str) == Some("preflight")
     {
         // window = _recent_snapshots(name, STALL_SWEEPS-1, max_age_s=STALL_SWEEPS*600) + [snap]
-        let mut window = recent_snapshots(
-            &name,
-            STALL_SWEEPS - 1,
-            Some((STALL_SWEEPS as f64) * 600.0),
-        );
+        let mut window =
+            recent_snapshots(&name, STALL_SWEEPS - 1, Some((STALL_SWEEPS as f64) * 600.0));
         window.push(snap.clone());
         let all_preflight = window.iter().all(|s| {
             s.get("status").and_then(Value::as_str) == Some("error")
@@ -580,7 +656,10 @@ fn sweep_repo(
                     "{name} STALLED: stuck in preflight for {STALL_SWEEPS} sweeps"
                 ));
                 // hb2.get('last_summary') or '' then [:200]
-                let last_summary = hb2.get("last_summary").and_then(Value::as_str).unwrap_or("");
+                let last_summary = hb2
+                    .get("last_summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 let evidence = format!(
                     "running but stuck in preflight for {STALL_SWEEPS} consecutive sweeps — {}",
                     py_slice_200(last_summary)
@@ -616,6 +695,9 @@ pub fn sweep() -> Value {
         return json!({"ts": now(), "disabled": true, "actions": [], "snapshots": []});
     }
     let auto_push_flag = auto_push();
+    if control::registry::autopilot_enabled() {
+        return sweep_autopilot(auto_push_flag);
+    }
     let mut actions: Vec<String> = Vec::new();
     let mut snapshots: Vec<Value> = Vec::new();
     // Crash-restart budget for THIS sweep (disk-meltdown guard — see sweep_repo). Shared across
@@ -626,10 +708,7 @@ pub fn sweep() -> Value {
         if !r.is_object() {
             continue;
         }
-        let has_name = r
-            .get("name")
-            .map(json_truthy)
-            .unwrap_or(false);
+        let has_name = r.get("name").map(json_truthy).unwrap_or(false);
         if !has_name {
             continue;
         }
@@ -638,8 +717,14 @@ pub fn sweep() -> Value {
         // "<name> sweep error: <e>" action and the sweep continues to the next repo. This is the
         // crash-recovery layer, so a panic in one repo's recover()/start() must NOT stop the others
         // from being restarted. (Requires unwinding panics — see [profile.release] in Cargo.toml.)
-        let name = r.get("name").and_then(Value::as_str).unwrap_or("?").to_string();
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sweep_repo(&r, auto_push_flag, &restart_budget))) {
+        let name = r
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sweep_repo(&r, auto_push_flag, &restart_budget)
+        })) {
             Ok((repo_actions, snap)) => {
                 actions.extend(repo_actions);
                 snapshots.push(snap);
@@ -680,7 +765,10 @@ pub fn main() -> i32 {
             std::fs::create_dir_all(parent)?;
         }
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)?;
         for snap in &snapshots {
             writeln!(f, "{}", serde_json::to_string(snap).unwrap_or_default())?;
         }
@@ -691,9 +779,13 @@ pub fn main() -> i32 {
     let actions: Vec<String> = out
         .get("actions")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
-    let summary = if actions.is_empty() {
+    let mut summary = if actions.is_empty() {
         "all healthy, no action".to_string()
     } else {
         actions.join("; ")
@@ -719,6 +811,9 @@ pub fn main() -> i32 {
     let ops_payload = std::panic::catch_unwind(crate::ops::outcomes::sweep)
         .unwrap_or_else(|_| json!({"projects": {}}));
     let ops_summary = crate::ops::outcomes::payload_summary(&ops_payload);
+    if summary == "all healthy, no action" && ops_needs_attention(&ops_payload) {
+        summary = "ops red/yellow; Solomon Autopilot proof required".to_string();
+    }
     let line = format!(
         "{} watchdog: {}/{} running | {} | ops: {}",
         out.get("ts").and_then(Value::as_str).unwrap_or(""),
@@ -732,7 +827,10 @@ pub fn main() -> i32 {
     let _ = (|| -> std::io::Result<()> {
         use std::io::Write;
         let out_log = paths::here().join("runtime").join("_watchdog.out.log");
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&out_log)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&out_log)?;
         writeln!(f, "{line}")?;
         Ok(())
     })();
@@ -750,10 +848,10 @@ pub fn main() -> i32 {
     // CEO RHYTHM GRAFT (v2 Phase B): after the two-plane sweep, the day-gated morning plan +
     // evening verified-outcome summary (see ceo::tick — cheap no-op on all but two sweeps a day).
     // catch_unwind mirrors the ops graft: a CEO failure must never abort crash-recovery.
-    let _ = std::panic::catch_unwind(crate::ceo::tick);
+    spawn_watchdog_graft(&CEO_GRAFT_RUNNING, crate::ceo::tick);
     // HOUSEKEEPING GRAFT (v2): day-gated (04:00) storage sweep — worktree prune, merged rsi/
     // branches, stale/oversized build dirs (see housekeeping.rs). Same isolation contract.
-    let _ = std::panic::catch_unwind(crate::housekeeping::tick);
+    spawn_watchdog_graft(&HOUSEKEEPING_GRAFT_RUNNING, crate::housekeeping::tick);
     // MANAGED-APP REDEPLOY GRAFT: close the "fix merged but never reaches the running app" deadlock
     // — rebuild+relaunch a managed repo's LIVE app binary when the deployed binary is stale (a
     // deploy-gap probe) AND the app is down (a process probe), but ONLY for a repo carrying a
@@ -765,8 +863,9 @@ pub fn main() -> i32 {
     // deploy::maybe_redeploy_managed_apps.
     let ops_payload_for_deploy = ops_payload.clone();
     std::thread::spawn(move || {
-        let _ =
-            std::panic::catch_unwind(|| crate::deploy::maybe_redeploy_managed_apps(&ops_payload_for_deploy));
+        let _ = std::panic::catch_unwind(|| {
+            crate::deploy::maybe_redeploy_managed_apps(&ops_payload_for_deploy)
+        });
     });
     // SELF-REDEPLOY: the periodic check that swaps Solomon's OWN production binary when the checkout
     // is behind origin/main, but ONLY in a safe drain window (no lane mid-ship, no live-money lane
@@ -789,6 +888,27 @@ pub fn main() -> i32 {
 // --------------------------------------------------------------------------- //
 // helpers
 // --------------------------------------------------------------------------- //
+
+struct GraftFlagGuard(&'static AtomicBool);
+
+impl Drop for GraftFlagGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+fn spawn_watchdog_graft<F>(running: &'static AtomicBool, f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    if running.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let _guard = GraftFlagGuard(running);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    });
+}
 
 /// Python f-string interpolation of a possibly-missing dict value (`res.get('pid')`, etc.). A JSON
 /// string renders without quotes; a missing key / null renders as Python's `None`; numbers/bools
@@ -823,7 +943,12 @@ fn py_slice_200(s: &str) -> String {
 /// when NO repo has ever iterated (a fresh install / wiped runtime — treated as a stale fleet, not a
 /// panic). Returns the human page body when a standstill is present, else `None`. An empty fleet
 /// (`total == 0`) is never a standstill — there is nothing to be down.
-fn standstill_reason(newest_age_s: Option<f64>, running: usize, total: usize, threshold_s: f64) -> Option<String> {
+fn standstill_reason(
+    newest_age_s: Option<f64>,
+    running: usize,
+    total: usize,
+    threshold_s: f64,
+) -> Option<String> {
     if total == 0 {
         return None; // no lanes configured — nothing can stand still
     }
@@ -852,7 +977,10 @@ fn newest_lane_age_s(now: DateTime<Utc>) -> Option<f64> {
             Some(n) if !n.is_empty() => n,
             _ => continue,
         };
-        let history = paths::here().join("runtime").join(name).join("history.jsonl");
+        let history = paths::here()
+            .join("runtime")
+            .join(name)
+            .join("history.jsonl");
         let ts_raw = crate::ops::ledger::lane_activity(&history, now)
             .get("last_iteration_ts")
             .cloned()
@@ -935,11 +1063,21 @@ mod tests {
     #[test]
     fn should_restart_stopped_or_no_heartbeat_left_alone() {
         // clean exit
-        assert!(!should_restart(false, &json!({"status": "stopped"}), false, false));
+        assert!(!should_restart(
+            false,
+            &json!({"status": "stopped"}),
+            false,
+            false
+        ));
         // no heartbeat -> {} -> no status -> left alone
         assert!(!should_restart(false, &json!({}), false, false));
         // status missing / null / empty-string -> falsy -> left alone
-        assert!(!should_restart(false, &json!({"status": null}), false, false));
+        assert!(!should_restart(
+            false,
+            &json!({"status": null}),
+            false,
+            false
+        ));
         assert!(!should_restart(false, &json!({"status": ""}), false, false));
     }
 
@@ -973,7 +1111,10 @@ mod tests {
             Some("base clean again — cleared dirty_base_persistent stop")
         );
         // still dirty -> leave the stop (do not thrash).
-        assert_eq!(persistent_stop_cleared("dirty_base_persistent", false, false, false), None);
+        assert_eq!(
+            persistent_stop_cleared("dirty_base_persistent", false, false, false),
+            None
+        );
     }
 
     #[test]
@@ -984,7 +1125,10 @@ mod tests {
             Some("base pushed again — cleared unpushed_base_persistent stop")
         );
         // still ahead -> leave the stop.
-        assert_eq!(persistent_stop_cleared("unpushed_base_persistent", false, false, false), None);
+        assert_eq!(
+            persistent_stop_cleared("unpushed_base_persistent", false, false, false),
+            None
+        );
     }
 
     #[test]
@@ -995,14 +1139,20 @@ mod tests {
             Some("base gate green again — cleared base_gate_red_persistent stop")
         );
         // gate still red -> leave the stop (do not thrash).
-        assert_eq!(persistent_stop_cleared("base_gate_red_persistent", false, false, false), None);
+        assert_eq!(
+            persistent_stop_cleared("base_gate_red_persistent", false, false, false),
+            None
+        );
     }
 
     #[test]
     fn persistent_stop_cleared_ignores_other_reasons() {
         // a true operator Stop carries no reason marker -> never auto-cleared.
         assert_eq!(persistent_stop_cleared("", true, true, true), None);
-        assert_eq!(persistent_stop_cleared("anything_else", true, true, true), None);
+        assert_eq!(
+            persistent_stop_cleared("anything_else", true, true, true),
+            None
+        );
     }
 
     // -------- sweep_repo: recover() is SKIPPED on the sweep that heals a persistent stop --------
@@ -1024,11 +1174,14 @@ mod tests {
     #[test]
     fn sweep_repo_skips_recover_after_persistent_stop_heal() {
         use std::process::Command;
-        let tag = format!("wd_heal_{}_{}", std::process::id(),
-                          std::time::SystemTime::now()
-                              .duration_since(std::time::UNIX_EPOCH)
-                              .map(|d| d.as_nanos() % 1_000_000)
-                              .unwrap_or(0));
+        let tag = format!(
+            "wd_heal_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() % 1_000_000)
+                .unwrap_or(0)
+        );
         // temp git repo with a clean base tree.
         let git_dir = std::env::temp_dir().join(format!("solomon_{tag}"));
         let _ = std::fs::remove_dir_all(&git_dir);
@@ -1040,7 +1193,11 @@ mod tests {
             vec!["commit", "--allow-empty", "-m", "init"],
             vec!["branch", "-M", "main"],
         ] {
-            let st = Command::new("git").args(&args).current_dir(&git_dir).status().unwrap();
+            let st = Command::new("git")
+                .args(&args)
+                .current_dir(&git_dir)
+                .status()
+                .unwrap();
             assert!(st.success(), "git {:?} failed in {:?}", args, git_dir);
         }
         let repo = json!({"name": tag, "path": git_dir.to_string_lossy()});
@@ -1058,11 +1215,17 @@ mod tests {
             })).unwrap(),
         ).unwrap();
 
-        let (actions, _snap) = sweep_repo(&repo, false, &std::cell::Cell::new(MAX_LANE_RESTARTS_PER_SWEEP));
+        let (actions, _snap) = sweep_repo(
+            &repo,
+            false,
+            &std::cell::Cell::new(MAX_LANE_RESTARTS_PER_SWEEP),
+        );
 
         // The heal fired and removed the sentinel.
         assert!(
-            actions.iter().any(|a| a.contains("auto-recover: base clean again")),
+            actions
+                .iter()
+                .any(|a| a.contains("auto-recover: base clean again")),
             "heal action missing: {actions:?}"
         );
         assert!(!rt.join("stop").exists(), "stop sentinel not cleared");
@@ -1073,8 +1236,14 @@ mod tests {
             !actions.iter().any(|a| a.contains(" recover: ")),
             "recover ran on the heal sweep (re-observed stale heartbeat): {actions:?}"
         );
-        assert!(!rt.join("escalation.json").exists(), "recover wrote a spurious escalation");
-        assert!(!rt.join("supervisor.jsonl").exists(), "recover wrote a spurious supervisor record");
+        assert!(
+            !rt.join("escalation.json").exists(),
+            "recover wrote a spurious escalation"
+        );
+        assert!(
+            !rt.join("supervisor.jsonl").exists(),
+            "recover wrote a spurious supervisor record"
+        );
 
         let _ = std::fs::remove_dir_all(&rt);
         let _ = std::fs::remove_dir_all(&git_dir);
@@ -1107,7 +1276,11 @@ mod tests {
             vec!["commit", "--allow-empty", "-m", "init"],
             vec!["branch", "-M", "main"],
         ] {
-            let st = Command::new("git").args(&args).current_dir(&git_dir).status().unwrap();
+            let st = Command::new("git")
+                .args(&args)
+                .current_dir(&git_dir)
+                .status()
+                .unwrap();
             assert!(st.success(), "git {:?} failed in {:?}", args, git_dir);
         }
         let repo = json!({"name": tag, "path": git_dir.to_string_lossy()});
@@ -1132,10 +1305,16 @@ mod tests {
         );
         // MUST NOT have started the lane (no spawn) — no "restarted <name> (pid ...)" action.
         assert!(
-            !actions.iter().any(|a| a.contains(&format!("restarted {tag}"))),
+            !actions
+                .iter()
+                .any(|a| a.contains(&format!("restarted {tag}"))),
             "lane was restarted despite an exhausted budget: {actions:?}"
         );
-        assert_eq!(budget.get(), 0, "a deferred restart must not change the budget");
+        assert_eq!(
+            budget.get(),
+            0,
+            "a deferred restart must not change the budget"
+        );
 
         let _ = std::fs::remove_dir_all(&rt);
         let _ = std::fs::remove_dir_all(&git_dir);
@@ -1171,7 +1350,9 @@ mod tests {
     // (no real ntfy/toast) and, post Part-1, does not touch the live _notify.jsonl either.
     #[test]
     fn standstill_alarm_pages_once_and_rearms_on_recovery() {
-        let _env = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
         let marker = standstill_marker();
         let _ = std::fs::remove_file(&marker);
@@ -1179,7 +1360,10 @@ mod tests {
 
         // First standstill sweep (fleet down): arms the marker. age is irrelevant when running==0.
         standstill_alarm(None, 0, 4, now);
-        assert!(marker.exists(), "first standstill must arm the dedupe marker");
+        assert!(
+            marker.exists(),
+            "first standstill must arm the dedupe marker"
+        );
         let armed_at = std::fs::read_to_string(&marker).unwrap_or_default();
 
         // Still down next sweep: marker unchanged (paged once — not re-written, not re-paged).
@@ -1193,10 +1377,41 @@ mod tests {
 
         // Recovery (all lanes running AND a fresh iteration): marker cleared, alarm re-armed.
         standstill_alarm(Some(60.0), 4, 4, now);
-        assert!(!marker.exists(), "recovery must clear the marker to re-arm the alarm");
+        assert!(
+            !marker.exists(),
+            "recovery must clear the marker to re-arm the alarm"
+        );
 
         let _ = std::fs::remove_file(&marker);
         std::env::remove_var("SOLOMON_NOTIFY_OFF");
+    }
+
+    #[test]
+    fn watchdog_graft_runs_single_flight_and_resets() {
+        static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        spawn_watchdog_graft(&RUNNING, move || {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let (skipped_tx, skipped_rx) = std::sync::mpsc::channel();
+        spawn_watchdog_graft(&RUNNING, move || {
+            skipped_tx.send(()).unwrap();
+        });
+        assert!(skipped_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        release_tx.send(()).unwrap();
+        for _ in 0..50 {
+            if !RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!RUNNING.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     // -------- _auto_push truthiness --------
@@ -1242,8 +1457,8 @@ mod tests {
         // Hermetic: write to an ISOLATED temp log and read it via recent_snapshots_from — never the
         // real mon_log — so concurrent tests, repeated `cargo test` runs, and the live watchdog can
         // neither bleed records in nor accumulate residue.
-        let log = std::env::temp_dir()
-            .join(format!("solomon_wd_snaps_{}.jsonl", std::process::id()));
+        let log =
+            std::env::temp_dir().join(format!("solomon_wd_snaps_{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&log);
 
         let fresh = now();
@@ -1252,11 +1467,35 @@ mod tests {
             .to_string();
         // Append: two fresh for our name, one old for our name, one fresh for another repo, one junk.
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&log).unwrap();
-        writeln!(f, "{}", json!({"ts": old, "repo": name, "status": "error", "phase": "preflight"})).unwrap();
-        writeln!(f, "{}", json!({"ts": fresh, "repo": name, "status": "error", "phase": "preflight"})).unwrap();
-        writeln!(f, "{}", json!({"ts": fresh, "repo": name, "status": "error", "phase": "preflight"})).unwrap();
-        writeln!(f, "{}", json!({"ts": fresh, "repo": "someone_else", "status": "x"})).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
+        writeln!(
+            f,
+            "{}",
+            json!({"ts": old, "repo": name, "status": "error", "phase": "preflight"})
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            json!({"ts": fresh, "repo": name, "status": "error", "phase": "preflight"})
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            json!({"ts": fresh, "repo": name, "status": "error", "phase": "preflight"})
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            json!({"ts": fresh, "repo": "someone_else", "status": "x"})
+        )
+        .unwrap();
         writeln!(f, "not json").unwrap();
         drop(f);
 
@@ -1266,7 +1505,9 @@ mod tests {
         // Age bound 600s: the old record is dropped; only the 2 fresh remain; take last 2.
         let got = recent_snapshots_from(&log, name, 2, Some(600.0));
         assert_eq!(got.len(), 2);
-        assert!(got.iter().all(|r| r.get("repo").and_then(Value::as_str) == Some(name)));
+        assert!(got
+            .iter()
+            .all(|r| r.get("repo").and_then(Value::as_str) == Some(name)));
 
         // k larger than available -> all (after age filter).
         assert_eq!(recent_snapshots_from(&log, name, 50, Some(600.0)).len(), 2);
@@ -1302,9 +1543,21 @@ mod tests {
     fn lane_health_all_gate_red_is_degraded() {
         // 3 consecutive gate-RED reverts → degraded:3x gate-RED
         let h = vec![
-            hist_rec("reverted", Some(false), "Reverted — tests failed (2 failed)."),
-            hist_rec("reverted", Some(false), "Reverted — tests failed (1 failed)."),
-            hist_rec("reverted", Some(false), "Reverted — tests failed (3 failed)."),
+            hist_rec(
+                "reverted",
+                Some(false),
+                "Reverted — tests failed (2 failed).",
+            ),
+            hist_rec(
+                "reverted",
+                Some(false),
+                "Reverted — tests failed (1 failed).",
+            ),
+            hist_rec(
+                "reverted",
+                Some(false),
+                "Reverted — tests failed (3 failed).",
+            ),
         ];
         assert_eq!(
             lane_health(true, &h, 3),
@@ -1316,7 +1569,11 @@ mod tests {
     fn lane_health_mixed_timeout_and_gate_red_is_degraded() {
         let h = vec![
             hist_rec("noop", None, "Pi session timed out."),
-            hist_rec("reverted", Some(false), "Reverted — tests failed (1 failed)."),
+            hist_rec(
+                "reverted",
+                Some(false),
+                "Reverted — tests failed (1 failed).",
+            ),
             hist_rec("noop", None, "Pi session timed out."),
         ];
         assert_eq!(
@@ -1351,9 +1608,21 @@ mod tests {
     fn lane_health_non_gate_red_revert_is_healthy() {
         // A revert with tests.green == true (leak-guard, anti-gaming, eval gate) is not gate-RED.
         let h = vec![
-            hist_rec("reverted", Some(false), "Reverted — tests failed (1 failed)."),
-            hist_rec("reverted", Some(true), "Reverted — leak guard: secret detected."),
-            hist_rec("reverted", Some(false), "Reverted — tests failed (2 failed)."),
+            hist_rec(
+                "reverted",
+                Some(false),
+                "Reverted — tests failed (1 failed).",
+            ),
+            hist_rec(
+                "reverted",
+                Some(true),
+                "Reverted — leak guard: secret detected.",
+            ),
+            hist_rec(
+                "reverted",
+                Some(false),
+                "Reverted — tests failed (2 failed).",
+            ),
         ];
         assert_eq!(lane_health(true, &h, 3), None);
     }
@@ -1367,7 +1636,11 @@ mod tests {
                 hist_rec(bad, None, "something"),
                 hist_rec("noop", None, "Pi session timed out."),
             ];
-            assert_eq!(lane_health(true, &h, 3), None, "status={bad} should be healthy");
+            assert_eq!(
+                lane_health(true, &h, 3),
+                None,
+                "status={bad} should be healthy"
+            );
         }
     }
 
@@ -1411,6 +1684,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ops_needs_attention_on_red_or_yellow() {
+        assert!(ops_needs_attention(
+            &json!({"projects": {"sover": {"status": "red"}}})
+        ));
+        assert!(ops_needs_attention(
+            &json!({"projects": {"dotz": {"status": "yellow"}}})
+        ));
+        assert!(!ops_needs_attention(
+            &json!({"projects": {"maki": {"status": "green"}}})
+        ));
+        assert!(!ops_needs_attention(&json!({})));
+    }
+
     // -------- stall detector anti-thrash: pre-recover escalation snapshot --------
     // The stall detector's anti-thrash checks the escalation category BEFORE recover() overwrites
     // it. Without the pre-recover snapshot, recover() runs first and overwrites escalation.json
@@ -1443,7 +1730,11 @@ mod tests {
             vec!["commit", "--allow-empty", "-m", "init"],
             vec!["branch", "-M", "main"],
         ] {
-            let st = Command::new("git").args(&args).current_dir(&git_dir).status().unwrap();
+            let st = Command::new("git")
+                .args(&args)
+                .current_dir(&git_dir)
+                .status()
+                .unwrap();
             assert!(st.success(), "git {:?} failed in {:?}", args, git_dir);
         }
         let repo = json!({"name": tag, "path": git_dir.to_string_lossy()});
@@ -1454,7 +1745,11 @@ mod tests {
         // Live lock (this process's PID) + fresh error/preflight heartbeat with a generic summary
         // that falls through to unknown_error in diagnose().
         let run_id = format!("tok-{tag}");
-        std::fs::write(rt.join("lock"), format!("{}\n{}", std::process::id(), run_id)).unwrap();
+        std::fs::write(
+            rt.join("lock"),
+            format!("{}\n{}", std::process::id(), run_id),
+        )
+        .unwrap();
         let fresh = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         std::fs::write(
             rt.join("heartbeat.json"),
@@ -1464,8 +1759,10 @@ mod tests {
                 "run_id": run_id,
                 "updated_at": fresh,
                 "last_summary": "an unclassified preflight error occurred",
-            })).unwrap(),
-        ).unwrap();
+            }))
+            .unwrap(),
+        )
+        .unwrap();
 
         // Pre-existing "running_stalled" escalation — the anti-thrash must see this BEFORE recover()
         // overwrites it, and suppress the re-escalation.
@@ -1476,8 +1773,10 @@ mod tests {
                 "category": "running_stalled",
                 "evidence": "running but stuck in preflight for 3 consecutive sweeps",
                 "suggested_manual_steps": ["cd \"<repo>\"", "git status"],
-            })).unwrap(),
-        ).unwrap();
+            }))
+            .unwrap(),
+        )
+        .unwrap();
 
         // 2 prior error/preflight snapshots in _monitor.jsonl (for STALL_SWEEPS=3, we need
         // STALL_SWEEPS-1=2 prior + the current snap from this sweep). Fresh timestamps so the
@@ -1499,7 +1798,8 @@ mod tests {
                 "iteration": Value::Null,
                 "last_status": Value::Null,
                 "diagnosis": "unknown_error",
-            })).unwrap()
+            }))
+            .unwrap()
         };
         {
             use std::io::Write;
@@ -1512,7 +1812,11 @@ mod tests {
             writeln!(f, "{}", snap_line(&tag)).unwrap();
         }
 
-        let (actions, _snap) = sweep_repo(&repo, false, &std::cell::Cell::new(MAX_LANE_RESTARTS_PER_SWEEP));
+        let (actions, _snap) = sweep_repo(
+            &repo,
+            false,
+            &std::cell::Cell::new(MAX_LANE_RESTARTS_PER_SWEEP),
+        );
 
         // The stall detector must NOT re-emit the STALLED action — the pre-existing
         // "running_stalled" escalation (captured before recover() overwrote it) suppresses it.
@@ -1526,9 +1830,7 @@ mod tests {
         if let Ok(content) = std::fs::read_to_string(&mon) {
             let kept: Vec<&str> = content
                 .lines()
-                .filter(|line| {
-                    !line.contains(&format!("\"repo\":\"{}\"", tag))
-                })
+                .filter(|line| !line.contains(&format!("\"repo\":\"{}\"", tag)))
                 .collect();
             let _ = std::fs::write(&mon, format!("{}\n", kept.join("\n")));
         }
