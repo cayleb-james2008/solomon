@@ -459,17 +459,39 @@ fn stash_has_real_content(ctx: &Ctx, ref_str: &str, extra: &[Regex]) -> bool {
 
 /// Preserve a stash's content to a `solomon-recovered/<ts>-<idx>` branch via `git stash branch`,
 /// then commit and return to the base branch. `git stash branch` applies the stash to a new branch
-/// and DROPS the stash on success. Returns true on success; on failure the stash is RETAINED and
-/// the error is surfaced loudly (heartbeat + log) for manual recovery.
+/// and DROPS the stash on success. Returns true on success; on a `stash branch` failure the stash
+/// is RETAINED and the error is surfaced loudly (heartbeat + log) for manual recovery. On a
+/// commit failure AFTER the stash was consumed, the content is left uncommitted on the new branch
+/// (never destroyed) and false is returned with a loud heartbeat.
 fn recover_stash_to_branch(ctx: &mut Ctx, stash_ref: &str, idx: usize) -> bool {
     let ts = ctx::stamp();
     let branch = format!("solomon-recovered/{ts}-{idx}");
     let res = ctx.git(&["stash", "branch", &branch, stash_ref], 120);
     if res.code == 0 {
-        // Stash applied + auto-dropped. Commit the changes so they survive a checkout.
+        // Stash applied + auto-dropped. Commit the changes (runner identity, result CHECKED) so
+        // they survive a checkout. A failed commit followed by `checkout --force` would DESTROY
+        // the just-recovered content — the same ignored-commit bug as the 2026-07-06 kairos drop.
         ctx.git(&["add", "-A"], 120);
         let msg = format!("solomon-recovered: swept preflight work from {stash_ref}");
-        let _ = ctx.git(&["commit", "-m", &msg], 120);
+        let cm = runner_commit(ctx, &msg);
+        if cm.code != 0 {
+            let err: String = cm.stderr.trim().chars().take(200).collect();
+            ctx.log(&format!(
+                "stash-hygiene: WARNING — {stash_ref} applied to branch '{branch}' but the commit \
+                 FAILED ({err}); the stash is already consumed, so the content sits UNCOMMITTED on \
+                 '{branch}' — NOT force-checking out {} (that would destroy it)",
+                ctx.base_branch
+            ));
+            ctx.heartbeat(json!({
+                "status": "error",
+                "phase": "preflight",
+                "last_summary": format!(
+                    "Recovered preflight work is UNCOMMITTED on branch '{branch}' (commit failed: {err}). \
+                     Manual recovery: commit it there before any forced checkout."
+                ),
+            }));
+            return false;
+        }
         ctx.git(&["checkout", "--force", &ctx.base_branch], 120);
         ctx.log(&format!(
             "stash-hygiene: recovered real content from {stash_ref} to branch '{branch}'"
@@ -666,6 +688,49 @@ pub fn git_add_all(ctx: &Ctx) -> crate::control::proc::RunOut {
         }
     }
     r
+}
+
+/// Email used for every RUNNER-authored commit (matches the operator/agent convention already in
+/// the shipped history of every lane).
+pub const RUNNER_COMMIT_EMAIL: &str = "caylebalvarezjames@gmail.com";
+
+/// The engine's agent-author convention for runner-created commits: "<repo>-rsi agent".
+pub fn runner_author(ctx: &Ctx) -> String {
+    format!("{}-rsi agent", ctx.name)
+}
+
+/// Commit the staged index as the RUNNER (the runner owns git; agents own code). Identity is
+/// injected inline (`git -c user.name=… -c user.email=… commit`) so the commit NEVER depends on
+/// repo-local or global git config. Root cause of the 2026-07-06 kairos silent drop: the target
+/// repo had no user.name/user.email anywhere, the runner's bare `git commit` failed rc=128
+/// "Author identity unknown", the RunOut was ignored, and gate-green work was dropped as a bare
+/// "no commits ahead after gate". Callers MUST check the returned code.
+pub fn runner_commit(ctx: &Ctx, message: &str) -> crate::control::proc::RunOut {
+    let name_cfg = format!("user.name={}", runner_author(ctx));
+    let email_cfg = format!("user.email={RUNNER_COMMIT_EMAIL}");
+    ctx.git(
+        &["-c", &name_cfg, "-c", &email_cfg, "commit", "-m", message],
+        120,
+    )
+}
+
+/// Files that would be LOST if the branch were dropped right now: `git status --porcelain` paths
+/// (tracked modifications + untracked non-ignored files; ignored files never appear). Used to
+/// (a) decide whether a no-commits-ahead branch actually carries agent work and (b) NAME what a
+/// drop would discard — a post-green-gate drop must never be a bare "dropping branch". A failed
+/// `git status` returns a single pseudo-entry naming the failure (fail-loud, never fail-clean).
+pub fn dirty_files(ctx: &Ctx) -> Vec<String> {
+    let st = ctx.git(&["status", "--porcelain"], 120);
+    if st.code != 0 {
+        let err: String = st.stderr.trim().chars().take(120).collect();
+        return vec![format!("(git status --porcelain failed rc={}: {err})", st.code)];
+    }
+    st.stdout
+        .lines()
+        .filter(|l| l.len() > 3)
+        .map(|l| l.chars().skip(3).collect::<String>().trim().to_string())
+        .filter(|f| !f.is_empty())
+        .collect()
 }
 
 /// run_improver._repo_row (~1260-1269): THIS repo's repos.json row (read fresh so a dashboard edit
@@ -1010,6 +1075,49 @@ mod tests {
             branch
         };
         (c, dir)
+    }
+
+    /// dirty_files: names tracked modifications AND untracked non-ignored files; ignored files
+    /// never appear; a clean tree yields an empty list. This is the would-be-dropped diagnosis
+    /// for the post-green-gate no-commits path.
+    #[test]
+    fn dirty_files_names_tracked_and_untracked_not_ignored() {
+        let (c, dir) = real_repo_ctx();
+        assert!(dirty_files(&c).is_empty(), "fresh repo should be clean");
+
+        std::fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
+        c.git(&["add", "-A"], 10);
+        c.git(&["commit", "--quiet", "-m", "ignore logs"], 10);
+
+        std::fs::write(dir.join("README.md"), "# test\nchanged\n").unwrap(); // tracked mod
+        std::fs::write(dir.join("new_module.py"), "x = 1\n").unwrap(); // untracked
+        std::fs::write(dir.join("noise.log"), "ignored\n").unwrap(); // ignored
+
+        let files = dirty_files(&c);
+        assert!(files.iter().any(|f| f == "README.md"), "files: {files:?}");
+        assert!(files.iter().any(|f| f == "new_module.py"), "files: {files:?}");
+        assert!(
+            !files.iter().any(|f| f.contains("noise.log")),
+            "ignored file must not appear: {files:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// runner_commit: commits the staged index with the inline runner identity — result checked,
+    /// author independent of any repo config (the -c injection is the whole point).
+    #[test]
+    fn runner_commit_uses_inline_runner_identity() {
+        let (c, dir) = real_repo_ctx();
+        std::fs::write(dir.join("work.py"), "y = 2\n").unwrap();
+        c.git(&["add", "-A"], 10);
+        let cm = runner_commit(&c, "rsi: runner-owned commit\n\nbody");
+        assert_eq!(cm.code, 0, "stderr: {}", cm.stderr);
+        let ident = c.git(&["log", "-1", "--format=%an|%ae"], 10).stdout;
+        assert_eq!(
+            ident.trim(),
+            format!("{}|{}", runner_author(&c), RUNNER_COMMIT_EMAIL)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// HARD INVARIANT: a preflight stash with real dirty-base content (a non-agent-artifact
