@@ -243,6 +243,7 @@ fn check_impl(repo_root: &Path, runtime_root: &Path, rows: &[Value], now: f64) -
 /// excepted (git writes their subjects). Pure — this is the machine-readable form of the doc's
 /// audit query; the repo-history test below runs it against the ACTUAL `git log` output so the
 /// convention can never again be a write-only ledger.
+#[allow(dead_code)] // consumed by the build-gate enforcement test, not by the runtime bin
 pub fn valid_provenance_subject(subject: &str) -> bool {
     let s = subject.trim_start();
     if s.starts_with("Merge ") {
