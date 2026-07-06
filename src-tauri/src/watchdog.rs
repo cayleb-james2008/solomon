@@ -33,6 +33,7 @@ use crate::supervisor;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// monitor.STALL_SWEEPS — consecutive error/preflight sweeps (incl. this one) that mark a lane STALLED.
@@ -56,6 +57,9 @@ const HEALTH_K: usize = 3;
 /// that a slow pi session or a sleeping lane never trips it, short enough that a real wedge pages the
 /// operator the same day instead of after a multi-day post-mortem.
 const STANDSTILL_S: f64 = 3.0 * 3600.0;
+
+static CEO_GRAFT_RUNNING: AtomicBool = AtomicBool::new(false);
+static HOUSEKEEPING_GRAFT_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// monitor.DISABLED — global kill-switch path: HERE/runtime/_watchdog.disabled.
 fn disabled_path() -> std::path::PathBuf {
@@ -844,10 +848,10 @@ pub fn main() -> i32 {
     // CEO RHYTHM GRAFT (v2 Phase B): after the two-plane sweep, the day-gated morning plan +
     // evening verified-outcome summary (see ceo::tick — cheap no-op on all but two sweeps a day).
     // catch_unwind mirrors the ops graft: a CEO failure must never abort crash-recovery.
-    let _ = std::panic::catch_unwind(crate::ceo::tick);
+    spawn_watchdog_graft(&CEO_GRAFT_RUNNING, crate::ceo::tick);
     // HOUSEKEEPING GRAFT (v2): day-gated (04:00) storage sweep — worktree prune, merged rsi/
     // branches, stale/oversized build dirs (see housekeeping.rs). Same isolation contract.
-    let _ = std::panic::catch_unwind(crate::housekeeping::tick);
+    spawn_watchdog_graft(&HOUSEKEEPING_GRAFT_RUNNING, crate::housekeeping::tick);
     // MANAGED-APP REDEPLOY GRAFT: close the "fix merged but never reaches the running app" deadlock
     // — rebuild+relaunch a managed repo's LIVE app binary when the deployed binary is stale (a
     // deploy-gap probe) AND the app is down (a process probe), but ONLY for a repo carrying a
@@ -884,6 +888,27 @@ pub fn main() -> i32 {
 // --------------------------------------------------------------------------- //
 // helpers
 // --------------------------------------------------------------------------- //
+
+struct GraftFlagGuard(&'static AtomicBool);
+
+impl Drop for GraftFlagGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+fn spawn_watchdog_graft<F>(running: &'static AtomicBool, f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    if running.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let _guard = GraftFlagGuard(running);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    });
+}
 
 /// Python f-string interpolation of a possibly-missing dict value (`res.get('pid')`, etc.). A JSON
 /// string renders without quotes; a missing key / null renders as Python's `None`; numbers/bools
@@ -1359,6 +1384,34 @@ mod tests {
 
         let _ = std::fs::remove_file(&marker);
         std::env::remove_var("SOLOMON_NOTIFY_OFF");
+    }
+
+    #[test]
+    fn watchdog_graft_runs_single_flight_and_resets() {
+        static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        spawn_watchdog_graft(&RUNNING, move || {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let (skipped_tx, skipped_rx) = std::sync::mpsc::channel();
+        spawn_watchdog_graft(&RUNNING, move || {
+            skipped_tx.send(()).unwrap();
+        });
+        assert!(skipped_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        release_tx.send(()).unwrap();
+        for _ in 0..50 {
+            if !RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!RUNNING.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     // -------- _auto_push truthiness --------
