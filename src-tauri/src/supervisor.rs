@@ -538,6 +538,35 @@ pub fn diagnose(repo: &Value) -> Value {
     })
 }
 
+/// EVERY category diagnose() above can assign to its `cat` binding — kept IMMEDIATELY ADJACENT to
+/// diagnose() so the two cannot drift: adding a branch above means adding its literal here, and
+/// the actions.rs closure test then forces an actions.json mapping for it in the SAME commit
+/// (cargo test — the build gate — is red otherwise). "ok" is included so the registry mapping is
+/// total, not special-cased. A source-scan test below cross-checks this list against the actual
+/// string literals diagnose() assigns.
+pub fn diagnose_categories() -> &'static [&'static str] {
+    &[
+        "ok",
+        "needs_goal",
+        "no_key",
+        "key_shape_mismatch",
+        "quota_error",
+        "gh_not_ready",
+        "revert_failed",
+        "dirty_tree",
+        "base_out_of_band",
+        "untracked_refusal",
+        "persistent_self_stop",
+        "stale_lock",
+        "stop_lingering",
+        "stuck",
+        "gate_red_streak",
+        "ci_red_streak",
+        "noop_streak",
+        "unknown_error",
+    ]
+}
+
 /// Anti-thrash helper: count recent supervisor.jsonl records that are a RUNG-0, non-escalate
 /// auto-fix of `cat`. Mirrors the comprehension in diagnose().
 ///
@@ -639,21 +668,69 @@ fn suggested_steps(repo: &Value, cat: &str) -> Vec<String> {
     }
 }
 
+/// Parse a supervisor timestamp string ("%Y-%m-%dT%H:%M:%SZ", the format every stamp in this file
+/// uses). Missing/garbled input -> None (callers treat that as "no valid stamp", never a panic).
+fn parse_ts(s: &str) -> Option<chrono::DateTime<Utc>> {
+    NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%SZ")
+        .ok()
+        .map(|d| d.and_utc())
+}
+
+/// now + secs, formatted like every other stamp in this file.
+fn ts_in(secs: u64) -> String {
+    let dt = Utc::now() + chrono::Duration::seconds(secs.min(i64::MAX as u64) as i64);
+    dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Overwrite runtime/<name>/escalation.json with an already-built record (the TTL pre-step's
+/// re-stamp path). Same swallow-OSError contract as write_escalation.
+fn rewrite_escalation_file(repo: &Value, rec: &Value) {
+    let dir = match rt(repo) {
+        Some(d) => d,
+        None => return,
+    };
+    let _ = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        let body = serde_json::to_vec_pretty(rec).map_err(std::io::Error::other)?;
+        std::fs::write(dir.join("escalation.json"), body)
+    })();
+}
+
 /// solomon._write_escalation: overwrite runtime/<name>/escalation.json with the current diagnosis +
 /// suggested manual steps (category-deduped: a single overwrite). No-op without a runtime dir; an
 /// OSError is swallowed. `d` must carry `category` + `evidence`.
+///
+/// TTL stamps (closed action registry, catalog #3): every escalation carries `expires_at`
+/// (now + actions.json ttl_s for the category) and `fallback_runs: 0`. recover()'s TTL pre-step
+/// executes the category's registered fallback once the stamp expires — no escalation can wait
+/// for the operator forever. A SAME-CATEGORY overwrite (re-observation of the same standing
+/// problem on a later sweep) PRESERVES the live expires_at/fallback_runs/fallback_history:
+/// re-stamping on every sweep would push the fallback deadline out indefinitely — the exact dead
+/// end the TTL exists to kill.
 pub fn write_escalation(repo: &Value, d: &Value) {
     let dir = match rt(repo) {
         Some(d) => d,
         None => return,
     };
     let category = d.get("category").and_then(Value::as_str).unwrap_or("");
-    let rec = json!({
+    let policy = crate::actions::policy_for(category);
+    let mut rec = json!({
         "ts": now(),
         "category": d.get("category").cloned().unwrap_or(Value::Null),
         "evidence": d.get("evidence").cloned().unwrap_or(Value::Null),
         "suggested_manual_steps": suggested_steps(repo, category),
+        "expires_at": ts_in(policy.ttl_s),
+        "fallback_runs": 0,
     });
+    if let Some(prev) = read_escalation(repo) {
+        if prev.get("category").and_then(Value::as_str) == Some(category) {
+            for k in ["expires_at", "fallback_runs", "fallback_history"] {
+                if let Some(v) = prev.get(k) {
+                    rec[k] = v.clone();
+                }
+            }
+        }
+    }
     let _ = (|| -> std::io::Result<()> {
         std::fs::create_dir_all(&dir)?;
         // json.dump(rec, f, indent=2).
@@ -877,6 +954,123 @@ pub fn note_healthy(repo: &Value) {
     }
 }
 
+/// TTL escalation pre-step (closed action registry, catalog #3: "no 'wait for operator' dead
+/// ends"). Runs BEFORE the existing recover() ladder, and is purely additive:
+///
+///   * no escalation.json, or one whose `expires_at` has NOT passed -> None (existing behavior,
+///     byte-for-byte untouched);
+///   * a pre-TTL (legacy/hand-written) escalation without `expires_at` -> stamp one from the
+///     category's actions.json TTL and fall through (it can now never wait forever);
+///   * an EXPIRED escalation -> execute the category's registered fallback via
+///     actions::execute_action, increment `fallback_runs`, re-stamp `expires_at` (one execution
+///     per TTL window), and record the action into BOTH the escalation record
+///     (`fallback_history`) and supervisor.jsonl (the sweep actions list);
+///   * `fallback_runs` >= max -> degrade to the marker-deduped operator page, re-stamped daily.
+///
+/// The escalation record is never deleted here except by an executed CLEARING fallback
+/// (clear_escalation_and_retry) — detection always terminates in actuation: resolution
+/// (note_healthy), an executed fallback, or a daily deduped page.
+fn ttl_escalation_step(repo: &Value, auto_push: bool) -> Option<Value> {
+    let mut esc = read_escalation(repo)?;
+    let category = esc
+        .get("category")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if category.is_empty() {
+        return None; // corrupt/foreign record — leave the existing ladder to overwrite it
+    }
+    let policy = crate::actions::policy_for(&category);
+    let expires = esc
+        .get("expires_at")
+        .and_then(Value::as_str)
+        .and_then(parse_ts);
+    let expires = match expires {
+        None => {
+            // Legacy escalation from before the TTL flow (or a hand-written one): stamp a TTL now
+            // so it enters the actuation cycle; this sweep's ladder proceeds unchanged.
+            esc["expires_at"] = json!(ts_in(policy.ttl_s));
+            if esc.get("fallback_runs").and_then(Value::as_u64).is_none() {
+                esc["fallback_runs"] = json!(0);
+            }
+            rewrite_escalation_file(repo, &esc);
+            return None;
+        }
+        Some(t) => t,
+    };
+    if Utc::now() <= expires {
+        return None; // un-expired: existing recover()/diagnose() behavior, untouched
+    }
+
+    let runs = esc.get("fallback_runs").and_then(Value::as_u64).unwrap_or(0);
+    let degraded = runs >= policy.max_fallback_runs;
+    let (kind, window_s) = if degraded {
+        // Fallbacks exhausted: the documented degraded mode is a deduped operator page, re-armed
+        // daily — the operator keeps being told (once/day), the engine never silently parks.
+        (crate::actions::DEGRADED_KIND.to_string(), 86_400u64)
+    } else {
+        (policy.fallback.clone(), policy.ttl_s)
+    };
+    let out = crate::actions::execute_action(&kind, repo, &category, auto_push);
+    let ok = out.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let label = if degraded {
+        format!("ttl_degraded_page:{category}")
+    } else {
+        format!("ttl_fallback:{kind}")
+    };
+
+    // Re-stamp + record into the escalation — UNLESS the executed action retired the file itself
+    // (clear_escalation_and_retry): resurrecting it would undo the clear; a recurrence gets a
+    // fresh escalation with a fresh TTL cycle instead.
+    if read_escalation(repo).is_some() {
+        if !degraded {
+            esc["fallback_runs"] = json!(runs + 1);
+        }
+        esc["expires_at"] = json!(ts_in(window_s));
+        let mut hist = esc
+            .get("fallback_history")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        hist.push(json!({"ts": now(), "action": kind, "ok": ok, "degraded": degraded}));
+        esc["fallback_history"] = Value::Array(hist);
+        rewrite_escalation_file(repo, &esc);
+    }
+
+    let msg = if degraded {
+        format!(
+            "escalation TTL expired with {} fallback runs exhausted — paged operator (deduped), next window 24h",
+            policy.max_fallback_runs
+        )
+    } else {
+        format!(
+            "escalation TTL expired — executed fallback '{kind}' (run {}/{})",
+            runs + 1,
+            policy.max_fallback_runs
+        )
+    };
+    append_jsonl(
+        repo,
+        "supervisor.jsonl",
+        &json!({
+            "ts": now(),
+            "category": category,
+            "rung": 3,
+            "actions": [label.clone()],
+            "escalate": false,
+            "message": msg,
+        }),
+    );
+    Some(json!({
+        "ok": ok,
+        "category": category,
+        "actions_taken": [label],
+        "escalate": false,
+        "message": msg,
+        "ttl_expired": true,
+    }))
+}
+
 pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: bool) -> Value {
     let d = diagnose(repo);
     let cat = d
@@ -894,6 +1088,13 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
         // escalate=false, breaking the dedupe guard.
         note_healthy(repo);
         return json!({"ok": true, "category": "ok", "actions_taken": [], "escalate": false, "message": "healthy"});
+    }
+
+    // TTL escalation pre-step (catalog #3): an escalation that has outlived its TTL executes its
+    // registered degraded-mode fallback instead of waiting for the operator forever. Absent or
+    // un-expired escalations fall through to the existing ladder UNCHANGED (purely additive).
+    if let Some(out) = ttl_escalation_step(repo, auto_push) {
+        return out;
     }
 
     let mut actions: Vec<String> = Vec::new();
@@ -2723,5 +2924,260 @@ mod tests {
             spend_restart_budget(),
             "budget unset again after with_restart_budget scope"
         );
+    }
+
+    // ---------------- closed action registry: diagnose_categories() cannot drift ----------------
+    // Source-scan cross-check: every string literal diagnose() assigns to its `cat` binding must
+    // appear in diagnose_categories() and vice versa. Adjacency is the intent; this test is the
+    // enforcement — a new diagnosis branch without a registry entry fails HERE, and the actions.rs
+    // closure test then forces the actions.json mapping.
+    #[test]
+    fn diagnose_categories_matches_the_literals_diagnose_assigns() {
+        let src = include_str!("supervisor.rs");
+        // Built dynamically so this test's own source cannot match itself.
+        let needle = format!("cat = {}", '"');
+        let mut found: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut rest = src;
+        while let Some(i) = rest.find(&needle) {
+            let after = &rest[i + needle.len()..];
+            match after.find('"') {
+                Some(j) => {
+                    found.insert(after[..j].to_string());
+                    rest = &after[j..];
+                }
+                None => break,
+            }
+        }
+        let listed: std::collections::BTreeSet<String> = diagnose_categories()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            found, listed,
+            "diagnose()'s assigned category literals and diagnose_categories() drifted — \
+             update diagnose_categories() (and actions.json, which the closure test enforces)"
+        );
+    }
+
+    // ---------------- TTL escalations (closed action registry, catalog #3) ----------------
+
+    fn write_esc_file(dir: &Path, rec: &Value) {
+        std::fs::write(
+            dir.join("escalation.json"),
+            serde_json::to_vec_pretty(rec).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Seconds from now until the record's expires_at (negative = already expired).
+    fn esc_expires_in(repo: &Value) -> i64 {
+        let esc = read_escalation(repo).expect("escalation.json present");
+        let ts = esc["expires_at"].as_str().expect("expires_at stamped");
+        (parse_ts(ts).expect("expires_at parses") - Utc::now()).num_seconds()
+    }
+
+    /// Hold the notify env lock and force the kill-switch on for the closure's duration, so TTL
+    /// tests that reach page_operator_deduped never shell out to curl/powershell or pop a toast.
+    fn with_notify_off<T>(f: impl FnOnce() -> T) -> T {
+        let _g = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        let out = f();
+        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        out
+    }
+
+    // write_escalation stamps expires_at = now + actions.json ttl_s(category) and fallback_runs 0.
+    #[test]
+    fn ttl_write_escalation_stamps_expiry_and_fallback_runs() {
+        let (dir, repo) = tmp_repo("ttlstamp");
+        write_escalation(&repo, &json!({"category": "no_key", "evidence": "x"}));
+        let esc = read_escalation(&repo).unwrap();
+        assert_eq!(esc["fallback_runs"], json!(0));
+        let delta = esc_expires_in(&repo);
+        // no_key ttl_s is 3600 in actions.json; generous tolerance for slow CI.
+        assert!(
+            (3000..=4200).contains(&delta),
+            "expires_at should be ~1h out, got {delta}s"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A same-category overwrite preserves the live TTL cycle (re-observation must not push the
+    // fallback deadline out forever); a DIFFERENT category re-stamps fresh.
+    #[test]
+    fn ttl_same_category_overwrite_preserves_cycle() {
+        let (dir, repo) = tmp_repo("ttlpreserve");
+        write_escalation(&repo, &json!({"category": "no_key", "evidence": "x"}));
+        // Simulate a mid-cycle record: sentinel expiry + 2 fallback runs already spent.
+        let mut esc = read_escalation(&repo).unwrap();
+        esc["expires_at"] = json!("2000-01-01T00:00:00Z");
+        esc["fallback_runs"] = json!(2);
+        write_esc_file(&dir, &esc);
+
+        write_escalation(&repo, &json!({"category": "no_key", "evidence": "re-observed"}));
+        let esc2 = read_escalation(&repo).unwrap();
+        assert_eq!(esc2["expires_at"], json!("2000-01-01T00:00:00Z"), "cycle preserved");
+        assert_eq!(esc2["fallback_runs"], json!(2), "runs preserved");
+        assert_eq!(esc2["evidence"], json!("re-observed"), "diagnosis payload still refreshed");
+
+        // a different category is a NEW problem: fresh stamp, runs reset.
+        write_escalation(&repo, &json!({"category": "quota_error", "evidence": "429"}));
+        let esc3 = read_escalation(&repo).unwrap();
+        assert_eq!(esc3["fallback_runs"], json!(0));
+        assert!(esc_expires_in(&repo) > 0, "fresh future expiry for the new category");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // An EXPIRED escalation executes its registered fallback exactly once per TTL window, records
+    // it in the escalation record AND supervisor.jsonl, and re-stamps the expiry.
+    #[test]
+    fn ttl_expiry_executes_fallback_exactly_once_per_window() {
+        with_notify_off(|| {
+            let (dir, repo) = tmp_repo("ttlexpire");
+            // Standing no_key problem (fallback in actions.json: page_operator_deduped)…
+            write_hb(
+                &dir,
+                &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}),
+            );
+            // …whose escalation TTL has already lapsed.
+            write_esc_file(
+                &dir,
+                &json!({
+                    "ts": "2026-01-01T00:00:00Z", "category": "no_key", "evidence": "x",
+                    "suggested_manual_steps": [], "expires_at": "2026-01-01T01:00:00Z",
+                    "fallback_runs": 0
+                }),
+            );
+
+            let out1 = recover(&repo, false, false, false);
+            assert_eq!(out1["ttl_expired"], json!(true));
+            assert_eq!(out1["escalate"], json!(false));
+            assert_eq!(
+                out1["actions_taken"],
+                json!(["ttl_fallback:page_operator_deduped"]),
+                "the registered fallback executed and landed in the sweep actions list"
+            );
+            // recorded into the escalation record + re-armed for one full window.
+            let esc = read_escalation(&repo).unwrap();
+            assert_eq!(esc["fallback_runs"], json!(1));
+            assert_eq!(esc["fallback_history"].as_array().unwrap().len(), 1);
+            assert_eq!(esc["fallback_history"][0]["action"], json!("page_operator_deduped"));
+            assert!(esc_expires_in(&repo) > 3000, "expiry re-stamped a window out");
+            assert!(dir.join("_paged_no_key").exists(), "page marker stamped");
+
+            // Second sweep inside the fresh window: NO second execution — the pre-step defers and
+            // the existing ladder runs (a plain re-escalation), exactly the old behavior.
+            let out2 = recover(&repo, false, false, false);
+            assert!(out2.get("ttl_expired").is_none());
+            let esc2 = read_escalation(&repo).unwrap();
+            assert_eq!(esc2["fallback_runs"], json!(1), "no double execution in one window");
+            let sup = std::fs::read_to_string(dir.join("supervisor.jsonl")).unwrap();
+            assert_eq!(
+                sup.matches("ttl_fallback:page_operator_deduped").count(),
+                1,
+                "exactly one TTL fallback record per window"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    // fallback_runs >= max_fallback_runs degrades to the deduped daily page: expires_at re-stamps
+    // ~24h out, runs stop climbing, and the action is the degraded page — never a silent park.
+    #[test]
+    fn ttl_max_fallback_runs_degrades_to_daily_page() {
+        with_notify_off(|| {
+            let (dir, repo) = tmp_repo("ttldegrade");
+            write_hb(
+                &dir,
+                &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}),
+            );
+            write_esc_file(
+                &dir,
+                &json!({
+                    "ts": "2026-01-01T00:00:00Z", "category": "no_key", "evidence": "x",
+                    "suggested_manual_steps": [], "expires_at": "2026-01-01T01:00:00Z",
+                    "fallback_runs": 3
+                }),
+            );
+            let out = recover(&repo, false, false, false);
+            assert_eq!(out["ttl_expired"], json!(true));
+            assert_eq!(out["ok"], json!(true));
+            assert_eq!(out["actions_taken"], json!(["ttl_degraded_page:no_key"]));
+            let esc = read_escalation(&repo).unwrap();
+            assert_eq!(esc["fallback_runs"], json!(3), "runs freeze once degraded");
+            let delta = esc_expires_in(&repo);
+            assert!(
+                (80_000..=90_000).contains(&delta),
+                "degraded page re-arms ~daily, got {delta}s"
+            );
+            assert!(dir.join("_paged_no_key").exists());
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    // An UNKNOWN category (a disk escalation nothing in diagnose() emits — e.g. the watchdog's
+    // running_stalled cousin, or operator hand-edits) gets default_ttl_s + the deduped page:
+    // never a panic, never a silent dead end.
+    #[test]
+    fn ttl_unknown_category_defaults_and_pages_never_panics() {
+        with_notify_off(|| {
+            let (dir, repo) = tmp_repo("ttlunknown");
+            write_hb(&dir, &json!({"status": "error", "last_summary": "boom"}));
+            write_esc_file(
+                &dir,
+                &json!({
+                    "ts": "2026-01-01T00:00:00Z", "category": "martian_weather", "evidence": "?",
+                    "suggested_manual_steps": [], "expires_at": "2026-01-01T01:00:00Z",
+                    "fallback_runs": 0
+                }),
+            );
+            let out = recover(&repo, false, false, false);
+            assert_eq!(out["ttl_expired"], json!(true));
+            assert_eq!(
+                out["actions_taken"],
+                json!(["ttl_fallback:page_operator_deduped"]),
+                "unknown category falls back to the deduped operator page"
+            );
+            let esc = read_escalation(&repo).unwrap();
+            assert_eq!(esc["category"], json!("martian_weather"));
+            assert_eq!(esc["fallback_runs"], json!(1));
+            let delta = esc_expires_in(&repo);
+            // default_ttl_s is 3600.
+            assert!(
+                (3000..=4200).contains(&delta),
+                "unknown category re-arms with default_ttl_s, got {delta}s"
+            );
+            assert!(dir.join("_paged_martian_weather").exists());
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    // A legacy (pre-TTL / hand-written) escalation WITHOUT expires_at gets stamped on the next
+    // sweep and the ladder proceeds unchanged — it enters the actuation cycle instead of being a
+    // grandfathered dead end.
+    #[test]
+    fn ttl_legacy_escalation_without_expiry_gets_stamped_not_executed() {
+        let (dir, repo) = tmp_repo("ttllegacy");
+        write_hb(
+            &dir,
+            &json!({"status": "error", "last_summary": "OPENROUTER_API_KEY not set"}),
+        );
+        write_esc_file(
+            &dir,
+            &json!({
+                "ts": "2026-01-01T00:00:00Z", "category": "no_key", "evidence": "x",
+                "suggested_manual_steps": []
+            }),
+        );
+        let out = recover(&repo, false, false, false);
+        // No TTL actuation on the stamping sweep — the normal ladder ran (plain escalation).
+        assert!(out.get("ttl_expired").is_none());
+        assert_eq!(out["category"], json!("no_key"));
+        let esc = read_escalation(&repo).unwrap();
+        assert_eq!(esc["fallback_runs"], json!(0));
+        assert!(esc_expires_in(&repo) > 0, "legacy record now carries a live TTL");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

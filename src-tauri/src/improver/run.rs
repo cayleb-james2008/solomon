@@ -247,6 +247,24 @@ pub fn main(args: &[String]) -> i32 {
         return 2;
     }
 
+    // CONTROLLER-CLEAN PREFLIGHT (catalog #6: the control plane exempting itself from its own
+    // gates — 601 uncommitted lines on an off-base branch hand-built into production). ONLY when
+    // the target repo IS solomon itself: the control plane can never again iterate itself from an
+    // uncommitted/off-base state. Managed repos keep their own preflight bails; the healing path
+    // for a crash-left dirty tree is the supervisor's RUNG-0 reset, after which the next start
+    // passes this gate.
+    if ctx.name == "solomon" {
+        if let Err(detail) = crate::provenance::controller_clean() {
+            ctx.heartbeat(json!({
+                "status": "error",
+                "phase": "preflight",
+                "last_summary": format!("controller tree dirty/off-base — {detail}"),
+            }));
+            println!("ERROR: controller tree dirty/off-base — {detail}");
+            return 2;
+        }
+    }
+
     // global BASE_BRANCH
     let pr_target = a.pr_target_branch.trim().to_string();
     ctx.base_branch = if !pr_target.is_empty() {

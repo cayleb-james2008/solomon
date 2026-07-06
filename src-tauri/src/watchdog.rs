@@ -1,8 +1,11 @@
 //! Native Rust port of `monitor.py` — Solomon's watchdog + data collector.
 //!
 //! Behavior is bug-for-bug with `monitor.py`. Runs every ~2 min INSIDE the visibly-open
-//! Solomon.exe (the run_gui tick thread — NO scheduled task exists and none may be created,
-//! operator rule) or on demand via `solomon watchdog`. Each sweep, for every registered repo, it:
+//! Solomon.exe (the run_gui tick thread) AND every 5 min out-of-band via the Solomon Sentinel
+//! scheduled task (`tools/install_sentinel.ps1` -> `solomon watchdog`; renegotiated by the
+//! operator 2026-07-06 after the liveness autopsy — GUI-tick-only liveness caused the 8h/25.5h
+//! watchdog gaps, so the GUI tick is now the SECONDARY layer), or on demand via `solomon
+//! watchdog`. Each sweep, for every registered repo, it:
 //!
 //!   1. **Restarts a CRASHED loop.** A loop that exits cleanly (operator Stop, or max-iterations)
 //!      writes `status="stopped"` in its last heartbeat via the runner's `finally` block; a
@@ -689,16 +692,127 @@ fn sweep_repo(
     (actions, snap)
 }
 
+// --------------------------------------------------------------------------- //
+// RSI-v3 grafts (controller preflight + janitor + config provenance)
+// --------------------------------------------------------------------------- //
+
+/// Janitor cadence stamp: `<HERE>/runtime/_janitor.stamp`, refreshed after each completed pass.
+const JANITOR_INTERVAL_S: u64 = 6 * 3600;
+
+/// CONTROLLER-CLEAN PREFLIGHT (catalog #6): surface + page (marker-deduped) when Solomon's OWN
+/// tree is dirty or off-base. Only surfaces — the sweep's restart-liveness duties always still run
+/// (liveness is never hostage to hygiene); the hard refusal lives in improver::run for the solomon
+/// lane. Skipped while the solomon lane's runner lock is LIVE: a gated rsi/* iteration legitimately
+/// dirties the tree mid-flight — the failure mode is an ABANDONED dirty/off-base controller (the
+/// 601-uncommitted-lines incident), i.e. dirt with no live gated run. Paging every legit iteration
+/// would be catalog-#8 alert-flood.
+fn controller_preflight_actions() -> Vec<String> {
+    let solomon_running = control::registry::load_repos().iter().any(|r| {
+        r.get("name").and_then(Value::as_str) == Some("solomon") && control::locks::is_running(r)
+    });
+    if solomon_running {
+        return Vec::new();
+    }
+    let marker = paths::here().join("runtime").join("_controller_dirty_paged");
+    match crate::provenance::controller_clean() {
+        Err(detail) => {
+            if !marker.exists() {
+                let _ = crate::notify::send(&crate::notify::Notice::red(
+                    "Solomon: controller tree dirty/off-base".into(),
+                    detail.clone(),
+                ));
+                let _ = (|| -> std::io::Result<()> {
+                    if let Some(p) = marker.parent() {
+                        std::fs::create_dir_all(p)?;
+                    }
+                    std::fs::write(&marker, now())
+                })();
+            }
+            vec![format!(
+                "CONTROLLER DIRTY: {detail} — engine refuses meta-work until the controller tree is committed/on-base"
+            )]
+        }
+        Ok(()) => {
+            // Recovered: clear the dedupe marker so the next dirty state re-pages.
+            let _ = std::fs::remove_file(&marker);
+            Vec::new()
+        }
+    }
+}
+
+/// JANITOR (requirement 5): run at most every 6 h, riding whichever cadence fires first (GUI tick
+/// or Sentinel). The stamp is written AFTER a completed pass so a crashed pass retries next sweep.
+fn janitor_graft_actions() -> Vec<String> {
+    let stamp = paths::here().join("runtime").join("_janitor.stamp");
+    let fresh = std::fs::metadata(&stamp)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| d.as_secs() < JANITOR_INTERVAL_S)
+        .unwrap_or(false);
+    if fresh {
+        return Vec::new();
+    }
+    let out = crate::janitor::sweep();
+    let _ = (|| -> std::io::Result<()> {
+        if let Some(p) = stamp.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        std::fs::write(&stamp, now())
+    })();
+    out.get("actions")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// CONFIG-PROVENANCE TRIPWIRE (catalog #6): one check per sweep; actions only on transitions.
+fn provenance_graft_actions() -> Vec<String> {
+    crate::provenance::check()
+        .get("actions")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// All three grafts, each catch_unwind-isolated: a hygiene/provenance failure only ever loses its
+/// own action strings — it can NEVER abort the crash-restart sweep below it.
+fn rsi_v3_grafts() -> Vec<String> {
+    let mut actions: Vec<String> = Vec::new();
+    for graft in [
+        controller_preflight_actions as fn() -> Vec<String>,
+        janitor_graft_actions,
+        provenance_graft_actions,
+    ] {
+        if let Ok(mut a) = std::panic::catch_unwind(graft) {
+            actions.append(&mut a);
+        }
+    }
+    actions
+}
+
 /// monitor.sweep: one watchdog pass over all repos. Returns {ts, disabled, actions, snapshots}.
 pub fn sweep() -> Value {
     if disabled_path().exists() {
         return json!({"ts": now(), "disabled": true, "actions": [], "snapshots": []});
     }
+    // RSI-v3 grafts ride EVERY sweep (both cadences, both scheduler modes): controller-clean
+    // preflight first (its action is prepended), then the 6h-stamped janitor, then the config
+    // provenance tripwire. None of them can abort the crash-restart duties below.
+    let graft_actions = rsi_v3_grafts();
     let auto_push_flag = auto_push();
     if control::registry::autopilot_enabled() {
-        return sweep_autopilot(auto_push_flag);
+        let mut out = sweep_autopilot(auto_push_flag);
+        if !graft_actions.is_empty() {
+            if let Some(arr) = out.get_mut("actions").and_then(Value::as_array_mut) {
+                for (i, a) in graft_actions.iter().enumerate() {
+                    arr.insert(i, json!(a));
+                }
+            }
+        }
+        return out;
     }
-    let mut actions: Vec<String> = Vec::new();
+    let mut actions: Vec<String> = graft_actions;
     let mut snapshots: Vec<Value> = Vec::new();
     // Crash-restart budget for THIS sweep (disk-meltdown guard — see sweep_repo). Shared across
     // every repo; each real (re)start spends one, and lanes over budget defer to a later sweep.
@@ -746,6 +860,30 @@ pub fn sweep() -> Value {
 /// human-readable line to runtime/_watchdog.out.log. Returns the process exit code.
 pub fn main() -> i32 {
     let out = sweep();
+    // SENTINEL HEARTBEAT (dead-man visibility): EVERY watchdog run — the GUI tick or the
+    // out-of-band Solomon Sentinel scheduled task — stamps runtime/_sentinel_heartbeat.json, so
+    // "when did a sweep last actually run?" is answerable from disk even when both stdout and the
+    // GUI are gone (the 8h/25.5h-gap failure had no such record). Best-effort, OSError -> pass.
+    let n_actions = out
+        .get("actions")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let _ = (|| -> std::io::Result<()> {
+        let p = paths::here().join("runtime").join("_sentinel_heartbeat.json");
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(
+            &p,
+            serde_json::to_string(&json!({
+                "ts": now(),
+                "pid": std::process::id(),
+                "actions": n_actions,
+            }))
+            .unwrap_or_default(),
+        )
+    })();
     if out.get("disabled").and_then(Value::as_bool) == Some(true) {
         println!(
             "{} watchdog disabled (kill-switch present) — no action",
@@ -799,9 +937,11 @@ pub fn main() -> i32 {
     // over the live fleet (ops::outcomes::sweep — all probes, all projects) and append the ops
     // summary so the watchdog line is TWO-PLANE truth: "code 5/6 running | ops: asmodeus
     // RED(fills_recency) ...". A running loop with a dead product can never print "all healthy"
-    // again. NO scheduled task exists and none may be created (operator rule) — this sweep runs
-    // only while Solomon.exe is visibly open; the first sweep after process start writes the
-    // blind-window gap into runtime/ops_status.json. catch_unwind mirrors the per-repo guard
+    // again. The Solomon Sentinel scheduled task (tools/install_sentinel.ps1) runs `solomon
+    // watchdog` every 5 minutes out-of-band; the GUI tick sweep remains as a secondary layer
+    // (renegotiated by the operator 2026-07-06 after the liveness autopsy). The first sweep after
+    // process start writes the blind-window gap into runtime/ops_status.json. catch_unwind
+    // mirrors the per-repo guard
     // above: an ops-plane failure must never abort the code-plane crash-recovery sweep.
     // Run the ops sweep once and KEEP the payload (not just the summary): the managed-app redeploy
     // graft below reads the same fresh per-project rollups (deploy-gap + process-down) this sweep

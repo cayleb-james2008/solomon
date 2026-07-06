@@ -24,7 +24,9 @@
 use serde_json::{json, Value};
 
 use crate::improver::ctx::{self, Ctx};
-use crate::improver::{backlog, build_sem, escalation, gates, gitops, phases, pi, ship, visual};
+use crate::improver::{
+    backlog, build_sem, escalation, freshness, gates, gitops, phases, pi, progress, ship, visual,
+};
 
 use regex::Regex;
 use std::collections::HashSet;
@@ -44,6 +46,14 @@ const NOTE_LIMIT: i64 = 3;
 /// behave differently (different branch prefix, goal, system prompt, and gate-skips), as in the
 /// source. The iteration counter is incremented ONLY once the implement phase is actually reached.
 pub fn one_iteration(ctx: &mut Ctx) {
+    // METRIC-FRESHNESS / HOLD / BUDGET short-circuit (RSI v3 req 4, catalog #1): no git preflight,
+    // no gate run, no ideate, no pi call — and no iteration-counter tick — unless the tier-1
+    // objective gained new data (or the repo has no freshness config). Also honors the WS5
+    // provenance-tripwire HOLD_META and opens the per-cycle token/wall budget window.
+    if freshness::short_circuit(ctx) {
+        return;
+    }
+
     // branch = "rsi/beautify-<stamp>" / "rsi/solomon-<stamp>" / "rsi/iter-<stamp>"
     let stamp = ctx::stamp();
     let branch = if ctx.beautify {
@@ -370,6 +380,11 @@ Have the gate print a pytest-style 'N passed' or unittest 'Ran N tests' summary.
     // TIER -> BUDGET: the per-item implement timeout, defaulting to the standard wall; the normal
     // (non-beautify/non-solomon) path may raise it to TIMEOUT_DEEP for an architecture/[campaign] item.
     let mut item_timeout: i64 = pi::TIMEOUT_IMPLEMENT;
+    // PROGRESS LEDGER (catalog #5 retry theater): the canonical (key, pre-iteration state hash)
+    // pair the terminal record_outcome calls (wiring point B) compare against. Both stay empty on
+    // the beautify/solomon lanes (fixed goals, single-shot) — record_outcome no-ops on an empty key.
+    let mut progress_key = String::new();
+    let mut progress_pre_hash = String::new();
 
     if ctx.solomon {
         goal = "supervise: diagnose and fix the persistent gate failure".to_string();
@@ -394,6 +409,18 @@ Then stop."
         ideate_phase(ctx);
         let (g, tier) = backlog::top_backlog_item(ctx)
             .unwrap_or_else(|| ("model-chosen improvement".to_string(), "chore".to_string()));
+        // PROGRESS LEDGER + QUARANTINE (wiring point A — catalog #5): a key that already completed
+        // 3x with zero observable state delta must not be selected again for 24h — defer it and
+        // re-select ONCE; if the re-selected key is ALSO quarantined, idle out (all_quarantined
+        // heartbeat, no pi spend) so the scheduler is forced onto different work / fresh ideation.
+        let (g, tier) = match progress::filter_quarantined_selection(ctx, g, tier) {
+            Some(sel) => {
+                progress_key = sel.key;
+                progress_pre_hash = sel.pre_hash;
+                (sel.goal, sel.tier)
+            }
+            None => return, // all_quarantined: heartbeat + log already written; no pi spend
+        };
         // EMPTY-GOAL GUARD.
         if backlog::needs_goal_skip(ctx, &g) {
             ctx.heartbeat(json!({
@@ -467,6 +494,10 @@ Then stop."
     // the gate/ship path). Any other nonzero+empty is the generic Exception path (handled below).
     if p.code == 124 {
         ctx.log("Pi session timed out");
+        // PROGRESS LEDGER (wiring point B): record at every terminal BEFORE the escalation notes /
+        // drop_branch — their own defer/history bookkeeping writes would register as a state delta
+        // and mask true no-progress (the exact blind spot catalog #5 quarantines).
+        progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "noop");
         escalation::note_timeout(ctx, &goal, NOTE_LIMIT);
         gitops::drop_branch(ctx, &branch, "noop", "Pi session timed out.", "sleeping");
         return;
@@ -497,6 +528,7 @@ Then stop."
         ctx.log(&format!(
             "Pi UNRUNNABLE (extension/startup load error — agent never started; not a model no-op): {why}"
         ));
+        progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "error");
         gitops::drop_branch(
             ctx,
             &branch,
@@ -541,6 +573,10 @@ Then stop."
             "Pi QUOTA/TRANSPORT ERROR (429 / usage limit / rate limit — NOT a model no-op; \
 NOT counted toward noop_streak, no reset): {why}"
         ));
+        // progress ledger: deliberately NOT recorded — a quota/transport error means the job never
+        // ran (catalog #5 quarantines jobs that COMPLETE with no delta); recording it would
+        // quarantine unattempted items during a fleet-wide 429 storm, mirroring why this path also
+        // skips the noop-escalation ladder.
         gitops::drop_branch(
             ctx,
             &branch,
@@ -564,6 +600,7 @@ hallucinated its file edits; counting as a no-op",
             } else {
                 ctx.log("Pi made no changes — dropping branch");
             }
+            progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "noop");
             if narrated_noop {
                 escalation::note_narrated_noop(ctx, &goal, NOTE_LIMIT);
             } else {
@@ -605,6 +642,7 @@ hallucinated its file edits; counting as a no-op",
                 ctx.redact(&tail_chars(&tail, 400))
             ));
             let failed = tests.get("failed").and_then(Value::as_i64).unwrap_or(0);
+            progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "reverted");
             escalation::note_revert(
                 ctx,
                 &goal,
@@ -633,6 +671,7 @@ tests by correcting the implementation"
         ctx.heartbeat(json!({"phase": "lint"}));
         let (lint_ok, lint_reason) = gates::run_judge_mirror_lint_gate(ctx);
         if !lint_ok {
+            progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "reverted");
             escalation::note_revert(
                 ctx,
                 &goal,
@@ -658,6 +697,7 @@ declaring done"
         let gamed = gates::anti_gaming_reason(ctx, &base_tests, &tests, &diff);
         if let Some(gamed) = gamed {
             ctx.log(&format!("anti-gaming: {gamed} — reverting"));
+            progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "reverted");
             escalation::note_revert(
                 ctx,
                 &goal,
@@ -696,6 +736,7 @@ skip, xfail, delete, or weaken any test"
             ctx.log(&format!(
                 "cross-repo gate RED on dep '{failed}' — reverting: {ftail}"
             ));
+            progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "reverted");
             gitops::drop_branch(
                 ctx,
                 &branch,
@@ -727,6 +768,7 @@ skip, xfail, delete, or weaken any test"
                     .unwrap_or("eval score dropped")
                     .to_string();
                 ctx.log(&format!("eval gate RED: {ev_reason} — reverting"));
+                progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "reverted");
                 gitops::drop_branch(
                     ctx,
                     &branch,
@@ -755,6 +797,7 @@ skip, xfail, delete, or weaken any test"
     if add.code != 0 {
         let err: String = add.stderr.trim().chars().take(200).collect();
         ctx.log(&format!("git add -A failed: {err}"));
+        progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "error");
         gitops::abort_branch(ctx, &branch);
         ctx.heartbeat(json!({
             "status": "error",
@@ -788,6 +831,7 @@ skip, xfail, delete, or weaken any test"
         ctx.log(&format!(
             "rev-list failed: {detail} — keeping {branch} for inspection"
         ));
+        progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "error");
         ctx.git(&["checkout", &base_branch], 120);
         ctx.heartbeat(json!({
             "status": "error",
@@ -800,6 +844,7 @@ skip, xfail, delete, or weaken any test"
     }
     if rl.stdout.trim() == "0" {
         ctx.log("no commits ahead after gate — dropping branch");
+        progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "noop");
         gitops::drop_branch(ctx, &branch, "noop", &summary, "sleeping");
         return;
     }
@@ -849,6 +894,7 @@ not ticking '{}'",
             ctx.log(&format!(
                 "LEAK GUARD: {leak} — reverting (won't push private/secret data to a public repo)"
             ));
+            progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "reverted");
             gitops::drop_branch(
                 ctx,
                 &branch,
@@ -867,6 +913,10 @@ data or a secret to the PUBLIC repo; fix the change to exclude it."
     if ctx.review_enabled && !ctx.beautify && !ctx.solomon {
         let verdict = phases::run_review_phase(ctx, &branch, &goal, &summary);
         if verdict == "reject" {
+            // branch already reverted (+ history recorded) INSIDE run_review_phase — that history
+            // append reads as a state delta here, so this resets rather than counts; reject loops
+            // are covered by the anti-thrash consecutive-revert ladder instead.
+            progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "reverted");
             return; // branch already reverted inside run_review_phase
         }
         if verdict == "block" {
@@ -874,6 +924,7 @@ data or a secret to the PUBLIC repo; fix the change to exclude it."
             // (timeout/error/no-verdict) and unreviewed AI code must not auto-merge to a
             // shared, real-money main. Keep the gate-green rsi/* branch LOCAL — do not
             // ship, do not revert — and record it blocked for the operator to review.
+            progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "blocked");
             ctx.git(&["checkout", base_branch.as_str()], 30);
             ctx.heartbeat(json!({
                 "phase": "review",
@@ -939,6 +990,7 @@ data or a secret to the PUBLIC repo; fix the change to exclude it."
                     ctx.log(&format!(
                         "visual gate RED (visual_gate=on): {vreason} — reverting"
                     ));
+                    progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "reverted");
                     gitops::drop_branch(
                         ctx,
                         &branch,
@@ -961,6 +1013,8 @@ data or a secret to the PUBLIC repo; fix the change to exclude it."
 
     // honor an operator Stop that arrived during the (possibly long) iteration.
     if ctx.stop_path.exists() {
+        // progress ledger: not recorded — an operator stop is not a job outcome (the gate-green
+        // work is kept locally; "stopped" is outside the {shipped..error} outcome vocabulary).
         ctx.log("stop requested during iteration — committed locally, skipping PR");
         ctx.git(&["checkout", &base_branch], 120);
         ctx.heartbeat(json!({
@@ -1017,6 +1071,22 @@ data or a secret to the PUBLIC repo; fix the change to exclude it."
     // backlog item; requiring a confirmed merge keeps the loop revisiting it.
     let ship_mode = ctx.ship.clone();
     let landed = ship::ship_outcome(&pr, &ship_mode) == "shipped";
+    // PROGRESS LEDGER (wiring point B, ship terminal): record BEFORE mark_backlog_done /
+    // note_deviation rewrite the backlog (a bookkeeping write is not agent progress). "deviated" =
+    // the ship landed but was NOT the named item — the item itself made no progress, so a
+    // repeatedly-deviating key still accumulates strikes toward quarantine.
+    progress::record_outcome(
+        ctx,
+        &progress_key,
+        &progress_pre_hash,
+        if landed && item_deviated {
+            "deviated"
+        } else if landed {
+            "shipped"
+        } else {
+            "blocked" // ship_outcome's only non-"shipped" value
+        },
+    );
     if !ctx.beautify && !ctx.solomon && landed {
         if item_deviated {
             escalation::note_deviation(ctx, &goal, NOTE_LIMIT);

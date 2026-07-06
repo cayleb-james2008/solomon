@@ -10,6 +10,8 @@
 use crate::control::proc;
 use crate::improver::ctx::Ctx;
 use crate::improver::gates;
+use crate::improver::gitops;
+use crate::improver::tiers;
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -718,8 +720,29 @@ fn value_truthy(v: &Value) -> bool {
 ///   auto-merge -> push + open PR, then poll CI + squash-merge.
 /// push/pr/auto-merge without a remote degrade to local. Returns a dict with keys number, url,
 /// branch, state (+ verified/checks where applicable), byte-identical to the Python dict.
+///
+/// RSI v3 tiered ship: when the repo row declares `tiers.money_globs` and this branch's diff
+/// touches a money-path file, an `auto-merge` config is downgraded to `pr` for THIS ship only
+/// unless the fitness needle was ACTIVE for the iteration (EVAL_CMD configured + an after-score
+/// parsed — see tiers::eval_needle_active; iteration.rs is outside this workstream's writable
+/// scope, so activity is re-derived from the heartbeat keys the eval gate already writes rather
+/// than a new parameter). A money-path diff may auto-land ONLY under an active non-regressing
+/// needle; with the needle inactive a human merges it. `c.ship` itself is never mutated, and
+/// rows without `tiers` are byte-identical legacy.
 pub fn ship(c: &mut Ctx, branch: &str, title: &str, summary: &str, tests: &Value) -> Value {
-    let ship_mode = c.ship.clone();
+    let mut ship_mode = c.ship.clone();
+    let row = gitops::repo_row(c, &c.name);
+    if let Some(row_tiers) = row.get("tiers") {
+        let base = c.base_branch.clone();
+        let files = tiers::changed_files(c, &base);
+        let eval_active = tiers::eval_needle_active(c);
+        if let Some(mode) = tiers::money_ship_override(row_tiers, &files, eval_active, &ship_mode) {
+            c.log(
+                "tiered ship: money-path diff + inactive eval needle — shipping as PR (human merge), not auto-merge",
+            );
+            ship_mode = mode;
+        }
+    }
     let is_push_pr_am = matches!(ship_mode.as_str(), "push" | "pr" | "auto-merge");
 
     if is_push_pr_am && !c.has_remote() {
