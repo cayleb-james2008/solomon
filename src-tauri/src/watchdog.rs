@@ -699,7 +699,8 @@ fn sweep_repo(
 /// Janitor cadence stamp: `<HERE>/runtime/_janitor.stamp`, refreshed after each completed pass.
 const JANITOR_INTERVAL_S: u64 = 6 * 3600;
 
-/// CONTROLLER-CLEAN PREFLIGHT (catalog #6): surface + page (marker-deduped) when Solomon's OWN
+/// CONTROLLER-CLEAN PREFLIGHT (catalog #6): surface + page (marker-deduped, and confirmed across
+/// TWO consecutive probes — see [`controller_dirty_page_decision`]) when Solomon's OWN
 /// tree is dirty or off-base. Only surfaces — the sweep's restart-liveness duties always still run
 /// (liveness is never hostage to hygiene); the hard refusal lives in improver::run for the solomon
 /// lane. Skipped while the solomon lane's runner lock is LIVE: a gated rsi/* iteration legitimately
@@ -714,29 +715,58 @@ fn controller_preflight_actions() -> Vec<String> {
         return Vec::new();
     }
     let marker = paths::here().join("runtime").join("_controller_dirty_paged");
+    let pending = paths::here().join("runtime").join("_controller_dirty_pending");
     match crate::provenance::controller_clean() {
         Err(detail) => {
-            if !marker.exists() {
+            let (page_now, stamp_pending) =
+                controller_dirty_page_decision(marker.exists(), pending.exists());
+            let write_stamp = |p: &std::path::Path| {
+                let _ = (|| -> std::io::Result<()> {
+                    if let Some(parent) = p.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(p, now())
+                })();
+            };
+            if page_now {
                 let _ = crate::notify::send(&crate::notify::Notice::red(
                     "Solomon: controller tree dirty/off-base".into(),
                     detail.clone(),
                 ));
-                let _ = (|| -> std::io::Result<()> {
-                    if let Some(p) = marker.parent() {
-                        std::fs::create_dir_all(p)?;
-                    }
-                    std::fs::write(&marker, now())
-                })();
+                write_stamp(&marker);
+                let _ = std::fs::remove_file(&pending);
+            } else if stamp_pending {
+                write_stamp(&pending);
             }
             vec![format!(
                 "CONTROLLER DIRTY: {detail} — engine refuses meta-work until the controller tree is committed/on-base"
             )]
         }
         Ok(()) => {
-            // Recovered: clear the dedupe marker so the next dirty state re-pages.
+            // Recovered: clear the pending stamp AND the dedupe marker so the next dirty state
+            // starts a fresh two-probe confirmation.
+            let _ = std::fs::remove_file(&pending);
             let _ = std::fs::remove_file(&marker);
             Vec::new()
         }
+    }
+}
+
+/// TWO-CONSECUTIVE-PROBE page confirmation for the controller-dirty page (skeptic finding 6,
+/// 2026-07-06): the engine's own tmp+rename writes to watched config (proc.rs) race the sweep's
+/// `git status` on Windows — a single-probe page turned every race into a false RED (observed
+/// live 17:45Z: the sweep saw `[ D repos.json]` for a file that was present and clean seconds
+/// later), catalog #8's alert-fatigue generator. Dirt is PAGED only when seen on two consecutive
+/// sweeps: the first sighting stamps `_controller_dirty_pending` and pages nothing. The dirty
+/// SURFACE line (and improver::run's hard refusal) still fires on every probe — only the page is
+/// confirmation-gated. Returns `(page_now, stamp_pending)`. Pure — unit-tested.
+fn controller_dirty_page_decision(already_paged: bool, pending: bool) -> (bool, bool) {
+    if already_paged {
+        (false, false) // page already sent for this dirty episode — dedupe
+    } else if pending {
+        (true, false) // second consecutive dirty probe — confirmed real, page now
+    } else {
+        (false, true) // first sighting — could be a tmp+rename race; wait for the next probe
     }
 }
 
@@ -1179,6 +1209,21 @@ fn standstill_alarm(newest_age_s: Option<f64>, running: usize, total: usize, now
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // -------- controller-dirty page: two-consecutive-probe confirmation (pure logic) --------
+    // A single tmp+rename race (the engine's own repos.json write vs the sweep's git status) must
+    // NOT page; only dirt confirmed on two consecutive probes may, and once paged it stays deduped
+    // for the episode. (skeptic finding 6, 2026-07-06 — the periodic false-RED generator.)
+    #[test]
+    fn controller_dirty_pages_only_on_the_second_consecutive_probe() {
+        // first sighting: no page, stamp pending
+        assert_eq!(controller_dirty_page_decision(false, false), (false, true));
+        // second consecutive sighting: confirmed — page, consume pending
+        assert_eq!(controller_dirty_page_decision(false, true), (true, false));
+        // already paged this episode: dedupe regardless of pending state
+        assert_eq!(controller_dirty_page_decision(true, false), (false, false));
+        assert_eq!(controller_dirty_page_decision(true, true), (false, false));
+    }
 
     // -------- should_restart decision table (pure logic) --------
     #[test]

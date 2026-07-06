@@ -459,8 +459,11 @@ zero token spend (starve {k}/{max})",
     true
 }
 
-/// TIER-1 RED: the objective metric is unobservable — write the error heartbeat (the supervisor's
-/// diagnose surfaces it; WS3 maps it to a TTL'd page) and log. `id` falls back to the ledger's
+/// TIER-1 RED: the objective metric is unobservable — write the error heartbeat. The supervisor's
+/// diagnose() matches `reason == "metric_unobservable"` into its own category, which actions.json
+/// maps to `page_operator_deduped` (a TTL'd page, never restart_lane — a lane restart cannot fix a
+/// broken probe); the routing is asserted by supervisor's
+/// `diagnose_metric_unobservable_routes_to_its_own_category_not_unknown_error`. `id` falls back to the ledger's
 /// metric_id (the last identity we DID observe) so the page names the metric even when the probe
 /// output was garbage.
 fn unobservable_halt(ctx: &mut Ctx, id: Option<&str>, detail: &str) {

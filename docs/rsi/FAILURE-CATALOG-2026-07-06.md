@@ -47,3 +47,13 @@ Ranking = (how many projects exhibited it) × (how completely it killed the loop
 **Mechanism:** 310 undeduped housekeeping pages vs 17 standstill pages (solomon); 184 `title='t'` test notifications in the prod ledger; sover's tracked AGENT_LOG.md absorbed 3,413 test-run bootstrap lines, became "dirty tree = work," and manufactured 10 merged junk PRs. The operator was correctly paged about the standstill and didn't act — consistent with desensitization.
 **Projects:** solomon, sover. **Owner diagnosed:** junk-PRs yes; page-flood no.
 **Countermeasure:** every page class requires a **d
+
+---
+
+> **[TRUNCATION MARKER — added 2026-07-06 by the rsi-v3.1 skeptic-fix pass; not original text.]**
+> This design input arrived truncated mid-sentence in countermeasure #8 (the committed file ended
+> at "every page class requires a **d"). The implemented #8 behavior (24h/category page-marker
+> dedupe, standstill once-until-recovery pages, transitions-only provenance actions, and the
+> two-consecutive-probe confirmation for the controller-dirty page) was built from the mechanism
+> section above and the surviving fragment; full compliance with the operator's intended #8 text
+> is unverifiable until the operator restores it from the source document.

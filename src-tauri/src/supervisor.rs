@@ -236,10 +236,10 @@ fn push_base_if_ahead(repo: &Value) -> Value {
 /// solomon.diagnose: deterministic, file-only health classification (no git shell-out — cheap on
 /// every poll). Returns {name, healthy, category, evidence, recommended:[...], auto_safe, running}.
 ///
-/// The 17-category cascade ORDER is load-bearing:
-///   ok / needs_goal / no_key / key_shape_mismatch / gh_not_ready / revert_failed / dirty_tree / base_out_of_band /
-///   untracked_refusal / persistent_self_stop / stale_lock / stop_lingering / stuck / gate_red_streak /
-///   ci_red_streak / quota_error / noop_streak / unknown_error.
+/// The 18-category cascade ORDER is load-bearing:
+///   ok / needs_goal / metric_unobservable / no_key / key_shape_mismatch / gh_not_ready / revert_failed /
+///   dirty_tree / base_out_of_band / untracked_refusal / persistent_self_stop / stale_lock /
+///   stop_lingering / stuck / gate_red_streak / ci_red_streak / quota_error / noop_streak / unknown_error.
 pub fn diagnose(repo: &Value) -> Value {
     let name = paths::repo_name(repo);
     let hb = heartbeat::read_heartbeat(repo).unwrap_or_else(|| json!({}));
@@ -301,6 +301,26 @@ pub fn diagnose(repo: &Value) -> Value {
         cat = "needs_goal".into();
         ev = trunc_or(summary, 200, "no north-star GOAL and no actionable backlog");
         rec = vec!["set this repo's GOAL in Config so the loop has an objective".into()];
+        safe = false;
+    } else if status == Some("error") && reason == Some("metric_unobservable") {
+        // TIER-1 RED (catalog #1): freshness::unobservable_halt wrote status=error +
+        // reason=metric_unobservable when the objective metric probe broke. This is a PRECISE
+        // reason match placed early so probe-output text embedded in the summary can never divert
+        // it into a string-matched branch. Without this branch it fell through to the generic
+        // unknown_error catchall -> actions.json restart_lane — three pointless lane restarts
+        // (a restart cannot fix a broken probe) burying the flagship RED page. actions.json maps
+        // metric_unobservable -> page_operator_deduped (TTL'd), which is the catalog's routing.
+        cat = "metric_unobservable".into();
+        ev = trunc_or(
+            summary,
+            200,
+            "tier-1 objective metric is unobservable — meta-optimization halted",
+        );
+        rec = vec![
+            "fix the value-metric probe / source (schema, table, probe cmd) — restarting the \
+             lane cannot heal a blind objective"
+                .into(),
+        ];
         safe = false;
     } else if status == Some("error")
         && (summary.contains("not set") || summary.contains("API key"))
@@ -548,6 +568,7 @@ pub fn diagnose_categories() -> &'static [&'static str] {
     &[
         "ok",
         "needs_goal",
+        "metric_unobservable",
         "no_key",
         "key_shape_mismatch",
         "quota_error",
@@ -2226,6 +2247,48 @@ mod tests {
         assert_eq!(d["category"], "unknown_error");
         assert_eq!(d["evidence"], "weird thing");
         assert_eq!(d["auto_safe"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------- metric_unobservable: the tier-1 RED halt must route to its page ----------
+    // freshness::unobservable_halt writes {status:error, phase:preflight, reason:metric_unobservable}.
+    // Before the precise reason branch this fell through to unknown_error -> actions.json
+    // restart_lane: three pointless lane restarts burying the flagship RED. The category must be
+    // metric_unobservable (actions.json -> page_operator_deduped) and never auto_safe.
+    #[test]
+    fn diagnose_metric_unobservable_routes_to_its_own_category_not_unknown_error() {
+        let (dir, repo) = tmp_repo("unobservable");
+        write_hb(
+            &dir,
+            &json!({
+                "status": "error",
+                "phase": "preflight",
+                "reason": "metric_unobservable",
+                "last_summary": "tier-1 objective metric 'settled_usd_15m' is UNOBSERVABLE \
+                                 (probe rc=1) — meta-optimization halted",
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(
+            d["category"], "metric_unobservable",
+            "the RED halt must not fall through to unknown_error/restart_lane"
+        );
+        assert_eq!(d["auto_safe"], false);
+        assert!(
+            d["evidence"].as_str().unwrap().contains("UNOBSERVABLE"),
+            "{d}"
+        );
+        // probe text that happens to contain trigger words of LATER branches must not divert it
+        write_hb(
+            &dir,
+            &json!({
+                "status": "error",
+                "phase": "preflight",
+                "reason": "metric_unobservable",
+                "last_summary": "metric probe failed: API key table dirty / not set",
+            }),
+        );
+        assert_eq!(diagnose(&repo)["category"], "metric_unobservable");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
