@@ -344,7 +344,9 @@ fn run_ai_job(job: &Job, repos: &[Value], cfg: &Value, auto_push: bool, st: &mut
         || out.stdout.contains("\"reason\":\"quota_error\"")
         || out.stderr.contains("quota_error");
     if quota {
-        set_cooldown(st, cfg, "provider quota/rate limit");
+        // catalog #2: a quota error parks THAT endpoint (exponential, 6h cap) — never the
+        // fleet for cfg.cooldown_s (the 86400s blanket that put Gen-2 to sleep for a day).
+        set_quota_cooldown(st, cfg);
     }
     let diag = supervisor::diagnose(repo);
     let hist = heartbeat::read_history(repo, 1);
@@ -992,6 +994,45 @@ fn stale_non_ai_provider_cooldown(st: &Value) -> bool {
             == Some(false)
 }
 
+/// QUOTA cooldown for the autopilot (catalog #2, ported from the improver lanes): the cooldown
+/// window is the SHARED provider-budget ledger's per-endpoint exponential park
+/// (min(900*2^(n-1), 21600)s), never `cfg.cooldown_s` — the condemned 86400s blanket meant one
+/// quota error put all 5 autopilot targets to sleep for a day. The improver subprocess the
+/// autopilot spawns shares the same ledger (Solomon/runtime/_provider_budget.json), so when it
+/// already recorded the 429 this reuses that park stamp instead of double-bumping the backoff.
+/// The reason string stays byte-identical: stale_non_ai_provider_cooldown keys on it.
+fn set_quota_cooldown(st: &mut Value, cfg: &Value) {
+    set_quota_cooldown_at(st, cfg, &paths::here().join("runtime"))
+}
+
+fn set_quota_cooldown_at(st: &mut Value, cfg: &Value, fleet_dir: &Path) {
+    let provider = cfg
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("ollama-cloud")
+        .to_string();
+    let model = cfg
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("glm-5.2")
+        .to_string();
+    let until_unix = crate::improver::budget::quota_park_until_at(fleet_dir, &provider, &model);
+    let until = DateTime::<Utc>::from_timestamp(until_unix as i64, 0)
+        .unwrap_or_else(Utc::now)
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    st["cooldown"] = json!({
+        "since": now(),
+        "until": until,
+        "reason": "provider quota/rate limit",
+        "provider": provider.clone(),
+        "endpoint": format!("{provider}:{model}"),
+        "per_endpoint": true,
+    });
+}
+
+/// Blanket cooldown — DAILY-BUDGET use only (the window until the self-imposed call budget
+/// resets). Quota errors must go through [`set_quota_cooldown`]; never route a provider 429 here.
 fn set_cooldown(st: &mut Value, cfg: &Value, reason: &str) {
     let seconds = cfg
         .get("cooldown_s")
@@ -1245,6 +1286,42 @@ mod tests {
         assert!(jobs[0].requires_ai);
         assert!(jobs[0].reason.contains("stale quota"));
         let _ = std::fs::remove_dir_all(rt);
+    }
+
+    // ---- quota cooldown: per-endpoint exponential park, never the 86400s blanket ----
+    #[test]
+    fn quota_cooldown_is_per_endpoint_park_not_a_day_blanket() {
+        let dir = std::env::temp_dir().join(format!(
+            "solomon_fleet_quota_cd_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // cfg carries the condemned 86400s blanket — the quota path must IGNORE it.
+        let cfg = json!({"provider": "ollama-cloud", "model": "glm-5.2", "cooldown_s": 86_400});
+        let mut st = json!({});
+        set_quota_cooldown_at(&mut st, &cfg, &dir);
+        let until = cooldown_until(&st).expect("cooldown until parses");
+        let secs = (until - Utc::now()).num_seconds();
+        assert!(
+            (800..=21_700).contains(&secs),
+            "first 429 must park ~900s (exponential, 6h cap), got {secs}s"
+        );
+        assert_eq!(st["cooldown"]["reason"], json!("provider quota/rate limit"));
+        assert_eq!(st["cooldown"]["endpoint"], json!("ollama-cloud:glm-5.2"));
+        assert_eq!(st["cooldown"]["per_endpoint"], json!(true));
+        // second sighting of the SAME live park (e.g. the improver already recorded the 429):
+        // the stamp is reused, not double-bumped.
+        let mut st2 = json!({});
+        set_quota_cooldown_at(&mut st2, &cfg, &dir);
+        assert_eq!(st2["cooldown"]["until"], st["cooldown"]["until"]);
+        // (per-endpoint isolation — parking A leaves B Proceed — is asserted by budget.rs's
+        // parking_endpoint_a_leaves_endpoint_b_proceed on the same ledger primitive.)
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

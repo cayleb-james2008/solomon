@@ -445,6 +445,20 @@ Then stop."
         ctx.reasoning = tier_reasoning;
         item_timeout = tier_timeout;
         let mut t = escalation::build_task(ctx, &g, &tier);
+        // TASK-SIZE CALIBRATION (catalog #7): stamp the pending attempt for the fleet table
+        // (model = post-fallback ctx.pi_model, size_class = the item's tier; the terminal side
+        // rides progress::record_outcome), then consult the table — a (model, class) cell with
+        // >= MIN_ATTEMPTS of evidence and a ship-rate below the floor makes decomposition
+        // MANDATORY for this attempt (the item runs as its smallest shippable slice, never whole).
+        crate::improver::calibration::note_selection(ctx, &tier);
+        if let Some(directive) = crate::improver::calibration::decompose_directive(ctx, &tier) {
+            ctx.log(&format!(
+                "calibration: model '{}' ship-rate for '{tier}'-class items is below the floor — \
+                 decompose directive appended (catalog #7)",
+                ctx.pi_model
+            ));
+            t.push_str(&format!("\n\n{directive}"));
+        }
         // PLAN phase.
         if ctx.plan_enabled && !g.is_empty() {
             ctx.heartbeat(json!({"phase": "plan"}));

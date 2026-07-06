@@ -372,6 +372,22 @@ pub fn last_canary_age_secs(ctx: &Ctx, provider: &str, model: &str) -> Option<u6
     }
 }
 
+/// FLEET/AUTOPILOT path (catalog #2): the park stamp for an endpoint that just produced a quota
+/// outcome. When the endpoint is ALREADY parked (the improver subprocess shares this ledger and
+/// its pi.rs wiring normally records the 429 first) the live stamp is returned WITHOUT bumping the
+/// streak — double-counting one incident would double the backoff. Only an unparked endpoint gets
+/// a fresh record_quota. `dir` is the fleet runtime dir (Solomon/runtime) because the autopilot
+/// has no lane Ctx. This exists so fleet.rs can retire its 86400s blanket cooldown — the exact
+/// "one quota error = fleet asleep a day" mechanism the catalog autopsied — in favor of this
+/// ledger's min(900*2^(n-1), 21600)s per-endpoint schedule.
+pub fn quota_park_until_at(dir: &Path, provider: &str, model: &str) -> u64 {
+    let now = unix_now();
+    match preflight_at(dir, provider, model, now) {
+        Decision::Parked { until, .. } => until,
+        Decision::Proceed => record_quota_at(dir, provider, model, now),
+    }
+}
+
 /// The synthesized refusal stderr run_pi returns for a parked endpoint. The literal "429" is
 /// load-bearing: pi::is_quota_error matches it, so iteration/oneshot/supervisor classify the
 /// refusal as quota_error (never a model no-op) with zero new wiring.
@@ -1083,6 +1099,26 @@ mod tests {
             json!(20),
             "locked read-modify-write must not lose increments"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- fleet-path quota parking: no double-bump, exponential, never a day ----
+
+    #[test]
+    fn quota_park_until_reuses_live_park_and_records_fresh_one() {
+        let dir = test_dir();
+        let now = unix_now();
+        // unparked endpoint: records the 429 -> first park is the 15min base
+        let until1 = quota_park_until_at(&dir, "p", "m");
+        assert!(until1 >= now + PARK_BASE_S && until1 <= now + PARK_BASE_S + 5);
+        assert_eq!(read_ep(&dir, "p", "m")["consecutive_429"], json!(1));
+        // ALREADY parked (the improver subprocess recorded it): returns the live stamp
+        // without bumping the streak — one incident must not double the backoff.
+        let until2 = quota_park_until_at(&dir, "p", "m");
+        assert_eq!(until2, until1);
+        assert_eq!(read_ep(&dir, "p", "m")["consecutive_429"], json!(1));
+        // and it is NEVER the Gen-2 86400s blanket
+        assert!(until1 < now + 86_400);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

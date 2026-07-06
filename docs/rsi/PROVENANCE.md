@@ -24,8 +24,12 @@ in its subject line:
 - `operator:` — human-initiated. The operator (or a session acting on the operator's
   direct instruction) changed the file. Example:
   `operator: rsi-v3 baseline snapshot (tree normalization, docs/rsi design inputs)`
-- `rsi:` — engine-initiated. The RSI engine changed the file as part of an
-  autonomous cycle. Example: `rsi: park ollama-cloud/glm-5.2 until 2026-07-07T03:00Z`
+- `rsi` family — engine-initiated. The RSI engine changed the file as part of an
+  autonomous cycle. Plain `rsi:` (example:
+  `rsi: park ollama-cloud/glm-5.2 until 2026-07-07T03:00Z`), or a version-suffixed
+  release tag `rsi-vN:` / `rsi-vN.M:` (examples: `rsi-v3:`, `rsi-v3.1:`) for
+  engine-version landing commits. The suffix must be `-v` + a digit; dots and
+  lowercase alphanumerics may follow.
 
 Rules:
 
@@ -34,6 +38,13 @@ Rules:
    tag; prefer splitting the commit so config provenance stays legible.
 3. No third category. A watched-file commit without a tag is a convention violation
    and should be treated by tooling the same as an uncommitted mutation.
+
+Machine-readable form: `provenance::valid_provenance_subject`
+(`src-tauri/src/provenance.rs`), enforced by the
+`watched_file_commits_since_convention_carry_provenance_tags` test in the cargo-test
+build gate, which runs the audit query below over every commit since this convention
+landed (`4521559..HEAD`). Merge commits are excepted. The convention is therefore no
+longer a write-only ledger: an untagged watched-file commit turns the gate red.
 
 ## Enforcement (WS5 tripwire)
 
@@ -56,5 +67,7 @@ PR list and blame view without extra flags. Audit query:
 git log --oneline -- repos.json ops.json actions.json
 ```
 
-Every line of that output must start with `operator:` or `rsi:` (merge commits
-excepted). That property is the check; anything else is a gap in the gate.
+Every line of that output must start with `operator:` or an `rsi`-family tag (merge
+commits excepted; commits predating this convention are not retroactively judged).
+That property is the check — and it is executed, not aspirational: see the
+enforcement test named above.

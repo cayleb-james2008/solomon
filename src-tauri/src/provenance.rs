@@ -233,13 +233,58 @@ fn check_impl(repo_root: &Path, runtime_root: &Path, rows: &[Value], now: f64) -
 }
 
 // --------------------------------------------------------------------------- //
+// commit-tag convention (docs/rsi/PROVENANCE.md) — the checker that makes it enforced,
+// not write-only (skeptic finding 4, 2026-07-06)
+// --------------------------------------------------------------------------- //
+
+/// True iff a commit subject satisfies the PROVENANCE.md tag convention for watched-file commits:
+/// first token is `operator:` or an `rsi`-family tag (`rsi:`, or version-suffixed `rsi-vN...:`
+/// e.g. `rsi-v3:` / `rsi-v3.1:`), followed by a space and a non-empty body. Merge commits are
+/// excepted (git writes their subjects). Pure — this is the machine-readable form of the doc's
+/// audit query; the repo-history test below runs it against the ACTUAL `git log` output so the
+/// convention can never again be a write-only ledger.
+pub fn valid_provenance_subject(subject: &str) -> bool {
+    let s = subject.trim_start();
+    if s.starts_with("Merge ") {
+        return true;
+    }
+    if let Some(rest) = s.strip_prefix("operator: ") {
+        return !rest.trim().is_empty();
+    }
+    let Some(after_rsi) = s.strip_prefix("rsi") else {
+        return false;
+    };
+    // `rsi: ` or `rsi-vN[.M...]: ` — the version suffix must start `-v<digit>` and stay within
+    // [0-9a-z.] (lowercase, rule 1 of the convention).
+    let Some(tag_end) = after_rsi.find(": ") else {
+        return false;
+    };
+    let suffix = &after_rsi[..tag_end];
+    let body_ok = !after_rsi[tag_end + 2..].trim().is_empty();
+    if suffix.is_empty() {
+        return body_ok; // plain `rsi: `
+    }
+    let Some(ver) = suffix.strip_prefix("-v") else {
+        return false;
+    };
+    body_ok
+        && ver.starts_with(|c: char| c.is_ascii_digit())
+        && ver
+            .chars()
+            .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase() || c == '.')
+}
+
+// --------------------------------------------------------------------------- //
 // controller-clean preflight
 // --------------------------------------------------------------------------- //
 
 /// Err when Solomon's OWN tree (paths::here()) is dirty (`git status --porcelain` non-empty,
-/// runtime/ excluded — it is gitignored anyway) or HEAD is not the repos.json solomon row's
-/// pr_target_branch. The control plane must PROVE it is clean before meta-work; an indeterminate
-/// git result is therefore also an Err.
+/// runtime/ excluded — it is gitignored anyway), HEAD is not the repos.json solomon row's
+/// pr_target_branch, or the base carries commits its upstream does not have (a weeks-stale
+/// unpushed main is NOT clean — catalog #6's self-exemption; skeptic finding 4). The control
+/// plane must PROVE it is clean before meta-work; an indeterminate git result is therefore also
+/// an Err (a repo with NO upstream configured skips only the unpushed check — there is no remote
+/// to be out-of-band with).
 pub fn controller_clean() -> Result<(), String> {
     controller_clean_at(paths::here(), &solomon_base_branch())
 }
@@ -302,6 +347,53 @@ fn controller_clean_at(root: &Path, expected_branch: &str) -> Result<(), String>
         return Err(format!(
             "HEAD is '{branch}', not the base branch '{expected_branch}'"
         ));
+    }
+    // UNPUSHED-BASE check (skeptic finding 4): branch-name-only let a weeks-stale unpushed main
+    // count as "clean". Compare against the LOCAL remote-tracking ref (no network). A repo with
+    // no upstream configured (rev-parse @{upstream} fails) skips this check.
+    let upstream = proc::run(
+        &[
+            "git",
+            "-C",
+            &root_s,
+            "rev-parse",
+            "--abbrev-ref",
+            &format!("{branch}@{{upstream}}"),
+        ],
+        None,
+        Some(Duration::from_secs(60)),
+    );
+    if let Ok(up) = upstream {
+        if up.code == 0 && !up.stdout.trim().is_empty() {
+            let ahead = proc::run(
+                &[
+                    "git",
+                    "-C",
+                    &root_s,
+                    "rev-list",
+                    "--count",
+                    &format!("{}..HEAD", up.stdout.trim()),
+                ],
+                None,
+                Some(Duration::from_secs(60)),
+            )
+            .map_err(|e| format!("git rev-list failed: {e}"))?;
+            if ahead.code != 0 {
+                return Err(format!(
+                    "git rev-list exit {}: {}",
+                    ahead.code,
+                    ahead.stderr.trim()
+                ));
+            }
+            let n: u64 = ahead.stdout.trim().parse().unwrap_or(0);
+            if n > 0 {
+                return Err(format!(
+                    "base '{branch}' has {n} commit(s) not on its upstream '{}' — push or revert \
+                     them (an unpushed controller base is out-of-band; catalog #6)",
+                    up.stdout.trim()
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -477,6 +569,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // -------- valid_provenance_subject: the tag grammar --------
+    #[test]
+    fn provenance_subject_grammar_accepts_the_two_categories_only() {
+        // operator + rsi family (incl. version-suffixed engine tags)
+        assert!(valid_provenance_subject("operator: seed repos.json"));
+        assert!(valid_provenance_subject("rsi: park ollama-cloud/glm-5.2 until 2026-07-07"));
+        assert!(valid_provenance_subject("rsi-v3: supervisor diagnosis->action table"));
+        assert!(valid_provenance_subject("rsi-v3.1: skeptic fixes"));
+        // merge commits excepted (git writes their subjects)
+        assert!(valid_provenance_subject("Merge pull request #49 from x/y"));
+        // everything else is a violation
+        assert!(!valid_provenance_subject("feat: expose solomon autopilot console"));
+        assert!(!valid_provenance_subject("fix repos.json provider drift"));
+        assert!(!valid_provenance_subject("operator:missing-space"));
+        assert!(!valid_provenance_subject("operator: ")); // empty body
+        assert!(!valid_provenance_subject("rsi-x: wrong suffix shape"));
+        assert!(!valid_provenance_subject("rsi-v: no version digit"));
+        assert!(!valid_provenance_subject("rsi-V3: uppercase"));
+        assert!(!valid_provenance_subject("rsiv3: missing dash"));
+        assert!(!valid_provenance_subject(""));
+    }
+
+    // -------- the audit query, enforced: watched-file commits since the convention landed --------
+    // PROVENANCE.md declares `git log --oneline -- repos.json ops.json actions.json` as "the
+    // check"; before this test nothing ran it (skeptic finding 4: a write-only convention).
+    // Scope: commits AFTER 4521559 (the commit that introduced PROVENANCE.md) — history predating
+    // the convention is not retroactively judged. Skips (passes) only when git itself cannot
+    // resolve the range (e.g. a shallow clone), because an indeterminate answer is a tooling gap,
+    // not a violation.
+    #[test]
+    fn watched_file_commits_since_convention_carry_provenance_tags() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let out = Command::new("git")
+            .args([
+                "log",
+                "--format=%h%x09%s",
+                "4521559..HEAD",
+                "--",
+                "repos.json",
+                "ops.json",
+                "actions.json",
+            ])
+            .current_dir(&repo_root)
+            .output();
+        let out = match out {
+            Ok(o) if o.status.success() => o,
+            _ => {
+                eprintln!("skipping: git log could not resolve the convention range here");
+                return;
+            }
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let violations: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter(|l| {
+                let subject = l.splitn(2, '\t').nth(1).unwrap_or("");
+                !valid_provenance_subject(subject)
+            })
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "watched-file commits without a provenance tag (docs/rsi/PROVENANCE.md): {violations:?}"
+        );
+    }
+
     #[test]
     fn controller_clean_off_branch_is_err() {
         let dir = tmp_git_repo("branch");
@@ -486,6 +644,45 @@ mod tests {
         assert!(err.contains("'main'"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // -------- unpushed base: clean branch name is NOT enough (skeptic finding 4) --------
+    #[test]
+    fn controller_clean_unpushed_base_is_err_and_pushed_is_ok() {
+        let dir = tmp_git_repo("unpushed");
+        // a bare "origin" + tracking main -> upstream configured, in sync -> clean
+        let remote = std::env::temp_dir().join(format!(
+            "solomon_prov_remote_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() % 1_000_000)
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&remote);
+        std::fs::create_dir_all(&remote).unwrap();
+        let st = Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(&remote)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        git(&dir, &["remote", "add", "origin", &remote.to_string_lossy()]);
+        git(&dir, &["push", "-u", "origin", "main"]);
+        assert_eq!(controller_clean_at(&dir, "main"), Ok(()));
+        // a local commit not on origin -> Err (a stale unpushed main is out-of-band, not clean)
+        git(&dir, &["commit", "--allow-empty", "-m", "operator: local only"]);
+        let err = controller_clean_at(&dir, "main").unwrap_err();
+        assert!(err.contains("not on its upstream"), "{err}");
+        assert!(err.contains("1 commit"), "{err}");
+        // pushing heals it
+        git(&dir, &["push", "origin", "main"]);
+        assert_eq!(controller_clean_at(&dir, "main"), Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&remote);
+    }
+
+    // (repos WITHOUT an upstream skip the unpushed check — every other controller_clean test in
+    // this module runs on a remoteless tmp repo and stays green, which is that case's coverage.)
 
     // -------- check_impl: the full drift lifecycle on a tmp repo --------
     // touch (uncommitted) -> grace (no page) -> >600s (ONE page + HOLD_META in trading-adjacent

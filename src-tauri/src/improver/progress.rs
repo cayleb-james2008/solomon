@@ -248,6 +248,11 @@ state delta — scheduler must select different work"
         entry.insert("last_seen".to_string(), json!(now_iso));
     }
     write_ledger_value(ctx, &led);
+    // TASK-SIZE CALIBRATION (catalog #7, terminal side): every iteration terminal already funnels
+    // through here, so this ONE hook folds the outcome into the fleet's per-model
+    // {size_class, attempts, ships} table (calibration.rs stamped the pending attempt at pick
+    // time; only "shipped" counts as a ship). No-op when nothing is pending.
+    crate::improver::calibration::resolve_pending(ctx, outcome);
     if let Some(line) = quarantine_log {
         ctx.log(&line);
     }
@@ -267,9 +272,8 @@ pub struct Selection {
 
 /// Quarantine-filter the first-selected backlog item. Not quarantined => proceed with it. If it IS
 /// quarantined: defer it (so `top_backlog_item` yields the next item) and re-select ONCE; if the
-/// re-selected key is ALSO quarantined, write the `all_quarantined` idle heartbeat + log, delete
-/// the `improver/<name>/_ideate_done` gating marker if one exists (no such gating today => no-op),
-/// and return None — the caller returns without any pi spend. The returned `pre_hash` is computed
+/// re-selected key is ALSO quarantined, write the `all_quarantined` idle heartbeat + log and
+/// return None — the caller returns without any pi spend. The returned `pre_hash` is computed
 /// AFTER any defer (the defer rewrites the backlog, which is a state-hash component).
 pub fn filter_quarantined_selection(ctx: &mut Ctx, goal: String, tier: String) -> Option<Selection> {
     let key = selection_key(ctx, &goal);
@@ -296,23 +300,22 @@ pub fn filter_quarantined_selection(ctx: &mut Ctx, goal: String, tier: String) -
 }
 
 /// The no-work terminal of wiring point A: every selectable head is quarantined — idle out loudly
-/// (zero pi spend) and force ideation to grow the menu instead of re-running dead keys.
+/// (zero pi spend). HONEST about the degraded mode: the lane idles until a quarantine expires
+/// (24h) or new backlog items arrive (ideate_phase's normal refill valve, when the pipeline has it
+/// enabled). It does NOT claim to force ideation — no such gating marker exists, and inventing
+/// one here would be a write-only lever (the previous text/marker-delete were exactly that:
+/// skeptic finding 8, 2026-07-06).
 fn all_quarantined_bail(ctx: &mut Ctx) {
     ctx.heartbeat(json!({
         "status": "idle",
         "phase": Value::Null,
         "reason": "all_quarantined",
         "last_summary": "top backlog keys are quarantined (no state delta in 3 attempts each) — \
-forcing ideate next cycle",
+idling until a quarantine expires (24h) or new backlog items arrive",
     }));
-    // Delete the ideate-gating marker if such gating exists (none today — a plain no-op), so the
-    // next cycle's ideate is guaranteed to run and refill the menu.
-    if let Some(dir) = ctx.backlog.parent() {
-        let _ = std::fs::remove_file(dir.join("_ideate_done"));
-    }
     ctx.log(
         "SKIP iteration: all_quarantined — top backlog keys are quarantined (no state delta in \
-3 attempts each); forcing ideate next cycle (no pi spend)",
+3 attempts each); idling until a quarantine expires (24h) or new backlog items arrive (no pi spend)",
     );
 }
 
@@ -680,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn all_quarantined_idles_out_and_clears_the_ideate_marker() {
+    fn all_quarantined_idles_out_with_an_honest_degraded_mode_summary() {
         let mut c = test_ctx();
         std::fs::write(&c.backlog, TWO_ITEM_BACKLOG).unwrap();
         let (g1, t1) = backlog::top_backlog_item(&c).unwrap();
@@ -690,8 +693,6 @@ mod tests {
             &selection_key(&c, "beta tidy the developer docs"),
             unix_now() + 3600,
         );
-        let marker = c.backlog.parent().unwrap().join("_ideate_done");
-        std::fs::write(&marker, "x").unwrap();
 
         assert!(
             filter_quarantined_selection(&mut c, g1, t1).is_none(),
@@ -700,11 +701,35 @@ mod tests {
         assert_eq!(hb_str(&c, "status"), "idle");
         assert!(c.hb.get("phase").map(Value::is_null).unwrap_or(false), "phase: null");
         assert_eq!(hb_str(&c, "reason"), "all_quarantined");
+        // the summary must describe the REAL degraded mode (24h expiry / new items), never a
+        // "forcing ideate" no-op lever that does not exist (skeptic finding 8, 2026-07-06)
+        let summary = hb_str(&c, "last_summary");
+        assert!(summary.contains("idling until a quarantine expires"), "{summary}");
+        assert!(!summary.contains("forcing ideate"), "{summary}");
+    }
+
+    // ---- CALIBRATION WIRING (catalog #7): record_outcome resolves the pending attempt ----
+    #[test]
+    fn record_outcome_folds_the_pending_calibration_attempt_into_the_fleet_table() {
+        let mut c = test_ctx();
+        std::fs::write(&c.backlog, TWO_ITEM_BACKLOG).unwrap();
+        let key = selection_key(&c, "alpha improve the frobnicator pipeline end to end");
+        note_selected(&c, &key, "alpha improve the frobnicator pipeline end to end");
+        crate::improver::calibration::note_selection(&c, "feature");
+        let fleet_dir = c.runtime.parent().unwrap().to_path_buf();
+
+        record_outcome(&mut c, &key, "different-pre-hash", "shipped");
         assert_eq!(
-            hb_str(&c, "last_summary"),
-            "top backlog keys are quarantined (no state delta in 3 attempts each) — forcing \
-ideate next cycle"
+            crate::improver::calibration::cell_at(&fleet_dir, &c.pi_model, "feature"),
+            (1, 1),
+            "a shipped terminal records attempts+1, ships+1 via the record_outcome hook"
         );
-        assert!(!marker.exists(), "_ideate_done gating marker deleted");
+        // a non-ship terminal with a fresh pending marker counts as an attempt only
+        crate::improver::calibration::note_selection(&c, "feature");
+        record_outcome(&mut c, &key, "different-pre-hash", "reverted");
+        assert_eq!(
+            crate::improver::calibration::cell_at(&fleet_dir, &c.pi_model, "feature"),
+            (2, 1)
+        );
     }
 }
