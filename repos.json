@@ -187,5 +187,59 @@
             "reflect": false
         },
         "goal": "Improve Solomon itself -- the Rust/Tauri RSI control plane that runs autonomous improvement loops on other repos (the improver runner + supervisor recovery ladder + overnight watchdog + git/gh integration + the web dashboard), plus the v2 ops/CEO planes (ground-truth probes in ops.json, the outcomes ledger, ntfy/toast notifications, and the morning-plan/evening-summary rhythm in src/ceo.rs). Each iteration make ONE real, high-leverage improvement: fix a genuine bug, harden the improver loop / gate execution / lock & heartbeat handling / subprocess lifecycle, improve crash-recovery, the probe/ledger/notify/CEO planes, or the dashboard, or add missing test coverage. Pay special attention to the classes of management problem the operator has hit in practice: silent provider/model config drift (e.g. a per-repo provider and api_key going out of sync with no loud error), lanes thrashing/stalling without a real fix being found, stale heartbeat/escalation state that does not get re-observed after a fix lands, and MONITORING THEATER -- a green internal signal (heartbeat, lane iteration) standing in for a real outcome (a post published, a trade filled, a training run fired); harden the supervisor and the ops plane against these. Keep `cargo test` (run from src-tauri) green. PONYTAIL STYLE: the laziest solution that fully works -- stdlib over deps, native over custom, delete over add; add no abstraction or dependency you do not need. Much of the codebase is a deliberately bug-for-bug faithful port of the original Python (per-call-site truthiness mirrors, exact log strings, byte-identical argv) -- do NOT 'simplify' those away. A truthful 'nothing worth changing this cycle' beats a fabricated or cosmetic change."
+    },
+    {
+        "name": "kairos",
+        "branch_prefix": "rsi/",
+        "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\kairos",
+        "public": false,
+        "provider": "ollama-cloud",
+        "model": "glm-5.2",
+        "api_key": "OLLAMA_API_KEY",
+        "fallback": {
+            "provider": "ollama-cloud",
+            "model": "minimax-m3"
+        },
+        "ship": "auto-merge",
+        "pr_target_branch": "master",
+        "gate": ".venv\\Scripts\\python test_tracking.py",
+        "EVAL_CMD": ".venv\\Scripts\\python tools\\fitness.py",
+        "freshness": {
+            "cmd": ".venv\\Scripts\\python tools\\fitness.py --freshness",
+            "min_new_samples": 1,
+            "hard": true,
+            "max_starve_cycles": 16
+        },
+        "cycle_budget": {
+            "wall_s": 5400,
+            "pi_calls": 6
+        },
+        "tiers": {
+            "money_globs": [
+                "trader.py",
+                "kalshi_client.py",
+                "config.json"
+            ],
+            "protected": [
+                "promote.py",
+                "test_tracking.py",
+                "backtest.py",
+                "report.py",
+                "tools/fitness.py",
+                "AGENTS.md",
+                "HARNESS.md",
+                ".state/"
+            ]
+        },
+        "interval": 900,
+        "max_iterations": 0,
+        "reasoning": "xhigh",
+        "pipeline": {
+            "plan": false,
+            "review": true,
+            "ideate": false,
+            "reflect": false
+        },
+        "goal": "KAIROS NORTH STAR (operator contract 2026-07-06): $100 profit per 15-minute window on Kalshi across all positions/markets, pursued through HONEST evidence only. The objective metric is settled $/15-min-window from .state/kairos.db (paper worst-case-priced + live); tools/fitness.py is the needle — a change that lowers the fitness score reverts even with green tests. UNTOUCHABLE (the harness auto-reverts any diff touching them): promote.py (the ONLY automated authority over the live leash), test_tracking.py, backtest.py, report.py, tools/fitness.py, AGENTS.md, HARNESS.md, .state/. Never weaken the sacred-floor gate order in trader.Trader.tick(), the KILL/DRAIN semantics, the extreme-confidence skip, the fee-aware min-edge, per-trade/portfolio caps, loss-streak/daily stops, or the IOC-only order path — the mechanisms are frozen; only evidence moves the leash, via promote.py. 2026-07-06 bounds finding: bar backtests cannot certify edge in either direction — the aggressive next-bar replay is risk-mechanics + non-regression evidence; live/paper settled rows are the load-bearing truth. Each iteration: ONE high-leverage improvement toward more settled profit per window — edge capture, execution quality (fill/latency), market/timeframe coverage behind its own honest gate, risk-adjusted sizing inside Cayleb's 30-60% exposure band, or telemetry that sharpens the fitness signal. PONYTAIL: simplest change that fully works; a truthful null beats a fabricated improvement."
     }
 ]
