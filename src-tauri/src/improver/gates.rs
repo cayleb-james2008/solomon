@@ -525,11 +525,24 @@ pub fn item_demands_tests(goal: &str) -> bool {
 }
 
 /// run_improver._anti_gaming_reason (~1605-1650): why a GREEN gate should still be reverted as gamed,
-/// or None. Pure (no git/IO). The numeric rails (1-5) run only when both baselines are present; the
-/// count-less custom-gate rail (diff deletion) runs only when the baseline has no parseable
-/// passed/collected; the skip-marker rail always runs last.
+/// or None. The numeric rails (1-5) run only when both baselines are present; the count-less
+/// custom-gate rail (diff deletion) runs only when the baseline has no parseable passed/collected;
+/// the skip-marker rail always runs last. RSI v3 prepends a tier-0 rail: a repos.json row carrying
+/// a `tiers.protected` list write-protects its grader/leash files — a diff touching one is reverted
+/// before any numeric check (the loop must never edit the graders that grade it). Rows without
+/// `tiers` skip that rail entirely (legacy behavior byte-identical, no git call added).
 pub fn anti_gaming_reason(c: &Ctx, base_tests: &Value, tests: &Value, diff_text: &str) -> Option<String> {
-    let _ = c; // pure over its args; &Ctx kept for signature parity with the source's module scope.
+    // Tier-0 grader write-protection. The file list comes from the diff's OWN headers (the caller
+    // already produced this exact committed diff — no second git invocation); the row is read fresh
+    // so an operator edit to `tiers` takes effect mid-loop like every other repos.json key. A
+    // Some(reason) routes through the EXISTING anti-gaming revert machinery unchanged.
+    let row = gitops::repo_row(c, &c.name);
+    if let Some(row_tiers) = row.get("tiers") {
+        let files = crate::improver::tiers::files_from_diff(diff_text);
+        if let Some(reason) = crate::improver::tiers::protected_violation(row_tiers, &files) {
+            return Some(reason);
+        }
+    }
     // `if base_tests and tests:` — both must be truthy objects (a non-empty dict).
     let bt_truthy = is_truthy_obj(base_tests);
     let t_truthy = is_truthy_obj(tests);

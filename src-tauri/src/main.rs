@@ -6,6 +6,7 @@
 // re-attach to the launching terminal (attach_parent_console) so their stdout stays visible.
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
+mod actions; // closed action registry + TTL escalation policies (actions.json) — every diagnosis maps to an executable remediation
 mod api; // native port of app.py's Api — the `bridge` command + headless backend (get_state, dispatch)
 mod ceo; // CEO rhythm (v2 Phase B): morning plan + evening verified-outcome summary (`plan`/`report` + watchdog graft)
 mod control; // native port of control.py — repos registry, git/gh, locks, runner (the `bridge` backend)
@@ -14,8 +15,10 @@ mod fleet; // single-agent autopilot scheduler: one provider key, one active AI 
 mod housekeeping; // storage housekeeping (v2): day-gated build-dir/branch/worktree cleanup on the watchdog tick
 mod hygiene; // repo-hygiene detection (report-only): flags off-base / dirty managed trees the CEO grafts surface
 mod improver; // native port of improver/run_improver.py — the per-repo RSI loop (`run-improver` subcommand)
+mod janitor; // storage janitor (RSI v3, requirement 5): temp deletion, log rotation, bounded runtime dirs, history compaction — rides the watchdog sweep behind a 6h stamp
 mod notify; // operator notifications (v2 Phase A): ntfy push + Windows toast, fed by ops incidents + CEO reports
 mod ops; // ops plane (Phase 1): ground-truth probes + honest fleet status (`probe` subcommand + watchdog graft)
+mod provenance; // config-provenance tripwire + controller-clean preflight (RSI v3, catalog #6): watched-config drift pages + holds trading lanes; Solomon refuses meta-work on itself from a dirty/off-base tree
 mod redeploy; // native self-redeploy: swap Solomon's own production binary in a safe drain window
 mod supervisor; // native port of improver/solomon.py — diagnose() + the 3-rung recover() ladder + escalation
 mod watchdog; // native port of monitor.py — the `watchdog` subcommand + the in-app 2-min tick (run_gui)
@@ -283,9 +286,11 @@ fn main() {
     if argv.first().map(String::as_str) == Some("run-improver") {
         std::process::exit(improver::run::main(&argv[1..]));
     }
-    // `solomon watchdog` — one on-demand watchdog sweep (the automatic every-2-min sweep lives in
-    // run_gui's tick thread; no scheduled task exists and none may be created — operator rule).
-    // Dispatch BEFORE run_gui so no window is created, and exit with watchdog::main's return code.
+    // `solomon watchdog` — one watchdog sweep. The Solomon Sentinel scheduled task
+    // (tools/install_sentinel.ps1) runs `solomon watchdog` every 5 minutes out-of-band; the GUI
+    // tick sweep remains as a secondary layer. Renegotiated by the operator 2026-07-06 after the
+    // liveness autopsy (GUI-tick-only liveness caused the 8h/25.5h watchdog gaps and 2+ day
+    // outages). Dispatch BEFORE run_gui so no window is created; exit with watchdog::main's code.
     if argv.first().map(String::as_str) == Some("watchdog") {
         std::process::exit(watchdog::main());
     }
@@ -357,11 +362,11 @@ fn run_gui() {
     control::proc::init_app_job();
     // THE IN-APP WATCHDOG TICK (v2 Phase A): the every-2-min sweep lives INSIDE the visibly-open
     // Solomon.exe — crash-restart + RUNG-0 recovery + ops probes + incident notifications + the
-    // CEO rhythm all ride it. This is the Solomon-native replacement for the external loop the
-    // retired fleet-supervisor routine used to run. NO SCHEDULED TASK exists and none may be
-    // created (operator rule): app closed = an honest, notified blind window, never silent
-    // monitoring theater. The thread dies with the process; catch_unwind keeps one bad sweep from
-    // killing the tick.
+    // CEO rhythm all ride it. The Solomon Sentinel scheduled task (tools/install_sentinel.ps1)
+    // runs `solomon watchdog` every 5 minutes out-of-band; this GUI tick sweep remains as a
+    // secondary layer. Renegotiated by the operator 2026-07-06 after the liveness autopsy
+    // (GUI-tick-only liveness caused the 8h/25.5h watchdog gaps and 2+ day outages). The thread
+    // dies with the process; catch_unwind keeps one bad sweep from killing the tick.
     std::thread::spawn(|| loop {
         let _ = std::panic::catch_unwind(|| {
             let _ = watchdog::main();

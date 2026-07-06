@@ -14,6 +14,7 @@
 //! detection, and feedback injection).
 
 use crate::control::proc::{self, RunOut};
+use crate::improver::budget;
 use crate::improver::ctx::Ctx;
 
 use serde_json::{json, Value};
@@ -355,18 +356,22 @@ fn node_cli_from_shim(cmd_path: &str) -> Option<String> {
 /// RunOut{code: 124, stdout: <partial out>, stderr: <partial err> + "\n<argv0> timed out after <t>s"},
 /// the same rc=124/"timed out after Ns" convention ctx.git()/gh() use for their bounded timeouts, so
 /// the caller's existing timeout handling applies uniformly. Normal (non-timeout) returns are exact.
-pub fn run_pi(ctx: &mut Ctx, task: &str, timeout: i64, system_md: Option<&Path>) -> RunOut {
-    // ---- argv -------------------------------------------------------------- #
-    // DEVIATION (Windows): the Python `run_pi` spawned `pi` (which resolves to the npm `pi.CMD`
-    // batch shim) directly. Rust's std::process::Command REFUSES to spawn a `.cmd`/`.bat` when ANY
-    // argument contains a character it cannot safely escape into a batch command line — newlines in
-    // particular (the CVE-2024-24576 hardening, Rust ≥1.77.2): `spawn()` returns
-    // io::ErrorKind::InvalidInput "batch file arguments are invalid" INSTANTLY. The implement task is
-    // almost always multi-line (backlog item + gate/visual feedback), so every real iteration failed
-    // with an instant rc=-1 that the caller miscounted as a model no-op. Fix: when `pi` resolves to a
-    // batch shim, invoke the underlying `node <cli.js>` it wraps instead — node.exe is a real
-    // executable, so Command passes the multi-line arg through verbatim (byte-identical argv to what
-    // `pi.CMD` would have forwarded). Off Windows / non-batch pi: unchanged (program = the pi path).
+/// run_pi's exact pi argv (program + args) for the CURRENT ctx provider/model/reasoning. Extracted
+/// so `budget::run_canary` exercises the IDENTICAL invocation surface (same batch-shim bypass,
+/// extensions, system prompt) — a canary spawned any other way could pass while the real call path
+/// stays broken (the asmodeus dead-fallback failure shape).
+///
+/// DEVIATION (Windows): the Python `run_pi` spawned `pi` (which resolves to the npm `pi.CMD`
+/// batch shim) directly. Rust's std::process::Command REFUSES to spawn a `.cmd`/`.bat` when ANY
+/// argument contains a character it cannot safely escape into a batch command line — newlines in
+/// particular (the CVE-2024-24576 hardening, Rust ≥1.77.2): `spawn()` returns
+/// io::ErrorKind::InvalidInput "batch file arguments are invalid" INSTANTLY. The implement task is
+/// almost always multi-line (backlog item + gate/visual feedback), so every real iteration failed
+/// with an instant rc=-1 that the caller miscounted as a model no-op. Fix: when `pi` resolves to a
+/// batch shim, invoke the underlying `node <cli.js>` it wraps instead — node.exe is a real
+/// executable, so Command passes the multi-line arg through verbatim (byte-identical argv to what
+/// `pi.CMD` would have forwarded). Off Windows / non-batch pi: unchanged (program = the pi path).
+pub(crate) fn build_pi_argv(ctx: &Ctx, task: &str, system_md: Option<&Path>) -> Vec<String> {
     let pi = ctx.pi_exe();
     let (program, lead) = resolve_pi_invocation(&pi);
     let mut args: Vec<String> = vec![program];
@@ -399,13 +404,16 @@ pub fn run_pi(ctx: &mut Ctx, task: &str, timeout: i64, system_md: Option<&Path>)
     };
     args.push(sys_prompt.to_string_lossy().into_owned());
     args.push(task.to_string());
+    args
+}
 
-    // ---- env --------------------------------------------------------------- #
-    let mut cmd = Command::new(&args[0]);
-    cmd.args(&args[1..]);
-    cmd.current_dir(&ctx.repo);
+/// run_pi's process env, shared with `budget::run_canary` for the same fidelity reason as
+/// [`build_pi_argv`]: clean env (GITHUB_TOKEN/GH_TOKEN/PYTHONPATH/PYTHONHOME stripped, UTF-8
+/// stdio), the three RSI_* vars the unified provider.ts reads, and the agent-shim dir PREPENDED to
+/// PATH (so the agent's git/gh resolve to the refusing shims first).
+pub(crate) fn apply_pi_env(ctx: &Ctx, cmd: &mut Command) {
     // _clean_env(): strip GITHUB_TOKEN/GH_TOKEN/PYTHONPATH/PYTHONHOME + force UTF-8 stdio.
-    ctx.apply_clean_env(&mut cmd);
+    ctx.apply_clean_env(cmd);
     // The unified provider.ts registers the provider under RSI_PROVIDER; the extension reads the
     // model id (RSI_MODEL) and reasoning level (RSI_REASONING) from these.
     cmd.env("RSI_PROVIDER", &ctx.pi_provider);
@@ -422,6 +430,65 @@ pub fn run_pi(ctx: &mut Ctx, task: &str, timeout: i64, system_md: Option<&Path>)
         };
         cmd.env("PATH", new_path);
     }
+}
+
+pub fn run_pi(ctx: &mut Ctx, task: &str, timeout: i64, system_md: Option<&Path>) -> RunOut {
+    // ---- RSI v3 WIRING 1/4: per-cycle budget (freshness ledger, WS1; requirement 4) ---------- #
+    // Checked FIRST — an exhausted cycle budget must not even resolve/canary an endpoint. The
+    // return is shaped like the rc=124 timeout RunOut so every caller lands in its EXISTING
+    // note_timeout handling (no new wiring anywhere else), and the spawn is skipped entirely.
+    if let Some(reason) = crate::improver::freshness::budget_exceeded(ctx) {
+        ctx.log(&format!(
+            "run_pi refused: cycle budget exhausted — {reason} (no token spent)"
+        ));
+        return RunOut {
+            code: 124,
+            stdout: String::new(),
+            stderr: format!("cycle budget exhausted: {reason}"),
+        };
+    }
+
+    // ---- RSI v3 WIRING 2/4: endpoint resolution + provider-budget preflight (catalog #2) ----- #
+    // effective_endpoint returns the primary, or a canaried fallback when the primary is parked.
+    // If even the resolved endpoint is Parked (i.e. the fallback path is unusable too), refuse
+    // with a synthesized '429 ...' stderr: the literal "429" makes the EXISTING
+    // is_quota_error/is_quota_error_output paths in iteration/oneshot/supervisor classify this as
+    // quota_error — never a model no-op — with zero new wiring.
+    let (prov, model, is_fallback) = budget::effective_endpoint(ctx);
+    if let budget::Decision::Parked { until, why } = budget::preflight(ctx, &prov, &model) {
+        ctx.log(&format!(
+            "run_pi refused: {prov}:{model} parked by budget ledger until {until} — {why}"
+        ));
+        return RunOut {
+            code: 1,
+            stdout: String::new(),
+            stderr: budget::parked_stderr(until, &why),
+        };
+    }
+
+    // ---- RSI v3 WIRING 3/4: argv/env built against the RESOLVED endpoint --------------------- #
+    // build_pi_argv/apply_pi_env read ctx.pi_provider/pi_model; when the fallback is in effect
+    // they are swapped in for THIS call only and restored on every exit path below (the loop's
+    // configured endpoint is a per-repo contract, not ours to keep).
+    let saved_endpoint = (ctx.pi_provider.clone(), ctx.pi_model.clone());
+    if is_fallback {
+        let age = budget::last_canary_age_secs(ctx, &prov, &model)
+            .map(|a| format!("{a}s"))
+            .unwrap_or_else(|| "unknown".to_string());
+        ctx.log(&format!(
+            "provider fallback in effect: {}:{} -> {prov}:{model} (canary passed {age} ago)",
+            saved_endpoint.0, saved_endpoint.1
+        ));
+        ctx.pi_provider = prov.clone();
+        ctx.pi_model = model.clone();
+    }
+
+    // ---- argv + env ---------------------------------------------------------- #
+    let args = build_pi_argv(ctx, task, system_md);
+    let mut cmd = Command::new(&args[0]);
+    cmd.args(&args[1..]);
+    cmd.current_dir(&ctx.repo);
+    apply_pi_env(ctx, &mut cmd);
 
     // ---- spawn (Popen, new process group, piped, hidden) ------------------- #
     cmd.stdin(Stdio::null())
@@ -433,7 +500,10 @@ pub fn run_pi(ctx: &mut Ctx, task: &str, timeout: i64, system_md: Option<&Path>)
         Ok(c) => c,
         Err(e) => {
             // A spawn failure (missing pi) — Python would raise FileNotFoundError; surface a failed
-            // RunOut so the caller treats it like a failed pi session (rc!=0, empty stdout).
+            // RunOut so the caller treats it like a failed pi session (rc!=0, empty stdout). pi
+            // never started, so NO token was spent: nothing is recorded against any ledger.
+            ctx.pi_provider = saved_endpoint.0;
+            ctx.pi_model = saved_endpoint.1;
             return RunOut {
                 code: -1,
                 stdout: String::new(),
@@ -441,6 +511,11 @@ pub fn run_pi(ctx: &mut Ctx, task: &str, timeout: i64, system_md: Option<&Path>)
             };
         }
     };
+    // ---- RSI v3 WIRING 4/4 (spend side): a token is being spent NOW ---------- #
+    // Recorded after the REAL spawn and before waiting, so a crash/timeout mid-session still
+    // counted against both the fleet provider ledger and WS1's per-cycle call budget.
+    budget::record_call(ctx, &prov, &model);
+    crate::improver::freshness::note_pi_call(ctx);
     let pid = child.id();
     let started_at = crate::improver::ctx::now();
     let started_instant = std::time::Instant::now();
@@ -493,7 +568,7 @@ pub fn run_pi(ctx: &mut Ctx, task: &str, timeout: i64, system_md: Option<&Path>)
         h.and_then(|h| h.join().ok()).unwrap_or_default()
     };
     let dur = std::time::Duration::from_secs(timeout.max(0) as u64);
-    match child.wait_timeout(dur) {
+    let out = match child.wait_timeout(dur) {
         Ok(Some(status)) => {
             // Normal exit: the write ends are closed, so the readers finish; join for full output.
             pump.stop();
@@ -581,7 +656,23 @@ pub fn run_pi(ctx: &mut Ctx, task: &str, timeout: i64, system_md: Option<&Path>)
                 stderr: e.to_string(),
             }
         }
+    };
+    // restore the loop's configured endpoint (a fallback was for THIS call only)
+    ctx.pi_provider = saved_endpoint.0;
+    ctx.pi_model = saved_endpoint.1;
+    // ---- RSI v3 WIRING 4/4 (outcome side): quota parks THIS endpoint, never the fleet ------- #
+    // is_quota_error_output inspects BOTH streams (the 2026-07-03 incident put the 429 in stdout's
+    // structured errorMessage with empty stderr). A quota outcome escalates the endpoint's
+    // exponential park; anything else resets its consecutive-429 streak.
+    if is_quota_error_output(&out.stdout, &out.stderr) {
+        let until = budget::record_quota(ctx, &prov, &model);
+        ctx.log(&format!(
+            "provider quota error on {prov}:{model} — parked until {until} (per-endpoint exponential backoff)"
+        ));
+    } else {
+        budget::record_success(ctx, &prov, &model);
     }
+    out
 }
 
 struct PiHeartbeat<'a> {
@@ -689,11 +780,11 @@ fn elapsed_secs(started_at: std::time::Instant) -> i64 {
 /// (so taskkill /T can reach the node grandchild); a no-op off Windows (Python sets no preexec_fn /
 /// start_new_session, so the child stays in the parent's group there).
 #[cfg(windows)]
-fn apply_spawn_flags(cmd: &mut Command) {
+pub(crate) fn apply_spawn_flags(cmd: &mut Command) {
     cmd.creation_flags(proc::hidden_flags(false, true));
 }
 #[cfg(not(windows))]
-fn apply_spawn_flags(_cmd: &mut Command) {}
+pub(crate) fn apply_spawn_flags(_cmd: &mut Command) {}
 
 // --------------------------------------------------------------------------- #
 // final_text
@@ -1203,5 +1294,102 @@ add extra usage: https://ollama.com/settings (ref: c708135e-d4a9-484f-ac43-02478
         assert_eq!(c.pi_provider, saved_provider, "PI_PROVIDER restored");
         assert_eq!(c.pi_ext, saved_ext, "PI_EXT restored");
         let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    // ---- RSI v3 budget wiring: both refusals return BEFORE any spawn (no pi, no token) ----
+
+    fn unix_now_test() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Isolated wiring-test Ctx: own control dir (repos.json without a fallback) and an isolated
+    /// runtime whose PARENT is the fleet dir the provider ledger lives in.
+    fn wiring_ctx(tag: &str) -> Ctx {
+        let base = std::env::temp_dir().join(format!(
+            "solomon_pi_wire_{tag}_{}_{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        ));
+        let control = base.join("control");
+        let repo = base.join("repo");
+        let _ = std::fs::create_dir_all(&control);
+        let _ = std::fs::create_dir_all(&repo);
+        std::fs::write(control.join("repos.json"), r#"[{"name": "wiretest"}]"#).unwrap();
+        let mut c = Ctx::configure(&repo.to_string_lossy(), "wiretest", "ollama-cloud", None);
+        c.control = control;
+        c.runtime = base.join("runtime").join("wiretest");
+        c.heartbeat_path = c.runtime.join("heartbeat.json");
+        c.log_path = c.runtime.join("improver.log");
+        c.stop_path = c.runtime.join("stop");
+        let _ = std::fs::create_dir_all(&c.runtime);
+        c
+    }
+
+    #[test]
+    fn run_pi_parked_endpoint_returns_synthesized_429_without_spawn() {
+        let mut c = wiring_ctx("parked");
+        let now = unix_now_test();
+        // park the PRIMARY endpoint (ollama-cloud defaults: maki-cloud:glm-5.2) in the fleet ledger
+        let fleet = c.runtime.parent().unwrap().to_path_buf();
+        let _ = std::fs::create_dir_all(&fleet);
+        let ledger = json!({"endpoints": {"maki-cloud:glm-5.2": {
+            "window_cap_calls": 500, "window_started": now, "spent_calls": 1,
+            "park_until": now + 3600, "consecutive_429": 2, "last_canary_pass": 0}}});
+        std::fs::write(fleet.join("_provider_budget.json"), ledger.to_string()).unwrap();
+
+        let out = run_pi(&mut c, "do work", 60, None);
+        assert_eq!(out.code, 1);
+        assert_eq!(out.stdout, "");
+        assert!(
+            out.stderr.starts_with("429 provider parked by budget ledger until"),
+            "got: {}",
+            out.stderr
+        );
+        assert!(out.stderr.contains("(no token spent)"));
+        // the synthesized refusal MUST ride the existing quota classification (never a noop)
+        assert!(is_quota_error(&out.stderr));
+        assert!(is_quota_error_output(&out.stdout, &out.stderr));
+        // no spawn happened => no call was recorded against the parked endpoint
+        let after: Value = serde_json::from_str(
+            &std::fs::read_to_string(fleet.join("_provider_budget.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(after["endpoints"]["maki-cloud:glm-5.2"]["spent_calls"], json!(1));
+        // the loop's configured endpoint is untouched by the refusal
+        assert_eq!(c.pi_provider, "maki-cloud");
+        assert_eq!(c.pi_model, "glm-5.2");
+        let _ = std::fs::remove_dir_all(c.runtime.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn run_pi_cycle_budget_exhausted_returns_timeout_shaped_124() {
+        let mut c = wiring_ctx("cycle");
+        // WS1's per-cycle budget window, already blown: started 100s ago with a 10s wall cap
+        let now = unix_now_test();
+        let budget_file = json!({"started_at": (now as f64) - 100.0, "wall_s": 10.0, "pi_calls": 0});
+        std::fs::write(c.runtime.join("cycle_budget.json"), budget_file.to_string()).unwrap();
+
+        let out = run_pi(&mut c, "do work", 60, None);
+        // rc=124 is run_pi's timeout convention — callers land in their existing note_timeout path
+        assert_eq!(out.code, 124);
+        assert_eq!(out.stdout, "");
+        assert!(
+            out.stderr.starts_with("cycle budget exhausted:"),
+            "got: {}",
+            out.stderr
+        );
+        assert!(out.stderr.contains("wall budget exhausted"), "got: {}", out.stderr);
+        // refused BEFORE endpoint resolution: no fleet ledger was even seeded
+        assert!(
+            !c.runtime.parent().unwrap().join("_provider_budget.json").exists(),
+            "cycle-budget refusal must precede any provider-ledger IO"
+        );
+        let _ = std::fs::remove_dir_all(c.runtime.parent().unwrap().parent().unwrap());
     }
 }

@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "default_ttl_s": 3600,
+  "diagnoses": {
+    "ok": { "action": "none", "ttl_s": 3600, "fallback": "none", "max_fallback_runs": 3 },
+    "needs_goal": { "action": "page_operator_deduped", "ttl_s": 3600, "fallback": "page_operator_deduped", "max_fallback_runs": 3 },
+    "no_key": { "action": "page_operator_deduped", "ttl_s": 3600, "fallback": "page_operator_deduped", "max_fallback_runs": 3 },
+    "key_shape_mismatch": { "action": "page_operator_deduped", "ttl_s": 3600, "fallback": "page_operator_deduped", "max_fallback_runs": 3 },
+    "quota_error": { "action": "park_primary_endpoint", "ttl_s": 3600, "fallback": "park_primary_endpoint", "max_fallback_runs": 3 },
+    "gh_not_ready": { "action": "page_operator_deduped", "ttl_s": 3600, "fallback": "page_operator_deduped", "max_fallback_runs": 3 },
+    "revert_failed": { "action": "reset_to_base", "ttl_s": 3600, "fallback": "reset_to_base", "max_fallback_runs": 3 },
+    "dirty_tree": { "action": "reset_to_base", "ttl_s": 3600, "fallback": "reset_to_base", "max_fallback_runs": 3 },
+    "base_out_of_band": { "action": "page_operator_deduped", "ttl_s": 7200, "fallback": "page_operator_deduped", "max_fallback_runs": 3 },
+    "untracked_refusal": { "action": "page_operator_deduped", "ttl_s": 7200, "fallback": "page_operator_deduped", "max_fallback_runs": 3 },
+    "persistent_self_stop": { "action": "restart_lane", "ttl_s": 14400, "fallback": "restart_lane", "max_fallback_runs": 3 },
+    "stale_lock": { "action": "page_operator_deduped", "ttl_s": 3600, "fallback": "page_operator_deduped", "max_fallback_runs": 3 },
+    "stop_lingering": { "action": "page_operator_deduped", "ttl_s": 86400, "fallback": "page_operator_deduped", "max_fallback_runs": 3 },
+    "stuck": { "action": "restart_lane", "ttl_s": 3600, "fallback": "restart_lane", "max_fallback_runs": 3 },
+    "gate_red_streak": { "action": "run_fix_session", "ttl_s": 7200, "fallback": "run_fix_session", "max_fallback_runs": 3 },
+    "ci_red_streak": { "action": "run_fix_session", "ttl_s": 7200, "fallback": "run_fix_session", "max_fallback_runs": 3 },
+    "noop_streak": { "action": "clear_escalation_and_retry", "ttl_s": 7200, "fallback": "clear_escalation_and_retry", "max_fallback_runs": 3 },
+    "unknown_error": { "action": "restart_lane", "ttl_s": 7200, "fallback": "restart_lane", "max_fallback_runs": 3 },
+    "running_stalled": { "action": "page_operator_deduped", "ttl_s": 7200, "fallback": "page_operator_deduped", "max_fallback_runs": 3 },
+    "metric_unobservable": { "action": "page_operator_deduped", "ttl_s": 3600, "fallback": "page_operator_deduped", "max_fallback_runs": 3 }
+  }
+}
