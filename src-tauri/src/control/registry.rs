@@ -210,9 +210,9 @@ fn autopilot_config_from_entries(entries: &[Value]) -> Value {
     };
     set_default("mode", json!("single_agent"));
     set_default("mission", json!(AUTOPILOT_DEFAULT_MISSION));
-    set_default("provider", json!("openrouter"));
-    set_default("api_key", json!("OPENROUTER_API_KEY"));
-    set_default("model", json!("nvidia/nemotron-3-ultra-550b-a55b:free"));
+    set_default("provider", json!("ollama-cloud"));
+    set_default("api_key", json!("OLLAMA_API_KEY"));
+    set_default("model", json!("glm-5.2"));
     set_default("max_concurrent_agent_calls", json!(1));
     set_default("cooldown_s", json!(86400));
     set_default("daily_call_budget", json!(40));
@@ -1133,12 +1133,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn autopilot_config_defaults_to_single_openrouter_key() {
+    fn autopilot_config_defaults_to_single_ollama_cloud_key() {
         let cfg = autopilot_config_from_entries(&[]);
         assert_eq!(cfg["mode"], json!("single_agent"));
         assert_eq!(cfg["mission"], json!(AUTOPILOT_DEFAULT_MISSION));
-        assert_eq!(cfg["provider"], json!("openrouter"));
-        assert_eq!(cfg["api_key"], json!("OPENROUTER_API_KEY"));
+        assert_eq!(cfg["provider"], json!("ollama-cloud"));
+        assert_eq!(cfg["api_key"], json!("OLLAMA_API_KEY"));
+        assert_eq!(cfg["model"], json!("glm-5.2"));
         assert_eq!(cfg["max_concurrent_agent_calls"], json!(1));
         assert_eq!(
             cfg["targets"],

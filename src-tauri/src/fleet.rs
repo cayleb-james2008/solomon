@@ -6,6 +6,7 @@
 
 use crate::control::{heartbeat, locks, paths, proc, registry};
 use crate::improver::pi;
+use crate::notify;
 use crate::ops;
 use crate::supervisor;
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
@@ -50,6 +51,11 @@ impl Drop for AutopilotLease {
 pub fn state() -> Value {
     let cfg = registry::autopilot_config();
     let mut st = read_state(&cfg);
+    let mut changed = false;
+    if st.get("active").map(json_truthy).unwrap_or(false) && !autopilot_lock_live() {
+        st["active"] = Value::Null;
+        changed = true;
+    }
     let repos = registry::load_repos();
     let ops_payload = read_ops_payload();
     let jobs = plan_jobs(&repos, &cfg, &ops_payload, &st, None);
@@ -57,6 +63,10 @@ pub fn state() -> Value {
     st["queue"] = Value::Array(jobs.iter().map(job_value).collect());
     st["proofs"] = proof_records();
     st["config"] = public_config(&cfg);
+    if changed {
+        st["ts"] = json!(now());
+        let _ = write_state(&st);
+    }
     st
 }
 
@@ -130,6 +140,9 @@ pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
     st["ts"] = json!(now());
     st["queue"] = Value::Array(jobs.iter().map(job_value).collect());
     st["config"] = public_config(&cfg);
+    if stale_non_ai_provider_cooldown(&st) {
+        st["cooldown"] = Value::Null;
+    }
 
     if let Some(until) = cooldown_until(&st) {
         if until > Utc::now() {
@@ -183,10 +196,6 @@ pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
         finish_non_ai_job(&job, &repos, &ops_payload)
     };
     if job.kind == "cooldown" {
-        set_cooldown(&mut st, &cfg, "provider quota/rate limit");
-        append_event(
-            &json!({"event": "provider_cooldown", "repo": job.name, "reason": "quota_error heartbeat"}),
-        );
         for q in jobs
             .iter()
             .filter(|j| j.kind == "cooldown" && j.name != job.name)
@@ -308,15 +317,20 @@ fn run_ai_job(job: &Job, repos: &[Value], cfg: &Value, auto_push: bool, st: &mut
     else {
         return proof(job, "blocked", "repo not found", None, None);
     };
+    let provider = cfg
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("openrouter");
+    let key_env = provider_key_ref(provider);
     let key_ref = cfg
         .get("api_key")
         .and_then(Value::as_str)
-        .unwrap_or("OPENROUTER_API_KEY");
+        .unwrap_or(key_env);
     let Some(key_value) = resolve_key(key_ref) else {
         return proof(
             job,
             "blocked",
-            "OPENROUTER_API_KEY is not set for Solomon Autopilot",
+            &format!("{key_ref} is not set for Solomon Autopilot"),
             None,
             None,
         );
@@ -325,7 +339,7 @@ fn run_ai_job(job: &Job, repos: &[Value], cfg: &Value, auto_push: bool, st: &mut
     append_event(
         &json!({"event": "agent_call_started", "repo": job.name, "provider": cfg["provider"], "model": cfg["model"]}),
     );
-    let out = run_repo_once(repo, cfg, auto_push, &key_value);
+    let out = run_repo_once(repo, cfg, auto_push, key_env, &key_value);
     let quota = pi::is_quota_error_output(&out.stdout, &out.stderr)
         || out.stdout.contains("\"reason\":\"quota_error\"")
         || out.stderr.contains("quota_error");
@@ -486,13 +500,23 @@ fn plan_jobs(
         if manual_hit {
             priority = 1;
         }
-        let (kind, state, requires_ai, reason, next_action) = if diag_cat == "quota_error" {
+        let (kind, state, requires_ai, reason, next_action) = if diag_cat == "quota_error"
+            && quota_heartbeat_matches_config(repo, cfg)
+        {
             (
                 "cooldown",
                 "cooldown",
                 false,
                 "provider quota/rate-limit heartbeat",
                 "wait for cooldown; run non-LLM probes and cleanup",
+            )
+        } else if diag_cat == "quota_error" {
+            (
+                "implement",
+                "queued",
+                true,
+                "stale quota heartbeat does not match current provider/model",
+                "run one gated RSI iteration under the current provider",
             )
         } else if diag_cat == "stale_lock"
             && diag.get("auto_safe").and_then(Value::as_bool) == Some(true)
@@ -543,9 +567,6 @@ fn plan_jobs(
         if kind == "cooldown" {
             priority = 3;
         }
-        if cfg.get("provider").and_then(Value::as_str) != Some("openrouter") && requires_ai {
-            priority += 20;
-        }
         jobs.push(Job {
             name,
             kind: kind.into(),
@@ -565,18 +586,24 @@ fn plan_jobs(
     jobs
 }
 
-fn run_repo_once(repo: &Value, cfg: &Value, auto_push: bool, key_value: &str) -> proc::RunOut {
+fn run_repo_once(
+    repo: &Value,
+    cfg: &Value,
+    auto_push: bool,
+    key_env: &str,
+    key_value: &str,
+) -> proc::RunOut {
     let program = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "solomon.exe".to_string());
     let provider = cfg
         .get("provider")
         .and_then(Value::as_str)
-        .unwrap_or("openrouter");
+        .unwrap_or("ollama-cloud");
     let model = cfg
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or("nvidia/nemotron-3-ultra-550b-a55b:free");
+        .unwrap_or("glm-5.2");
     let argv = vec![
         program,
         "run-improver".into(),
@@ -607,6 +634,7 @@ fn run_repo_once(repo: &Value, cfg: &Value, auto_push: bool, key_value: &str) ->
     run_with_env(
         &argv,
         Path::new(&paths::repo_path(repo)),
+        key_env,
         key_value,
         Duration::from_secs(DEFAULT_RUN_TIMEOUT_S),
     )
@@ -615,7 +643,8 @@ fn run_repo_once(repo: &Value, cfg: &Value, auto_push: bool, key_value: &str) ->
 fn run_with_env(
     argv: &[String],
     cwd: &Path,
-    openrouter_key: &str,
+    key_env: &str,
+    key_value: &str,
     timeout: Duration,
 ) -> proc::RunOut {
     let mut cmd = Command::new(&argv[0]);
@@ -625,7 +654,7 @@ fn run_with_env(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("SOLOMON_AUTOPILOT_MODE", "single_agent")
-        .env("OPENROUTER_API_KEY", openrouter_key);
+        .env(key_env, key_value);
     proc::apply_clean_env(&mut cmd);
     #[cfg(windows)]
     cmd.creation_flags(proc::hidden_flags(false, false));
@@ -646,40 +675,39 @@ fn run_with_env(
 fn run_prepared(mut cmd: Command, timeout: Duration) -> std::io::Result<proc::RunOut> {
     use wait_timeout::ChildExt;
     let mut child = cmd.spawn()?;
-    let out_h = child.stdout.take().map(|mut s| {
-        std::thread::spawn(move || {
-            let mut buf = String::new();
-            let _ = s.read_to_string(&mut buf);
-            buf
-        })
-    });
-    let err_h = child.stderr.take().map(|mut s| {
-        std::thread::spawn(move || {
-            let mut buf = String::new();
-            let _ = s.read_to_string(&mut buf);
-            buf
-        })
-    });
-    let join = |h: Option<std::thread::JoinHandle<String>>| -> String {
-        h.and_then(|h| h.join().ok()).unwrap_or_default()
-    };
+    let out_rx = read_pipe_async(child.stdout.take());
+    let err_rx = read_pipe_async(child.stderr.take());
     match child.wait_timeout(timeout)? {
         Some(status) => Ok(proc::RunOut {
             code: status.code().unwrap_or(-1),
-            stdout: join(out_h),
-            stderr: join(err_h),
+            stdout: collect_pipe(out_rx),
+            stderr: collect_pipe(err_rx),
         }),
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            drop(out_h);
-            drop(err_h);
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "autopilot job timed out",
             ))
         }
     }
+}
+
+fn read_pipe_async<T: Read + Send + 'static>(pipe: Option<T>) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(mut s) = pipe {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            let _ = tx.send(buf);
+        });
+    }
+    rx
+}
+
+fn collect_pipe(rx: std::sync::mpsc::Receiver<String>) -> String {
+    rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default()
 }
 
 fn proof(
@@ -731,10 +759,56 @@ fn write_proof_value_at(rt: &Path, v: &Value) {
 
 fn read_proof(name: &str) -> Option<Value> {
     let rt = paths::runtime_dir(&json!({"name": name}))?;
-    std::fs::read(rt.join(PROOF_FILE))
+    let file_proof = std::fs::read(rt.join(PROOF_FILE))
         .or_else(|_| std::fs::read(rt.join(LEGACY_PROOF_FILE)))
         .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
+        .and_then(|b| serde_json::from_slice(&b).ok());
+    let history_proof = heartbeat::read_history(&json!({"name": name}), 1)
+        .last()
+        .and_then(|h| proof_from_history(name, h));
+    freshest_proof(file_proof, history_proof)
+}
+
+fn proof_from_history(name: &str, h: &Value) -> Option<Value> {
+    let status = h.get("status").and_then(Value::as_str)?;
+    let outcome = match status {
+        "shipped" => "shipped",
+        "blocked" => "blocked",
+        "quota_error" => "cooldown",
+        "reverted" => "proof_required",
+        _ => "proof_required",
+    };
+    Some(json!({
+        "ts": h.get("ts").cloned().unwrap_or_else(|| json!(now())),
+        "repo": name,
+        "job": "implement",
+        "state": status,
+        "outcome": outcome,
+        "summary": h.get("summary").cloned().unwrap_or_else(|| json!("latest RSI iteration recorded")),
+        "requires_ai": true,
+        "priority": 10,
+        "next_action": if outcome == "blocked" { "review blocker and choose the next gated action" } else { "collect evidence and choose the next gated improvement" },
+        "extra": {"latest_history": h},
+        "latest_history": h,
+    }))
+}
+
+fn freshest_proof(a: Option<Value>, b: Option<Value>) -> Option<Value> {
+    match (a, b) {
+        (Some(left), Some(right)) => {
+            if proof_time(&right) > proof_time(&left) {
+                Some(right)
+            } else {
+                Some(left)
+            }
+        }
+        (Some(v), None) | (None, Some(v)) => Some(v),
+        (None, None) => None,
+    }
+}
+
+fn proof_time(v: &Value) -> Option<DateTime<Utc>> {
+    v.get("ts").and_then(Value::as_str).and_then(parse_ts)
 }
 
 fn proof_records() -> Value {
@@ -751,6 +825,18 @@ fn acquire_lock() -> Result<Option<AutopilotLease>, String> {
     let dir = paths::here().join("runtime");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     acquire_lock_at(dir.join(LOCK_FILE))
+}
+
+fn autopilot_lock_live() -> bool {
+    autopilot_lock_live_at(&paths::here().join("runtime").join(LOCK_FILE))
+}
+
+fn autopilot_lock_live_at(path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let pid = raw.trim().parse::<i64>().unwrap_or(0);
+    pid != 0 && locks::pid_alive(pid)
 }
 
 fn acquire_lock_at(path: PathBuf) -> Result<Option<AutopilotLease>, String> {
@@ -856,9 +942,9 @@ fn public_config(cfg: &Value) -> Value {
     json!({
         "mode": cfg.get("mode").cloned().unwrap_or(json!("single_agent")),
         "mission": cfg.get("mission").cloned().unwrap_or(json!(registry::AUTOPILOT_DEFAULT_MISSION)),
-        "provider": cfg.get("provider").cloned().unwrap_or(json!("openrouter")),
-        "api_key": cfg.get("api_key").cloned().unwrap_or(json!("OPENROUTER_API_KEY")),
-        "model": cfg.get("model").cloned().unwrap_or(json!("nvidia/nemotron-3-ultra-550b-a55b:free")),
+        "provider": cfg.get("provider").cloned().unwrap_or(json!("ollama-cloud")),
+        "api_key": cfg.get("api_key").cloned().unwrap_or(json!("OLLAMA_API_KEY")),
+        "model": cfg.get("model").cloned().unwrap_or(json!("glm-5.2")),
         "max_concurrent_agent_calls": cfg.get("max_concurrent_agent_calls").cloned().unwrap_or(json!(1)),
         "cooldown_s": cfg.get("cooldown_s").cloned().unwrap_or(json!(86400)),
         "daily_call_budget": cfg.get("daily_call_budget").cloned().unwrap_or(json!(40)),
@@ -894,6 +980,18 @@ fn cooldown_value(st: &Value) -> Value {
     st.get("cooldown").cloned().unwrap_or(Value::Null)
 }
 
+fn stale_non_ai_provider_cooldown(st: &Value) -> bool {
+    st.get("cooldown")
+        .and_then(|c| c.get("reason"))
+        .and_then(Value::as_str)
+        == Some("provider quota/rate limit")
+        && st
+            .get("last_result")
+            .and_then(|r| r.get("requires_ai"))
+            .and_then(Value::as_bool)
+            == Some(false)
+}
+
 fn set_cooldown(st: &mut Value, cfg: &Value, reason: &str) {
     let seconds = cfg
         .get("cooldown_s")
@@ -905,7 +1003,7 @@ fn set_cooldown(st: &mut Value, cfg: &Value, reason: &str) {
         "since": now(),
         "until": until.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         "reason": reason,
-        "provider": cfg.get("provider").cloned().unwrap_or(json!("openrouter")),
+        "provider": cfg.get("provider").cloned().unwrap_or(json!("ollama-cloud")),
     });
 }
 
@@ -957,11 +1055,68 @@ fn cfg_targets(cfg: &Value) -> Vec<String> {
         .unwrap_or_else(registry::autopilot_targets)
 }
 
+fn provider_key_ref(provider: &str) -> &'static str {
+    match provider {
+        "ollama-cloud" => "OLLAMA_API_KEY",
+        _ => "OPENROUTER_API_KEY",
+    }
+}
+
+fn provider_matches_config(pi_provider: &str, cfg_provider: &str) -> bool {
+    match cfg_provider {
+        "ollama-cloud" => pi_provider == "maki-cloud" || pi_provider == "ollama-cloud",
+        "openrouter" => pi_provider == "openrouter",
+        _ => false,
+    }
+}
+
+fn quota_heartbeat_matches_config(repo: &Value, cfg: &Value) -> bool {
+    let hb = match heartbeat::read_heartbeat(repo) {
+        Some(h) => h,
+        None => return false,
+    };
+    let cooldown_s = cfg
+        .get("cooldown_s")
+        .and_then(Value::as_i64)
+        .unwrap_or(86400)
+        .max(0) as f64;
+    match heartbeat::heartbeat_age(&hb) {
+        Some(age) if age <= cooldown_s => {}
+        _ => return false,
+    }
+    let cfg_provider = cfg
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("ollama-cloud");
+    let pi_provider = hb
+        .get("pi")
+        .and_then(|p| p.get("provider"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !provider_matches_config(pi_provider, cfg_provider) {
+        return false;
+    }
+    let cfg_model = cfg
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("glm-5.2");
+    let hb_model = hb.get("model").and_then(Value::as_str).unwrap_or("");
+    let pi_model = hb
+        .get("pi")
+        .and_then(|p| p.get("model"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    hb_model == cfg_model || pi_model == cfg_model
+}
+
 fn resolve_key(key_ref: &str) -> Option<String> {
     if key_ref.starts_with("sk-or-v1-") {
         return Some(key_ref.to_string());
     }
-    std::env::var(key_ref).ok().filter(|s| !s.trim().is_empty())
+    std::env::var(key_ref)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| notify::env_value(key_ref))
 }
 
 fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
@@ -1036,12 +1191,15 @@ mod tests {
                 "status": "sleeping",
                 "phase": "quota_error",
                 "reason": "quota_error",
-                "last_summary": "429 Rate limit exceeded"
+                "last_summary": "429 Rate limit exceeded",
+                "updated_at": now(),
+                "model": "m",
+                "pi": {"provider": "openrouter", "model": "m"}
             }))
             .unwrap(),
         )
         .unwrap();
-        let cfg = json!({"provider": "openrouter", "targets": [name.clone()]});
+        let cfg = json!({"provider": "openrouter", "model": "m", "targets": [name.clone()]});
         let jobs = plan_jobs(
             &[repo.clone()],
             &cfg,
@@ -1051,6 +1209,41 @@ mod tests {
         );
         assert_eq!(jobs[0].kind, "cooldown");
         assert!(!jobs[0].requires_ai);
+        let _ = std::fs::remove_dir_all(rt);
+    }
+
+    #[test]
+    fn plan_jobs_reruns_stale_quota_heartbeat_under_current_provider() {
+        let name = format!("autopilot_stale_quota_{}", std::process::id());
+        let repo = json!({"name": name, "path": "C:/p/q"});
+        let rt = paths::runtime_dir(&repo).unwrap();
+        let _ = std::fs::create_dir_all(&rt);
+        std::fs::write(
+            rt.join("heartbeat.json"),
+            serde_json::to_string(&json!({
+                "status": "sleeping",
+                "phase": "quota_error",
+                "reason": "quota_error",
+                "last_summary": "old weekly usage limit",
+                "updated_at": "1999-01-01T00:00:00Z",
+                "model": "glm-5.2",
+                "pi": {"provider": "maki-cloud", "model": "glm-5.2"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let cfg =
+            json!({"provider": "ollama-cloud", "model": "glm-5.2", "targets": [name.clone()]});
+        let jobs = plan_jobs(
+            &[repo.clone()],
+            &cfg,
+            &json!({"projects": {"autopilot_stale": {"status": "green"}}}),
+            &json!({}),
+            None,
+        );
+        assert_eq!(jobs[0].kind, "implement");
+        assert!(jobs[0].requires_ai);
+        assert!(jobs[0].reason.contains("stale quota"));
         let _ = std::fs::remove_dir_all(rt);
     }
 
@@ -1077,6 +1270,56 @@ mod tests {
     }
 
     #[test]
+    fn autopilot_provider_key_ref_matches_provider() {
+        assert_eq!(provider_key_ref("ollama-cloud"), "OLLAMA_API_KEY");
+        assert_eq!(provider_key_ref("openrouter"), "OPENROUTER_API_KEY");
+        assert_eq!(provider_key_ref("unknown"), "OPENROUTER_API_KEY");
+    }
+
+    #[test]
+    fn stale_non_ai_provider_cooldown_detects_bad_heartbeat_cooldown() {
+        assert!(stale_non_ai_provider_cooldown(&json!({
+            "cooldown": {"reason": "provider quota/rate limit"},
+            "last_result": {"requires_ai": false}
+        })));
+        assert!(!stale_non_ai_provider_cooldown(&json!({
+            "cooldown": {"reason": "provider quota/rate limit"},
+            "last_result": {"requires_ai": true}
+        })));
+        assert!(!stale_non_ai_provider_cooldown(&json!({
+            "cooldown": {"reason": "daily call budget reached"},
+            "last_result": {"requires_ai": false}
+        })));
+    }
+
+    #[test]
+    fn collect_pipe_returns_when_reader_does_not_finish() {
+        let (_tx, rx) = std::sync::mpsc::channel::<String>();
+        let start = std::time::Instant::now();
+        assert_eq!(collect_pipe(rx), "");
+        assert!(start.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn autopilot_lock_live_checks_pid_truth() {
+        let dir = std::env::temp_dir().join(format!(
+            "solomon_autopilot_live_lock_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("autopilot.lock");
+
+        assert!(!autopilot_lock_live_at(&path));
+        std::fs::write(&path, "2147483646").unwrap();
+        assert!(!autopilot_lock_live_at(&path));
+        std::fs::write(&path, std::process::id().to_string()).unwrap();
+        assert!(autopilot_lock_live_at(&path));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn read_proof_falls_back_to_legacy_fleet_file() {
         let name = format!("autopilot_legacy_proof_{}", std::process::id());
         let repo = json!({"name": name});
@@ -1090,6 +1333,42 @@ mod tests {
         .unwrap();
         let proof = read_proof(repo["name"].as_str().unwrap()).unwrap();
         assert_eq!(proof["outcome"], json!("blocked"));
+        let _ = std::fs::remove_dir_all(rt);
+    }
+
+    #[test]
+    fn read_proof_prefers_fresher_history_over_stale_file() {
+        let name = format!("autopilot_history_proof_{}", std::process::id());
+        let repo = json!({"name": name});
+        let rt = paths::runtime_dir(&repo).unwrap();
+        let _ = std::fs::remove_dir_all(&rt);
+        std::fs::create_dir_all(&rt).unwrap();
+        std::fs::write(
+            rt.join(PROOF_FILE),
+            serde_json::to_vec(&json!({
+                "ts": "1999-01-01T00:00:00Z",
+                "repo": name,
+                "outcome": "cooldown"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            rt.join("history.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "ts": "2026-07-06T02:12:35Z",
+                    "status": "blocked",
+                    "summary": "judge timed out; kept local"
+                }))
+                .unwrap()
+            ),
+        )
+        .unwrap();
+        let proof = read_proof(&name).unwrap();
+        assert_eq!(proof["outcome"], json!("blocked"));
+        assert_eq!(proof["summary"], json!("judge timed out; kept local"));
         let _ = std::fs::remove_dir_all(rt);
     }
 
