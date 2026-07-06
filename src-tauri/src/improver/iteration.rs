@@ -824,17 +824,26 @@ skip, xfail, delete, or weaken any test"
         ctx.record_history("error", Some(&branch), &summary, None);
         return;
     }
-    if ctx.git(&["diff", "--cached", "--quiet"], 120).code != 0 {
+    let commit_msg = {
         let title = if ctx.beautify {
             "beautify repo".to_string()
         } else {
             ship::pr_title(ctx, if item_deviated { "" } else { &goal }, &summary)
         };
         let prefix = if ctx.beautify { "docs" } else { "rsi" };
-        ctx.git(
-            &["commit", "-m", &format!("{prefix}: {title}\n\n{summary}")],
-            120,
-        );
+        format!("{prefix}: {title}\n\n{summary}")
+    };
+    if ctx.git(&["diff", "--cached", "--quiet"], 120).code != 0 {
+        // Runner-identity commit with the result CHECKED. A bare `git commit` here failed rc=128
+        // ("Author identity unknown") in an identity-less repo on 2026-07-06, was ignored, and
+        // gate-green kairos work fell through to a silent "no commits ahead" drop.
+        let cm = gitops::runner_commit(ctx, &commit_msg);
+        if cm.code != 0 {
+            let err: String = cm.stderr.trim().chars().take(200).collect();
+            ctx.log(&format!(
+                "runner commit failed ({err}) — retrying via the dirty-tree fallback below"
+            ));
+        }
     }
     let rl = ctx.git(
         &["rev-list", "--count", &format!("{base_branch}..HEAD")],
@@ -857,10 +866,34 @@ skip, xfail, delete, or weaken any test"
         return;
     }
     if rl.stdout.trim() == "0" {
-        ctx.log("no commits ahead after gate — dropping branch");
-        progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "noop");
-        gitops::drop_branch(ctx, &branch, "noop", &summary, "sleeping");
-        return;
+        // NO commits ahead after a GREEN gate. Distinguish "the agent produced nothing" (clean
+        // tree — the only legitimate drop) from "the agent produced gate-green work but never ran
+        // `git commit`" (dirty tree — the RUNNER commits it; gate-green work is never silently
+        // discarded). See FAILURE-CATALOG-2026-07-06 "gate-green work dropped on missing agent
+        // commit".
+        match resolve_no_commits_ahead(ctx, &commit_msg) {
+            NoCommitsOutcome::RunnerCommitted => { /* fall through to the normal ship path */ }
+            NoCommitsOutcome::Drop { detail } => {
+                ctx.log(&format!("{detail} — dropping branch"));
+                progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "noop");
+                gitops::drop_branch(ctx, &branch, "noop", &format!("{detail}. {summary}"), "sleeping");
+                return;
+            }
+            NoCommitsOutcome::Error { detail } => {
+                ctx.log(&format!("{detail} — keeping {branch} + dirty tree for inspection"));
+                progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "error");
+                ctx.heartbeat(json!({
+                    "status": "error",
+                    "phase": "commit",
+                    "last_summary": format!(
+                        "Gate passed but the agent's uncommitted work could not be committed by the \
+                         runner — {detail}. {summary}"
+                    ),
+                }));
+                ctx.record_history("error", Some(&branch), &summary, None);
+                return;
+            }
+        }
     }
 
     // Catch a DEVIATING agent that reports ITEM-STATUS: done while shipping UNRELATED work.
@@ -1740,6 +1773,63 @@ pub fn tier_budget(tier: &str, base_reasoning: &str, base_timeout: i64) -> (Stri
     }
 }
 
+/// Outcome of resolving a green-gate branch that has NO commits ahead of base.
+#[derive(Debug, PartialEq)]
+pub(crate) enum NoCommitsOutcome {
+    /// The runner committed the agent's uncommitted gate-green work — proceed to the ship path.
+    RunnerCommitted,
+    /// Genuinely nothing to ship — drop the branch. `detail` NAMES what (if anything) is being
+    /// dropped, for the log line and history entry (never a bare "dropping branch").
+    Drop { detail: String },
+    /// The runner's commit failed — keep the branch + dirty tree for inspection; never discard.
+    Error { detail: String },
+}
+
+/// The runner-owns-git rail for a green gate with zero commits ahead: a CLEAN tree is the only
+/// legitimate drop; a DIRTY tree means the agent implemented gate-green work but never ran
+/// `git commit`, so the RUNNER stages and commits it itself (inline runner identity) and shipping
+/// proceeds normally. Introduced after 2026-07-06, when a correct kairos change passed the test
+/// AND eval gates and was then silently destroyed by the bare no-commits drop.
+pub(crate) fn resolve_no_commits_ahead(ctx: &mut Ctx, commit_msg: &str) -> NoCommitsOutcome {
+    let dirty = gitops::dirty_files(ctx);
+    if dirty.is_empty() {
+        return NoCommitsOutcome::Drop {
+            detail: "no commits ahead after gate and the working tree is clean (0 files changed — \
+                     nothing was produced to ship)"
+                .to_string(),
+        };
+    }
+    let names = char_slice(&dirty.join(", "), 400);
+    ctx.log(&format!(
+        "no commits ahead after gate but the tree is DIRTY ({} file(s): {names}) — the agent never \
+         ran `git commit`; the runner is committing the gate-green work itself",
+        dirty.len()
+    ));
+    gitops::git_add_all(ctx);
+    if ctx.git(&["diff", "--cached", "--quiet"], 120).code == 0 {
+        // Nothing stageable (e.g. every dirty path is excluded/private) — a drop, but a NAMED one.
+        return NoCommitsOutcome::Drop {
+            detail: format!(
+                "no commits ahead after gate and the dirty files were all excluded from staging \
+                 (would-be-dropped: {names})"
+            ),
+        };
+    }
+    let cm = gitops::runner_commit(ctx, commit_msg);
+    if cm.code != 0 {
+        let err: String = cm.stderr.trim().chars().take(200).collect();
+        return NoCommitsOutcome::Error {
+            detail: format!("runner commit FAILED ({err}); uncommitted files: {names}"),
+        };
+    }
+    ctx.log(&format!(
+        "runner committed the gate-green work as '{} <{}>' — proceeding to ship",
+        gitops::runner_author(ctx),
+        gitops::RUNNER_COMMIT_EMAIL
+    ));
+    NoCommitsOutcome::RunnerCommitted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1787,6 +1877,110 @@ mod tests {
         c.lessons = c.runtime.join("LESSONS.md");
         c.stop_path = c.runtime.join("stop");
         c
+    }
+
+    // ---- resolve_no_commits_ahead: real git repo tests (runner-commits rail) ----
+
+    /// Helper: throwaway REAL git repo + Ctx with NO persistent committer identity — no local
+    /// user.name/user.email (the initial commit uses inline `-c`), reproducing the identity-less
+    /// kairos repo whose bare `git commit` failure caused the 2026-07-06 silent drop.
+    fn no_identity_repo_ctx() -> (Ctx, std::path::PathBuf, String) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "solomon_nocommit_repo_{}_{}",
+            std::process::id(),
+            uniq
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = Ctx::configure(&dir.to_string_lossy(), "testrepo", "ollama-cloud", None);
+        c.runtime = std::env::temp_dir().join(format!(
+            "solomon_nocommit_rt_{}_{}",
+            std::process::id(),
+            uniq
+        ));
+        std::fs::create_dir_all(&c.runtime).unwrap();
+        assert_eq!(c.git(&["init", "--quiet"], 30).code, 0);
+        // Initial commit via INLINE identity only — the repo keeps no user.name/user.email.
+        std::fs::write(dir.join("README.md"), "# test\n").unwrap();
+        c.git(&["add", "-A"], 10);
+        assert_eq!(
+            c.git(
+                &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", "initial"],
+                10
+            )
+            .code,
+            0
+        );
+        let base = {
+            let b = c
+                .git(&["rev-parse", "--abbrev-ref", "HEAD"], 10)
+                .stdout
+                .trim()
+                .to_string();
+            if b.is_empty() || b == "HEAD" { "main".to_string() } else { b }
+        };
+        c.base_branch = base.clone();
+        (c, dir, base)
+    }
+
+    /// HARD INVARIANT: gate-green agent work left UNCOMMITTED (dirty tree, no commits ahead) is
+    /// committed BY THE RUNNER with the agent-author convention — and shipping proceeds — even in
+    /// a repo with no committer identity configured anywhere locally.
+    #[test]
+    fn no_commits_dirty_tree_runner_commits_with_agent_author() {
+        let (mut c, dir, base) = no_identity_repo_ctx();
+        assert_eq!(c.git(&["checkout", "-q", "-b", "rsi/iter-test"], 10).code, 0);
+        // The "agent" edits a tracked file and adds a new test file, but never runs git commit.
+        std::fs::write(dir.join("README.md"), "# test\nimproved\n").unwrap();
+        std::fs::write(dir.join("tests_rsi.py"), "def test_floor(): assert True\n").unwrap();
+
+        let out = resolve_no_commits_ahead(&mut c, "rsi: starvation floor\n\nsummary line");
+        assert_eq!(out, NoCommitsOutcome::RunnerCommitted);
+
+        // Exactly one runner commit ahead of base — the ship path has something to ship.
+        let ahead = c
+            .git(&["rev-list", "--count", &format!("{base}..HEAD")], 10)
+            .stdout;
+        assert_eq!(ahead.trim(), "1");
+        // Authored with the engine's runner/agent convention, independent of git config.
+        let ident = c.git(&["log", "-1", "--format=%an|%ae|%s"], 10).stdout;
+        assert_eq!(
+            ident.trim(),
+            format!(
+                "{}|{}|rsi: starvation floor",
+                gitops::runner_author(&c),
+                gitops::RUNNER_COMMIT_EMAIL
+            )
+        );
+        // Nothing left behind to lose on a later checkout.
+        assert_eq!(c.git(&["status", "--porcelain"], 10).stdout.trim(), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A genuinely CLEAN tree with no commits ahead still drops — but with a diagnosis that names
+    /// the (empty) drop instead of a bare "dropping branch".
+    #[test]
+    fn no_commits_clean_tree_drops_with_named_diagnosis() {
+        let (mut c, dir, base) = no_identity_repo_ctx();
+        assert_eq!(c.git(&["checkout", "-q", "-b", "rsi/iter-test"], 10).code, 0);
+
+        let out = resolve_no_commits_ahead(&mut c, "rsi: nothing\n\nsummary");
+        match out {
+            NoCommitsOutcome::Drop { detail } => {
+                assert!(detail.contains("working tree is clean"), "detail: {detail}");
+                assert!(detail.contains("0 files changed"), "detail: {detail}");
+            }
+            other => panic!("expected Drop for a clean tree, got {other:?}"),
+        }
+        // No commit was fabricated.
+        let ahead = c
+            .git(&["rev-list", "--count", &format!("{base}..HEAD")], 10)
+            .stdout;
+        assert_eq!(ahead.trim(), "0");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- parse_ideas: strict tier form, leverage clamp, sort, fallback ----
