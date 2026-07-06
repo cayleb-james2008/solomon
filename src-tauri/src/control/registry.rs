@@ -26,6 +26,8 @@ fn provider_default_model(provider: &str) -> &'static str {
     }
 }
 
+pub const AUTOPILOT_DEFAULT_MISSION: &str = "Autonomously improve, ship, monitor, and grow managed projects toward their stated end goals with one efficient Solomon agent, preserving safety gates and proof.";
+
 /// Python truthiness of a JSON value as used by `(repo or {}).get(k) or default`:
 /// null / "" / false / 0 / 0.0 / [] / {} are falsy.
 fn truthy(v: &Value) -> bool {
@@ -126,6 +128,105 @@ pub fn read_repos_json() -> Vec<Value> {
     read_repos_json_strict().unwrap_or_default()
 }
 
+/// Top-level Autopilot config embedded in repos.json as a nameless sentinel entry:
+/// `{ "autopilot": { ... } }`. load_repos() skips nameless objects, so the sentinel never becomes a
+/// project, while repo-config writes still preserve it. Older `{ "fleet": { ... } }` entries are
+/// accepted as a one-release compatibility fallback. Missing fields get conservative single-key
+/// defaults.
+pub fn autopilot_config() -> Value {
+    autopilot_config_from_entries(&read_repos_json())
+}
+
+pub fn autopilot_enabled() -> bool {
+    autopilot_config()
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        == "single_agent"
+}
+
+pub fn autopilot_targets() -> Vec<String> {
+    autopilot_config()
+        .get("targets")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            vec![
+                "sover".to_string(),
+                "dotz".to_string(),
+                "asmodeus".to_string(),
+                "maki".to_string(),
+                "solomon".to_string(),
+            ]
+        })
+}
+
+pub fn fleet_config() -> Value {
+    autopilot_config()
+}
+
+pub fn fleet_enabled() -> bool {
+    autopilot_enabled()
+}
+
+pub fn fleet_targets() -> Vec<String> {
+    autopilot_targets()
+}
+
+fn autopilot_config_from_entries(entries: &[Value]) -> Value {
+    let mut cfg = match entries
+        .iter()
+        .find_map(|v| {
+            v.as_object()
+                .and_then(|o| o.get("autopilot"))
+                .and_then(Value::as_object)
+                .cloned()
+        })
+        .or_else(|| {
+            entries.iter().find_map(|v| {
+                v.as_object()
+                    .and_then(|o| o.get("fleet"))
+                    .and_then(Value::as_object)
+                    .cloned()
+            })
+        }) {
+        Some(o) => o,
+        None => Map::new(),
+    };
+    if cfg.get("mode").and_then(Value::as_str) == Some("single_fleet") {
+        cfg.insert("mode".to_string(), json!("single_agent"));
+    }
+    let mut set_default = |key: &str, value: Value| {
+        let missing = cfg.get(key).map(truthy).unwrap_or(false) == false;
+        if missing {
+            cfg.insert(key.to_string(), value);
+        }
+    };
+    set_default("mode", json!("single_agent"));
+    set_default("mission", json!(AUTOPILOT_DEFAULT_MISSION));
+    set_default("provider", json!("ollama-cloud"));
+    set_default("api_key", json!("OLLAMA_API_KEY"));
+    set_default("model", json!("glm-5.2"));
+    set_default("max_concurrent_agent_calls", json!(1));
+    set_default("cooldown_s", json!(86400));
+    set_default("daily_call_budget", json!(40));
+    set_default(
+        "adaptive_phase_policy",
+        json!("cheap_by_default_deep_on_red_noop_critical_or_campaign"),
+    );
+    set_default(
+        "targets",
+        json!(["sover", "dotz", "asmodeus", "maki", "solomon"]),
+    );
+    Value::Object(cfg)
+}
+
 /// control._read_repos_json_strict: open utf-8 + json.load. FileNotFound -> Ok([]); a parsed
 /// non-list -> Err("repos.json is not a JSON list"); decode/OS errors -> Err (propagate to the
 /// lenient wrappers). This is the ABSENT(->[]) vs PRESENT-but-corrupt(->Err) distinction.
@@ -208,7 +309,10 @@ pub fn load_repos() -> Vec<Value> {
         base.insert("name".to_string(), Value::String(name.clone()));
         let needs_prefix = !base.get("branch_prefix").map(truthy).unwrap_or(false);
         if needs_prefix {
-            base.insert("branch_prefix".to_string(), Value::String("rsi/".to_string()));
+            base.insert(
+                "branch_prefix".to_string(),
+                Value::String("rsi/".to_string()),
+            );
         }
     }
 
@@ -328,7 +432,11 @@ pub fn project_api_key(repo: &Value) -> String {
 /// control.project_goal: the north-star goal, stripped, or "" (unset).
 pub fn project_goal(repo: &Value) -> String {
     let v = get(repo, "goal");
-    let s = if truthy(v) { v.as_str().unwrap_or("") } else { "" };
+    let s = if truthy(v) {
+        v.as_str().unwrap_or("")
+    } else {
+        ""
+    };
     s.trim().to_string()
 }
 
@@ -378,9 +486,9 @@ pub fn set_repo_config(
     };
 
     // Find the existing entry index (first dict whose name matches).
-    let idx = entries.iter().position(|r| {
-        r.is_object() && r.get("name").and_then(Value::as_str) == Some(name)
-    });
+    let idx = entries
+        .iter()
+        .position(|r| r.is_object() && r.get("name").and_then(Value::as_str) == Some(name));
 
     let pos = match idx {
         Some(i) => i,
@@ -388,7 +496,10 @@ pub fn set_repo_config(
             // New entry: name, branch_prefix, then [path] if discovered.
             let mut obj = Map::new();
             obj.insert("name".to_string(), Value::String(name.to_string()));
-            obj.insert("branch_prefix".to_string(), Value::String("rsi/".to_string()));
+            obj.insert(
+                "branch_prefix".to_string(),
+                Value::String("rsi/".to_string()),
+            );
             if let Some(disc) = discover_projects()
                 .into_iter()
                 .find(|d| d.get("name").and_then(Value::as_str) == Some(name))
@@ -403,7 +514,9 @@ pub fn set_repo_config(
     };
 
     {
-        let entry = entries[pos].as_object_mut().expect("matched entry is an object");
+        let entry = entries[pos]
+            .as_object_mut()
+            .expect("matched entry is an object");
         if let Some(v) = provider {
             entry.insert("provider".to_string(), Value::String(v.to_string()));
         }
@@ -478,7 +591,11 @@ pub fn parse_repo_spec(spec: &str) -> Option<(String, String)> {
             return None;
         }
         // s.split("github.com/", 1)[1]
-        s = s.split_once("github.com/").map(|x| x.1).unwrap_or("").to_string();
+        s = s
+            .split_once("github.com/")
+            .map(|x| x.1)
+            .unwrap_or("")
+            .to_string();
     }
     let s = s.trim_matches('/');
     let s = s.strip_suffix(".git").unwrap_or(s);
@@ -506,10 +623,13 @@ pub fn add_project(spec: &str) -> Value {
     let dest = projects.join(&name);
     let gh_s = gh_exe.to_string_lossy().into_owned();
     let dest_s = dest.to_string_lossy().into_owned();
+    // Bounded timeout (network clone on a UI handler thread) — a hung/unreachable GitHub or a
+    // credential prompt on the null stdin must not block the handler forever. 5 min is generous for
+    // a large repo; on timeout the Err branch returns {ok:false,error} instead of hanging.
     let r = match proc::run(
         &[gh_s.as_str(), "repo", "clone", spec.trim(), dest_s.as_str()],
         Some(&projects),
-        None,
+        Some(std::time::Duration::from_secs(300)),
     ) {
         Ok(r) => r,
         Err(e) => return json!({"ok": false, "error": e.to_string()}),
@@ -555,7 +675,11 @@ pub fn connect_project(
         if !cloned.get("ok").and_then(Value::as_bool).unwrap_or(false) {
             return cloned;
         }
-        let nm = cloned.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+        let nm = cloned
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let p = paths::projects_dir().join(&nm);
         (nm, abspath(&p.to_string_lossy()))
     };
@@ -572,12 +696,19 @@ pub fn connect_project(
     let mut entry = Map::new();
     entry.insert("name".to_string(), Value::String(name.clone()));
     entry.insert("path".to_string(), Value::String(path.clone()));
-    entry.insert("branch_prefix".to_string(), Value::String("rsi/".to_string()));
+    entry.insert(
+        "branch_prefix".to_string(),
+        Value::String("rsi/".to_string()),
+    );
     entry.insert("is_git".to_string(), Value::Bool(is_git));
     entry.insert("has_remote".to_string(), Value::Bool(has_remote));
     entry.insert(
         "ship".to_string(),
-        Value::String(if ship.is_empty() { "pr".to_string() } else { ship.to_string() }),
+        Value::String(if ship.is_empty() {
+            "pr".to_string()
+        } else {
+            ship.to_string()
+        }),
     );
 
     // 6) goal.
@@ -808,7 +939,11 @@ fn normpath(p: &str) -> String {
     let joined = if is_abs {
         format!("{}/{}", prefix, body)
     } else if prefix.is_empty() {
-        if body.is_empty() { ".".to_string() } else { body }
+        if body.is_empty() {
+            ".".to_string()
+        } else {
+            body
+        }
     } else {
         format!("{}{}", prefix, body)
     };
@@ -863,7 +998,10 @@ pub(crate) mod tests {
         assert_eq!(project_provider(&Value::Null), "ollama-cloud");
         assert_eq!(project_provider(&json!({})), "ollama-cloud");
         assert_eq!(project_provider(&json!({"provider": ""})), "ollama-cloud");
-        assert_eq!(project_provider(&json!({"provider": "openrouter"})), "openrouter");
+        assert_eq!(
+            project_provider(&json!({"provider": "openrouter"})),
+            "openrouter"
+        );
     }
 
     // ---- project_model ----
@@ -873,8 +1011,14 @@ pub(crate) mod tests {
             project_model(&json!({"model": "kimi-k2.7-code", "provider": "ollama-cloud"})),
             "kimi-k2.7-code"
         );
-        assert_eq!(project_model(&json!({"provider": "ollama-cloud"})), "glm-5.2");
-        assert_eq!(project_model(&json!({"provider": "openrouter"})), "qwen/qwen3-coder");
+        assert_eq!(
+            project_model(&json!({"provider": "ollama-cloud"})),
+            "glm-5.2"
+        );
+        assert_eq!(
+            project_model(&json!({"provider": "openrouter"})),
+            "qwen/qwen3-coder"
+        );
         assert_eq!(project_model(&json!({"provider": "anthropic"})), "glm-5.2");
         assert_eq!(project_model(&Value::Null), "glm-5.2");
     }
@@ -899,14 +1043,20 @@ pub(crate) mod tests {
     fn project_gate_vectors() {
         assert_eq!(project_gate(&json!({})), None);
         assert_eq!(project_gate(&json!({"gate": ""})), None);
-        assert_eq!(project_gate(&json!({"gate": "make test"})), Some("make test".to_string()));
+        assert_eq!(
+            project_gate(&json!({"gate": "make test"})),
+            Some("make test".to_string())
+        );
     }
 
     // ---- project_pr_target_branch ----
     #[test]
     fn project_pr_target_branch_vectors() {
         assert_eq!(project_pr_target_branch(&json!({})), "main");
-        assert_eq!(project_pr_target_branch(&json!({"pr_target_branch": "develop"})), "develop");
+        assert_eq!(
+            project_pr_target_branch(&json!({"pr_target_branch": "develop"})),
+            "develop"
+        );
     }
 
     // ---- project_interval ----
@@ -943,7 +1093,10 @@ pub(crate) mod tests {
     fn project_api_key_vectors() {
         assert_eq!(project_api_key(&json!({})), "");
         assert_eq!(project_api_key(&json!({"api_key": ""})), "");
-        assert_eq!(project_api_key(&json!({"api_key": "sk-or-v1-xyz"})), "sk-or-v1-xyz");
+        assert_eq!(
+            project_api_key(&json!({"api_key": "sk-or-v1-xyz"})),
+            "sk-or-v1-xyz"
+        );
         // non-string truthy values fall through to "" (str_or only accepts truthy strings)
         assert_eq!(project_api_key(&json!({"api_key": 123})), "");
     }
@@ -952,8 +1105,14 @@ pub(crate) mod tests {
     #[test]
     fn project_goal_vectors() {
         assert_eq!(project_goal(&json!({})), "");
-        assert_eq!(project_goal(&json!({"goal": "  improve maki \n"})), "improve maki");
-        assert_eq!(project_goal(&json!({"goal": "line1\nline2"})), "line1\nline2");
+        assert_eq!(
+            project_goal(&json!({"goal": "  improve maki \n"})),
+            "improve maki"
+        );
+        assert_eq!(
+            project_goal(&json!({"goal": "line1\nline2"})),
+            "line1\nline2"
+        );
     }
 
     // ---- project_sandbox ----
@@ -966,9 +1125,58 @@ pub(crate) mod tests {
         );
         assert_eq!(project_sandbox(&json!({"sandbox": "on"})), Value::Null);
         assert_eq!(
-            project_sandbox(&json!({"sandbox": {"enabled": true, "launch": "npm run dev", "pages": ["/"]}})),
+            project_sandbox(
+                &json!({"sandbox": {"enabled": true, "launch": "npm run dev", "pages": ["/"]}})
+            ),
             json!({"enabled": true, "launch": "npm run dev", "pages": ["/"]})
         );
+    }
+
+    #[test]
+    fn autopilot_config_defaults_to_single_ollama_cloud_key() {
+        let cfg = autopilot_config_from_entries(&[]);
+        assert_eq!(cfg["mode"], json!("single_agent"));
+        assert_eq!(cfg["mission"], json!(AUTOPILOT_DEFAULT_MISSION));
+        assert_eq!(cfg["provider"], json!("ollama-cloud"));
+        assert_eq!(cfg["api_key"], json!("OLLAMA_API_KEY"));
+        assert_eq!(cfg["model"], json!("glm-5.2"));
+        assert_eq!(cfg["max_concurrent_agent_calls"], json!(1));
+        assert_eq!(
+            cfg["targets"],
+            json!(["sover", "dotz", "asmodeus", "maki", "solomon"])
+        );
+    }
+
+    #[test]
+    fn autopilot_config_sentinel_overrides_defaults_without_becoming_repo() {
+        let entries = vec![
+            json!({"autopilot": {"daily_call_budget": 9, "targets": ["sover"], "model": "free-model"}}),
+            json!({"name": "sover", "path": "/p/sover"}),
+        ];
+        let cfg = autopilot_config_from_entries(&entries);
+        assert_eq!(cfg["daily_call_budget"], json!(9));
+        assert_eq!(cfg["targets"], json!(["sover"]));
+        assert_eq!(cfg["model"], json!("free-model"));
+        assert_eq!(cfg["mode"], json!("single_agent"));
+        let out = merge(vec![], entries);
+        assert_eq!(
+            out,
+            vec![json!({"name": "sover", "path": "/p/sover", "branch_prefix": "rsi/"})]
+        );
+    }
+
+    #[test]
+    fn autopilot_config_falls_back_to_legacy_fleet_sentinel() {
+        let entries = vec![json!({"fleet": {
+            "mode": "single_fleet",
+            "daily_call_budget": 7,
+            "targets": ["maki"]
+        }})];
+        let cfg = autopilot_config_from_entries(&entries);
+        assert_eq!(cfg["mode"], json!("single_agent"));
+        assert_eq!(cfg["daily_call_budget"], json!(7));
+        assert_eq!(cfg["targets"], json!(["maki"]));
+        assert_eq!(cfg["mission"], json!(AUTOPILOT_DEFAULT_MISSION));
     }
 
     // ---- _parse_repo_spec ----
@@ -976,9 +1184,18 @@ pub(crate) mod tests {
     fn parse_repo_spec_vectors() {
         let name = |s: &str| parse_repo_spec(s).map(|(_, n)| n);
         assert_eq!(name("owner/repo"), Some("repo".to_string()));
-        assert_eq!(name("https://github.com/owner/repo"), Some("repo".to_string()));
-        assert_eq!(name("https://github.com/owner/repo.git"), Some("repo".to_string()));
-        assert_eq!(name("https://github.com/owner/repo/"), Some("repo".to_string()));
+        assert_eq!(
+            name("https://github.com/owner/repo"),
+            Some("repo".to_string())
+        );
+        assert_eq!(
+            name("https://github.com/owner/repo.git"),
+            Some("repo".to_string())
+        );
+        assert_eq!(
+            name("https://github.com/owner/repo/"),
+            Some("repo".to_string())
+        );
         assert_eq!(name("https://gitlab.com/owner/repo"), None);
         assert_eq!(name("owner"), None);
         assert_eq!(name("owner/repo/extra"), None);
@@ -995,7 +1212,11 @@ pub(crate) mod tests {
             std::collections::HashMap::new();
         for d in discovered {
             if let Value::Object(obj) = d {
-                let name = obj.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                let name = obj
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 if !merged.contains_key(&name) {
                     order.push(name.clone());
                 }
@@ -1020,28 +1241,40 @@ pub(crate) mod tests {
             }
             base.insert("name".to_string(), Value::String(name.clone()));
             if !base.get("branch_prefix").map(truthy).unwrap_or(false) {
-                base.insert("branch_prefix".to_string(), Value::String("rsi/".to_string()));
+                base.insert(
+                    "branch_prefix".to_string(),
+                    Value::String("rsi/".to_string()),
+                );
             }
         }
-        order.into_iter().filter_map(|n| merged.remove(&n).map(Value::Object)).collect()
+        order
+            .into_iter()
+            .filter_map(|n| merged.remove(&n).map(Value::Object))
+            .collect()
     }
 
     #[test]
     fn load_repos_discovered_only() {
         let out = merge(
-            vec![json!({"name": "a", "path": "/a", "branch_prefix": "rsi/", "is_git": true, "has_remote": false})],
+            vec![
+                json!({"name": "a", "path": "/a", "branch_prefix": "rsi/", "is_git": true, "has_remote": false}),
+            ],
             vec![],
         );
         assert_eq!(
             out,
-            vec![json!({"name": "a", "path": "/a", "branch_prefix": "rsi/", "is_git": true, "has_remote": false})]
+            vec![
+                json!({"name": "a", "path": "/a", "branch_prefix": "rsi/", "is_git": true, "has_remote": false})
+            ]
         );
     }
 
     #[test]
     fn load_repos_config_overlays_discovered() {
         let out = merge(
-            vec![json!({"name": "a", "path": "/a", "branch_prefix": "rsi/", "is_git": true, "has_remote": true})],
+            vec![
+                json!({"name": "a", "path": "/a", "branch_prefix": "rsi/", "is_git": true, "has_remote": true}),
+            ],
             vec![json!({"name": "a", "provider": "openrouter", "model": "m"})],
         );
         assert_eq!(out.len(), 1);
@@ -1059,14 +1292,22 @@ pub(crate) mod tests {
         );
         assert_eq!(out.len(), 2);
         assert_eq!(out[0]["name"], json!("a")); // discovered first
-        assert_eq!(out[1], json!({"name": "z", "path": "/z", "branch_prefix": "rsi/"}));
+        assert_eq!(
+            out[1],
+            json!({"name": "z", "path": "/z", "branch_prefix": "rsi/"})
+        );
     }
 
     #[test]
     fn load_repos_skips_nondict_and_nameless() {
         let out = merge(
             vec![],
-            vec![json!(5), json!({"no": "name"}), json!({"name": ""}), json!({"name": "k"})],
+            vec![
+                json!(5),
+                json!({"no": "name"}),
+                json!({"name": ""}),
+                json!({"name": "k"}),
+            ],
         );
         assert_eq!(out, vec![json!({"name": "k", "branch_prefix": "rsi/"})]);
     }
@@ -1074,7 +1315,9 @@ pub(crate) mod tests {
     #[test]
     fn load_repos_path_override_wins() {
         let out = merge(
-            vec![json!({"name": "a", "path": "/disc", "is_git": true, "has_remote": false, "branch_prefix": "rsi/"})],
+            vec![
+                json!({"name": "a", "path": "/disc", "is_git": true, "has_remote": false, "branch_prefix": "rsi/"}),
+            ],
             vec![json!({"name": "a", "path": "/override"})],
         );
         assert_eq!(out[0]["path"], json!("/override"));
@@ -1094,7 +1337,10 @@ pub(crate) mod tests {
     // ---- normpath / parse helpers used by connect_project ----
     #[test]
     fn parse_repo_spec_owner_preserved() {
-        assert_eq!(parse_repo_spec("owner/repo"), Some(("owner".to_string(), "repo".to_string())));
+        assert_eq!(
+            parse_repo_spec("owner/repo"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
         assert_eq!(
             parse_repo_spec("https://github.com/acme/widget.git"),
             Some(("acme".to_string(), "widget".to_string()))
@@ -1107,12 +1353,24 @@ pub(crate) mod tests {
         // not collapse to a single one (which made connect_project reject UNC-hosted projects).
         let sep = if cfg!(windows) { "\\" } else { "/" };
         let unc = |segs: &[&str]| format!("{0}{0}{1}", sep, segs.join(sep));
-        assert_eq!(normpath("\\\\server\\share\\proj"), unc(&["server", "share", "proj"]));
-        assert_eq!(normpath("//server/share/proj"), unc(&["server", "share", "proj"]));
+        assert_eq!(
+            normpath("\\\\server\\share\\proj"),
+            unc(&["server", "share", "proj"])
+        );
+        assert_eq!(
+            normpath("//server/share/proj"),
+            unc(&["server", "share", "proj"])
+        );
         // .. inside a UNC path resolves lexically while the \\server\share root is retained.
-        assert_eq!(normpath("//server/share/a/../b"), unc(&["server", "share", "b"]));
+        assert_eq!(
+            normpath("//server/share/a/../b"),
+            unc(&["server", "share", "b"])
+        );
         // split_drive recognizes the UNC root and a drive letter; other rooted/relative paths unaffected.
-        assert_eq!(split_drive("//server/share/proj"), ("//server/share".to_string(), "/proj"));
+        assert_eq!(
+            split_drive("//server/share/proj"),
+            ("//server/share".to_string(), "/proj")
+        );
         assert_eq!(split_drive("C:/x"), ("C:".to_string(), "/x"));
         assert_eq!(split_drive("/just/rooted"), (String::new(), "/just/rooted"));
         // a lone //server with no share component is NOT a drive (ntpath returns no drive).
@@ -1159,8 +1417,12 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             let p = paths::repos_json();
             match &self.saved {
-                Some(b) => { let _ = std::fs::write(&p, b); }
-                None => { let _ = std::fs::remove_file(&p); }
+                Some(b) => {
+                    let _ = std::fs::write(&p, b);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&p);
+                }
             }
         }
     }
@@ -1170,37 +1432,90 @@ pub(crate) mod tests {
         let g = ReposGuard::capture();
         // set the per-repo key
         let r = set_repo_config(
-            "testrepo_ak", None, None, None, None, None, None, None, None, None, None,
+            "testrepo_ak",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             Some("sk-or-v1-perrepo"),
         );
         assert_eq!(r, json!({"ok": true}));
         let rows = g.read();
-        let row = rows.iter().find(|r| r.get("name").and_then(Value::as_str) == Some("testrepo_ak"))
+        let row = rows
+            .iter()
+            .find(|r| r.get("name").and_then(Value::as_str) == Some("testrepo_ak"))
             .expect("entry written");
-        assert_eq!(row.get("api_key").and_then(Value::as_str), Some("sk-or-v1-perrepo"));
+        assert_eq!(
+            row.get("api_key").and_then(Value::as_str),
+            Some("sk-or-v1-perrepo")
+        );
         assert_eq!(project_api_key(row), "sk-or-v1-perrepo");
         // clear it (Some("") writes empty -> project_api_key treats as unset)
         let _ = set_repo_config(
-            "testrepo_ak", None, None, None, None, None, None, None, None, None, None,
+            "testrepo_ak",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             Some(""),
         );
         let rows = g.read();
-        let row = rows.iter().find(|r| r.get("name").and_then(Value::as_str) == Some("testrepo_ak"))
+        let row = rows
+            .iter()
+            .find(|r| r.get("name").and_then(Value::as_str) == Some("testrepo_ak"))
             .expect("entry present");
         assert_eq!(project_api_key(row), "", "empty api_key reads as unset");
         // None leaves it untouched (re-set, then None-call must not clear)
         let _ = set_repo_config(
-            "testrepo_ak", None, None, None, None, None, None, None, None, None, None,
+            "testrepo_ak",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             Some("sk-or-v1-keep"),
         );
         let _ = set_repo_config(
-            "testrepo_ak", None, None, None, None, None, None, None, None, None, None,
+            "testrepo_ak",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             None,
         );
         let rows = g.read();
-        let row = rows.iter().find(|r| r.get("name").and_then(Value::as_str) == Some("testrepo_ak"))
+        let row = rows
+            .iter()
+            .find(|r| r.get("name").and_then(Value::as_str) == Some("testrepo_ak"))
             .expect("entry present");
-        assert_eq!(project_api_key(row), "sk-or-v1-keep", "None api_key leaves it untouched");
+        assert_eq!(
+            project_api_key(row),
+            "sk-or-v1-keep",
+            "None api_key leaves it untouched"
+        );
     }
 
     #[test]
@@ -1208,18 +1523,47 @@ pub(crate) mod tests {
         let g = ReposGuard::capture();
         // seed with an api_key
         let _ = set_repo_config(
-            "testrepo_keep", None, None, None, None, None, None, None, None, None, None,
+            "testrepo_keep",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             Some("sk-or-v1-orig"),
         );
         // a call that does NOT pass api_key (None) must preserve the existing key
         let _ = set_repo_config(
-            "testrepo_keep", Some("openrouter"), None, None, None, None, None, None, None, None, None,
+            "testrepo_keep",
+            Some("openrouter"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             None,
         );
         let rows = g.read();
-        let row = rows.iter().find(|r| r.get("name").and_then(Value::as_str) == Some("testrepo_keep"))
+        let row = rows
+            .iter()
+            .find(|r| r.get("name").and_then(Value::as_str) == Some("testrepo_keep"))
             .expect("entry present");
-        assert_eq!(row.get("provider").and_then(Value::as_str), Some("openrouter"));
-        assert_eq!(project_api_key(row), "sk-or-v1-orig", "api_key preserved when not passed");
+        assert_eq!(
+            row.get("provider").and_then(Value::as_str),
+            Some("openrouter")
+        );
+        assert_eq!(
+            project_api_key(row),
+            "sk-or-v1-orig",
+            "api_key preserved when not passed"
+        );
     }
 }

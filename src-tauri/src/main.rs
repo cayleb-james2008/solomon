@@ -10,6 +10,7 @@ mod api; // native port of app.py's Api — the `bridge` command + headless back
 mod ceo; // CEO rhythm (v2 Phase B): morning plan + evening verified-outcome summary (`plan`/`report` + watchdog graft)
 mod control; // native port of control.py — repos registry, git/gh, locks, runner (the `bridge` backend)
 mod deploy; // managed-app redeploy: rebuild+relaunch a repo's live app binary when a fix merged but never deployed (deploy gap)
+mod fleet; // single-agent autopilot scheduler: one provider key, one active AI job, proof records
 mod housekeeping; // storage housekeeping (v2): day-gated build-dir/branch/worktree cleanup on the watchdog tick
 mod hygiene; // repo-hygiene detection (report-only): flags off-base / dirty managed trees the CEO grafts surface
 mod improver; // native port of improver/run_improver.py — the per-repo RSI loop (`run-improver` subcommand)
@@ -66,7 +67,9 @@ async fn update_status(app: &tauri::AppHandle) -> Value {
         Ok(Some(update)) => {
             json!({"ok": true, "available": true, "currentSha": current_sha, "version": update.version})
         }
-        Ok(None) => json!({"ok": true, "available": false, "currentSha": current_sha, "version": Value::Null}),
+        Ok(None) => {
+            json!({"ok": true, "available": false, "currentSha": current_sha, "version": Value::Null})
+        }
         Err(_) => json!({"ok": false, "available": false}),
     }
 }
@@ -79,7 +82,10 @@ async fn apply_update(app: &tauri::AppHandle) -> Value {
         Err(e) => return json!({"ok": false, "error": e.to_string()}),
     };
     match updater.check().await {
-        Ok(Some(update)) => match update.download_and_install(|_chunk, _total| {}, || {}).await {
+        Ok(Some(update)) => match update
+            .download_and_install(|_chunk, _total| {}, || {})
+            .await
+        {
             Ok(()) => {
                 app.restart();
             }
@@ -172,8 +178,22 @@ fn run_headless(args: &[String]) -> i32 {
 
 fn usage() {
     eprintln!(
-        "usage: solomon state | start <name> | stop <name> | supervise [name] | serve-health [port] | probe [name] | plan | report | watchdog"
+        "usage: solomon state | autopilot-state | autopilot-wake [name] | autopilot-pause | supervise [name] | serve-health [port] | probe [name] | plan | report | watchdog"
     );
+}
+
+fn is_autopilot_subcommand(sub: Option<&str>) -> bool {
+    matches!(
+        sub,
+        Some(
+            "autopilot-state"
+                | "autopilot-wake"
+                | "autopilot-pause"
+                | "fleet-state"
+                | "fleet-once"
+                | "fleet-drain"
+        )
+    )
 }
 
 /// app.serve_health: a tiny stdlib HTTP server on 127.0.0.1 serving the health payload as JSON on
@@ -269,6 +289,29 @@ fn main() {
     if argv.first().map(String::as_str) == Some("watchdog") {
         std::process::exit(watchdog::main());
     }
+    // `solomon fleet-*` — the single-agent scheduler surface. Dispatch before the GUI so these remain
+    // headless, and keep them in this one exe (no companion daemon/runtime).
+    if is_autopilot_subcommand(argv.first().map(String::as_str)) {
+        let st = api::AppState::load();
+        let out = match argv[0].as_str() {
+            "autopilot-state" | "fleet-state" => fleet::state(),
+            "autopilot-wake" | "fleet-once" => {
+                fleet::wake(st.get_auto_push(), argv.get(1).map(String::as_str))
+            }
+            "autopilot-pause" => fleet::pause(),
+            "fleet-drain" => {
+                let limit = argv
+                    .get(1)
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                fleet::drain(st.get_auto_push(), limit)
+            }
+            _ => unreachable!(),
+        };
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        let ok = out.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        std::process::exit(if ok { 0 } else { 1 });
+    }
     // `solomon probe [name] [--json]` — the ops-plane ground-truth probe runner (Phase 1). Dispatch
     // BEFORE run_gui so no window is created, and exit with the verdict code: 0 = all green,
     // 3 = any yellow, 4 = any red (2 stays the usage-error code).
@@ -279,7 +322,10 @@ fn main() {
     // (the day-gated automatic runs ride the watchdog tick; the CLI bypasses the day gate WITHOUT
     // touching _ceo_state.json, so a manual run never suppresses the scheduled one). Exit 0 on
     // ok, 1 on failure — the JSON result is printed either way.
-    if matches!(argv.first().map(String::as_str), Some("plan") | Some("report")) {
+    if matches!(
+        argv.first().map(String::as_str),
+        Some("plan") | Some("report")
+    ) {
         let out = if argv[0] == "plan" {
             ceo::morning_plan()
         } else {
@@ -354,7 +400,7 @@ fn run_gui() {
 
 #[cfg(test)]
 mod tests {
-    use super::run_headless;
+    use super::{is_autopilot_subcommand, run_headless};
 
     // Usage errors on the main entrypoint must report non-zero (exit 2, the argparse convention
     // improver::run::parse_args also uses) — not silent success. A scripted `solomon start && ...`
@@ -380,5 +426,21 @@ mod tests {
     #[test]
     fn run_headless_unknown_subcommand_is_usage_error() {
         assert_eq!(run_headless(&["frobnicate".to_string()]), 2);
+    }
+
+    #[test]
+    fn autopilot_cli_commands_and_hidden_aliases_are_recognized() {
+        for sub in [
+            "autopilot-state",
+            "autopilot-wake",
+            "autopilot-pause",
+            "fleet-state",
+            "fleet-once",
+            "fleet-drain",
+        ] {
+            assert!(is_autopilot_subcommand(Some(sub)), "{sub} not recognized");
+        }
+        assert!(!is_autopilot_subcommand(Some("loop-start")));
+        assert!(!is_autopilot_subcommand(None));
     }
 }

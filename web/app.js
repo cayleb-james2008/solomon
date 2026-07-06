@@ -1,6 +1,6 @@
-/* Solomon v2 — cyberbrutalist fleet control over the pywebview Api bridge.
-   Leads with FLEET TRUTH (ops probes + 24h business outcomes), the CEO rhythm
-   (morning plan / evening report), and the incident feed; loop config, activity,
+/* Solomon Autopilot over the pywebview Api bridge.
+   Leads with mission, current action, proof, blockers, the CEO rhythm
+   (morning plan / evening report), and the incident feed. Activity
    and approvals remain as panels. Customizable workspace: open panels from the
    bento menu, drag to rearrange. Append ?mock=1 for sample data in a browser. */
 
@@ -17,10 +17,9 @@ const REASON = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const PROV = { "ollama-cloud": "Ollama Cloud", "openrouter": "OpenRouter" };
 const KNOWN_MODELS = ["kimi-k2.7-code", "glm-5.2", "minimax-m3", "nex-agi/nex-n2-pro:free", "qwen3-coder", "deepseek-v3"];
 const PANEL_TYPES = {
-  fleet: { title: "Fleet", icon: '<rect x="3" y="3" width="8" height="8" rx="1"/><rect x="13" y="3" width="8" height="8" rx="1"/><rect x="3" y="13" width="8" height="8" rx="1"/><rect x="13" y="13" width="8" height="8" rx="1"/>', desc: "Ground-truth probes + 24h outcomes per project" },
+  autopilot: { title: "Solomon Autopilot", icon: '<path d="M12 3l7 4v5c0 4.4-2.8 7.2-7 9-4.2-1.8-7-4.6-7-9V7z"/><path d="M9 12l2 2 4-5"/>', desc: "Mission, current action, proof, and blockers" },
   ceo: { title: "CEO Rhythm", icon: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/>', desc: "Morning plan · evening report · deliveries" },
   incidents: { title: "Incidents", icon: '<path d="M12 3l10 18H2z"/><path d="M12 10v5"/><circle cx="12" cy="18" r="0.5"/>', desc: "Red / recovered transitions (24h)" },
-  loops: { title: "Loop Controls", icon: '<rect x="3" y="4" width="18" height="6" rx="2"/><rect x="3" y="14" width="18" height="6" rx="2"/><circle cx="7" cy="7" r="1.2"/><circle cx="7" cy="17" r="1.2"/>', desc: "Start/Stop + selectors for every repo" },
   activity: { title: "Activity", icon: '<path d="M3 12h4l2 6 4-14 2 8h6"/>', desc: "Live log + recent iterations" },
   approvals: { title: "Approvals", icon: '<path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/>', desc: "Open pull requests across repos" },
 };
@@ -57,12 +56,12 @@ function ago(iso) {
 }
 
 /* ---------- app state ---------- */
-const state = { repos: [], providers: ["ollama-cloud", "openrouter"], gh_ready: false, keys: {}, github: {}, auto_push: true, ops: null };
+const state = { repos: [], providers: ["ollama-cloud", "openrouter"], gh_ready: false, keys: {}, github: {}, auto_push: true, ops: null, autopilot: null, fleet: null };
 let layout = [];
 const panels = new Map();   // id -> { el, update }
 
 const DEFAULT_LAYOUT = () => ([
-  { id: uid(), type: "fleet", span2: true },
+  { id: uid(), type: "autopilot", span2: true },
   { id: uid(), type: "ceo" },
   { id: uid(), type: "incidents" },
   { id: uid(), type: "approvals" },
@@ -168,7 +167,7 @@ function loopRow(r) {
     const running = cur.running;
     btn.classList.toggle("primary", !running);
     btn.classList.toggle("danger", running);
-    btn.innerHTML = (running ? ic("stop", 14) : ic("play", 14)) + (running ? "Stop" : "Start");
+    btn.innerHTML = (running ? ic("stop", 14) : ic("play", 14)) + (running ? "Pause" : "Wake");
     btn.disabled = false;
     // keep selectors in sync unless the operator is editing one
     const setSel = (f, v) => { if (f._sel && document.activeElement !== f._sel) f._sel.value = v; };
@@ -191,7 +190,7 @@ function loopsPanel(body) {
     rows.clear();
     if (!state.repos.length) { body.appendChild(h("p", "muted", "No repos registered. Add one in Settings.")); return; }
     state.repos.forEach(r => { const lr = loopRow(r); rows.set(r.name, lr); body.appendChild(lr.el); });
-    const hint = h("p", "muted", "Everything else (gate, goal, contracts) is auto-configured by the PI agent on Start.");
+    const hint = h("p", "muted", "Everything else (gate, goal, contracts) is auto-configured by the agent on wake.");
     hint.style.cssText = "margin:10px 2px 0;font-size:11px"; body.appendChild(hint);
   }
   build();
@@ -312,8 +311,11 @@ function approvalsPanel(body) {
       const sp = h("span", "spacer");
       const merge = h("button", "btn sm primary", ic("merge", 13) + "Merge");
       const close = h("button", "btn sm danger", ic("x", 13) + "Close");
-      merge.onclick = async () => { merge.disabled = true; const x = await act("merge", repo, pr.number); toast(x && x.ok ? `${repo} #${pr.number} merged` : `Merge failed: ${(x && x.error) || "?"}`, x && x.ok ? "ok" : "err"); setTimeout(refresh, 700); };
-      close.onclick = async () => { close.disabled = true; const x = await act("close", repo, pr.number); toast(x && x.ok ? `${repo} #${pr.number} closed` : `Close failed: ${(x && x.error) || "?"}`, x && x.ok ? "ok" : "err"); setTimeout(refresh, 700); };
+      // Re-enable in a finally so a FAILED merge/close (PR stays open, unchanged signature -> no
+      // rebuild) can be retried from the UI instead of being stuck disabled until an unrelated
+      // PR-set change.
+      merge.onclick = async () => { merge.disabled = true; try { const x = await act("merge", repo, pr.number); toast(x && x.ok ? `${repo} #${pr.number} merged` : `Merge failed: ${(x && x.error) || "?"}`, x && x.ok ? "ok" : "err"); } finally { merge.disabled = false; } setTimeout(refresh, 700); };
+      close.onclick = async () => { close.disabled = true; try { const x = await act("close", repo, pr.number); toast(x && x.ok ? `${repo} #${pr.number} closed` : `Close failed: ${(x && x.error) || "?"}`, x && x.ok ? "ok" : "err"); } finally { close.disabled = false; } setTimeout(refresh, 700); };
       row.append(main, sp, merge, close);
       body.appendChild(row);
     });
@@ -331,7 +333,7 @@ function fmtDelta(d) {
   const s = (d >= 0 ? "+" : "") + Number(d).toFixed(2);
   return s;
 }
-function fleetCard(name, p, oc) {
+function fleetCard(name, p, oc, proof, job) {
   const cls = p.status || "grey";
   const card = h("div", "fcard " + cls);
 
@@ -380,6 +382,18 @@ function fleetCard(name, p, oc) {
     card.appendChild(h("div", "fcard-reasons" + (cls === "red" ? " red" : ""), esc(p.reasons.join("\n"))));
   }
 
+  if (job) {
+    const j = h("div", "fleet-job");
+    j.innerHTML = `<b>${esc(job.job || "job")}</b><span>${esc(job.state || "queued")} | P${esc(job.priority ?? "?")}</span><em>${esc(job.next_action || job.reason || "")}</em>`;
+    card.appendChild(j);
+  }
+  if (proof) {
+    const outcome = proof.outcome || "proof";
+    const pr = h("div", "fcard-proof " + esc(outcome));
+    pr.innerHTML = `<b>${esc(outcome)}</b><span>${esc(ago(proof.ts) || "fresh")}</span><em title="${esc(proof.summary || "")}">${esc(proof.summary || "")}</em>`;
+    card.appendChild(pr);
+  }
+
   // lane row: live status + start/stop (reuses the loops panel actions)
   const lane = h("div", "fcard-lane");
   const r = repoByName(name);
@@ -408,17 +422,58 @@ function fleetCard(name, p, oc) {
 function fleetPanel(body) {
   let sig = "";
   let cards = [];
+  function agentBar(fleet) {
+    const active = fleet.active || null;
+    const cfg = fleet.config || {};
+    const cooldown = fleet.cooldown || null;
+    const daily = fleet.daily || {};
+    const bar = h("div", "fleet-agent");
+    const activeTxt = active ? `${active.repo} | ${active.job}` : "idle";
+    const coolTxt = cooldown && cooldown.until ? cooldown.until : "ready";
+    const q = (fleet.queue || []).length;
+    bar.innerHTML = `<div class="agent-kv"><span>agent</span><b>${esc(activeTxt)}</b></div>`
+      + `<div class="agent-kv"><span>provider</span><b>${esc(cfg.provider || "openrouter")}</b><em>${esc(cfg.model || "")}</em></div>`
+      + `<div class="agent-kv"><span>budget</span><b>${esc(daily.calls || 0)}/${esc(cfg.daily_call_budget || "?")}</b></div>`
+      + `<div class="agent-kv ${cooldown ? "warn" : "ok"}"><span>quota</span><b>${esc(coolTxt)}</b></div>`
+      + `<div class="agent-kv"><span>queue</span><b>${esc(q)}</b></div>`;
+    const actions = h("div", "fleet-agent-actions");
+    const once = h("button", "btn sm primary", "Wake Solomon");
+    once.onclick = async () => {
+      once.disabled = true;
+      const x = await act("fleet_once");
+      toast(x && x.ok ? "Solomon cycle recorded" : `Solomon failed: ${(x && x.error) || "?"}`, x && x.ok ? "ok" : "err");
+      once.disabled = false;
+      refresh();
+    };
+    const drain = h("button", "btn sm", "Sweep 1");
+    drain.onclick = async () => {
+      drain.disabled = true;
+      const x = await act("fleet_drain", 1);
+      toast(x && x.ok ? "Sweep recorded" : `Sweep failed: ${(x && x.error) || "?"}`, x && x.ok ? "ok" : "err");
+      drain.disabled = false;
+      refresh();
+    };
+    actions.append(once, drain);
+    bar.appendChild(actions);
+    return bar;
+  }
   function build() {
     body.innerHTML = "";
     cards = [];
     const o = state.ops || {};
+    const fleet = o.fleet || state.fleet || {};
     const opsProjects = (o.ops && o.ops.projects) || {};
     const outProjects = (o.outcomes && o.outcomes.projects) || {};
-    const names = [...new Set([...Object.keys(opsProjects), ...Object.keys(outProjects)])];
+    const proofs = fleet.proofs || {};
+    const jobs = {};
+    (fleet.queue || []).forEach(j => { if (j && j.repo) jobs[j.repo] = j; });
+    if (fleet.active && fleet.active.repo) jobs[fleet.active.repo] = fleet.active;
+    const names = [...new Set([...Object.keys(opsProjects), ...Object.keys(outProjects), ...Object.keys(proofs), ...Object.keys(jobs)])];
     if (!names.length) {
-      body.appendChild(h("p", "muted", "No fleet data yet — the watchdog tick writes probe verdicts within ~2 minutes of launch."));
+      body.appendChild(h("p", "muted", "No Autopilot data yet. Wake Solomon to collect proof and blocker state."));
       return;
     }
+    body.appendChild(agentBar(fleet));
     const note = h("div", "fleet-note");
     const bw = o.ops && o.ops.blind_window_s;
     note.innerHTML = `<span>probes checked ${esc(ago(o.ops && o.ops.checked_at) || "—")}</span>`
@@ -426,40 +481,205 @@ function fleetPanel(body) {
     body.appendChild(note);
     const grid = h("div", "fleet-grid");
     names
-      .map(n => [n, opsProjects[n] || {}, outProjects[n] || {}])
+      .map(n => [n, opsProjects[n] || {}, outProjects[n] || {}, proofs[n] || null, jobs[n] || null])
       .sort((a, b) => (a[1].priority ?? a[2].priority ?? 99) - (b[1].priority ?? b[2].priority ?? 99))
-      .forEach(([n, p, oc]) => { const c = fleetCard(n, p, oc); cards.push(c); grid.appendChild(c); });
+      .forEach(([n, p, oc, proof, job]) => { const c = fleetCard(n, p, oc, proof, job); cards.push(c); grid.appendChild(c); });
     body.appendChild(grid);
   }
   function updateLaneRows() {
     cards.forEach(c => {
       const r = repoByName(c._name);
-      const s = r ? statusOf(r) : { cls: "grey", label: "not a lane", phase: "" };
+      const s = r ? statusOf(r) : { cls: "grey", label: "not active", phase: "" };
       if (c._dot) c._dot.className = "dot " + s.cls;
       if (c._meta) c._meta.textContent = s.label + (s.phase ? " · " + s.phase : "") + (r && r.model ? " · " + r.model : "");
       if (c._laneBtn && r) {
         const running = r.running;
         c._laneBtn.classList.toggle("primary", !running);
         c._laneBtn.classList.toggle("danger", running);
-        c._laneBtn.innerHTML = (running ? ic("stop", 13) : ic("play", 13)) + (running ? "Stop" : "Start");
+        c._laneBtn.innerHTML = (running ? ic("stop", 13) : ic("play", 13)) + (running ? "Pause" : "Wake");
       }
     });
   }
   build(); updateLaneRows();
   return { update() {
     const o = state.ops || {};
-    const s = JSON.stringify([o.ops, o.outcomes]);
+    const s = JSON.stringify([o.ops, o.outcomes, o.fleet, state.fleet]);
     if (s !== sig) { sig = s; build(); }
     updateLaneRows();
   } };
 }
 
 /* ---------- panel: CEO rhythm (v2 — plan / report / deliveries) ---------- */
+function shortText(v, fallback = "unknown") {
+  if (v == null || v === "") return fallback;
+  return String(v)
+    .replace(/\bfleet\b/ig, "Autopilot")
+    .replace(/\blane\b/ig, "project")
+    .replace(/\bloop\b/ig, "run")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function latestProof(proofs, fallback) {
+  const rows = Object.values(proofs || {}).filter(Boolean);
+  rows.sort((a, b) => Date.parse(b.ts || 0) - Date.parse(a.ts || 0));
+  return rows[0] || fallback || null;
+}
+function autopilotProofRow(proof) {
+  if (!proof) return h("div", "fcard-proof proof_required", "<b>proof</b><span>missing</span><em>No recent proof record yet.</em>");
+  const outcome = proof.outcome || "proof";
+  const pr = h("div", "fcard-proof " + esc(outcome));
+  const summary = shortText(proof.summary || "", "");
+  pr.innerHTML = `<b>${esc(outcome)}</b><span>${esc(ago(proof.ts) || "fresh")}</span><em title="${esc(summary)}">${esc(summary)}</em>`;
+  return pr;
+}
+function autopilotWaitTags(p, proof, job, autopilot) {
+  const tags = [];
+  if (autopilot && autopilot.paused) tags.push("paused");
+  if (autopilot && autopilot.cooldown) tags.push("quota cooldown");
+  if (p.restart_forbidden) tags.push("live-money safety");
+  if (job && job.requires_ai) tags.push("agent work");
+  if (job && (job.state === "proof_required" || job.job === "proof_required")) tags.push("proof required");
+  if (proof && ["blocked", "cooldown", "proof_required", "error"].includes(proof.outcome)) tags.push(proof.outcome);
+  if (!proof) tags.push("proof missing");
+  return [...new Set(tags)].slice(0, 4);
+}
+function autopilotBlockerCard(name, p, oc, proof, job, autopilot) {
+  const cls = p.status || (proof && proof.outcome) || (job && job.state) || "grey";
+  const card = h("div", "fcard blocker " + cls);
+  const top = h("div", "fcard-top");
+  top.append(
+    h("span", "fcard-name", esc(name)),
+    h("span", "fcard-prio", "P" + esc(p.priority ?? oc.priority ?? job?.priority ?? "?")),
+    h("span", "fcard-status " + esc(cls), esc(cls)),
+  );
+  card.appendChild(top);
+
+  const reason = (p.reasons && p.reasons[0]) || (job && job.reason) || (proof && proof.summary) || "needs a fresh verified outcome";
+  const action = (job && job.next_action) || (p.restart_forbidden ? "wait for safety rails to clear" : "collect evidence and choose the next gated improvement");
+  card.appendChild(h("div", "blocker-why", `<span>why</span><b>${esc(shortText(reason))}</b>`));
+  card.appendChild(h("div", "blocker-action", `<span>next</span><b>${esc(shortText(action))}</b>`));
+
+  const tags = autopilotWaitTags(p, proof, job, autopilot);
+  if (tags.length) {
+    const wrap = h("div", "blocker-tags");
+    tags.forEach(t => wrap.appendChild(h("span", "tag", esc(t))));
+    card.appendChild(wrap);
+  }
+
+  const stats = h("div", "fcard-outcomes compact");
+  const stat = (val, lbl, tone) => {
+    const s = h("div", "fstat");
+    s.innerHTML = `<b class="${tone || ""}">${esc(val)}</b><span>${esc(lbl)}</span>`;
+    return s;
+  };
+  if (oc.iterations_24h !== undefined || oc.shipped_24h !== undefined) stats.appendChild(stat(`${oc.iterations_24h ?? "?"}/${oc.shipped_24h ?? "?"}`, "24h iters/ship", oc.iterations_24h === 0 ? "warn" : ""));
+  if (oc.posts_24h !== undefined) stats.appendChild(stat(oc.posts_24h ?? "?", "posts 24h", oc.posts_24h === 0 ? "err" : "ok"));
+  if (oc.equity_delta_24h !== undefined) stats.appendChild(stat(fmtDelta(oc.equity_delta_24h), "equity 24h", oc.equity_delta_24h > 0 ? "ok" : "warn"));
+  if (stats.childNodes.length) card.appendChild(stats);
+  card.appendChild(autopilotProofRow(proof));
+  return card;
+}
+function autopilotPanel(body) {
+  let sig = "";
+  function agentBar(autopilot) {
+    const active = autopilot.active || null;
+    const cfg = autopilot.config || {};
+    const cooldown = autopilot.cooldown || null;
+    const daily = autopilot.daily || {};
+    const bar = h("div", "autopilot-agent");
+    const activeTxt = active ? `${active.repo} / ${active.job}` : (autopilot.paused ? "paused" : "idle");
+    const coolTxt = cooldown && cooldown.until ? cooldown.until : "ready";
+    const q = (autopilot.queue || []).length;
+    bar.innerHTML = `<div class="agent-kv"><span>agent</span><b>${esc(activeTxt)}</b></div>`
+      + `<div class="agent-kv"><span>provider</span><b>${esc(cfg.provider || "openrouter")}</b><em>${esc(cfg.model || "")}</em></div>`
+      + `<div class="agent-kv"><span>budget</span><b>${esc(daily.calls || 0)}/${esc(cfg.daily_call_budget || "?")}</b></div>`
+      + `<div class="agent-kv ${cooldown ? "warn" : "ok"}"><span>quota</span><b>${esc(coolTxt)}</b></div>`
+      + `<div class="agent-kv"><span>queue</span><b>${esc(q)}</b></div>`;
+    const actions = h("div", "autopilot-actions");
+    const wake = h("button", "btn sm primary", "Wake Solomon");
+    wake.onclick = async () => {
+      wake.disabled = true;
+      const x = await act("autopilot_wake");
+      toast(x && x.ok ? "Solomon woke" : `Wake failed: ${(x && x.error) || "?"}`, x && x.ok ? "ok" : "err");
+      wake.disabled = false;
+      refresh();
+    };
+    const pause = h("button", "btn sm", "Pause");
+    pause.onclick = async () => {
+      pause.disabled = true;
+      const x = await act("autopilot_pause");
+      toast(x && x.ok ? "Solomon paused" : `Pause failed: ${(x && x.error) || "?"}`, x && x.ok ? "ok" : "err");
+      pause.disabled = false;
+      refresh();
+    };
+    actions.append(wake, pause);
+    bar.appendChild(actions);
+    return bar;
+  }
+  function build() {
+    body.innerHTML = "";
+    const o = state.ops || {};
+    const autopilot = state.autopilot || o.autopilot || o.fleet || state.fleet || {};
+    const opsProjects = (o.ops && o.ops.projects) || {};
+    const outProjects = (o.outcomes && o.outcomes.projects) || {};
+    const proofs = autopilot.proofs || {};
+    const jobs = {};
+    (autopilot.queue || []).forEach(j => { if (j && j.repo) jobs[j.repo] = j; });
+    if (autopilot.active && autopilot.active.repo) jobs[autopilot.active.repo] = autopilot.active;
+    const names = [...new Set([...Object.keys(opsProjects), ...Object.keys(outProjects), ...Object.keys(proofs), ...Object.keys(jobs)])];
+    const cfg = autopilot.config || {};
+    const mission = cfg.mission || "Autonomously improve, ship, monitor, and grow managed projects toward their stated end goals with one efficient Solomon agent, preserving safety gates and proof.";
+    body.appendChild(h("div", "mission", `<span>mission</span><p>${esc(mission)}</p>`));
+    body.appendChild(agentBar(autopilot));
+    if (!names.length) {
+      body.appendChild(h("p", "muted", "No Autopilot data yet. Wake Solomon to collect proof and blocker state."));
+      return;
+    }
+
+    const proof = latestProof(proofs, autopilot.last_result);
+    const active = autopilot.active || (autopilot.queue && autopilot.queue[0]) || null;
+    const current = h("div", "autopilot-current");
+    current.innerHTML = `<div><span>objective</span><b>${esc(active ? `${active.repo}: ${active.job || "objective"}` : "observe and improve the highest-leverage blocker")}</b></div>`
+      + `<div><span>next action</span><b>${esc(active ? (active.next_action || active.reason || "run gated improvement") : "hold until a blocker or stale proof appears")}</b></div>`;
+    current.appendChild(autopilotProofRow(proof));
+    body.appendChild(current);
+
+    const note = h("div", "autopilot-note");
+    const bw = o.ops && o.ops.blind_window_s;
+    note.innerHTML = `<span>probes checked ${esc(ago(o.ops && o.ops.checked_at) || "none yet")}</span>`
+      + (bw > 600 ? `<span class="blind">blind ${(bw / 3600).toFixed(1)}h before that</span>` : "");
+    body.appendChild(note);
+
+    const blockers = names
+      .map(n => [n, opsProjects[n] || {}, outProjects[n] || {}, proofs[n] || null, jobs[n] || null])
+      .filter(([, p, , proof, job]) => {
+        const st = p.status || "";
+        const outcome = proof && proof.outcome;
+        return job || st === "red" || st === "yellow" || ["blocked", "cooldown", "proof_required", "error", "reverted"].includes(outcome);
+      })
+      .sort((a, b) => (a[1].priority ?? a[2].priority ?? 99) - (b[1].priority ?? b[2].priority ?? 99))
+      .slice(0, 8);
+    const grid = h("div", "autopilot-grid");
+    if (!blockers.length) grid.appendChild(h("div", "empty-inline", "No actionable blockers. Solomon is waiting for fresh proof, quota, or the next objective."));
+    blockers.forEach(([n, p, oc, proof, job]) => grid.appendChild(autopilotBlockerCard(n, p, oc, proof, job, autopilot)));
+    body.appendChild(grid);
+  }
+  build();
+  return { update() {
+    const o = state.ops || {};
+    const s = JSON.stringify([o.ops, o.outcomes, o.autopilot, state.autopilot]);
+    if (s !== sig) { sig = s; build(); }
+  } };
+}
+
 function ceoPanel(body) {
   let sig = "";
   let tab = "report";
   function gateState(sec, today) {
     if (!sec) return ["pending", "pending"];
+    // A give-up sentinel ({done, gave_up}) is stamped when the plan LLM call failed all attempts —
+    // it must NOT render as a green 'done' (the day was never actually planned).
+    if (sec.gave_up && sec.done === today) return ["failed", "gave up"];
     if (sec.done === today) return ["done", "done"];
     if ((sec.attempts || 0) > 0) return ["failed", `${sec.attempts} failed`];
     return ["pending", "pending"];
@@ -533,7 +753,7 @@ function incidentsPanel(body) {
   function build() {
     body.innerHTML = "";
     const inc = ((state.ops || {}).incidents || []).slice().reverse();
-    if (!inc.length) { body.appendChild(h("p", "muted", "No incidents in the last 24h. Quiet is only good when the Fleet panel is green.")); return; }
+    if (!inc.length) { body.appendChild(h("p", "muted", "No incidents in the last 24h. Quiet is only good when the Autopilot panel is green.")); return; }
     inc.forEach(i => {
       const ev = i.event === "recovered" ? "recovered" : "red";
       const row = h("div", "inc " + ev);
@@ -575,10 +795,9 @@ function makePanel(spec) {
   el.ondrop = e => { e.preventDefault(); el.classList.remove("dragover"); if (dragId && dragId !== spec.id) reorder(dragId, spec.id); };
 
   let api = { update() {} };
-  if (spec.type === "fleet") api = fleetPanel(body);
+  if (spec.type === "autopilot") api = autopilotPanel(body);
   else if (spec.type === "ceo") api = ceoPanel(body);
   else if (spec.type === "incidents") api = incidentsPanel(body);
-  else if (spec.type === "loops") api = loopsPanel(body);
   else if (spec.type === "activity") api = activityPanel(body, spec);
   else if (spec.type === "approvals") api = approvalsPanel(body);
   return { el, update: api.update };
@@ -608,7 +827,7 @@ function applyState() { panels.forEach(p => { try { p.update(); } catch (e) { /*
 /* ---------- data ---------- */
 async function refresh() {
   try { const s = await call("get_state"); Object.assign(state, s); } catch (e) { /* keep prior */ }
-  // v2 fleet payload rides the same tick (server-side cached ~15s, so the 4s poll stays cheap).
+  // Autopilot payload rides the same tick (server-side cached ~15s, so the 4s poll stays cheap).
   try { state.ops = await call("ops_state"); } catch (e) { /* keep prior */ }
   applyState();
 }
@@ -636,7 +855,7 @@ function outsideBento(e) { if (!$("#bento").contains(e.target) && e.target !== $
 /* ---------- settings drawer ---------- */
 function openSettings() {
   const d = $("#settings"); d.innerHTML = "";
-  d.append(h("h3", null, "Settings"), h("p", "sub", "Give the agent a key, a repo, and a branch — it configures the rest."));
+  d.append(h("h3", null, "Settings"), h("p", "sub", "Give Solomon a key or a repo; Autopilot handles the rest."));
 
   // API keys
   const keys = h("div", "sect", `<h4>API keys</h4>`);
@@ -669,7 +888,7 @@ function openSettings() {
   const glob = h("div", "sect", `<h4>Global</h4>`);
   const apRow = h("div", "row");
   const sw = h("button", "switch" + (state.auto_push ? " on" : ""), '<span class="knob"></span>');
-  sw.onclick = async () => { const v = !state.auto_push; const x = await act("set_auto_push", v); if (x && x.ok) { state.auto_push = v; sw.classList.toggle("on", v); } };
+  sw.onclick = async () => { const v = !state.auto_push; const x = await act("set_auto_push", v); if (x && x.ok) { state.auto_push = v; sw.classList.toggle("on", v); } else { toast(`Auto-push change failed: ${(x && x.error) || "?"}`, "err"); } };
   apRow.append(h("span", "lbl", "Auto-push<small>push/PR finished work automatically</small>"), h("span", "spacer"), sw);
   glob.appendChild(apRow); d.appendChild(glob);
 
@@ -689,15 +908,17 @@ async function boot() {
   let saved = null;
   try { saved = await call("get_layout"); } catch {}
   if (!Array.isArray(saved) || !saved.length) { try { saved = JSON.parse(localStorage.getItem("solomon.layout") || "null"); } catch {} }
-  layout = (Array.isArray(saved) && saved.length ? saved : DEFAULT_LAYOUT()).map(p => ({ id: p.id || uid(), type: p.type, repo: p.repo, span2: !!p.span2 }));
+  layout = (Array.isArray(saved) && saved.length ? saved : DEFAULT_LAYOUT())
+    .map(p => ({ id: p.id || uid(), type: p.type === "fleet" ? "autopilot" : p.type, repo: p.repo, span2: !!p.span2 }))
+    .filter(p => p.type !== "loops");
   // v2 migration (once): a layout saved before the fleet-first redesign gets the new planes
   // prepended so the redesign is what the operator actually sees. The one-shot flag means a
   // deliberately-removed fleet panel never comes back on its own.
   let migrated = false;
   try { migrated = localStorage.getItem("solomon.v2fleet") === "1"; } catch {}
-  if (!migrated && !layout.some(p => p.type === "fleet" || p.type === "ceo")) {
+  if (!migrated && !layout.some(p => p.type === "autopilot" || p.type === "ceo")) {
     layout = [
-      { id: uid(), type: "fleet", span2: true },
+      { id: uid(), type: "autopilot", span2: true },
       { id: uid(), type: "ceo" },
       { id: uid(), type: "incidents" },
     ].concat(layout);
@@ -743,7 +964,14 @@ const mock = (() => {
   ];
   let lay = null;
   return {
-    get_state: () => ({ repos, providers: ["ollama-cloud", "openrouter"], gh_ready: true, keys: { "ollama-cloud": true }, github: { user: "cayleb" }, auto_push: true }),
+    get_state: () => ({ repos, providers: ["ollama-cloud", "openrouter"], gh_ready: true, keys: { "ollama-cloud": true }, github: { user: "cayleb" }, auto_push: true, fleet: {
+      config: { mode: "single_fleet", provider: "openrouter", model: "nvidia/nemotron-3-ultra-550b-a55b:free", daily_call_budget: 40 },
+      active: { repo: "sover", job: "implement", priority: 10 },
+      queue: [{ repo: "asmodeus", job: "proof_required", state: "proof_required", priority: 5, next_action: "surface blocker" }],
+      cooldown: null,
+      daily: { date: "2026-07-04", calls: 3 },
+      proofs: { sover: { ts: new Date(Date.now() - 600000).toISOString(), outcome: "proof_required", summary: "posting blocker captured without retry storm" } },
+    } }),
     get_layout: () => lay, set_layout: (l) => { lay = l; return { ok: true }; },
     current_sha: () => ({ sha: "efd7ba2" }),
     // v2 fleet payload (shape byte-identical to api::ops_state).
@@ -764,11 +992,22 @@ const mock = (() => {
         daedulus: { priority: 3, iterations_24h: 0, shipped_24h: 0 },
         dotz: { priority: 4, iterations_24h: 68, shipped_24h: 41 },
       } },
+      fleet: {
+        config: { mode: "single_fleet", provider: "openrouter", model: "nvidia/nemotron-3-ultra-550b-a55b:free", daily_call_budget: 40 },
+        active: { repo: "sover", job: "implement", priority: 10 },
+        queue: [{ repo: "asmodeus", job: "proof_required", state: "proof_required", priority: 5, next_action: "surface blocker" }],
+        cooldown: null,
+        daily: { date: "2026-07-04", calls: 3 },
+        proofs: {
+          sover: { ts: new Date(Date.now() - 600000).toISOString(), outcome: "proof_required", summary: "posting blocker captured without retry storm" },
+          asmodeus: { ts: new Date(Date.now() - 3600000).toISOString(), outcome: "blocked", summary: "restart forbidden by live-money probes" },
+        },
+      },
       ceo: {
         today: "2026-07-02", plan_hour: 7, summary_hour: 20,
         plan: { done: "2026-07-02" }, summary: {},
         plan_md: "# Solomon morning plan — 2026-07-02\n\n## asmodeus\n- **goal** [refactor]: decouple the equity writers\n- **why**: the fitness signal is corrupted\n",
-        report_md: "# Solomon evening report — 2026-07-01\n\nfleet: asmodeus YELLOW(auth_health) sover RED(publish_recency)\n\n## sover (priority 2)\n- ⚠ sover: ZERO posts in 24h\n",
+        report_md: "# Solomon evening report — 2026-07-01\n\nautopilot: asmodeus YELLOW(auth_health) sover RED(publish_recency)\n\n## sover (priority 2)\n- ⚠ sover: ZERO posts in 24h\n",
       },
       incidents: [
         { ts: new Date(Date.now() - 7200000).toISOString(), event: "red", probe_id: "sover/publish_recency", detail: "age 26.1h > 24h" },
@@ -799,6 +1038,7 @@ const mock = (() => {
       }
       return out;
     },
+    autopilot_wake: () => ({ ok: true }), autopilot_pause: () => ({ ok: true }),
     set_repo_config: () => ({ ok: true }), start: () => ({ ok: true }), stop: () => ({ ok: true }),
     merge: () => ({ ok: true }), close: () => ({ ok: true }), set_key: () => ({ ok: true }),
     github_login_start: () => ({ ok: true }), add_project: () => ({ ok: true, name: "newrepo" }), set_auto_push: () => ({ ok: true }),
