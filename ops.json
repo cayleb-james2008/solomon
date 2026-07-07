@@ -8,11 +8,11 @@
                 "id": "fills_recency",
                 "kind": "sqlite_query",
                 "db": "%LOCALAPPDATA%\\Asmodeus\\state\\asmodeus.db",
-                "query": "SELECT MAX(created_at) FROM venue_fills",
+                "query": "SELECT MAX(created_at) FROM trades WHERE mode='live'",
                 "mode": "age",
                 "yellow_after_s": 43200,
                 "red_after_s": 86400,
-                "comment": "Market-hours awareness is OUT of scope for Phase 1 — weekend/closed-market gaps will show yellow/red honestly; a market-hours-aware threshold is a Phase 2+ follow-up."
+                "comment": "2026-07-07: the old 'SELECT MAX(created_at) FROM venue_fills' referenced a table that does not exist in schema.rs (the live schema has 'trades', not 'venue_fills') -> the probe read UNOBSERVABLE forever (metric_unobservable), which is a false blind-spot, not a healthy signal. 'trades WHERE mode=live' is the live fill-recency truth (created_at is a TEXT RFC3339 stamp, parsed by probe::parse_ts). NULL (no live trades yet) degrades to yellow unobservable by design, never a crash. Market-hours awareness stays OUT of scope for Phase 1 — weekend/closed-market gaps show yellow/red honestly; a market-hours-aware threshold is a Phase 2+ follow-up."
             },
             {
                 "id": "open_trade_stuck",
@@ -28,10 +28,10 @@
                 "id": "equity_fresh",
                 "kind": "sqlite_query",
                 "db": "%LOCALAPPDATA%\\Asmodeus\\state\\asmodeus.db",
-                "query": "SELECT MAX(ts) FROM equity WHERE source='tradelocker'",
+                "query": "SELECT MAX(ts) FROM equity WHERE mode='live'",
                 "mode": "age",
                 "red_after_s": 900,
-                "comment": "Best-effort: this table intermittently reads as 'database disk image is malformed' (observed 2026-07-01, succeeded later the same day) -> such failures degrade to yellow unobservable, never a crash."
+                "comment": "2026-07-07: dropped the brittle literal 'source=tradelocker' (the equity recorder writes source='' by default, schema.rs equity.source DEFAULT '' — so the old filter matched zero rows and returned NULL -> yellow unobservable forever). 'mode=live' is the recorder's real partition of live vs paper equity snapshots. Best-effort: this table intermittently reads as 'database disk image is malformed' (observed 2026-07-01 and again 2026-07-07) -> such failures degrade to yellow unobservable, never a crash."
             },
             {
                 "id": "auth_health",

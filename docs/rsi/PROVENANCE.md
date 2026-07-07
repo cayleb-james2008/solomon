@@ -46,6 +46,19 @@ build gate, which runs the audit query below over every commit since this conven
 landed (`4521559..HEAD`). Merge commits are excepted. The convention is therefore no
 longer a write-only ledger: an untagged watched-file commit turns the gate red.
 
+## Grandfathered exceptions
+
+The enforcement test began actually running (rather than being aspirational) after some
+watched-file commits had already landed untagged. History is **not** rewritten to fix them —
+the convention's own rule is to surface a violation, not launder it into history. Each known
+pre-enforcement violation is instead acknowledged here and excluded from the gate by full sha
+(see `GRANDFATHERED` in the enforcement test):
+
+- `16aed999a3be8074f22a88a53a95925709660d54` — `fleet fairness fix: AI improver before stuck
+  non-AI proof_required at equal priority`. Touched `repos.json` without a provenance tag; landed
+  before the gate was executed. New watched-file commits still require a tag — this list is
+  append-only for genuinely historical commits, never a bypass for new ones.
+
 ## Enforcement (WS5 tripwire)
 
 WS5's config-provenance tripwire watches the files above and **pages on any
