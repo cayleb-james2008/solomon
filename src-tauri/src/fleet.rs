@@ -582,7 +582,11 @@ fn plan_jobs(
     jobs.sort_by(|a, b| {
         a.priority
             .cmp(&b.priority)
-            .then_with(|| a.requires_ai.cmp(&b.requires_ai))
+            // AI (true) before non-AI (false) at equal priority: a runnable AI improver
+            // job must not be permanently starved behind a stuck non-AI proof_required
+            // no-op (e.g. dotz). `b.cmp(&a)` puts `true` first. proof_required still runs
+            // whenever it outranks (lower priority number) any AI job — the ladder is intact.
+            .then_with(|| b.requires_ai.cmp(&a.requires_ai))
             .then_with(|| a.name.cmp(&b.name))
     });
     jobs
@@ -1286,6 +1290,87 @@ mod tests {
         assert!(jobs[0].requires_ai);
         assert!(jobs[0].reason.contains("stale quota"));
         let _ = std::fs::remove_dir_all(rt);
+    }
+
+    // ---- deadlock regression: a permanently-noop non-AI proof_required job at the same
+    // priority as runnable AI improver jobs must NOT permanently head the queue. Before the
+    // fleet.rs sort tiebreak flip (requires_ai: true before false at equal priority), a stuck
+    // priority-10 non-AI `proof_required` job (e.g. dotz, from needs_goal + auto_safe!=true)
+    // was `jobs.first()` every sweep and `fleet::once` spun on it forever, starving the
+    // priority-10 AI improvers (maki/sover/asmodeus/solomon). This proves the scheduler now
+    // SELECTS a runnable AI job instead of the no-op head. ----
+    #[test]
+    fn plan_jobs_selects_ai_job_over_permanent_noop_proof_required() {
+        // The proof_required repo is named to sort ALPHABETICALLY FIRST, so only the
+        // requires_ai tiebreak (the fix) — not the name tiebreak — can move the AI job
+        // ahead of it. If the fix regresses, jobs[0] falls back to this no-op head.
+        let noop = format!("aaa_noop_proof_{}", std::process::id());
+        let ai = format!("zzz_ai_improver_{}", std::process::id());
+        let noop_repo = json!({"name": noop, "path": format!("C:/p/{noop}")});
+        let ai_repo = json!({"name": ai, "path": format!("C:/p/{ai}")});
+
+        // Drive the no-op repo into a non-AI proof_required job via diagnose():
+        // status=error + reason=needs_goal => category "needs_goal", auto_safe=false =>
+        // fleet plan_jobs proof_required branch (requires_ai=false).
+        let noop_rt = paths::runtime_dir(&noop_repo).unwrap();
+        let _ = std::fs::create_dir_all(&noop_rt);
+        std::fs::write(
+            noop_rt.join("heartbeat.json"),
+            serde_json::to_string(&json!({
+                "status": "error",
+                "reason": "needs_goal",
+                "last_summary": "no north-star GOAL and no actionable backlog",
+                "updated_at": now(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // The AI repo has a clean/idle heartbeat => diagnose category "ok"; ops RED then
+        // makes it an `implement`/requires_ai=true job. Both jobs land at priority 10 (ops RED),
+        // so the ONLY thing separating them is the requires_ai tiebreak under test.
+        let ai_rt = paths::runtime_dir(&ai_repo).unwrap();
+        let _ = std::fs::create_dir_all(&ai_rt);
+        std::fs::write(
+            ai_rt.join("heartbeat.json"),
+            serde_json::to_string(&json!({
+                "status": "idle",
+                "updated_at": now(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let cfg = json!({"provider": "openrouter", "targets": [noop.clone(), ai.clone()]});
+        let mut projects = Map::new();
+        // Both RED => both priority 10, forcing the tie the deadlock lived in.
+        projects.insert(noop.clone(), json!({"status": "red", "reasons": ["noop_streak=red"]}));
+        projects.insert(ai.clone(), json!({"status": "red", "reasons": ["publish_recency=red"]}));
+        let ops = json!({"projects": Value::Object(projects)});
+        let st = json!({"manual_queue": []});
+
+        let jobs = plan_jobs(&[noop_repo, ai_repo], &cfg, &ops, &st, None);
+
+        // Precondition sanity: both jobs planned, both at priority 10, and the no-op really is
+        // a non-AI proof_required job (the absorbing head the deadlock spun on).
+        let noop_job = jobs.iter().find(|j| j.name == noop).expect("noop job planned");
+        let ai_job = jobs.iter().find(|j| j.name == ai).expect("ai job planned");
+        assert_eq!(noop_job.kind, "proof_required");
+        assert!(!noop_job.requires_ai, "noop must be the non-AI proof_required head");
+        assert_eq!(noop_job.priority, 10, "ops-RED noop must be priority 10");
+        assert!(ai_job.requires_ai, "ai job must be a runnable AI improver");
+        assert_eq!(ai_job.priority, 10, "ops-RED ai job must be priority 10");
+
+        // THE FIX: at equal priority the scheduler picks the runnable AI improver, NOT the
+        // permanently-noop proof_required job — even though the no-op sorts first by name.
+        assert_eq!(
+            jobs[0].name, ai,
+            "scheduler must select the runnable AI job, not spin on the no-op proof_required head"
+        );
+        assert!(jobs[0].requires_ai, "jobs.first() must be an AI improver job");
+
+        let _ = std::fs::remove_dir_all(noop_rt);
+        let _ = std::fs::remove_dir_all(ai_rt);
     }
 
     // ---- quota cooldown: per-endpoint exponential park, never the 86400s blanket ----
