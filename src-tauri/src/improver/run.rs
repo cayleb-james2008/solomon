@@ -13,7 +13,7 @@
 
 use crate::control::{locks, paths};
 use crate::improver::ctx::{now, Ctx};
-use crate::improver::{iteration, oneshot, phases};
+use crate::improver::{iteration, oneshot, park, phases};
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -462,12 +462,38 @@ set this repo's PR-target branch to a real branch in Config."
             clean_exit = true;
             break;
         }
-        // interruptible 1s-granular cooldown
-        for _ in 0..a.interval.max(1) {
-            if ctx.stop_path.exists() {
-                break;
+        // EVENT-DRIVEN WAKE + MAX-PARK FLOOR (RSI v3 WS5 #3; audit A.1): demote the blind fixed
+        // `interval` sleep to a bounded, event-aware park. The `continue_or_park` self-grade parks
+        // 0s after a productive ship (pick up the next ready item immediately) and otherwise parks
+        // at most `park::MAX_PARK_FLOOR_S` (5 min) — never the full 900s a lane like kairos was
+        // configured for. The 1s-granular loop still wakes instantly on an operator KILL/Stop, and
+        // now ALSO wakes early when the tier-1 objective gains new data during the park (the
+        // freshness ledger advancing), so a fresh sample is acted on without waiting out the floor.
+        let plan = park::park_decision(&ctx.hb, a.interval.max(1));
+        if plan.park_s == 0 {
+            ctx.log(&format!("no park ({}) — continuing immediately", plan.why));
+        } else {
+            let before = park::read_freshness_mark(&ctx.runtime.join("freshness.json"));
+            let mut wake = park::WakeSource::FloorElapsed;
+            for _ in 0..plan.park_s {
+                if ctx.stop_path.exists() {
+                    wake = park::WakeSource::Kill;
+                    break;
+                }
+                if before.is_some()
+                    && park::has_fresh_data(
+                        before,
+                        park::read_freshness_mark(&ctx.runtime.join("freshness.json")),
+                    )
+                {
+                    wake = park::WakeSource::FreshData;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
             }
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            if wake != park::WakeSource::FloorElapsed {
+                ctx.log(&format!("park woke early: {} ({})", wake.tag(), plan.why));
+            }
         }
     }
 
