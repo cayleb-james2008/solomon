@@ -73,11 +73,11 @@
         "ship": "auto-merge",
         "pr_target_branch": "main",
         "freshness": {
-            "cmd": "python tools\\freshness.py",
+            "cmd": ".venv\\Scripts\\python tools\\freshness.py",
             "min_new_samples": 1,
             "hard": true,
             "max_starve_cycles": 16,
-            "comment": "2026-07-07: park the CODE improver when GGG gained no new PUBLISHED reel since the last decision -- reads the live post_registry.json (operator/live-app truth), never a self-reported heartbeat. Sover's youtube publish_recency RED is a real-world outcome the code improver cannot move, so it should PARK (zero token spend) here instead of burning a glm-5.2 call every sweep; the ops plane keeps that RED paging the operator separately. Escape valve: after 16 starved cycles ONE non-metric upkeep cycle runs (max_starve_cycles floored to >=1 in freshness.rs; NEVER set <=0). Uses system 'python' (sover has no repo .venv; emitter is stdlib-only sqlite3/json so no external deps). Emitter path %LOCALAPPDATA%\\Sover\\data\\ggg\\post_registry.json is verified present; a missing registry halts UNOBSERVABLE (paged), which is the honest signal."
+            "comment": "2026-07-07: park the CODE improver when GGG gained no new PUBLISHED reel since the last decision -- reads the live post_registry.json (operator/live-app truth), never a self-reported heartbeat. Sover's youtube publish_recency RED is a real-world outcome the code improver cannot move, so it should PARK (zero token spend) here instead of burning a glm-5.2 call every sweep; the ops plane keeps that RED paging the operator separately. Escape valve: after 16 starved cycles ONE non-metric upkeep cycle runs (max_starve_cycles floored to >=1 in freshness.rs; NEVER set <=0). Emitter path %LOCALAPPDATA%\\Sover\\data\\ggg\\post_registry.json is verified present; a missing registry halts UNOBSERVABLE (paged), which is the honest signal."
         },
         "interval": 120,
         "max_iterations": 0,
