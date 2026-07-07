@@ -15,7 +15,8 @@
                 "dotz",
                 "asmodeus",
                 "maki",
-                "solomon"
+                "solomon",
+                "kairos"
             ]
         }
     },
@@ -211,8 +212,8 @@
         "model": "glm-5.2",
         "api_key": "OLLAMA_API_KEY",
         "fallback": {
-            "provider": "ollama-cloud",
-            "model": "minimax-m3"
+            "provider": "openrouter",
+            "model": "qwen/qwen3-coder"
         },
         "ship": "auto-merge",
         "pr_target_branch": "master",

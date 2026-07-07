@@ -271,5 +271,60 @@
                 "comment": "The watchdog appends here every ~2min while Solomon.exe is open; stale while the app is closed is the honest blind-window signal."
             }
         ]
+    },
+    {
+        "name": "kairos",
+        "priority": 7,
+        "comment": "Live-money Kalshi trader (30-60% equity band, $100/15-min-window north star). Was DOCUMENTED-BUT-STRANDED: a full repos.json lane (freshness, tiers, money_globs, live-money goal) with ZERO ops-plane coverage, so a dead kairos product would print no RED and never page -- the exact monitoring-theater failure the solomon goal warns against (2026-07-07 audit). All db reads are read-only (SQLITE_OPEN_READ_ONLY); a corrupt/locked db degrades to yellow 'unobservable', never a crash. tick_recency reads the LIVE trading truth (the decisions table's newest tick), NOT an internal RSI-lane signal.",
+        "probes": [
+            {
+                "id": "tick_recency",
+                "kind": "sqlite_query",
+                "db": "${REPO}\\.state\\kairos.db",
+                "query": "SELECT MAX(ts) FROM decisions",
+                "mode": "age",
+                "yellow_after_s": 3600,
+                "red_after_s": 21600,
+                "comment": "decisions.ts is a Unix-epoch float (parse_ts handles epoch). The live loop writes a decision row every tick while it is trading; a stale MAX(ts) is the honest 'the trader stopped deciding' signal (dead product). Yellow at 1h (a quiet market / between-window gap), red at 6h. NULL (no decisions yet) degrades to yellow unobservable by design. Market-hours awareness is out of scope for Phase 1 (weekend/closed gaps read yellow/red honestly), same convention as asmodeus fills_recency."
+            },
+            {
+                "id": "live_settle_recency",
+                "kind": "sqlite_query",
+                "db": "${REPO}\\.state\\kairos.db",
+                "query": "SELECT MAX(ts) FROM trades WHERE mode='live' AND status='settled'",
+                "mode": "age",
+                "yellow_after_s": 86400,
+                "red_after_s": 259200,
+                "null_status": "green",
+                "comment": "Newest SETTLED live trade -- the settled-$/window objective's ground truth. NULL (no settled live trades yet, e.g. paper-dominant while the leash is tight) is green by design: an absent live fill is not a failure signal on its own (paper still proves sizing truth). Wide thresholds (1d yellow / 3d red) because live fills are intentionally rare under the aggressive-but-gated leash; this catches a live path that has gone fully silent for days, not normal sparsity."
+            },
+            {
+                "id": "process",
+                "kind": "process",
+                "process_name": "python.exe",
+                "path_contains": "projects\\kairos",
+                "comment": "The live trader fleet (app.py / maker.py / maker_hourly.py / strategist.py) all run as python.exe from the kairos .venv, ExecutablePath under projects\\kairos. ANY live instance reads green; the whole family absent reads red (product process down). Matched by NAME + EXECUTABLE-PATH, never PID (PIDs recycle)."
+            },
+            {
+                "id": "outcome_streak",
+                "kind": "jsonl_tail",
+                "file": "runtime\\kairos\\history.jsonl",
+                "field": "status",
+                "mode": "streak",
+                "want": "shipped",
+                "last_n": 5,
+                "comment": "The RSI-lane ship streak (Solomon's improvement loop for kairos), same shape as the other managed lanes."
+            },
+            {
+                "id": "heartbeat_fresh",
+                "kind": "json_field",
+                "file": "runtime\\kairos\\heartbeat.json",
+                "path": "updated_at",
+                "mode": "age",
+                "yellow_after_s": 21600,
+                "red_after_s": 86400,
+                "comment": "The RSI-lane heartbeat freshness, same shape/thresholds as dotz/maki. Distinct from tick_recency: this watches Solomon's improver loop on kairos, tick_recency watches the live product itself."
+            }
+        ]
     }
 ]
