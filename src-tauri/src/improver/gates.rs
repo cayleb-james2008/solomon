@@ -278,15 +278,59 @@ pub fn run_gate_once(c: &mut Ctx, effective_gate_cmd: &str) -> (bool, Value, Str
     (green, Value::Object(tests), tail_1500(&out))
 }
 
+/// A gate run that EXITS 0 but produced no parseable test counts (0 collected/passed/failed/errors,
+/// not a timeout, not already flagged unrunnable) cannot be trusted GREEN. Every configured lane gate
+/// is a real test runner (pytest / unittest / `cargo test`), so an all-zero count means zero tests
+/// actually ran or parsed — the empty-suite-counted-green hole (anti-gaming failure mode #1). This is
+/// the discriminating predicate; kept pure so it is trivially testable.
+fn is_empty_green(green: bool, tests: &Value) -> bool {
+    green
+        && !value_truthy(tests.get("timeout"))
+        && !value_truthy(tests.get("gate_unrunnable"))
+        && tests.get("collected").and_then(Value::as_i64).unwrap_or(0) == 0
+        && tests.get("passed").and_then(Value::as_i64).unwrap_or(0) == 0
+        && tests.get("failed").and_then(Value::as_i64).unwrap_or(0) == 0
+        && tests.get("errors").and_then(Value::as_i64).unwrap_or(0) == 0
+}
+
+/// Force a substanceless "green" (exit 0, zero parseable counts) to RED + `gate_unrunnable` so it can
+/// never ship a change. A custom GATE_CMD would otherwise bypass every empty/marker/retry safeguard
+/// (its returncode alone was authoritative); the built-in path could also fall through to a green
+/// empty result after its retries. Both now converge here.
+fn force_red_if_empty_green(
+    green: bool,
+    tests: Value,
+    tail: String,
+    c: &mut Ctx,
+) -> (bool, Value, String) {
+    if !is_empty_green(green, &tests) {
+        return (green, tests, tail);
+    }
+    let mut tests = tests;
+    if let Value::Object(m) = &mut tests {
+        m.insert("gate_unrunnable".to_string(), json!(true));
+        m.insert("green".to_string(), json!(false));
+    }
+    c.log(
+        "gate EXITED 0 but produced NO parseable test counts (0 collected) — a test gate that ran \
+zero verifiable tests cannot be trusted green; forcing base gate RED (anti-gaming: no substanceless \
+green ship)",
+    );
+    (false, tests, tail)
+}
+
 /// run_improver.run_gate (~1467-1512): authoritative test gate. A CUSTOM GATE_CMD runs exactly once
-/// (its returncode is authoritative; the empty-retry framing is pytest-only). The built-in pytest gate
-/// retries up to 3 times (sleeping 3s) on an EMPTY result (0 collected/passed/failed/errors and not a
-/// timeout) — a transient collection glitch — UNLESS the tail carries an import/collection error
-/// marker, in which case it is surfaced immediately as `gate_unrunnable` (no retry).
+/// (its returncode is authoritative; the empty-retry framing is pytest-only) — but a green-yet-empty
+/// result is still forced RED via `force_red_if_empty_green` so a substanceless pass can't ship. The
+/// built-in pytest gate retries up to 3 times (sleeping 3s) on an EMPTY result (0 collected/passed/
+/// failed/errors and not a timeout) — a transient collection glitch — UNLESS the tail carries an
+/// import/collection error marker, in which case it is surfaced immediately as `gate_unrunnable` (no
+/// retry); a still-empty green after all retries is likewise forced RED.
 pub fn run_gate(c: &mut Ctx) -> (bool, Value, String) {
     let effective_gate_cmd = c.gate_cmd.clone();
     if !effective_gate_cmd.is_empty() {
-        return run_gate_once(c, &effective_gate_cmd);
+        let (green, tests, tail) = run_gate_once(c, &effective_gate_cmd);
+        return force_red_if_empty_green(green, tests, tail, c);
     }
     let mut last: (bool, Value, String) = (false, Value::Null, String::new());
     for attempt in 0..3 {
@@ -322,7 +366,10 @@ repo that has tests; retrying in 3s",
             std::thread::sleep(Duration::from_secs(3));
         }
     }
-    last
+    // All retries still empty and no import/collection marker: a green-but-empty result here is not a
+    // transient glitch we can trust — force it RED rather than shipping on zero verified tests.
+    let (green, tests, tail) = last;
+    force_red_if_empty_green(green, tests, tail, c)
 }
 
 // --------------------------------------------------------------------------- #
@@ -1184,6 +1231,41 @@ mod tests {
         assert_eq!(m["failed"], json!(2));
         assert_eq!(m["errors"], json!(1));
         assert_eq!(m["collected"], json!(7));
+    }
+
+    // ---- is_empty_green: the substanceless-green rail (empty-suite-counted-green hole) ----
+    #[test]
+    fn empty_green_gate_is_untrusted() {
+        // exit 0 but ZERO parseable counts — a custom gate that emitted no pytest/unittest/cargo
+        // summary, or a suite that collected nothing. MUST be flagged so it is forced RED, not shipped.
+        assert!(is_empty_green(
+            true,
+            &json!({"passed":0,"failed":0,"errors":0,"skipped":0,"collected":0,"green":true})
+        ));
+        // a real run with parseable tests is trusted GREEN: NOT flagged (kairos: "Ran 74 tests").
+        assert!(!is_empty_green(
+            true,
+            &Value::Object(parse_counts("Ran 74 tests in 1.2s\n\nOK", 0))
+        ));
+        assert!(!is_empty_green(
+            true,
+            &Value::Object(parse_counts("===== 5 passed in 0.2s =====", 0))
+        ));
+        // a RED run (rc != 0) is already a failure — not this rail's concern.
+        assert!(!is_empty_green(
+            false,
+            &json!({"passed":0,"failed":0,"errors":0,"skipped":0,"collected":0,"green":false})
+        ));
+        // a timeout already carries its own RED signature — not re-flagged.
+        assert!(!is_empty_green(
+            true,
+            &json!({"collected":0,"passed":0,"failed":0,"errors":0,"timeout":true})
+        ));
+        // an already-surfaced import/collection unrunnable is not double-flagged.
+        assert!(!is_empty_green(
+            true,
+            &json!({"collected":0,"passed":0,"failed":0,"errors":0,"gate_unrunnable":true})
+        ));
     }
 
     // ---- anti_gaming_reason (Gate #2), exact spec strings ----
