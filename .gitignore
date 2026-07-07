@@ -14,6 +14,17 @@ improver/*/backlog.md
 improver/*/LESSONS.md
 # test-only default-name ("repo") contract scratch; recreated by the e2e suite, no managed repo uses it
 improver/repo/
+# test-scratch working dirs (2026-07-07 audit A.6): the supervisor/watchdog/budget suites write
+# PID-suffixed scratch dirs into the live improver/ + runtime/ trees. runtime/ is already ignored
+# above; these prefixes keep the improver/ (and any stray top-level) copies out of `git status
+# --porcelain` so they can NEVER trip the controller-clean gate (catalog #6). The janitor reaps the
+# aged copies for storage hygiene; this keeps them invisible to git the instant they are created.
+sup_test_*/
+testrepo_*/
+wd_ar_*/
+wd_heal_*/
+wd_stall_*/
+app_test_*/
 .env
 .solomon.json
 .rsi-control.json
