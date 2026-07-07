@@ -621,13 +621,25 @@ mod tests {
                 return;
             }
         };
+        // Grandfathered pre-enforcement violations (docs/rsi/PROVENANCE.md "Grandfathered
+        // exceptions"): watched-file commits that landed before this gate was actually executed.
+        // History is not rewritten — the convention says surface a violation, don't launder it —
+        // so each is recorded here by full sha and excluded rather than retroactively judged.
+        // Matched via `full.starts_with(short)` because git's `%h` is always a prefix of `%H`,
+        // so this holds regardless of the abbreviation length git chooses.
+        // ponytail: exact-sha allowlist; if these ever recur, split the offending commit instead.
+        const GRANDFATHERED: &[&str] = &["16aed999a3be8074f22a88a53a95925709660d54"];
         let text = String::from_utf8_lossy(&out.stdout);
         let violations: Vec<&str> = text
             .lines()
             .filter(|l| !l.trim().is_empty())
             .filter(|l| {
-                let subject = l.splitn(2, '\t').nth(1).unwrap_or("");
-                !valid_provenance_subject(subject)
+                let mut parts = l.splitn(2, '\t');
+                let short = parts.next().unwrap_or("").trim();
+                let subject = parts.next().unwrap_or("");
+                let grandfathered =
+                    !short.is_empty() && GRANDFATHERED.iter().any(|full| full.starts_with(short));
+                !grandfathered && !valid_provenance_subject(subject)
             })
             .collect();
         assert!(

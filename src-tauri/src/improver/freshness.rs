@@ -884,6 +884,117 @@ mod tests {
         );
     }
 
+    // ---- fleet-lane scenario: no-new-evidence lane PARKS while a fresh-evidence lane RUNS,
+    //      and no lane is permanently starved (2026-07-07: the asmodeus+sover gating fix) ----
+
+    /// A probe that emits the EXACT contract shape our real emitters produce
+    /// (asmodeus tools/freshness.py "live_settled_fills", sover tools/freshness.py
+    /// "published_reels"): {metric_id, latest_ts, n_samples, observable:true}. `n`/`ts` are
+    /// baked into the script string so a lane can present "no new data" vs "a fresh sample".
+    fn evidence_probe(metric: &str, n: i64, ts: f64) -> String {
+        // Windows `echo` and POSIX single-quoted echo both pass the JSON through byte-for-byte
+        // here (no shell metachars inside the object). Kept identical across platforms so the
+        // scenario asserts the same on the CI box and the live Windows host.
+        let obj = format!(
+            r#"{{"metric_id":"{metric}","latest_ts":{ts},"n_samples":{n},"observable":true}}"#
+        );
+        #[cfg(windows)]
+        {
+            format!("echo {obj}")
+        }
+        #[cfg(not(windows))]
+        {
+            format!("printf '%s\\n' '{obj}'")
+        }
+    }
+
+    fn lane_with_probe(probe: &str) -> Ctx {
+        test_ctx(Some(
+            json!([{ "name": "freshtest", "freshness": {"cmd": probe} }]),
+        ))
+    }
+
+    /// The load-bearing property of the asmodeus+sover fix: given two fleet lanes probing a
+    /// live objective, the lane whose objective gained NO new operator-written samples PARKS
+    /// (skip, zero token spend), while the lane that DID gain a fresh sample proceeds — so AI
+    /// cycles stop being wasted on an evidence-gated lane and flow to a lane with real new work.
+    #[test]
+    fn stale_lane_parks_while_fresh_lane_runs_and_no_lane_is_permanently_starved() {
+        // --- Lane A ("sover-like"): a settled baseline, then the SAME probe result forever
+        //     (no new publish) -> must PARK on every subsequent cycle. ---
+        let stale_probe = evidence_probe("published_reels", 112, 1_000.0);
+        let mut lane_a = lane_with_probe(&stale_probe);
+        // cycle 1: no ledger -> first observation baselines -> proceed (the one allowed run)
+        assert!(!short_circuit(&mut lane_a), "lane A cycle 1 baselines and runs");
+        // cycles 2..=5: identical probe (no new sample) -> PARK every time, spending no tokens
+        for cycle in 2..=5 {
+            assert!(
+                short_circuit(&mut lane_a),
+                "lane A cycle {cycle}: no new evidence -> PARK (skip)"
+            );
+            assert_eq!(hb_str(&lane_a, "status"), "idle");
+            assert_eq!(hb_str(&lane_a, "reason"), "no_new_data");
+            assert!(
+                hb_str(&lane_a, "last_summary").contains("zero token spend"),
+                "park must be the zero-token-spend skip; got: {}",
+                hb_str(&lane_a, "last_summary")
+            );
+        }
+        // starvation is bounded and rising, never pinned/forgotten
+        assert_eq!(read_ledger(&lane_a).unwrap().starve_count, 4);
+
+        // --- Lane B ("asmodeus-like"): seed the SAME stale baseline, but this cycle a fresh
+        //     settled fill has landed (n grew, ts advanced) -> the lane RUNS. ---
+        let fresh_probe = evidence_probe("live_settled_fills", 8, 2_000.0);
+        let mut lane_b = lane_with_probe(&fresh_probe);
+        write_ledger(
+            &lane_b,
+            &Ledger {
+                metric_id: "live_settled_fills".into(),
+                last_seen_ts: 1_000.0,
+                last_n_samples: 5,
+                starve_count: 3,
+            },
+        );
+        assert!(
+            !short_circuit(&mut lane_b),
+            "lane B: a fresh settled fill -> the cycle RUNS (not starved)"
+        );
+        let lb = read_ledger(&lane_b).unwrap();
+        assert_eq!(
+            (lb.last_n_samples, lb.last_seen_ts, lb.starve_count),
+            (8, 2_000.0, 0),
+            "running rebaselines the ledger and clears the starve counter"
+        );
+
+        // --- No lane is permanently starved: drive Lane A's stale probe up to the escape
+        //     valve; at max_starve_cycles it MUST release ONE upkeep cycle and reset. ---
+        // lane_a is currently at starve_count=4 with default max_starve_cycles=16. Skip until
+        // one below the valve, then assert the valve releases exactly once.
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            assert!(guard < 100, "escape valve never fired — a lane is pinned forever");
+            let before = read_ledger(&lane_a).unwrap().starve_count;
+            let skipped = short_circuit(&mut lane_a);
+            if !skipped {
+                // the escape valve fired: one non-metric upkeep cycle was allowed and the
+                // counter reset — the lane is NOT permanently starved.
+                assert_eq!(
+                    read_ledger(&lane_a).unwrap().starve_count,
+                    0,
+                    "escape valve resets the starve counter"
+                );
+                assert_eq!(
+                    before + 1,
+                    16,
+                    "valve fires at exactly max_starve_cycles (default 16)"
+                );
+                break;
+            }
+        }
+    }
+
     // ---- HOLD_META (WS5 provenance tripwire) ----
 
     #[test]
