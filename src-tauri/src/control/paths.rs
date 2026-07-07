@@ -26,22 +26,38 @@ pub fn here() -> &'static Path {
                 return p;
             }
         }
-        if let Ok(exe) = std::env::current_exe() {
-            let mut probe = exe.parent().map(Path::to_path_buf);
-            // depth 6 (NOT 8): control._base_dir uses range(6) — the exe dir + up to 5 ancestors.
-            // solomon_repo() (apptest_health.rs) uses 8, a deliberately different constant; do not unify.
-            for _ in 0..6 {
-                match probe {
-                    Some(ref dir) if dir.join("improver").is_dir() => return dir.clone(),
-                    Some(ref dir) => probe = dir.parent().map(Path::to_path_buf),
-                    None => break,
+        // audit A.6 root-cause (2026-07-07): under `cargo test`, with no explicit SOLOMON_HOME
+        // override, pin HERE to a throwaway temp home. Every test that touches per-repo state
+        // (supervisor/watchdog/contracts/heartbeat/locks/…) resolves its working dirs through
+        // here() (HERE/runtime/<name>, HERE/improver/<name>), so redirecting here() is what
+        // actually moves those scratch roots off the LIVE operator tree — the reason editing the
+        // individual test helpers alone cannot fix it. Tests that need a real HERE (apptest_health)
+        // set SOLOMON_HOME explicitly and hit the branch above, so their behavior is unchanged.
+        #[cfg(test)]
+        {
+            let home = std::env::temp_dir().join(format!("solomon_test_home_{}", std::process::id()));
+            let _ = std::fs::create_dir_all(home.join("improver"));
+            home
+        }
+        #[cfg(not(test))]
+        {
+            if let Ok(exe) = std::env::current_exe() {
+                let mut probe = exe.parent().map(Path::to_path_buf);
+                // depth 6 (NOT 8): control._base_dir uses range(6) — the exe dir + up to 5 ancestors.
+                // solomon_repo() (apptest_health.rs) uses 8, a deliberately different constant; do not unify.
+                for _ in 0..6 {
+                    match probe {
+                        Some(ref dir) if dir.join("improver").is_dir() => return dir.clone(),
+                        Some(ref dir) => probe = dir.parent().map(Path::to_path_buf),
+                        None => break,
+                    }
+                }
+                if let Some(dir) = exe.parent() {
+                    return dir.to_path_buf();
                 }
             }
-            if let Some(dir) = exe.parent() {
-                return dir.to_path_buf();
-            }
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
         }
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     })
 }
 
