@@ -16,6 +16,7 @@ mod housekeeping; // storage housekeeping (v2): day-gated build-dir/branch/workt
 mod hygiene; // repo-hygiene detection (report-only): flags off-base / dirty managed trees the CEO grafts surface
 mod improver; // native port of improver/run_improver.py — the per-repo RSI loop (`run-improver` subcommand)
 mod janitor; // storage janitor (RSI v3, requirement 5): temp deletion, log rotation, bounded runtime dirs, history compaction — rides the watchdog sweep behind a 6h stamp
+mod money_guard; // NO-MONEY-OUT guard: fail-closed, preemptive money-out chokepoint — Solomon never moves money out; only whitelisted lanes' own bots place trades (human-gated money-out doctrine, now ENFORCED)
 mod notify; // operator notifications (v2 Phase A): ntfy push + Windows toast, fed by ops incidents + CEO reports
 mod ops; // ops plane (Phase 1): ground-truth probes + honest fleet status (`probe` subcommand + watchdog graft)
 mod provenance; // config-provenance tripwire + controller-clean preflight (RSI v3, catalog #6): watched-config drift pages + holds trading lanes; Solomon refuses meta-work on itself from a dirty/off-base tree
