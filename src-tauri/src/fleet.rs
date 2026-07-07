@@ -27,6 +27,15 @@ const LEGACY_STATE_FILE: &str = "fleet_state.json";
 const LEGACY_PROOF_FILE: &str = "fleet_proof.json";
 const DEFAULT_RUN_TIMEOUT_S: u64 = 14_400;
 
+/// Consecutive autopilot sweeps a lane must be `proof_required` before the watchdog's
+/// autopilot recover pass is allowed to force a stop→ideate→restart heal on it. This is the
+/// time-decay the permanent-stuck audit found missing: `finish_non_ai_job`'s proof_required arm
+/// mutates nothing, so a lane diagnosed `noop_streak`→`auto_safe=false` re-diagnoses the same
+/// frozen corpse every ~5-min sweep forever. The watchdog only heals after N such sweeps (not
+/// every sweep — that would token-thrash), which combined with `recover()`'s own `prior_heals<3`
+/// exponential backoff caps the force-cycle. 3 sweeps ≈ 15 min at the 5-min sentinel cadence.
+pub const STUCK_SWEEP_THRESHOLD: u64 = 3;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Job {
     name: String,
@@ -214,6 +223,17 @@ pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
     ));
     st["active"] = Value::Null;
     st["last_result"] = result.clone();
+    // Per-lane stuck counter (time-decay for the watchdog's autopilot recover pass). A lane whose
+    // fleet outcome is `proof_required` produced NO mutation this sweep (finish_non_ai_job's
+    // proof_required arm is inert) — increment. Any other outcome (shipped/blocked/complete/
+    // cooldown/etc.) means the lane moved, so clear the entry. The watchdog reads this via
+    // `stuck_sweeps` and only force-heals a lane stuck >= STUCK_SWEEP_THRESHOLD sweeps. Purely
+    // additive state key; read_state/write_state round-trip arbitrary JSON.
+    bump_stuck_counter(
+        &mut st,
+        &job.name,
+        result.get("outcome").and_then(Value::as_str) == Some("proof_required"),
+    );
     st["queue"] = Value::Array(
         plan_jobs(&repos, &cfg, &read_ops_payload(), &st, only_name)
             .iter()
@@ -901,6 +921,64 @@ fn write_state(st: &Value) -> std::io::Result<()> {
     proc::atomic_write_json(&p, st)
 }
 
+/// Maintain `st["stuck"][name] = {"sweeps": N, "ts": <iso>}`. When `is_proof_required`, increment
+/// the lane's sweep count (it took no mutating action this sweep); otherwise remove the entry (the
+/// lane moved, so it is no longer stuck). The schema is owned here so the state stays consistent;
+/// the watchdog reads it read-only via `stuck_sweeps`. Best-effort: never panics on a malformed map.
+fn bump_stuck_counter(st: &mut Value, name: &str, is_proof_required: bool) {
+    if !st.get("stuck").map(Value::is_object).unwrap_or(false) {
+        st["stuck"] = json!({});
+    }
+    let stuck = match st["stuck"].as_object_mut() {
+        Some(m) => m,
+        None => return,
+    };
+    if is_proof_required {
+        let prev = stuck
+            .get(name)
+            .and_then(|e| e.get("sweeps"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        stuck.insert(name.to_string(), json!({"sweeps": prev + 1, "ts": now()}));
+    } else {
+        stuck.remove(name);
+    }
+}
+
+/// Read a lane's consecutive-`proof_required`-sweep count from the persisted autopilot state.
+/// 0 when the lane is not stuck (entry absent) or the state is unreadable. Lets the watchdog's
+/// autopilot recover pass gate its force-heal on a real time-decay window (STUCK_SWEEP_THRESHOLD)
+/// without owning the state schema. Reads the same `runtime/autopilot_state.json` the fleet writes.
+pub fn stuck_sweeps(name: &str) -> u64 {
+    let cfg = registry::autopilot_config();
+    read_state(&cfg)
+        .get("stuck")
+        .and_then(|s| s.get(name))
+        .and_then(|e| e.get("sweeps"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+/// Clear a lane's stuck counter in the persisted autopilot state (round-tripping the file). The
+/// watchdog calls this after a successful force-heal so the lane starts a fresh time-decay window
+/// rather than immediately re-qualifying next sweep. No-op (Ok) when the entry is already absent.
+pub fn reset_stuck_sweeps(name: &str) -> std::io::Result<()> {
+    let cfg = registry::autopilot_config();
+    let mut st = read_state(&cfg);
+    let present = st
+        .get("stuck")
+        .and_then(|s| s.get(name))
+        .is_some();
+    if !present {
+        return Ok(());
+    }
+    if let Some(m) = st.get_mut("stuck").and_then(Value::as_object_mut) {
+        m.remove(name);
+    }
+    st["ts"] = json!(now());
+    write_state(&st)
+}
+
 fn append_event(event: &Value) {
     let mut obj = match event {
         Value::Object(o) => o.clone(),
@@ -1202,6 +1280,34 @@ mod tests {
 
     fn repo(name: &str) -> Value {
         json!({"name": name, "path": format!("C:/p/{name}")})
+    }
+
+    // Stuck-counter round-trip: a `proof_required` outcome (inert fleet action) increments the
+    // per-lane counter; ANY other outcome clears the entry. This is the time-decay the watchdog's
+    // autopilot recover pass gates on (via stuck_sweeps) to escape the permanent-stuck trap.
+    #[test]
+    fn bump_stuck_counter_increments_on_proof_required_and_clears_otherwise() {
+        let mut st = json!({});
+        bump_stuck_counter(&mut st, "dotz", true);
+        bump_stuck_counter(&mut st, "dotz", true);
+        bump_stuck_counter(&mut st, "dotz", true);
+        assert_eq!(
+            st["stuck"]["dotz"]["sweeps"], 3,
+            "three consecutive proof_required sweeps → count 3: {st}"
+        );
+        // A different lane tracks independently.
+        bump_stuck_counter(&mut st, "sover", true);
+        assert_eq!(st["stuck"]["sover"]["sweeps"], 1);
+        assert_eq!(st["stuck"]["dotz"]["sweeps"], 3);
+        // A non-proof_required outcome (shipped/blocked/complete/cooldown) clears the lane.
+        bump_stuck_counter(&mut st, "dotz", false);
+        assert!(
+            st["stuck"].get("dotz").is_none(),
+            "a non-proof_required outcome must clear the stuck entry: {st}"
+        );
+        // Clearing an absent lane is a harmless no-op.
+        bump_stuck_counter(&mut st, "never_seen", false);
+        assert!(st["stuck"].get("never_seen").is_none());
     }
 
     #[test]
