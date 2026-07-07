@@ -29,6 +29,16 @@ app_test_*/
 .solomon.json
 .rsi-control.json
 
+# defensive secret/cred + heavy-artifact coverage (most are absent in this pure-Rust
+# repo today, but pinned so they can NEVER be committed if a tool/lane creates them)
+config.json
+.state/
+.venv/
+node_modules/
+target/
+*.key
+*.pem
+
 # managed-repo clones an operator may relocate under Solomon (repos.json path -> repos/<name>);
 # these are NOT Solomon source — keep them out of git and out of Solomon's own pytest collection
 repos/
