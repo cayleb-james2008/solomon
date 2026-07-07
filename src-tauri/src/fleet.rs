@@ -377,9 +377,7 @@ fn run_ai_job(job: &Job, repos: &[Value], cfg: &Value, auto_push: bool, st: &mut
         "shipped"
     } else if latest.get("status").and_then(Value::as_str) == Some("blocked") {
         "blocked"
-    } else if latest.get("status").and_then(Value::as_str) == Some("reverted") {
-        "proof_required"
-    } else if out.code == 0 {
+    } else if latest.get("status").and_then(Value::as_str) == Some("reverted") || out.code == 0 {
         "proof_required"
     } else {
         "blocked"
@@ -1352,7 +1350,7 @@ mod tests {
         .unwrap();
         let cfg = json!({"provider": "openrouter", "model": "m", "targets": [name.clone()]});
         let jobs = plan_jobs(
-            &[repo.clone()],
+            std::slice::from_ref(&repo),
             &cfg,
             &json!({"projects": {}}),
             &json!({}),
@@ -1386,7 +1384,7 @@ mod tests {
         let cfg =
             json!({"provider": "ollama-cloud", "model": "glm-5.2", "targets": [name.clone()]});
         let jobs = plan_jobs(
-            &[repo.clone()],
+            std::slice::from_ref(&repo),
             &cfg,
             &json!({"projects": {"autopilot_stale": {"status": "green"}}}),
             &json!({}),

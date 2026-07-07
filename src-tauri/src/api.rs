@@ -1074,6 +1074,7 @@ mod tests {
         // Each arm line has the shape:  "name" [| "name"]* =>
         // Grab every quoted token that appears on a line ending in `=>` within the match body.
         let mut arms: Vec<String> = Vec::new();
+        let arm_token = regex::Regex::new(r#""([a-z_]+)""#).unwrap();
         for line in body.lines() {
             let t = line.trim();
             // Only arm lines (LHS ends in `=>`), never a comment or a nested-value line.
@@ -1082,10 +1083,7 @@ mod tests {
             }
             // The pattern portion is everything left of `=>`.
             let lhs = &t[..t.find("=>").unwrap()];
-            for cap in regex::Regex::new(r#""([a-z_]+)""#)
-                .unwrap()
-                .captures_iter(lhs)
-            {
+            for cap in arm_token.captures_iter(lhs) {
                 arms.push(cap[1].to_string());
             }
         }
