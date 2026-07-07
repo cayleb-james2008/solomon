@@ -274,7 +274,151 @@ fn sweep_autopilot(auto_push_flag: bool) -> Value {
             actions.push(json!("autopilot queue checked"));
         }
     }
+    // AUTOPILOT PERMANENT-STUCK HEAL (2026-07-07 audit): `fleet::once` above routes a lane that
+    // diagnoses `noop_streak`→`auto_safe=false` to an inert `proof_required` job that mutates
+    // nothing — and the whole crash-restart + recover() machinery of the non-autopilot sweep is
+    // bypassed by `sweep()`'s early `return out`. So on the autopilot path a dead/stuck lane was
+    // NEVER restarted and NEVER healed: a permanent absorbing state the scheduler re-diagnosed
+    // every sweep. Reach the EXISTING supervisor recover() heal here, after the fleet lease is
+    // released, gated by a per-lane stuck-sweep counter (time-decay) and a `noop_streak`-only
+    // diagnose filter (freshness discipline — evidence-starved categories keep parking). The heal
+    // itself (stop→ideate→restart) and its `prior_heals<3` backoff are unchanged and reused.
+    let heal_actions = autopilot_recover_pass(&repos, auto_push_flag);
+    for a in heal_actions {
+        actions.push(json!(a));
+    }
     json!({"ts": now(), "disabled": false, "actions": actions, "snapshots": snapshots, "autopilot": out.clone(), "fleet": out})
+}
+
+/// The autopilot force-heal pass (production wiring). Reads the real autopilot targets and the
+/// per-lane stuck counter the fleet persists, then delegates the decision to
+/// `autopilot_recover_pass_inner` with the live `fleet::stuck_sweeps` / `fleet::reset_stuck_sweeps`
+/// dependencies injected. Kept thin so the decision logic below is unit-testable in isolation of
+/// the real `runtime/autopilot_state.json` and `autopilot_config()`.
+fn autopilot_recover_pass(repos: &[Value], auto_push_flag: bool) -> Vec<String> {
+    let targets = control::registry::autopilot_targets();
+    autopilot_recover_pass_inner(
+        repos,
+        &targets,
+        auto_push_flag,
+        crate::fleet::STUCK_SWEEP_THRESHOLD,
+        &|name| crate::fleet::stuck_sweeps(name),
+        &|name| crate::fleet::reset_stuck_sweeps(name),
+    )
+}
+
+/// Decision core of the autopilot force-heal. For each autopilot target that the fleet has left
+/// stuck as `proof_required` for at least `threshold` sweeps AND that currently diagnoses
+/// `noop_streak`, run the existing `supervisor::recover()` heal (stop→ideate→restart) under the
+/// shared per-sweep restart budget, then reset that lane's stuck counter via `reset_stuck`. Returns
+/// the action strings to append to the sweep's `actions`. The `stuck_sweeps` / `reset_stuck`
+/// closures are injected so tests can drive the gate deterministically without touching global
+/// autopilot state.
+///
+/// Guardrails (all reused, none weakened):
+///   - stuck-counter gate (`threshold` = `STUCK_SWEEP_THRESHOLD`): only every Nth sweep — the
+///     time-decay the permanent-trap lacked. A lane must be stuck this long before ANY heal fires.
+///   - `noop_streak`-only diagnose filter: `needs_goal`/`metric_unobservable`/`quota_error` and
+///     every other evidence-gated category are NOT force-cycled — they keep parking/escalating.
+///   - shared `MAX_LANE_RESTARTS_PER_SWEEP` budget via `with_restart_budget` (disk-meltdown guard).
+///   - `recover()`'s own `prior_heals<3` exponential backoff → after 3 ideate-heals it pages
+///     instead of a 4th heal, so no force-cycle-forever.
+///   - operator-pause guard: an explicitly paused lane (`runtime/<name>/paused`) is skipped
+///     BEFORE diagnose/recover — recover() does NOT honor the pause sentinel itself, so this
+///     pass enforces it here, mirroring the crash-restart path's `if !paused` recover guard.
+///   - `recover()` itself defers cleanly on an in-flight iteration.
+fn autopilot_recover_pass_inner(
+    repos: &[Value],
+    targets: &[String],
+    auto_push_flag: bool,
+    threshold: u64,
+    stuck_sweeps: &dyn Fn(&str) -> u64,
+    reset_stuck: &dyn Fn(&str) -> std::io::Result<()>,
+) -> Vec<String> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let mut actions: Vec<String> = Vec::new();
+    // Arm the SAME shared per-sweep budget the crash-restart path uses so a sweep where several
+    // lanes are stuck can't fire more than MAX_LANE_RESTARTS_PER_SWEEP heavy stop→ideate→restart
+    // spawns total. recover() spends via spend_restart_budget() inside this armed scope.
+    supervisor::with_restart_budget(MAX_LANE_RESTARTS_PER_SWEEP, || {
+        for name in targets {
+            // Resolve the target NAME to its registry repo dict (diagnose/recover need the Value).
+            let Some(r) = repos
+                .iter()
+                .find(|r| r.get("name").and_then(Value::as_str) == Some(name.as_str()))
+            else {
+                continue;
+            };
+            // Operator-pause guard (mirrors the crash-restart path's `if !paused` at the recover()
+            // call — see the `paused` guard where sweep_repo runs its RUNG-0 recover). `paused`
+            // means "hands off this lane for the automated sweep": a human dropped
+            // `runtime/<name>/paused` to hold it. recover() does NOT honor that sentinel itself
+            // (it stops→ideates→restarts unconditionally), so WITHOUT this skip a lane the
+            // operator explicitly paused would still be force-stopped→ideated→restarted — a
+            // safety-gate weakening. Skip BEFORE diagnose/recover so a paused lane costs nothing
+            // and is never touched.
+            let paused = paths::runtime_dir(r)
+                .map(|d| d.join("paused").exists())
+                .unwrap_or(false);
+            if paused {
+                continue;
+            }
+            // Time-decay gate: only heal a lane that has been proof_required for >= threshold
+            // sweeps. Below threshold, leave it to the fleet (anti-thrash — no heal every sweep).
+            if stuck_sweeps(name) < threshold {
+                continue;
+            }
+            // Freshness discipline: only the specific stuck cause (`noop_streak`) is force-healed.
+            // recover() would itself route other categories, but gating HERE keeps the force-cycle
+            // strictly scoped to the permanent-trap cause and avoids re-cycling a lane whose real
+            // blocker is evidence-starved (needs_goal / metric_unobservable / quota_error).
+            let cat = supervisor::diagnose(r)
+                .get("category")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if cat != "noop_streak" {
+                continue;
+            }
+            // Run the existing heal — identical arg shape to sweep_repo's call (allow_pi=false,
+            // allow_restart=auto_push, auto_push=auto_push). It stops→ideates→restarts, backs off
+            // via prior_heals<3, and spends the shared restart budget.
+            let rec = supervisor::recover(r, false, auto_push_flag, auto_push_flag);
+            let mut healed = false;
+            if let Some(taken) = rec.get("actions_taken").and_then(Value::as_array) {
+                if !taken.is_empty() {
+                    let joined = taken
+                        .iter()
+                        .map(|v| {
+                            v.as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| py_repr(Some(v)))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    actions.push(format!("{name} recover: {joined}"));
+                    // A real heal took place (stop/ideate/restart) — reset the time-decay window so
+                    // the lane isn't re-force-cycled next sweep before its relaunched loop can prove
+                    // itself. A pure `restart_deferred` (budget spent) is also non-empty but must NOT
+                    // reset — the heal didn't actually run, so keep the counter to retry next sweep.
+                    healed = taken
+                        .iter()
+                        .any(|v| v.as_str() == Some("restart") || v.as_str() == Some("ideate"));
+                }
+            }
+            if json_truthy(rec.get("escalate").unwrap_or(&Value::Null)) {
+                actions.push(format!("{name} ESCALATED: {}", py_repr(rec.get("category"))));
+            }
+            if healed {
+                if let Err(e) = reset_stuck(name) {
+                    actions.push(format!("{name} stuck-counter reset FAILED: {e}"));
+                }
+            }
+        }
+    });
+    actions
 }
 
 fn ops_needs_attention(payload: &Value) -> bool {
@@ -2021,5 +2165,279 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&rt);
         let _ = std::fs::remove_dir_all(&git_dir);
+    }
+
+    // ================= AUTOPILOT PERMANENT-STUCK HEAL (autopilot_recover_pass) =================
+    // The fleet's autopilot path routes a `noop_streak`→`auto_safe=false` lane to an inert
+    // `proof_required` job and `sweep()`'s early `return out` bypasses the crash-restart + recover()
+    // machinery — a permanent absorbing state (the 2026-07-07 audit). autopilot_recover_pass_inner
+    // reaches the existing recover() heal, gated by a stuck-sweep time-decay counter and a
+    // `noop_streak`-only diagnose filter. These tests drive the gate deterministically via injected
+    // stuck-sweeps/reset closures (no global autopilot state touched).
+
+    // Seed a runtime dir for a named lane with 5 consecutive noops + a sleeping heartbeat and NO
+    // lock → diagnose() returns noop_streak (5-noop history; no lock so it doesn't divert to
+    // stale_lock; not running so not in-flight) and the lane is heal-eligible. No lock is used so
+    // runner::stop sees a not-running lane and confirms the stop immediately, letting the heal
+    // proceed through ideate→restart deterministically in-test (a LIVE-lock fixture cannot stop the
+    // test's own process, which is why the supervisor sleeping-lane test only asserts on `stop`).
+    fn seed_noop_streak_lane(tag: &str) -> (std::path::PathBuf, Value) {
+        let name = format!("wd_ar_{tag}_{}", std::process::id());
+        let repo = json!({ "name": name });
+        let dir = paths::runtime_dir(&repo).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body: String = (0..5)
+            .map(|_| json!({"status": "noop"}).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("history.jsonl"), body).unwrap();
+        let fresh = (Utc::now() - chrono::Duration::seconds(1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        std::fs::write(
+            dir.join("heartbeat.json"),
+            json!({"status": "sleeping", "phase": "sleep", "run_id": "tok-ar", "updated_at": fresh})
+                .to_string(),
+        )
+        .unwrap();
+        (dir, repo)
+    }
+
+    // (1a) A lane stuck N>=THRESHOLD sweeps as proof_required AND diagnosing noop_streak gets a REAL
+    // recover cycle (a stop→ideate→restart heal, evidenced by the "recover:" action carrying "stop")
+    // and its stuck counter is reset — proving the permanent trap is now escapable on autopilot.
+    #[test]
+    fn autopilot_recover_heals_stuck_noop_lane_at_threshold() {
+        let (dir, repo) = seed_noop_streak_lane("heal");
+        let name = repo["name"].as_str().unwrap().to_string();
+        assert_eq!(supervisor::diagnose(&repo)["category"], "noop_streak");
+        let repos = vec![repo.clone()];
+        let targets = vec![name.clone()];
+        let reset_hits = std::cell::Cell::new(0u32);
+        let actions = autopilot_recover_pass_inner(
+            &repos,
+            &targets,
+            true,                       // auto_push_flag → allow_restart true
+            crate::fleet::STUCK_SWEEP_THRESHOLD,
+            &|_n| crate::fleet::STUCK_SWEEP_THRESHOLD, // stuck exactly at the threshold
+            &|_n| {
+                reset_hits.set(reset_hits.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(
+            actions.iter().any(|a| a.starts_with(&format!("{name} recover:")) && a.contains("stop")),
+            "expected a real recover heal (stop,...) for the stuck noop lane: {actions:?}"
+        );
+        assert_eq!(
+            reset_hits.get(),
+            1,
+            "a successful heal must reset the lane's stuck counter exactly once"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // (1b) Anti-thrash gate: the SAME stuck noop lane below the threshold (stuck_sweeps=1) does NOT
+    // fire a heal — no recover action, no reset, no stop sentinel. The time-decay the trap lacked.
+    #[test]
+    fn autopilot_recover_does_not_fire_below_threshold() {
+        let (dir, repo) = seed_noop_streak_lane("below");
+        let name = repo["name"].as_str().unwrap().to_string();
+        assert_eq!(supervisor::diagnose(&repo)["category"], "noop_streak");
+        let repos = vec![repo.clone()];
+        let targets = vec![name.clone()];
+        let reset_hits = std::cell::Cell::new(0u32);
+        let actions = autopilot_recover_pass_inner(
+            &repos,
+            &targets,
+            true,
+            crate::fleet::STUCK_SWEEP_THRESHOLD,
+            &|_n| 1, // only 1 sweep stuck — below THRESHOLD (3)
+            &|_n| {
+                reset_hits.set(reset_hits.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(
+            actions.is_empty(),
+            "below-threshold lane must not be force-healed: {actions:?}"
+        );
+        assert_eq!(reset_hits.get(), 0, "no heal → no counter reset");
+        assert!(
+            !dir.join("stop").exists(),
+            "below-threshold lane must not be stopped (no force-cycle every sweep)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // (1c) BLOCKER regression (skeptic NO-GO fix): a lane that IS stuck at threshold AND diagnoses
+    // noop_streak — i.e. identical to (1a), which DOES heal — is NOT healed when the operator has
+    // explicitly paused it (`runtime/<name>/paused` present). recover() does not honor the pause
+    // sentinel itself, so the pass must skip a paused lane BEFORE diagnose/recover. Asserts no
+    // recover action, no counter reset, and (critically) no `stop` sentinel written — proving a
+    // paused lane is never force-stopped→ideated→restarted (a safety-gate weakening otherwise).
+    #[test]
+    fn autopilot_recover_skips_paused_lane() {
+        let (dir, repo) = seed_noop_streak_lane("paused");
+        let name = repo["name"].as_str().unwrap().to_string();
+        // Same eligible fixture as the (1a) heal case: threshold-stuck + noop_streak.
+        assert_eq!(supervisor::diagnose(&repo)["category"], "noop_streak");
+        // Operator hold: drop the pause sentinel the crash-restart path also honors.
+        std::fs::write(dir.join("paused"), "").unwrap();
+        let repos = vec![repo.clone()];
+        let targets = vec![name.clone()];
+        let reset_hits = std::cell::Cell::new(0u32);
+        let actions = autopilot_recover_pass_inner(
+            &repos,
+            &targets,
+            true,
+            crate::fleet::STUCK_SWEEP_THRESHOLD,
+            &|_n| crate::fleet::STUCK_SWEEP_THRESHOLD, // stuck long enough to heal if not paused
+            &|_n| {
+                reset_hits.set(reset_hits.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(
+            actions.is_empty(),
+            "a paused lane must NOT be force-healed even when otherwise heal-eligible: {actions:?}"
+        );
+        assert_eq!(reset_hits.get(), 0, "no heal on a paused lane → no counter reset");
+        assert!(
+            !dir.join("stop").exists(),
+            "a paused lane must never be force-stopped by the recover pass"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // (2) Backoff: a lane at threshold with 3 prior noop_streak+ideate heals in supervisor.jsonl
+    // ESCALATES (pages) instead of a 4th force-heal (recover()'s prior_heals<3). No infinite cycle.
+    #[test]
+    fn autopilot_recover_backs_off_after_three_prior_heals() {
+        let (dir, repo) = seed_noop_streak_lane("backoff");
+        let name = repo["name"].as_str().unwrap().to_string();
+        // 3 prior RUNG-0.5 noop_streak heals that took an "ideate" action → prior_heals==3.
+        let sup: String = (0..3)
+            .map(|_| {
+                json!({"category":"noop_streak","rung":0,"escalate":false,"actions":["stop","ideate","restart"]})
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("supervisor.jsonl"), sup).unwrap();
+        assert_eq!(supervisor::diagnose(&repo)["category"], "noop_streak");
+        let repos = vec![repo.clone()];
+        let targets = vec![name.clone()];
+        let reset_hits = std::cell::Cell::new(0u32);
+        let actions = autopilot_recover_pass_inner(
+            &repos,
+            &targets,
+            true,
+            crate::fleet::STUCK_SWEEP_THRESHOLD,
+            &|_n| crate::fleet::STUCK_SWEEP_THRESHOLD,
+            &|_n| {
+                reset_hits.set(reset_hits.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(
+            actions.iter().any(|a| a.starts_with(&format!("{name} ESCALATED:"))),
+            "after 3 prior heals the pass must escalate (page), not force a 4th heal: {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|a| a.contains("recover:") && a.contains("restart")),
+            "no 4th restart heal may fire once backed off: {actions:?}"
+        );
+        assert_eq!(reset_hits.get(), 0, "an escalation (no heal) must not reset the counter");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // (3) Freshness discipline: a lane stuck at threshold but diagnosing a NON-noop_streak,
+    // evidence-gated category (needs_goal) is NOT force-cycled — it keeps parking. Evidence-starved
+    // repos are never force-restarted by this pass.
+    #[test]
+    fn autopilot_recover_skips_non_noop_streak_category() {
+        let name = format!("wd_ar_needsgoal_{}", std::process::id());
+        let repo = json!({ "name": name });
+        let dir = paths::runtime_dir(&repo).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // needs_goal: an error heartbeat with reason=needs_goal (see diagnose_needs_goal_precedence).
+        std::fs::write(
+            dir.join("heartbeat.json"),
+            json!({"status": "error", "reason": "needs_goal", "last_summary": ""}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(supervisor::diagnose(&repo)["category"], "needs_goal");
+        let repos = vec![repo.clone()];
+        let targets = vec![name.clone()];
+        let reset_hits = std::cell::Cell::new(0u32);
+        let actions = autopilot_recover_pass_inner(
+            &repos,
+            &targets,
+            true,
+            crate::fleet::STUCK_SWEEP_THRESHOLD,
+            &|_n| crate::fleet::STUCK_SWEEP_THRESHOLD, // stuck long enough, but wrong category
+            &|_n| {
+                reset_hits.set(reset_hits.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(
+            actions.is_empty(),
+            "an evidence-gated needs_goal lane must NOT be force-cycled: {actions:?}"
+        );
+        assert_eq!(reset_hits.get(), 0);
+        assert!(!dir.join("stop").exists(), "needs_goal lane must not be stopped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // (4) Budget: THREE stuck noop lanes in one pass with MAX_LANE_RESTARTS_PER_SWEEP=2 → at most 2
+    // heavy stop→ideate→restart heals actually run; the 3rd is deferred (restart_deferred), proving
+    // the shared per-sweep restart budget caps the disk-meltdown blast radius. (MAX==2 asserted so
+    // the test tracks the constant.)
+    #[test]
+    fn autopilot_recover_respects_shared_restart_budget() {
+        assert_eq!(MAX_LANE_RESTARTS_PER_SWEEP, 2, "test assumes a budget of 2");
+        let mut dirs = Vec::new();
+        let mut repos = Vec::new();
+        let mut targets = Vec::new();
+        for i in 0..3 {
+            let (dir, repo) = seed_noop_streak_lane(&format!("budget{i}"));
+            targets.push(repo["name"].as_str().unwrap().to_string());
+            repos.push(repo);
+            dirs.push(dir);
+        }
+        let actions = autopilot_recover_pass_inner(
+            &repos,
+            &targets,
+            true,
+            crate::fleet::STUCK_SWEEP_THRESHOLD,
+            &|_n| crate::fleet::STUCK_SWEEP_THRESHOLD,
+            &|_n| Ok(()),
+        );
+        // Exactly one lane is deferred once the 2-slot budget is spent (restart_deferred surfaces in
+        // the recover action string). recover() reserves the slot BEFORE stopping, so a deferred
+        // lane is never left stopped-but-not-restarted.
+        let deferred = actions
+            .iter()
+            .filter(|a| a.contains("restart_deferred"))
+            .count();
+        let real_heals = actions
+            .iter()
+            .filter(|a| a.contains("recover:") && a.contains("restart") && !a.contains("restart_deferred"))
+            .count();
+        assert!(
+            real_heals <= MAX_LANE_RESTARTS_PER_SWEEP,
+            "no more than the budget of heavy restarts may run: {actions:?}"
+        );
+        assert!(
+            deferred >= 1,
+            "with 3 stuck lanes and a budget of 2, at least one lane must defer: {actions:?}"
+        );
+        for dir in dirs {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
