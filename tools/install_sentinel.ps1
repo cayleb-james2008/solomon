@@ -47,6 +47,10 @@ if (-not (Test-Path $exe)) {
 }
 
 # Current user, default (non-elevated) run level; /F replaces an existing task in place.
+# The 5-min cadence is the FLEET-PLANE max-park liveness FLOOR (audit A.1 / park.rs::MAX_PARK_FLOOR_S
+# = 300s): the guaranteed upper bound on how long the fleet can go un-swept even with no in-app GUI
+# tick. It is a floor, not the primary pacing — the per-lane improver loop now wakes event-driven
+# (freshness new-sample / KILL, see improver::park) well inside this window. Do NOT lengthen it.
 schtasks /Create /F /TN "$TaskName" /SC MINUTE /MO 5 /TR "`"$exe`" watchdog"
 if ($LASTEXITCODE -eq 0) {
     Write-Output "installed: '$TaskName' -> `"$exe`" watchdog (every 5 minutes, current user)"
