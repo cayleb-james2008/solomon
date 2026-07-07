@@ -203,7 +203,7 @@ fn autopilot_config_from_entries(entries: &[Value]) -> Value {
         cfg.insert("mode".to_string(), json!("single_agent"));
     }
     let mut set_default = |key: &str, value: Value| {
-        let missing = cfg.get(key).map(truthy).unwrap_or(false) == false;
+        let missing = !cfg.get(key).map(truthy).unwrap_or(false);
         if missing {
             cfg.insert(key.to_string(), value);
         }
