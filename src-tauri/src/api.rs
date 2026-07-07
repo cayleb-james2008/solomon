@@ -434,12 +434,113 @@ fn safe<T>(fn_: impl FnOnce() -> T + std::panic::UnwindSafe, default: T) -> T {
 }
 
 // --------------------------------------------------------------------------- #
+// the bridge method surface — a compile-time-checked source of truth
+// --------------------------------------------------------------------------- #
+//
+// The JS bridge is stringly-typed: `window.pywebview.api` is a Proxy (main.rs) that forwards ANY
+// method name to `invoke('bridge', {method, args})`, and this module resolves it by matching a
+// `&str`. Nothing at compile time tied the set of methods `dispatch` HANDLES to the set the
+// frontend (web/app.js) CALLS, so a backend rename or a frontend typo drifted silently — the exact
+// "API drift" class the ws-improve audit named. These two closed lists + the closure test below
+// pin the surface the same STRUCTURAL way `actions.rs`'s `ACTION_KINDS` pins the recovery kinds:
+// the surface is enumerable in one place (so `web/api.d.ts` / a TS stub can be generated from or
+// checked against it), and the `#[test]` goes RED the moment `dispatch`'s match arms and this
+// registry disagree in EITHER direction. The test parses this file's own source and executes NO
+// dispatch arm, so it is completely free of the side effects (thread spawns, git/gh, fleet
+// mutation) a live probe of `get_state`/`run_plan`/`supervise`/`autopilot_*` would incur.
+
+/// Every method name `dispatch` resolves (the `_ => unknown method` arm rejects anything else). Kept
+/// in dispatch declaration order. The closure test asserts this equals the literal set of arms.
+pub const API_METHODS: &[&str] = &[
+    // in-app updater (cached stub; update_status/apply_update are bridge-only, see below)
+    "cached_update_status",
+    "current_sha",
+    // combined dashboard state
+    "get_state",
+    // ops / CEO plane (dashboard v2)
+    "ops_state",
+    "autopilot_state",
+    "fleet_state",
+    "autopilot_wake",
+    "fleet_once",
+    "autopilot_pause",
+    "fleet_drain",
+    "run_plan",
+    "run_report",
+    // control
+    "start",
+    "stop",
+    "beautify",
+    "merge",
+    "close",
+    // config
+    "set_repo_config",
+    "set_key",
+    "add_project",
+    "connect_project",
+    "github_login_start",
+    // review / workspace / insights
+    "pr_diff",
+    "read_log",
+    "read_history",
+    "read_contract",
+    "write_contract",
+    "metrics",
+    "cleanup_worktrees",
+    "clean_branch",
+    "start_app_test",
+    "stop_app_test",
+    "app_test_state",
+    "app_test_frame",
+    "read_app_test_report",
+    // provisioning + Solomon supervisor
+    "ensure_contracts",
+    "enrich_contract",
+    "ideate",
+    "supervise",
+    "read_supervisor_log",
+    "read_escalation",
+    "clear_escalation",
+    // misc
+    "open_url",
+    "get_theme",
+    "set_theme",
+    "get_auto_push",
+    "set_auto_push",
+    "get_auto_ai_fix",
+    "set_auto_ai_fix",
+    "get_layout",
+    "set_layout",
+];
+
+/// Methods the frontend Proxy calls that are handled in `main.rs::bridge` (they need the tauri
+/// AppHandle for `tauri-plugin-updater`) and NEVER reach `dispatch`. Listed here so the COMPLETE
+/// bridge surface is enumerable from one place (`bridge_surface`), not split across two files
+/// with nothing tying them together.
+pub const BRIDGE_ONLY_METHODS: &[&str] = &["update_status", "apply_update"];
+
+/// The complete method surface the JS bridge may invoke: everything `dispatch` resolves plus the
+/// AppHandle-only methods `main.rs::bridge` special-cases. The single source of truth a generated
+/// `web/api.d.ts` (or a frontend-call audit) can be checked against, so a backend rename or a
+/// frontend typo is caught instead of silently rejected at runtime.
+pub fn bridge_surface() -> Vec<&'static str> {
+    API_METHODS
+        .iter()
+        .copied()
+        .chain(BRIDGE_ONLY_METHODS.iter().copied())
+        .collect()
+}
+
+// --------------------------------------------------------------------------- #
 // dispatch — mirror every Api method (JS calls positionally)
 // --------------------------------------------------------------------------- #
 
 /// The native equivalent of the pywebview js_api surface. `method` is the Api method name; `args` are
 /// the positional arguments in the same order app.py's signature declares them. Returns the bridge
 /// Value, or Err(message) for an unknown method (the JS bridge surfaces it as a rejected call).
+///
+/// The set of methods handled here is pinned by [`API_METHODS`] via a build-time closure test — an
+/// arm added/removed without updating the registry fails `cargo test` (the drift guard).
 pub fn dispatch(method: &str, args: &[Value]) -> Result<Value, String> {
     // A fresh load per dispatch: disk (.solomon.json) is the source of truth (see module note).
     let mut st = AppState::load();
@@ -940,6 +1041,148 @@ fn health_repo(r: &Value) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // -------- API surface closure contract (drift guard) --------
+    // The bridge is stringly-typed: dispatch resolves a `&str` method and the frontend Proxy can
+    // send any name. API_METHODS is the declared source of truth for that surface; this test pins
+    // it to the ACTUAL dispatch match arms by parsing this file's own source, so a method arm added
+    // (or renamed/removed) without updating API_METHODS fails `cargo test` — the build gate — in
+    // EITHER direction. It executes NO dispatch arm, so it never spawns a thread, runs git/gh, or
+    // mutates fleet state (a live probe of get_state/run_plan/supervise/autopilot_* would).
+
+    /// The literal method-name arms of the `dispatch` match, scraped from this file's own source
+    /// (deterministic path from the manifest dir — mirrors actions.rs::repo_actions_json). Captures
+    /// both single arms (`"m" =>`) and alternations (`"a" | "b" =>`), scoped to the match body
+    /// (between `let v: Value = match method {` and the `_ => return Err` sentinel arm), so unrelated
+    /// string literals elsewhere in dispatch (e.g. a `json!` payload) are never miscounted as arms.
+    fn dispatch_match_arms() -> Vec<String> {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("api.rs"),
+        )
+        .expect("api.rs readable from CARGO_MANIFEST_DIR");
+        let start = src
+            .find("let v: Value = match method {")
+            .expect("dispatch match head present");
+        let end = src[start..]
+            .find("_ => return Err(")
+            .map(|i| start + i)
+            .expect("dispatch match sentinel arm present");
+        let body = &src[start..end];
+
+        // Each arm line has the shape:  "name" [| "name"]* =>
+        // Grab every quoted token that appears on a line ending in `=>` within the match body.
+        let mut arms: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let t = line.trim();
+            // Only arm lines (LHS ends in `=>`), never a comment or a nested-value line.
+            if t.starts_with("//") || !t.contains("=>") {
+                continue;
+            }
+            // The pattern portion is everything left of `=>`.
+            let lhs = &t[..t.find("=>").unwrap()];
+            for cap in regex::Regex::new(r#""([a-z_]+)""#)
+                .unwrap()
+                .captures_iter(lhs)
+            {
+                arms.push(cap[1].to_string());
+            }
+        }
+        arms
+    }
+
+    #[test]
+    fn api_methods_registry_matches_dispatch_arms_exactly() {
+        use std::collections::BTreeSet;
+        let arms: BTreeSet<String> = dispatch_match_arms().into_iter().collect();
+        let registry: BTreeSet<String> = API_METHODS.iter().map(|s| s.to_string()).collect();
+
+        // Same cardinality of unique names in the registry as literal arms (no duplicate registry
+        // entry, and every arm — incl. each side of an alternation like autopilot_state|fleet_state
+        // — is registered).
+        let missing_from_registry: Vec<&String> = arms.difference(&registry).collect();
+        let stale_in_registry: Vec<&String> = registry.difference(&arms).collect();
+        assert!(
+            missing_from_registry.is_empty(),
+            "dispatch handles methods absent from API_METHODS (add them): {missing_from_registry:?}"
+        );
+        assert!(
+            stale_in_registry.is_empty(),
+            "API_METHODS names methods dispatch no longer handles (remove them): {stale_in_registry:?}"
+        );
+        // No accidental duplicate entries in the declared list.
+        assert_eq!(
+            API_METHODS.len(),
+            registry.len(),
+            "API_METHODS has duplicate entries: {API_METHODS:?}"
+        );
+    }
+
+    #[test]
+    fn bridge_surface_is_dispatch_plus_apphandle_only_methods_disjoint() {
+        // The complete frontend-callable surface = dispatch methods ∪ the AppHandle-only methods
+        // main.rs::bridge special-cases. The two sets must be DISJOINT (a bridge-only method must
+        // not ALSO be a dispatch arm, or main.rs would shadow a live handler and the surface count
+        // would double-count it).
+        use std::collections::BTreeSet;
+        let api: BTreeSet<&str> = API_METHODS.iter().copied().collect();
+        for m in BRIDGE_ONLY_METHODS {
+            assert!(
+                !api.contains(m),
+                "{m} is AppHandle-only (main.rs::bridge) yet also a dispatch arm — remove one"
+            );
+        }
+        // cached_update_status IS a dispatch arm (benign stub) and must stay OUT of the bridge-only
+        // set — it is the one updater method that does NOT need the AppHandle.
+        assert!(
+            api.contains("cached_update_status"),
+            "cached_update_status must remain a dispatch stub"
+        );
+        let surface = bridge_surface();
+        assert_eq!(
+            surface.len(),
+            API_METHODS.len() + BRIDGE_ONLY_METHODS.len(),
+            "bridge_surface must be the disjoint union of the two registries"
+        );
+        // Sanity: the two updater methods that route through main.rs are present in the full surface.
+        assert!(surface.contains(&"update_status"));
+        assert!(surface.contains(&"apply_update"));
+    }
+
+    #[test]
+    fn dispatch_rejects_a_method_outside_the_registry() {
+        // The runtime contract behind the registry: a name not in API_METHODS is rejected (never a
+        // silent no-op), and every declared method is at least RECOGNIZED (does not hit the unknown
+        // arm). Recognition is asserted for the side-effect-free read/config methods only; the
+        // heavy/mutating arms (get_state, run_plan, supervise, autopilot_*, fleet_*) are proven to be
+        // arms by the source-parse test above, so they are not live-probed here.
+        assert!(dispatch("no_such_bridge_method_xyz", &[]).is_err());
+
+        let bogus = json!("definitely-not-a-registered-repo-xyz");
+        for m in [
+            "cached_update_status",
+            "read_log",
+            "read_history",
+            "metrics",
+            "read_contract",
+            "read_escalation",
+            "clear_escalation",
+            "get_theme",
+            "get_auto_push",
+            "get_auto_ai_fix",
+            "get_layout",
+        ] {
+            let r = dispatch(m, std::slice::from_ref(&bogus));
+            assert!(
+                r.is_ok(),
+                "{m} is in API_METHODS but dispatch rejected it as unknown"
+            );
+            if let Err(e) = r {
+                assert!(!e.contains("unknown method"), "{m}: {e}");
+            }
+        }
+    }
 
     // -------- jsonl_tail (v2 dashboard payload helper) --------
     #[test]
