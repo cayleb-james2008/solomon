@@ -68,11 +68,34 @@ fn protected(name: &str) -> bool {
     PROTECTED.iter().any(|p| p.eq_ignore_ascii_case(name))
 }
 
+/// Test-scratch dir name prefixes the janitor reaps (2026-07-07 audit A.6). `cargo test` writes
+/// PID-suffixed working dirs directly into the LIVE `<HERE>/runtime/` (the supervisor/watchdog/
+/// fleet tests exercise the real runtime dir, not `std::env::temp_dir()`), so they accumulate
+/// unbounded — 19 observed on 2026-07-07. They are pure test detritus (no live ledger ever lands
+/// under these names), so the janitor prunes them as stale temp. NOTE: `runtime/` is already
+/// wholesale-gitignored, so these do NOT trigger the `git status --porcelain` controller-dirty
+/// gate — this is storage hygiene (the janitor's bounded-runtime-dir contract), not a
+/// controller-clean fix. Matched as a `starts_with` prefix so the PID/nanos suffix is irrelevant.
+const TEST_SCRATCH_DIR_PREFIXES: &[&str] = &[
+    "sup_test_",
+    "testrepo_",
+    "wd_ar_",
+    "wd_heal_",
+    "wd_stall_",
+    "app_test_",
+];
+
 /// The stale-temp deletion predicate (pure — unit-tested): `_bb_*.js` / `_bb_*.md` / `*.tmp` /
-/// `_debug_*` files and `__pycache__` dirs. Age is checked by the caller (all classes: 7 days).
+/// `_debug_*` files, and `__pycache__` + the test-scratch (`sup_test_*`/`testrepo_*`/`wd_ar_*`/
+/// `wd_heal_*`/`wd_stall_*`/`app_test_*`) dirs. Age is checked by the caller (all classes: 7 days).
 fn stale_temp(name: &str, is_dir: bool) -> bool {
     if is_dir {
-        return name == "__pycache__";
+        if name == "__pycache__" {
+            return true;
+        }
+        return TEST_SCRATCH_DIR_PREFIXES
+            .iter()
+            .any(|p| name.starts_with(p));
     }
     let n = name.to_ascii_lowercase();
     (n.starts_with("_bb_") && (n.ends_with(".js") || n.ends_with(".md")))
@@ -361,9 +384,19 @@ mod tests {
             ("_debug_dump.txt", false, true),
             ("__pycache__", true, true),
             ("__pycache__", false, false), // dir-only pattern
+            // test-scratch dirs (audit A.6): reaped as dirs, never as files
+            ("sup_test_stale_live_pid_154396", true, true),
+            ("testrepo_keep", true, true),
+            ("wd_ar_heal_15760", true, true),
+            ("wd_heal_21792_293700", true, true),
+            ("wd_stall_14520_83900", true, true),
+            ("app_test_foo_123", true, true),
+            ("sup_test_stale_live_pid_154396", false, false), // dir-only: a same-named FILE is left alone
+            ("sup_testish", true, false),                     // needs the trailing underscore prefix
             ("history.jsonl", false, false),
             ("heartbeat.json", false, false),
             ("normal.log", false, false),
+            ("runtime", true, false), // a real lane/runtime dir must never match
         ] {
             assert_eq!(stale_temp(name, is_dir), want, "{name} is_dir={is_dir}");
         }
