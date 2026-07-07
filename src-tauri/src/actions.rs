@@ -146,6 +146,14 @@ pub fn policy_for(category: &str) -> Policy {
 /// `category` threads the diagnosis identity into the page-dedup marker; `auto_push` threads the
 /// same global ship gate `recover()` already threads to its own restart/fix-session spawns.
 pub fn execute_action(kind: &str, repo: &Value, category: &str, auto_push: bool) -> Value {
+    // OUTERMOST default-DENY: the NO-MONEY-OUT guard. Checked BEFORE any action
+    // machinery runs, so no money-capable action can execute without passing it.
+    // Returns Some(refusal) for a DENIED money action (money-out / unknown /
+    // ambiguous — fail-closed), None to proceed. Transparent to every non-money
+    // kind. See money_guard.rs for the HARD invariant + doctrine lineage.
+    if let Some(refusal) = crate::money_guard::guard(kind, repo) {
+        return refusal;
+    }
     match kind {
         // healthy / nothing to do — an explicit no-op so "every diagnosis maps" includes "ok".
         "none" => json!({"ok": true, "kind": "none", "detail": "no action required"}),
