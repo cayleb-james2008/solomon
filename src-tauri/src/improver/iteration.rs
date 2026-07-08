@@ -543,7 +543,50 @@ Then stop."
     } else {
         item_timeout // TIER -> BUDGET: TIMEOUT_DEEP for an architecture/[campaign] item, else standard
     };
-    let p = pi::run_pi(ctx, &task, implement_timeout, system_md.as_deref());
+    // D10 — the implement step now routes through the CEO orchestrator's constrained-Specialist
+    // dispatch (the SAME gate-first seam the onboarding path uses), instead of calling pi::run_pi
+    // inline. On a normal engineering iteration this is a byte-identical relocation: a plain `Code`
+    // task on an ordinary lane is neither money-capable nor a governance target, so the fail-closed
+    // gate (money_guard -> pecrt::safety) admits it and pi runs with the EXACT same
+    // task/timeout/system_md as before. The win is a single audited chokepoint — a money- or
+    // self-governance-tagged task kind is REFUSED here BEFORE any pi spawn, and a future
+    // Growth/Finance specialist would be selected by task kind at this one point. The gate adds
+    // routing, never a bypass: the downstream freshness/blast-radius/skeptic/KILL/ship gates still
+    // decide every action.
+    let repo_row = gitops::repo_row(ctx, &ctx.name.clone());
+    let p = match crate::ceo::orchestrator::dispatch_engineering_on_ctx(
+        ctx,
+        &repo_row,
+        crate::ceo::orchestrator::TaskKind::Code,
+        &task,
+        implement_timeout,
+        system_md.as_deref(),
+    ) {
+        Ok(run_out) => run_out,
+        Err(refusal) => {
+            // Gate DENY — fail-closed, NO pi spawn, NO token spent. On a normal engineering lane a
+            // plain code task is never denied; this is the defensive branch that fires only if a
+            // money-out / self-governance surface were ever attributed to a coding task. Idle it out
+            // honestly (record a non-op, drop the branch), exactly as a refused non-op would.
+            let why = refusal
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| refusal.to_string());
+            ctx.log(&format!(
+                "implement step REFUSED at the orchestrator gate (no pi spawn, no token spent): {why}"
+            ));
+            progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "noop");
+            gitops::drop_branch(
+                ctx,
+                &branch,
+                "noop",
+                "implement step refused at the orchestrator gate (fail-closed).",
+                "sleeping",
+            );
+            return;
+        }
+    };
     // pi::run_pi never panics: a timeout returns rc=124, a spawn failure rc<0 with empty stdout.
     // The Python TimeoutExpired -> _drop_branch(noop, "Pi session timed out.") path is reproduced
     // by detecting the rc=124 timeout marker ALONE (run_pi sets 124 only on a timeout, and pi streams
