@@ -50,6 +50,20 @@ pub mod orchestrator;
 // tool is denied by default. See research.rs.
 pub mod research;
 
+// D8 Layer 3: the CROSS-PROJECT wins ledger reader — the minimal cross-project learning surfaced
+// into the morning plan. It TAILS the existing append-only runtime/outcomes.jsonl and extracts
+// ANONYMIZED prior wins (shipped iteration / published post / positive equity day / live trade)
+// with zero lane identity, which the plan prompt consults. A write-only ledger (written by the
+// evening summary but never read back into planning) fails its wiring #[test]. See wins.rs.
+pub mod wins;
+
+// D8 Layer 3: the plug-and-play ONBOARDING path — given (project path + API-key env) ALONE it
+// auto-detects the stack, seeds a real freshness objective (emitter verified present per D1's rule,
+// else the honest no_objective sentinel), provisions an ISOLATED runtime/<name>/ state dir, writes
+// the repos.json row (ZERO hand-editing), and runs ONE gated cycle through the existing gates. See
+// onboard.rs.
+pub mod onboard;
+
 use crate::control::{paths, proc};
 use crate::notify::{self, Notice};
 use crate::ops::{self, ledger};
@@ -365,11 +379,18 @@ pub fn morning_plan() -> Value {
         top-ranked lane, the scale/boost move, and what is held and why). Reply with STRICT JSON \
         only: {\"lanes\": {\"<lane>\": {\"tier\": \"chore|feature|refactor|architecture\", \
         \"goal\": \"<one sentence>\", \"why\": \"<one sentence>\"}}, \
-        \"fleet\": {\"allocation\": \"<one sentence>\"}} — one lanes entry per lane given.";
-    let user = serde_json::to_string_pretty(
-        &json!({"date": today, "lanes": ctx, "allocation": allocation}),
-    )
-    .unwrap_or_default();
+        \"fleet\": {\"allocation\": \"<one sentence>\"}} — one lanes entry per lane given. You are \
+        ALSO given `prior_wins`: an ANONYMIZED, cross-project tally of what KINDS of moves have \
+        actually WON across the fleet's recent history (shipped iterations, published posts with \
+        URLs, positive-equity days, live fills) — NO lane is named. Let it bias each lane's goal \
+        toward move-shapes with a real track record; it is context, never an excuse to fabricate a \
+        win a lane did not earn (an EMPTY prior_wins means the fleet has no recent wins — plan \
+        honestly from the measured outcomes, do not invent momentum).";
+    // D8 cross-project learning: the ANONYMIZED prior-wins tally, READ fresh from
+    // runtime/outcomes.jsonl and spliced into the plan prompt so a new lane's plan is informed by
+    // what has actually won across the fleet (never a lane name — anonymized by construction).
+    let prior_wins = wins::prior_wins();
+    let user = build_plan_user_json(&today, &ctx, &allocation, &prior_wins);
 
     let reply = match ollama_chat(CEO_MODEL, system, &user) {
         Ok(r) => r,
@@ -452,6 +473,22 @@ pub fn morning_plan() -> Value {
         .join("\n");
     let _ = notify::send(&Notice::plan(format!("Solomon morning plan {today}"), body));
     json!({"ok": true, "applied": applied, "report": report_path.to_string_lossy()})
+}
+
+/// Assemble the morning-plan prompt's USER JSON (pure — the unit-tested seam). The D8 wins-ledger
+/// wiring lives HERE so it can be proven: `prior_wins` is spliced under the `"prior_wins"` key, so a
+/// non-empty wins summary MUST appear in the serialized prompt. The wiring `#[test]`
+/// `wins_ledger_is_consulted_in_the_plan_prompt` seeds the real outcomes.jsonl, calls
+/// `wins::prior_wins()`, and asserts the win lands here — a WRITE-ONLY outcomes ledger (never read
+/// back into planning) would leave `prior_wins` empty and fail that assertion (failure catalog #5).
+fn build_plan_user_json(today: &str, ctx: &[Value], allocation: &Value, prior_wins: &Value) -> String {
+    serde_json::to_string_pretty(&json!({
+        "date": today,
+        "lanes": ctx,
+        "allocation": allocation,
+        "prior_wins": prior_wins,
+    }))
+    .unwrap_or_default()
 }
 
 /// The per-day idempotence marker appended to every CEO backlog item.
@@ -1658,6 +1695,78 @@ pub fn next_watch(snapshot: &Value, status: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===================================================================== #
+    // D8 ACCEPTANCE (b): the CROSS-PROJECT wins ledger is CONSULTED in the
+    // plan prompt. This is the "no write-only ledger" contract (failure
+    // catalog #5) for the outcomes ledger's planning-read side: the evening
+    // summary WRITES runtime/outcomes.jsonl; the morning plan must READ it
+    // back into the prompt. We seed a real win into the ledger, run the REAL
+    // reader (wins::prior_wins), and assert the win lands in the assembled
+    // plan-prompt user JSON. A write-only ledger (never read into planning)
+    // would leave prior_wins EMPTY and this assertion would fail.
+    // ===================================================================== #
+    #[test]
+    fn wins_ledger_is_consulted_in_the_plan_prompt() {
+        // Write a snapshot line into the REAL outcomes.jsonl (under the per-process test HERE, so
+        // this is hermetic and never touches the operator's live ledger). It records a lane that
+        // shipped + moved equity — real, evidenced wins.
+        let path = ledger::ledger_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let snapshot = json!({
+            "date": "2026-07-07",
+            "projects": {
+                "seedlane": {"shipped_24h": 2, "equity_delta_24h": 12.5, "live_trades_24h": 1}
+            }
+        });
+        // append (do not clobber a real ledger if one exists under the test home)
+        use std::io::Write;
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .expect("open outcomes.jsonl for the seed write");
+            writeln!(f, "{}", snapshot).unwrap();
+        }
+
+        // (1) The REAL reader consulted the ledger and surfaced the win (proving it is READ, not
+        // write-only).
+        let prior_wins = wins::prior_wins();
+        assert!(
+            wins::has_wins(&prior_wins),
+            "wins::prior_wins must READ the seeded outcomes.jsonl and surface a win: {prior_wins}"
+        );
+
+        // (2) The reader's output is SPLICED into the plan prompt: the assembled user JSON carries
+        // the anonymized win shapes. This is the wiring — a lane's plan is informed by prior wins.
+        let user = build_plan_user_json("2026-07-08", &[], &json!({}), &prior_wins);
+        assert!(user.contains("prior_wins"), "the prompt must carry the prior_wins block: {user}");
+        assert!(
+            user.contains("shipped_iteration") || user.contains("positive_equity_day"),
+            "the anonymized win shape must appear in the plan prompt (reader consulted): {user}"
+        );
+        // ANONYMIZED: the lane name that produced the win is NEVER in the prompt's wins block.
+        // (build_plan_user_json is given empty lanes, so any "seedlane" could only come from wins.)
+        assert!(
+            !user.contains("seedlane"),
+            "the wins block must be anonymized — no lane name leaks into the plan prompt: {user}"
+        );
+
+        // (3) NEGATIVE control (the write-only failure mode): an EMPTY summary — what a NEVER-READ
+        // ledger would yield — carries no win shape into the prompt. So the win in (2) is present
+        // ONLY because the reader actually read the ledger.
+        let empty_user = build_plan_user_json("2026-07-08", &[], &json!({}), &wins::wins_summary_from_lines(&[], 14));
+        assert!(
+            !empty_user.contains("shipped_iteration") && !empty_user.contains("positive_equity_day"),
+            "an unread (write-only) ledger yields no win in the prompt — the presence of a win \
+             proves the reader is wired: {empty_user}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 
     // -------- day gate (pure) --------
     #[test]
