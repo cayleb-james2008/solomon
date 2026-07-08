@@ -50,6 +50,16 @@ pub mod orchestrator;
 // tool is denied by default. See research.rs.
 pub mod research;
 
+// D12 Phase D rung 1: the FIRST specialist that ACTS on public projects to GROW them — organic-only,
+// gate-bounded, money-out human-gated. Behind the same `trait Specialist`, it DRAFTS organic growth
+// content (README/docs/examples/release-notes/showcase copy) into a GATED per-lane drafts log exactly
+// as Research drafts, and — behind a per-lane opt-in flag (`growth_publish`), dry-run-first — invokes
+// a project's OWN sanctioned publish lane (never a raw external post). Its whitelist names ZERO
+// money-capable and ZERO raw-external-mutation tools; every paid kind (buy_ads/pay_invoice/stripe/
+// ad_spend/withdraw) is REFUSED at the SAME fail-closed money_guard gate Research enforces. See
+// growth.rs.
+pub mod growth;
+
 // D8 Layer 3: the CROSS-PROJECT wins ledger reader — the minimal cross-project learning surfaced
 // into the morning plan. It TAILS the existing append-only runtime/outcomes.jsonl and extracts
 // ANONYMIZED prior wins (shipped iteration / published post / positive equity day / live trade)
