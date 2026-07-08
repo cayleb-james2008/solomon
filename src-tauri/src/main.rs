@@ -19,6 +19,7 @@ mod janitor; // storage janitor (RSI v3, requirement 5): temp deletion, log rota
 mod money_guard; // NO-MONEY-OUT guard: fail-closed, preemptive money-out chokepoint — Solomon never moves money out; only whitelisted lanes' own bots place trades (human-gated money-out doctrine, now ENFORCED)
 mod notify; // operator notifications (v2 Phase A): ntfy push + Windows toast, fed by ops incidents + CEO reports
 mod ops; // ops plane (Phase 1): ground-truth probes + honest fleet status (`probe` subcommand + watchdog graft)
+mod pecrt; // PECRT Layer 0: shared wake-bus + three-tier warm-context memory — a scheduler+memory WRAPPER (never a new authority); every action it schedules re-enters the EXISTING gates (dual Rust+Python impl mirrors pecrt.py)
 mod provenance; // config-provenance tripwire + controller-clean preflight (RSI v3, catalog #6): watched-config drift pages + holds trading lanes; Solomon refuses meta-work on itself from a dirty/off-base tree
 mod redeploy; // native self-redeploy: swap Solomon's own production binary in a safe drain window
 mod supervisor; // native port of improver/solomon.py — diagnose() + the 3-rung recover() ladder + escalation
