@@ -350,10 +350,22 @@ fn ceo_slow_tail(snapshot: Value, status: Value) {
 
 /// The two day-gated CEO jobs — the morning plan (LLM, >= 07:00) and the evening summary
 /// (deterministic, >= 20:00) — each attempt-capped + idempotent (see `should_attempt`). Runs in the
-/// SLOW TAIL because `morning_plan` makes an ollama call; it OWNS the `_ceo_state.json`
-/// read-modify-write for BOTH sections (single-flighted by the tail guard, so the two RMW cycles never
-/// race a second tail's). This is a verbatim move of the prior in-tick day-gate block — the gates are
-/// UNCHANGED.
+/// SLOW TAIL because `morning_plan` makes an ollama call.
+///
+/// CROSS-PROCESS SAFETY: the tail's single-flight guard (`CEO_SLOW_TAIL_RUNNING`) is a process-LOCAL
+/// static, so it serializes tails only WITHIN one process. TWO OS processes run `watchdog::main()` and
+/// can each reach this RMW at once — the in-app GUI tick (main.rs, every 120 s) and the out-of-band
+/// `solomon watchdog` Sentinel one-shot (every 5 min) — and `proc::atomic_write_json` prevents a torn
+/// file but NOT a lost update: reading the gate, holding it across `morning_plan`'s ~250 s ollama call,
+/// then writing back lets a second process that read the SAME pending gate clobber the first's write
+/// (at worst a double plan for the day, or a lost/undercounted attempt). The plan section is therefore
+/// STAMP-FIRST — it persists the attempt BEFORE the slow call (mirroring `sover_boost::stamp_boost`),
+/// shrinking that window to near-zero: a concurrent sweep (or this process's own next sweep) then reads
+/// the bumped attempt and does not re-run. `should_attempt`/`record_attempt` semantics are UNCHANGED —
+/// the pre-stamp is exactly `record_attempt`'s failed-attempt value, which success / a third strike
+/// overwrite below, so every observable end state is byte-identical to the prior write-after order. The
+/// deterministic evening summary is fast, so its RMW window is already negligible; it keeps the plain
+/// record-after order.
 fn ceo_day_gates() {
     let now = chrono::Local::now();
     let today = now.format("%Y-%m-%d").to_string();
@@ -362,13 +374,24 @@ fn ceo_day_gates() {
 
     let plan_sec = st.get("plan").cloned().unwrap_or_else(|| json!({}));
     if should_attempt(&plan_sec, &today, hour, PLAN_HOUR) {
+        // STAMP-FIRST: persist the attempt (attempts+1, `done` preserved) BEFORE the slow ollama call,
+        // so a concurrent watchdog process — or a process killed mid-plan (the Sentinel one-shot exiting
+        // before its detached tail finishes) — cannot re-run the plan or lose the attempt. `pending` is
+        // exactly `record_attempt(&plan_sec, &today, false)` (the same bytes the old code wrote on a
+        // failed attempt); success and the third-strike give-up overwrite it below.
+        let pending = record_attempt(&plan_sec, &today, false);
+        st["plan"] = pending.clone();
+        write_state(&st);
+
         let ok = morning_plan()
             .get("ok")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let new_sec = record_attempt(&plan_sec, &today, ok);
-        // Third strike: give up for the day, loudly — an unplanned day must be a KNOWN unplanned day.
-        if !ok && attempts_today(&new_sec, &today) >= MAX_ATTEMPTS {
+        if ok {
+            st["plan"] = json!({"done": today});
+            write_state(&st);
+        } else if attempts_today(&pending, &today) >= MAX_ATTEMPTS {
+            // Third strike: give up for the day, loudly — an unplanned day must be a KNOWN unplanned day.
             let _ = notify::send(&Notice::red(
                 "Solomon: morning plan FAILED".into(),
                 format!("{MAX_ATTEMPTS} attempts failed — lanes continue on standing goals today"),
@@ -376,10 +399,10 @@ fn ceo_day_gates() {
             // Distinguishable give-up sentinel (NOT a plain success): the dashboard renders this as
             // 'gave up', not a green 'done', so an unplanned day is never shown as planned.
             st["plan"] = json!({"done": today, "gave_up": true});
-        } else {
-            st["plan"] = new_sec;
+            write_state(&st);
         }
-        write_state(&st);
+        // Plain failure (not the third strike): the STAMP-FIRST write already persisted attempts+1 —
+        // nothing more to write, and the attempt is durable even if this process now dies.
     }
 
     let sum_sec = st.get("summary").cloned().unwrap_or_else(|| json!({}));
