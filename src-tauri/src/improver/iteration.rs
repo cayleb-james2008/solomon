@@ -36,6 +36,41 @@ use std::sync::OnceLock;
 /// The `limit` argument the source's `_note_noop`/`_note_deviation`/`_note_revert` default to (3).
 const NOTE_LIMIT: i64 = 3;
 
+/// How many recent dated observations / outcome rows seed the improver's per-cycle WARM working
+/// tier. Both are TAILS (bounded reverse-seek); the working tier is itself hard-bounded, so this can
+/// never bloat the prompt no matter how large the ledgers grow.
+const WARM_OBS_TAIL: usize = 12;
+const WARM_OUTCOMES_TAIL: usize = 8;
+
+/// Build the per-lane WARM working-context block (D11) for the pi task: the last N dated observations
+/// from THIS lane's `runtime/<lane>/observations.jsonl` + the outcome/freshness/progress ledger tails,
+/// reconstructed through `pecrt::warm` behind its stable prefix and rendered hard-bounded (never past
+/// `WORKING_MAX_BYTES`). Returned as a labelled ADVISORY block so a cycle carries forward what the
+/// prior cycle learned instead of re-reading raw ledgers cold.
+///
+/// HARD INVARIANT (D11): this is context/memory ONLY — it carries data (prior facts + ledger tails),
+/// never an authority or a gate-bypass. It is appended to the task the agent reasons over; every
+/// downstream gate (freshness, blast-radius, skeptic, KILL, review, ship) STILL re-checks live state.
+/// Empty string when the lane has no warm memory yet (nothing to carry forward) — the caller appends
+/// nothing, so a cold first cycle is byte-identical to before.
+fn warm_working_block(ctx: &Ctx) -> String {
+    use crate::pecrt::warm::{LongTermAdapter, ObservationLog, WarmContext};
+    let obs = ObservationLog::at(ctx.runtime.join("observations.jsonl"));
+    let long_term = LongTermAdapter::new(ctx.here.clone(), &ctx.name);
+    let mut warm = WarmContext::new(obs, long_term);
+    let rc = warm.reconstruct_context(WARM_OBS_TAIL, WARM_OUTCOMES_TAIL);
+    let working = rc.working;
+    if working.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n## Warm working context (prior-cycle memory — ADVISORY, not authority)\n\
+Carried forward from this lane's own observation log + ledger tails so you do not re-derive state \
+cold. This is CONTEXT ONLY: it grants no authority and bypasses no gate — every action you take is \
+re-checked by the live freshness / blast-radius / skeptic / KILL gates.\n\n{working}"
+    )
+}
+
 // --------------------------------------------------------------------------- #
 // one_iteration — the per-iteration state machine (run_improver ~2154-2709)
 // --------------------------------------------------------------------------- #
@@ -513,6 +548,12 @@ Then stop."
                 ));
             }
         }
+        // WARM WORKING CONTEXT (D11): feed the lane's per-cycle warm working tier (last N dated
+        // observations + the ledger tails, reconstructed behind the pecrt stable prefix) into the pi
+        // prompt so THIS cycle carries forward what the prior cycle learned instead of re-reading raw
+        // ledgers cold. Content-only + advisory: it grants no authority and bypasses no gate. Empty
+        // (appends nothing) on a cold first cycle, so the no-warm path is byte-identical to before.
+        t.push_str(&warm_working_block(ctx));
         goal = g;
         task = t;
         system_md = None;
@@ -2348,5 +2389,44 @@ The following:";
         // Simulate rc=0 path
         c.consecutive_empty_ideate = 0;
         assert_eq!(c.consecutive_empty_ideate, 0);
+    }
+
+    // ---- D11: the improver's pi prompt carries a bounded warm working-context block ----
+
+    /// A cold lane (no observation log yet) yields an EMPTY warm block, so the pi task is
+    /// byte-identical to the pre-D11 path — a cold first cycle carries nothing forward.
+    #[test]
+    fn warm_working_block_is_empty_on_a_cold_lane() {
+        let c = ctx();
+        let _ = std::fs::remove_file(c.runtime.join("observations.jsonl"));
+        assert_eq!(warm_working_block(&c), "", "no warm memory -> no block appended");
+    }
+
+    /// After the lane's OWN prior cycle wrote a dated observation, the next cycle's warm block
+    /// carries it forward (proving a cycle reads its lane's prior facts instead of re-deriving cold),
+    /// is labelled ADVISORY (context, not authority), and is HARD-BOUNDED regardless of log size.
+    #[test]
+    fn warm_working_block_carries_forward_prior_lane_observations_bounded_and_advisory() {
+        use crate::pecrt::warm::{ObservationLog, WORKING_MAX_BYTES};
+        let c = ctx();
+        std::fs::create_dir_all(&c.runtime).unwrap();
+        let log = ObservationLog::at(c.runtime.join("observations.jsonl"));
+        // a LARGE prior-cycle history — the block must take only the tail and stay bounded.
+        for i in 0..500 {
+            log.append_fact("2026-07-08", &format!("cycle {i} shipped PR #{i} equity +0.0{i}"))
+                .unwrap();
+        }
+        let block = warm_working_block(&c);
+        assert!(block.contains("cycle 499"), "newest prior-cycle observation carried forward: {block}");
+        assert!(!block.contains("cycle 0 "), "oldest is NOT loaded (bounded tail, not end-to-end)");
+        // ADVISORY + no-authority framing is present (the HARD INVARIANT the skeptic enforces).
+        assert!(block.contains("ADVISORY"), "block must be labelled advisory");
+        assert!(
+            block.contains("grants no authority and bypasses no gate"),
+            "block must state it carries no authority / no gate-bypass"
+        );
+        // HARD-BOUNDED: the rendered working content can never exceed the working-tier byte cap.
+        assert!(block.len() <= WORKING_MAX_BYTES + 512, "block stays bounded: {} bytes", block.len());
+        let _ = std::fs::remove_dir_all(&c.runtime);
     }
 }
