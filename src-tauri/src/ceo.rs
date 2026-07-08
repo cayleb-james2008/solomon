@@ -67,6 +67,7 @@ pub mod onboard;
 use crate::control::{paths, proc};
 use crate::notify::{self, Notice};
 use crate::ops::{self, ledger};
+use crate::pecrt::warm::{LongTermAdapter, ObservationLog, ReconstructedContext, WarmContext};
 use chrono::{Timelike, Utc};
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
@@ -147,6 +148,84 @@ pub fn record_attempt(section: &Value, today: &str, ok: bool) -> Value {
 }
 
 // --------------------------------------------------------------------------- //
+// warm three-tier memory (D11) — the CEO's continuous-thread carry-forward
+// --------------------------------------------------------------------------- //
+
+/// The fleet-level CEO "lane" name. The CEO already owns `runtime/_ceo_state.json` /
+/// `runtime/_ceo_request.json`; its warm memory lives under the SAME `_ceo` prefix
+/// (`runtime/_ceo/observations.jsonl`) so it can never collide with a product lane's runtime dir.
+const CEO_WARM_LANE: &str = "_ceo";
+
+/// How many recent dated observations / outcome-ledger rows seed the reconstructed working tier.
+/// Both are TAILS (bounded reverse-seek), so a million-line log costs the same as a hundred-line one.
+const CEO_WARM_OBS_TAIL: usize = 24;
+const CEO_WARM_OUTCOMES_TAIL: usize = 12;
+
+/// `HERE/runtime/_ceo/observations.jsonl` — the CEO's append-only DATED observation log. Sibling of
+/// the per-lane observation logs the Research specialist writes (`runtime/<lane>/observations.jsonl`),
+/// so it is auto-bounded by the SAME janitor rules (`*.jsonl` rotation + the per-runtime-dir cap) —
+/// no new reaper is needed.
+fn ceo_obs_log_path() -> PathBuf {
+    paths::here()
+        .join("runtime")
+        .join(CEO_WARM_LANE)
+        .join("observations.jsonl")
+}
+
+/// Build the CEO's three-tier warm context: the append-only observation log (SHORT-TERM) + a
+/// READ-ONLY adapter over the ledgers Solomon already keeps (LONG-TERM: the shared
+/// `runtime/outcomes.jsonl`). No migration, no new store. `here()` is test-redirected, so this is
+/// hermetic under `cargo test`.
+fn ceo_warm() -> WarmContext {
+    ceo_warm_at(&ceo_obs_log_path(), paths::here())
+}
+
+/// Core of [`ceo_warm`], parameterized by the observation-log PATH and the HERE root so tests can
+/// point it at a per-test unique dir (Solomon's convention for parallel test isolation is unique
+/// paths, not serialization). Production always passes the `_ceo` path + the real HERE, so the wired
+/// behavior is identical — this only lets a test avoid racing on the single shared `_ceo` log.
+fn ceo_warm_at(obs_path: &std::path::Path, here: &std::path::Path) -> WarmContext {
+    let obs = ObservationLog::at(obs_path.to_path_buf());
+    let long_term = LongTermAdapter::new(here.to_path_buf(), CEO_WARM_LANE);
+    WarmContext::new(obs, long_term)
+}
+
+/// Reconstruct the CEO's WARM working context at the top of a tick — the stable-prefix'd,
+/// prior-observation-carrying prompt seed that REPLACES cold re-derivation as the thread's
+/// context/identity. HARD INVARIANT (D11): this is context/identity ONLY. It is NEVER read by a
+/// gate; the grafts below re-derive their decision inputs from a FRESH `ledger::snapshot()`. The
+/// STABLE_PREFIX embedded here already pins "you are a SCHEDULER and MEMORY wrapper, not an
+/// authority" — reconstruct_context can carry forward no authority and no gate-bypass. Emits the
+/// prefix cache-hit rate so the ~$4/day prefix-cache economics stay observable in the log.
+fn ceo_warm_reconstruct(warm: &mut WarmContext, log: &mut dyn FnMut(&str)) -> ReconstructedContext {
+    let ctx = warm.reconstruct_context(CEO_WARM_OBS_TAIL, CEO_WARM_OUTCOMES_TAIL);
+    log(&warm.cache.log_line());
+    ctx
+}
+
+/// Append ONE dated observation of this tick's decisions to the CEO's observation log. This is the
+/// SHORT-TERM write that the NEXT tick's `ceo_warm_reconstruct` reads back — the carry-forward that
+/// makes the thread warm instead of cold. `append_fact` enforces the dated-first-order-fact contract
+/// (rejects prose-of-prose / summary-of-summaries) and is append-only, so the log can never degrade
+/// into drift and can never gain a summary line. A rejected/failed append is swallowed (logged) — a
+/// disk hiccup or an accidentally-summary fact must never wedge the tick.
+fn ceo_append_tick_observation(warm: &WarmContext, iso_date: &str, fact: &str) {
+    if let Err(v) = warm.observations.append_fact(iso_date, fact) {
+        // Non-fatal: the fact is lost, not the tick. (v is the rejection reason.)
+        let _ = v;
+    }
+}
+
+/// Compose the one-line dated fact recording THIS tick's decisions/outcomes — a first-order fact
+/// (carries the epoch datum + the concrete gate states), never a rollup-of-rollups. Pure (caller
+/// supplies the states + epoch) so the carry-forward `#[test]` can pin the shape without a clock.
+fn ceo_tick_fact(epoch_s: u64, plan_state: &str, summary_state: &str) -> String {
+    format!(
+        "ceo tick t={epoch_s}: plan={plan_state} summary={summary_state}"
+    )
+}
+
+// --------------------------------------------------------------------------- //
 // tick — the watchdog graft
 // --------------------------------------------------------------------------- //
 
@@ -155,6 +234,22 @@ pub fn record_attempt(section: &Value, today: &str, ok: bool) -> Value {
 /// (the caller also wraps this in catch_unwind, matching the ops graft).
 pub fn tick() {
     blind_window_notice_once();
+
+    // WARM CARRY-FORWARD (D11): reconstruct the CEO thread's warm working context from its OWN prior
+    // observations + the ledger tails BEFORE the grafts run — the stable-prefix'd, prior-observation-
+    // carrying context that replaces cold re-derivation as the thread's identity. This is
+    // context/identity ONLY: it is NEVER read by a graft or a gate (those re-derive from the FRESH
+    // `ledger::snapshot()` below), and the STABLE_PREFIX inside it pins "scheduler, not authority" so
+    // it can carry forward no authority and no gate-bypass. Isolated in its own catch_unwind (like the
+    // grafts) so a warm-memory hiccup can never abort the watchdog sweep. The reconstructed context is
+    // intentionally not consumed by a downstream CEO LLM call yet (the morning plan builds its own
+    // prompt); the durable win of this wire is (a) the observable prefix cache-hit line and (b) the
+    // per-tick observation append below, which the NEXT tick reads back — the actual carry-forward.
+    let mut warm = ceo_warm();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut logf = |m: &str| eprintln!("[ceo] {m}");
+        let _ctx = ceo_warm_reconstruct(&mut warm, &mut logf);
+    }));
 
     // DETERMINISTIC ops-RED graft (v2, close-the-loop): every sweep, ensure each project whose
     // OUTCOME probe is RED carries a targeted [ops-auto:<probe>] fix item atop its backlog —
@@ -221,6 +316,43 @@ pub fn tick() {
             .unwrap_or(false);
         st["summary"] = record_attempt(&sum_sec, &today, ok);
         write_state(&st);
+    }
+
+    // WARM CARRY-FORWARD (D11), the append half: record ONE dated first-order fact of this tick's
+    // decisions (the plan / summary gate states this tick landed on) to the CEO observation log. This
+    // is the SHORT-TERM write the NEXT tick's `ceo_warm_reconstruct` reads back — so the second
+    // consecutive tick sees its own prior observation from the warm tier, not only a cold snapshot.
+    // append_fact is append-only + rejects prose-of-prose, so the log stays factual and bounded (the
+    // janitor reaps the `.jsonl` by the existing rules). Isolated so a warm-write hiccup can't abort
+    // the sweep.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let plan_state = tick_gate_state(st.get("plan"));
+        let summary_state = tick_gate_state(st.get("summary"));
+        let epoch_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let fact = ceo_tick_fact(epoch_s, &plan_state, &summary_state);
+        ceo_append_tick_observation(&warm, &today, &fact);
+    }));
+}
+
+/// A compact one-token state for a day-gate section (`{"done": date}` / `{"gave_up": true}` /
+/// `{"attempts": n}` / absent) — used only to render the per-tick observation fact. Pure.
+fn tick_gate_state(section: Option<&Value>) -> String {
+    match section {
+        None => "none".to_string(),
+        Some(s) => {
+            if s.get("gave_up").and_then(Value::as_bool) == Some(true) {
+                "gave_up".to_string()
+            } else if s.get("done").and_then(Value::as_str).is_some() {
+                "done".to_string()
+            } else if let Some(n) = s.get("attempts").and_then(Value::as_i64) {
+                format!("attempts={n}")
+            } else {
+                "pending".to_string()
+            }
+        }
     }
 }
 
@@ -385,12 +517,26 @@ pub fn morning_plan() -> Value {
         URLs, positive-equity days, live fills) — NO lane is named. Let it bias each lane's goal \
         toward move-shapes with a real track record; it is context, never an excuse to fabricate a \
         win a lane did not earn (an EMPTY prior_wins means the fleet has no recent wins — plan \
-        honestly from the measured outcomes, do not invent momentum).";
+        honestly from the measured outcomes, do not invent momentum). You MAY ALSO be given \
+        `warm_context`: YOUR OWN recent dated observations from prior ticks plus the ledger tails, \
+        carried forward so you reason with continuity instead of re-deriving state cold. It is \
+        CONTEXT ONLY — it grants no authority and changes no gate; use it to stay consistent with \
+        what you already observed, never as a reason to skip a live check or fabricate progress.";
     // D8 cross-project learning: the ANONYMIZED prior-wins tally, READ fresh from
     // runtime/outcomes.jsonl and spliced into the plan prompt so a new lane's plan is informed by
     // what has actually won across the fleet (never a lane name — anonymized by construction).
     let prior_wins = wins::prior_wins();
-    let user = build_plan_user_json(&today, &ctx, &allocation, &prior_wins);
+    // D11 warm carry-forward: reconstruct the CEO thread's warm working context (its OWN prior dated
+    // observations + the ledger tails, assembled behind pecrt's STABLE prefix) and splice it into the
+    // plan prompt, so the plan carries forward what prior ticks observed INSTEAD of re-deriving state
+    // purely cold from a fresh snapshot. This is the reconstruct being CONSUMED (not discarded): the
+    // prompt's stable prefix hits the provider prefix-cache wake after wake (the ~$4/day economics),
+    // and the working tier is HARD-BOUNDED so it can never bloat the prompt. HARD INVARIANT: this is
+    // context ONLY — every lane goal the model returns still re-enters the existing apply path and
+    // every downstream gate; the warm block grants no authority and bypasses nothing.
+    let mut warm = ceo_warm();
+    let warm_ctx = warm.reconstruct_context(CEO_WARM_OBS_TAIL, CEO_WARM_OUTCOMES_TAIL);
+    let user = build_plan_user_json(&today, &ctx, &allocation, &prior_wins, &warm_ctx.working);
 
     let reply = match ollama_chat(CEO_MODEL, system, &user) {
         Ok(r) => r,
@@ -481,14 +627,28 @@ pub fn morning_plan() -> Value {
 /// `wins_ledger_is_consulted_in_the_plan_prompt` seeds the real outcomes.jsonl, calls
 /// `wins::prior_wins()`, and asserts the win lands here — a WRITE-ONLY outcomes ledger (never read
 /// back into planning) would leave `prior_wins` empty and fail that assertion (failure catalog #5).
-fn build_plan_user_json(today: &str, ctx: &[Value], allocation: &Value, prior_wins: &Value) -> String {
-    serde_json::to_string_pretty(&json!({
+///
+/// D11: `warm_context` is the CEO thread's reconstructed WARM working tier (its own prior dated
+/// observations + the ledger tails, hard-bounded) spliced under `"warm_context"` — the carry-forward
+/// that makes the plan warm instead of cold. Empty string => the key is omitted (a cold first plan is
+/// byte-identical to before). Proven by `warm_context_is_consulted_in_the_plan_prompt`.
+fn build_plan_user_json(
+    today: &str,
+    ctx: &[Value],
+    allocation: &Value,
+    prior_wins: &Value,
+    warm_context: &str,
+) -> String {
+    let mut obj = json!({
         "date": today,
         "lanes": ctx,
         "allocation": allocation,
         "prior_wins": prior_wins,
-    }))
-    .unwrap_or_default()
+    });
+    if !warm_context.trim().is_empty() {
+        obj["warm_context"] = json!(warm_context);
+    }
+    serde_json::to_string_pretty(&obj).unwrap_or_default()
 }
 
 /// The per-day idempotence marker appended to every CEO backlog item.
@@ -1742,7 +1902,7 @@ mod tests {
 
         // (2) The reader's output is SPLICED into the plan prompt: the assembled user JSON carries
         // the anonymized win shapes. This is the wiring — a lane's plan is informed by prior wins.
-        let user = build_plan_user_json("2026-07-08", &[], &json!({}), &prior_wins);
+        let user = build_plan_user_json("2026-07-08", &[], &json!({}), &prior_wins, "");
         assert!(user.contains("prior_wins"), "the prompt must carry the prior_wins block: {user}");
         assert!(
             user.contains("shipped_iteration") || user.contains("positive_equity_day"),
@@ -1758,7 +1918,7 @@ mod tests {
         // (3) NEGATIVE control (the write-only failure mode): an EMPTY summary — what a NEVER-READ
         // ledger would yield — carries no win shape into the prompt. So the win in (2) is present
         // ONLY because the reader actually read the ledger.
-        let empty_user = build_plan_user_json("2026-07-08", &[], &json!({}), &wins::wins_summary_from_lines(&[], 14));
+        let empty_user = build_plan_user_json("2026-07-08", &[], &json!({}), &wins::wins_summary_from_lines(&[], 14), "");
         assert!(
             !empty_user.contains("shipped_iteration") && !empty_user.contains("positive_equity_day"),
             "an unread (write-only) ledger yields no win in the prompt — the presence of a win \
@@ -1766,6 +1926,42 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ===================================================================== #
+    // D11 ACCEPTANCE: the CEO's reconstructed WARM working context is CONSULTED
+    // in the plan prompt (the reconstruct is CONSUMED, not discarded). This is
+    // the "no cold re-derivation" contract for the plan prompt: a prior tick's
+    // observation, carried forward through pecrt::warm, must appear in the
+    // assembled plan user JSON under `warm_context`. An EMPTY warm context (a
+    // cold first plan) must OMIT the key entirely, so the cold path is
+    // byte-identical to the pre-D11 prompt (the negative control below).
+    // ===================================================================== #
+    #[test]
+    fn warm_context_is_consulted_in_the_plan_prompt() {
+        use crate::pecrt::warm::{LongTermAdapter, ObservationLog, WarmContext};
+        // A prior tick's observation, reconstructed through the SAME warm API morning_plan uses.
+        let obs_path = unique_ceo_obs_path("plan");
+        let log = ObservationLog::at(obs_path.clone());
+        log.append_fact("2026-07-08", "ceo tick t=1700009999: plan=done summary=pending")
+            .unwrap();
+        let mut warm = WarmContext::new(
+            ObservationLog::at(obs_path.clone()),
+            LongTermAdapter::new(paths::here().to_path_buf(), CEO_WARM_LANE),
+        );
+        let rc = warm.reconstruct_context(CEO_WARM_OBS_TAIL, CEO_WARM_OUTCOMES_TAIL);
+        // (1) the reconstructed warm working context carries the prior observation forward.
+        assert!(rc.working.contains("t=1700009999"), "warm working tier carried the prior tick obs");
+        // (2) it is SPLICED into the plan prompt under `warm_context` — a lane's plan is informed by
+        // what prior ticks observed (carry-forward), not a purely cold snapshot.
+        let user = build_plan_user_json("2026-07-08", &[], &json!({}), &json!({}), &rc.working);
+        assert!(user.contains("warm_context"), "the prompt must carry the warm_context block: {user}");
+        assert!(user.contains("t=1700009999"), "the prior tick observation must reach the plan prompt");
+        // (3) NEGATIVE control: an EMPTY warm context OMITS the key — a cold first plan is unchanged.
+        let cold = build_plan_user_json("2026-07-08", &[], &json!({}), &json!({}), "");
+        assert!(!cold.contains("warm_context"), "an empty warm context must omit the key: {cold}");
+
+        let _ = std::fs::remove_dir_all(obs_path.parent().unwrap());
     }
 
     // -------- day gate (pure) --------
@@ -2221,5 +2417,101 @@ mod tests {
         assert_eq!(pick_goal_post(None, "  fallback  "), "fallback");
         // neither present -> empty (lane stays dormant; the plane never invents work)
         assert_eq!(pick_goal_post(None, ""), "");
+    }
+
+    // ===================================================================== #
+    // D11 ACCEPTANCE: the CEO thread carries context forward through the warm
+    // tier instead of cold-deriving state every wake. The load-bearing proof
+    // is CARRY-FORWARD: a second consecutive tick, building a FRESH WarmContext
+    // (exactly as `tick()` does — `let mut warm = ceo_warm()` each call), reads
+    // back the observation the FIRST tick appended. `here()` is test-redirected
+    // (per-process temp home) so this is hermetic — it never touches the live
+    // CEO observation log.
+    // ===================================================================== #
+    /// A per-test unique CEO observation-log path (Solomon's parallel-isolation convention is unique
+    /// paths, not serialization — several ceo tests would otherwise race on the single shared `_ceo`
+    /// log). Points `ceo_warm_at` at an isolated dir while exercising the IDENTICAL construction seam.
+    fn unique_ceo_obs_path(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!("solomon_ceo_warm_{}_{}_{}", tag, std::process::id(), uniq))
+            .join("observations.jsonl")
+    }
+
+    #[test]
+    fn ceo_tick_reads_its_own_prior_observation_from_the_warm_tier() {
+        let obs_path = unique_ceo_obs_path("carry");
+        let here = paths::here().to_path_buf();
+
+        // ---- TICK 1: build a fresh warm context and append this tick's observation (the exact
+        // seam `tick()` runs at its end). Use a DISTINCTIVE epoch so we can find it back verbatim.
+        let warm1 = ceo_warm_at(&obs_path, &here);
+        let fact1 = ceo_tick_fact(1_700_000_111, "done", "pending");
+        ceo_append_tick_observation(&warm1, "2026-07-08", &fact1);
+
+        // ---- TICK 2: a BRAND-NEW WarmContext (nothing carried in memory — it must read from disk),
+        // reconstruct the working context (the seam `tick()` runs at its top). CARRY-FORWARD holds
+        // iff the working context contains tick 1's observation — proving the second tick reads its
+        // OWN prior observation from the warm tier, not only a cold snapshot.
+        let mut warm2 = ceo_warm_at(&obs_path, &here);
+        let mut sink = |_m: &str| {};
+        let ctx2 = ceo_warm_reconstruct(&mut warm2, &mut sink);
+        assert!(
+            ctx2.working.contains("t=1700000111"),
+            "second consecutive tick must read its OWN prior observation from the warm tier \
+(carry-forward), not cold-derive — working was: {}",
+            ctx2.working
+        );
+        // and it is assembled behind the STABLE prefix (prefix-cache economics) — the cold path never
+        // produced a stable-prefixed prompt at all.
+        assert!(
+            ctx2.full_prompt().starts_with(crate::pecrt::warm::STABLE_PREFIX),
+            "warm context must sit behind the stable prefix"
+        );
+
+        // ---- APPEND-ONLY: tick 2 appends its own fact; BOTH observations remain (append-only, the
+        // first is never rewritten or summarized away).
+        let fact2 = ceo_tick_fact(1_700_000_222, "done", "done");
+        ceo_append_tick_observation(&warm2, "2026-07-08", &fact2);
+        let tail = warm2.observations.tail(10);
+        assert!(tail.iter().any(|l| l.contains("t=1700000111")), "tick-1 obs still present (append-only)");
+        assert!(tail.iter().any(|l| l.contains("t=1700000222")), "tick-2 obs appended");
+        assert!(tail.iter().all(|l| l.starts_with("2026-07-08\t")), "every line is DATED");
+
+        let _ = std::fs::remove_dir_all(obs_path.parent().unwrap());
+    }
+
+    #[test]
+    fn ceo_tick_observation_is_a_dated_first_order_fact_not_a_summary() {
+        // the per-tick fact must PASS validate_fact (dated first-order fact) and must NOT be a
+        // summary-of-summaries — this is what keeps the observation log from degrading into drift.
+        let fact = ceo_tick_fact(1_700_000_333, "gave_up", "none");
+        assert!(
+            crate::pecrt::warm::ObservationLog::validate_fact(&fact).is_fact(),
+            "the tick fact must be a legal first-order dated fact: {fact}"
+        );
+        // a real append round-trips; a summary-shaped fact would be refused by append_fact.
+        let obs_path = unique_ceo_obs_path("fact");
+        let warm = ceo_warm_at(&obs_path, paths::here());
+        ceo_append_tick_observation(&warm, "2026-07-08", &fact);
+        assert_eq!(warm.observations.tail(5).len(), 1, "the legal fact appended");
+        // a summary is refused (append_fact returns Err; nothing persists) — the log can't drift.
+        let refused = warm
+            .observations
+            .append_fact("2026-07-08", "a summary of the summaries across all ticks");
+        assert!(refused.is_err(), "a summary-of-summaries must be refused");
+        assert_eq!(warm.observations.tail(5).len(), 1, "the refused summary did NOT persist");
+        let _ = std::fs::remove_dir_all(obs_path.parent().unwrap());
+    }
+
+    #[test]
+    fn tick_gate_state_renders_each_day_gate_shape() {
+        assert_eq!(tick_gate_state(None), "none");
+        assert_eq!(tick_gate_state(Some(&json!({"done": "2026-07-08"}))), "done");
+        assert_eq!(tick_gate_state(Some(&json!({"done": "2026-07-08", "gave_up": true}))), "gave_up");
+        assert_eq!(tick_gate_state(Some(&json!({"attempts_date": "2026-07-08", "attempts": 2}))), "attempts=2");
+        assert_eq!(tick_gate_state(Some(&json!({}))), "pending");
     }
 }
