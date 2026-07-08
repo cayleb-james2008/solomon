@@ -295,6 +295,61 @@ fn run_freshness_probe(ctx: &Ctx, script: &str) -> Result<Report, String> {
 }
 
 // --------------------------------------------------------------------------- #
+// crate-internal accessors for the outcome-critique layer (D3)
+// --------------------------------------------------------------------------- #
+//
+// The outcome-critique module (`outcome_critique.rs`) samples the SAME tier-1 metric this file
+// gates on, at ship time and again after the freshness window, to grade the SIGNED metric_delta of
+// a shipped change. It re-uses this file's probe machinery (the bounded shell exec, the last-line
+// JSON contract) rather than copying it — one probe implementation, one contract. These accessors
+// are `pub(crate)` and additive; they change NO existing behavior of `short_circuit`.
+
+/// The lane's configured freshness probe cmd, or None when the lane has no freshness config
+/// (`no_objective` sentinel / absent key => the critique layer is inert for that lane, exactly as
+/// the gate is). Read fresh from repos.json so a dashboard edit is honored, mirroring `short_circuit`.
+pub(crate) fn probe_cmd(ctx: &Ctx) -> Option<String> {
+    let row = gitops::repo_row(ctx, &ctx.name.clone());
+    freshness_cfg(&row).map(|c| c.cmd)
+}
+
+/// Run the lane's freshness probe ONCE and return the raw last-line JSON object (the probe's full
+/// contract payload — `metric_id`/`n_samples`/`observable`/`latest_ts` plus any lane-specific
+/// signed-value fields like kairos's `settled_usd_per_window_24h`). Err(detail) on every
+/// UNOBSERVABLE flavor (nonzero exit, timeout, spawn failure, no/garbage stdout). The critique
+/// layer needs the WHOLE object (not just the four `Report` fields), so this returns `Value`.
+pub(crate) fn probe_raw(ctx: &Ctx, script: &str) -> Result<Value, String> {
+    match run_shell_timed(ctx, script) {
+        Ok(p) if p.code != 0 => {
+            let tail: String = p.stderr.trim().chars().take(160).collect();
+            Err(format!(
+                "freshness cmd exited rc={}{}",
+                p.code,
+                if tail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {tail}")
+                }
+            ))
+        }
+        Ok(p) => {
+            let line = p
+                .stdout
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .ok_or_else(|| "freshness cmd produced no stdout".to_string())?;
+            serde_json::from_str::<Value>(line)
+                .map_err(|_| format!("last stdout line is not JSON: {}", head_chars(line, 160)))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            Err(format!("freshness cmd timed out after {FRESHNESS_CMD_TIMEOUT_S}s"))
+        }
+        Err(e) => Err(format!("freshness cmd failed to spawn: {e}")),
+    }
+}
+
+// --------------------------------------------------------------------------- #
 // HOLD_META — the WS5 config-provenance tripwire hold
 // --------------------------------------------------------------------------- #
 
