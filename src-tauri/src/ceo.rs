@@ -36,6 +36,14 @@ pub mod sover_boost;
 // blast-radius) DECIDE. It holds no new authority — DISPATCHES only. See orchestrator.rs.
 pub mod orchestrator;
 
+// D5 Layer 1: the FIRST non-engineering specialist behind the same `trait Specialist` — a RESEARCH
+// worker that ONLY reads the world and DRAFTS a provenance-tagged observation into a lane's PECRT
+// observation log. It publishes NOTHING and spends NOTHING: its whitelist names zero money-capable
+// and zero external-mutation tools, its scope is the drafts/observation-log path only, and its gate
+// reuses the SAME fail-closed money_guard + pecrt::safety composition — so any future publish/pay
+// tool is denied by default. See research.rs.
+pub mod research;
+
 use crate::control::{paths, proc};
 use crate::notify::{self, Notice};
 use crate::ops::{self, ledger};
