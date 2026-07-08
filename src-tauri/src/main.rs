@@ -22,6 +22,7 @@ mod ops; // ops plane (Phase 1): ground-truth probes + honest fleet status (`pro
 mod pecrt; // PECRT Layer 0: shared wake-bus + three-tier warm-context memory — a scheduler+memory WRAPPER (never a new authority); every action it schedules re-enters the EXISTING gates (dual Rust+Python impl mirrors pecrt.py)
 mod provenance; // config-provenance tripwire + controller-clean preflight (RSI v3, catalog #6): watched-config drift pages + holds trading lanes; Solomon refuses meta-work on itself from a dirty/off-base tree
 mod redeploy; // native self-redeploy: swap Solomon's own production binary in a safe drain window
+mod resurrector; // host-independent liveness floor (catalog #4): relaunch the GUI/CEO host when its heartbeat goes stale + page once (dead-man tripwire; rides the out-of-band sentinel sweep)
 mod supervisor; // native port of improver/solomon.py — diagnose() + the 3-rung recover() ladder + escalation
 mod watchdog; // native port of monitor.py — the `watchdog` subcommand + the in-app 2-min tick (run_gui)
 
@@ -370,6 +371,12 @@ fn run_gui() {
     // (GUI-tick-only liveness caused the 8h/25.5h watchdog gaps and 2+ day outages). The thread
     // dies with the process; catch_unwind keeps one bad sweep from killing the tick.
     std::thread::spawn(|| loop {
+        // HOST-INDEPENDENT LIVENESS FLOOR (catalog #4): the GUI/CEO host — and ONLY the GUI host, never
+        // a headless subcommand or the out-of-band sentinel — stamps runtime/_engine_heartbeat.json
+        // every tick. Its staleness is the true "the host is gone" signal the resurrector reads from
+        // the out-of-band sentinel sweep to relaunch a dead Solomon.exe. Stamp BEFORE the sweep so a
+        // slow/hanging sweep can never make a live host look dead. See resurrector.rs.
+        resurrector::stamp_engine_heartbeat();
         let _ = std::panic::catch_unwind(|| {
             let _ = watchdog::main();
         });

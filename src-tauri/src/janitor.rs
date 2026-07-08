@@ -25,6 +25,12 @@ const PROTECTED: &[&str] = &[
     "_provider_budget.json",
     "_sentinel_heartbeat.json",
     "_config_provenance.json",
+    // Host-independent liveness floor (catalog #4): the engine-host dead-man heartbeat + the
+    // paged-once dedupe marker the resurrector owns. Sweeping either would blind the liveness floor
+    // (a deleted heartbeat reads as "missing" -> Wait, and a deleted marker re-arms the page storm).
+    "_engine_heartbeat.json",
+    "_resurrector.marker",
+    "_resurrector.last",
 ];
 
 /// The tunable thresholds, parameterized so the unit tests exercise every phase on tiny tmp trees
