@@ -21,10 +21,12 @@
 //! `_sentinel_heartbeat.json` is stamped by EVERY watchdog run — the GUI tick AND the out-of-band
 //! sentinel — so it cannot distinguish "host alive" from "only the sentinel ran". A resurrector that
 //! keyed off it would think the host was alive whenever the sentinel had just run. So the GUI host
-//! writes its OWN marker, `runtime/_engine_heartbeat.json` = `{"ts","pid"}`, from `run_gui`'s tick
-//! thread (see `stamp_engine_heartbeat`, called only on the GUI path). The out-of-band sentinel
-//! process does NOT write it. Staleness of THIS file + a dead recorded PID is a true "the host is
-//! gone" signal a bare sweep cannot forge.
+//! writes its OWN marker, `runtime/_engine_heartbeat.json` = `{"ts","pid"}`, from a DEDICATED
+//! lightweight heartbeat thread in `run_gui` — on a fixed short cadence (`HEARTBEAT_STAMP_INTERVAL_S`),
+//! decoupled from the potentially-slow `watchdog::main()` sweep — so freshness tracks host-process
+//! liveness, not sweep-completion time (see `stamp_engine_heartbeat`, called only on the GUI path).
+//! The out-of-band sentinel process does NOT write it. Staleness of THIS file + a dead recorded PID
+//! is a true "the host is gone" signal a bare sweep cannot forge.
 //!
 //! # Where it runs
 //! Wired into `watchdog::main` behind `catch_unwind` (like the other grafts), so it runs on the ONE
@@ -40,20 +42,32 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 
 /// STALE_AFTER_S — the engine-host liveness threshold `T`. The GUI host stamps its heartbeat every
-/// `run_gui` tick (2 min). Three missed ticks (6 min) is unambiguous host death, not a slow tick,
-/// and is still well inside the sentinel's 5-min out-of-band cadence so the FIRST or SECOND sentinel
-/// sweep after a host death resurrects it — a bounded blind window measured in minutes, replacing
-/// the multi-DAY outages of catalog #4. A floor, not the pacing: do not lengthen it casually.
+/// `HEARTBEAT_STAMP_INTERVAL_S` (30 s) from a DEDICATED thread decoupled from the sweep, so `T` at
+/// 360 s means ~12 consecutive missed stamps — unambiguous host death, not a slow watchdog sweep
+/// (the stamp thread never runs the sweep, so a sweep that blocks on fleet-wide git subprocesses can
+/// no longer age a live host past `T`). It is still well inside the sentinel's 5-min out-of-band
+/// cadence so the FIRST or SECOND sentinel sweep after a host death resurrects it — a bounded blind
+/// window measured in minutes, replacing the multi-DAY outages of catalog #4. A floor, not the
+/// pacing: do not lengthen it casually.
 pub const STALE_AFTER_S: f64 = 360.0;
 
+/// HEARTBEAT_STAMP_INTERVAL_S — cadence of the DEDICATED engine-heartbeat thread in `run_gui`. The
+/// heartbeat is stamped from its own lightweight thread on THIS fixed short interval, independent of
+/// the potentially-slow `watchdog::main()` sweep, so heartbeat freshness tracks host-process liveness
+/// rather than sweep-completion time. Must stay well below `STALE_AFTER_S` (30 s vs 360 s = 12×
+/// headroom) so a healthy host is never mistaken for stale even if several stamps are missed; the
+/// `heartbeat_interval_is_well_below_staleness_threshold` test pins that invariant.
+pub const HEARTBEAT_STAMP_INTERVAL_S: u64 = 30;
+
 /// SPAWN_COOLDOWN_S — after a relaunch, suppress further respawns for this long. A freshly-launched
-/// host takes up to one tick (120 s) to stamp its first heartbeat, during which the OLD (dead) pid's
-/// stale heartbeat is still on disk; without a cooldown the next sentinel sweep (300 s) would see
-/// that stale record + the dead pid and spawn a REDUNDANT second host. The `tauri_plugin_single_instance`
+/// host publishes its first heartbeat quickly now (its dedicated heartbeat thread stamps on startup,
+/// within `HEARTBEAT_STAMP_INTERVAL_S`), but until that first stamp lands the OLD (dead) pid's stale
+/// heartbeat is still on disk; without a cooldown a sentinel sweep that races that window would see
+/// the stale record + the dead pid and spawn a REDUNDANT second host. The `tauri_plugin_single_instance`
 /// guard already makes a duplicate launch harmless (it focuses the existing window and exits), so
 /// this is belt-and-suspenders: it keeps the log clean and prevents a pathological respawn-every-sweep
-/// if a relaunch keeps failing. 240 s = two ticks, enough for a healthy new host to publish a fresh
-/// heartbeat and flip the decision to Wait naturally.
+/// if a relaunch keeps failing. 240 s is comfortably longer than a healthy new host needs to publish
+/// its first fresh heartbeat and flip the decision to Wait naturally.
 pub const SPAWN_COOLDOWN_S: f64 = 240.0;
 
 /// The engine-host dead-man heartbeat: `runtime/_engine_heartbeat.json`. Written ONLY by the GUI
@@ -84,8 +98,9 @@ fn now_str(now: DateTime<Utc>) -> String {
 }
 
 /// Stamp the engine-host heartbeat: `{"ts": <now>, "pid": <this process>}`. Called ONLY from the GUI
-/// host's tick thread (`run_gui`) — the headless subcommands (`watchdog`, `run-improver`, the
-/// sentinel) MUST NOT call it, or a bare sweep would forge host-liveness. Best-effort (atomic
+/// host's dedicated heartbeat thread (`run_gui`) — the headless subcommands (`watchdog`,
+/// `run-improver`, the sentinel) MUST NOT call it, or a bare sweep would forge host-liveness.
+/// Best-effort (atomic
 /// tmp+rename via `proc::write_json_atomic`); an IO error is swallowed exactly like every other
 /// runtime stamp — a failed heartbeat write must never crash the GUI.
 pub fn stamp_engine_heartbeat() {
@@ -436,6 +451,26 @@ mod tests {
         assert_eq!(decide(true, Some(-500.0), false, 360.0, false, false), Action::Wait);
     }
 
+    #[test]
+    fn heartbeat_interval_is_well_below_staleness_threshold() {
+        // The dedicated heartbeat thread stamps every HEARTBEAT_STAMP_INTERVAL_S, decoupled from the
+        // slow watchdog sweep. That interval MUST leave several missed stamps of headroom under
+        // STALE_AFTER_S, or a couple of skipped stamps on a busy host would forge a false-death.
+        // Encode the invariant: at least 4 consecutive stamps must fit inside the staleness window.
+        assert!(
+            (HEARTBEAT_STAMP_INTERVAL_S as f64) * 4.0 <= STALE_AFTER_S,
+            "interval {}s * 4 must be <= STALE_AFTER_S {}s so several missed stamps never look dead",
+            HEARTBEAT_STAMP_INTERVAL_S,
+            STALE_AFTER_S
+        );
+        // And it must be a positive, sane short cadence (30–60 s per the design).
+        assert!(
+            (1..=60).contains(&HEARTBEAT_STAMP_INTERVAL_S),
+            "cadence {}s must be a short 1–60 s interval",
+            HEARTBEAT_STAMP_INTERVAL_S
+        );
+    }
+
     // ---------------- heartbeat file reader / age / pid helpers ----------------
 
     #[test]
@@ -463,6 +498,36 @@ mod tests {
         // Corrupt JSON → None.
         std::fs::write(&p, "{not json").unwrap();
         assert!(read_engine_heartbeat().is_none());
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn stamp_writes_fresh_this_pid_heartbeat_that_reads_non_stale() {
+        // The dedicated heartbeat thread's whole job is one call to stamp_engine_heartbeat() per
+        // interval. Prove a SINGLE stamp writes an object heartbeat that reads back as this process,
+        // aged ~0, and comfortably inside the staleness window — i.e. one stamp keeps the host live
+        // regardless of what the (uncalled here) watchdog sweep is doing.
+        let _g = env_lock();
+        let dir = paths::here().join("runtime");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = engine_heartbeat_path();
+        let _ = std::fs::remove_file(&p);
+
+        stamp_engine_heartbeat();
+
+        let hb = read_engine_heartbeat().expect("stamp wrote an object heartbeat");
+        assert_eq!(
+            heartbeat_pid(&hb),
+            std::process::id() as i64,
+            "heartbeat records THIS process pid"
+        );
+        let age = heartbeat_age_s(&hb, Utc::now()).expect("stamped ts is parseable");
+        assert!(age >= 0.0 && age < 5.0, "a just-stamped heartbeat is fresh, age was {age}");
+        assert!(
+            age < STALE_AFTER_S,
+            "a single fresh stamp is well inside the staleness window"
+        );
 
         let _ = std::fs::remove_file(&p);
     }
