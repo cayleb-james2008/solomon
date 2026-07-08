@@ -32,6 +32,10 @@
         "pr_target_branch": "main",
         "gate": ".venv\\Scripts\\python -m pytest",
         "reasoning": "xhigh",
+        "freshness": {
+            "no_objective": true,
+            "comment": "2026-07-07 (Phase A.2): maki is a CODE-QUALITY lane -- its objective today is 'one real, high-leverage code/docs improvement, tests green + ruff clean', NOT a settled real-world outcome that accumulates samples in a ledger. There is no honest metric source to gate on: maki has no tools/freshness.py, no settled-$/window db, no published-artifact registry. Marking this lane explicitly no_objective (a documented sentinel) is the HONEST state -- fabricating a freshness emitter that points at a green 'tests pass' would be the exact fake-green trap the freshness gate exists to kill (freshness.rs #1 'value-blind objective'). no_objective + no cmd => freshness_cfg() returns None => byte-identical legacy behavior (the lane runs every cycle as before; never a false RED, never a fabricated park). When maki's objective is reoriented to a real business metric (AI-CEO roadmap Phase C: usage/downloads), replace this sentinel with a real emitter cmd + min_new_samples/hard/max_starve_cycles. The startup contract test (control/registry.rs) asserts every fleet lane is EITHER no_objective OR has an emitter whose file exists -- a missing/wrong emitter path fails the test rather than silently starving."
+        },
         "pipeline": {
             "plan": false,
             "review": false,
@@ -145,11 +149,9 @@
         "interval": 600,
         "max_iterations": 0,
         "reasoning": "xhigh",
-        "pipeline": {
-            "plan": false,
-            "review": false,
-            "ideate": false,
-            "reflect": false
+        "freshness": {
+            "no_objective": true,
+            "comment": "2026-07-07 (Phase A.2): daedulus (the Outis model-training control plane) is a CODE-QUALITY + PACED-TRAINING lane -- its objective today is reliability/upkeep plus a strictly-paced retrain decision ('no retrain warranted' is an explicit success), NOT a settled outcome that accumulates fresh samples every cycle. Its catalog/runs/eval artifacts exist, but a real freshness emitter (e.g. 'new champion promotion' or 'new benchmark row') does not exist on disk, and daedulus has NO repo .venv to run a Python probe. Marking this lane explicitly no_objective is the HONEST state -- pointing freshness.cmd at a nonexistent emitter would make a healthy lane read UNOBSERVABLE and halt forever (the documented sover/asmodeus trap), and fabricating a green would be the fake-green failure the gate exists to kill. no_objective + no cmd => freshness_cfg() returns None => byte-identical legacy behavior. Reorient to a real training-outcome emitter under AI-CEO roadmap Phase C (grade against the outis-core score, not green tests)."
         },
         "goal": "DAEDALUS NORTH STAR: autonomously and HONESTLY drive the Outis model-training control plane (this lane replaces the retired daedalus-outis-trainer routine, which the operator disabled 2026-07-01). Each iteration: read catalog/training_catalog.json, runs/, and the latest run/benchmark JSONs, then decide whether a training run is genuinely warranted -- data meaningfully broader/cleaner than the reigning baseline AND hardware actually free (RAM headroom, see below). PACING RULE (hard): never trigger training more than once per several hours and never on unchanged data (v16/v17 regressed from rapid retraining at the same small budget); an explicit 'no retrain warranted: <reason>' in the iteration summary is a SUCCESS, not a cop-out noop. When a retrain IS warranted, drive it through the repo's own CLI (prepare / plan / train / eval / overnight) and gate promotion on the strict outis-core grader: promote only if the score beats the reigning champion AND there is no safety regression. On non-training iterations, make ONE real reliability/codebase improvement -- the standing top blocker is RAM starvation killing runs (0xC0000005 crashes at ~1GB free; window-min preflight gates landed 2026-07-01 -- extend them): memory management, preflight windows, crash forensics, run resumability. 0 paid services; training stays local-only. PONYTAIL STYLE: the laziest solution that fully works; delete over add. A truthful null beats a fabricated improvement.",
         "public": false
@@ -168,6 +170,10 @@
         "interval": 300,
         "max_iterations": 0,
         "reasoning": "xhigh",
+        "freshness": {
+            "no_objective": true,
+            "comment": "2026-07-07 (Phase A.2): dotz (the native-Rust coding-agent dashboard) is a CODE-QUALITY lane -- its objective today is 'one additive, high-leverage code/docs improvement, green under cargo test -p dotz-core', NOT a settled real-world outcome that accumulates samples. There is no honest metric source to gate on: no tools/freshness.py, no settled-outcome db, no published-artifact registry. Marking this lane explicitly no_objective is the HONEST state -- fabricating a freshness emitter over a green test suite would be the exact fake-green trap the gate exists to kill (autopsy: 'dotz graded empty test suites green'). no_objective + no cmd => freshness_cfg() returns None => byte-identical legacy behavior. Reorient to a real usage/adoption metric under AI-CEO roadmap Phase C."
+        },
         "goal": "Improve dotz -- a native-Rust (axum + Tauri/WebView2 + `ort` ONNX embeddings) Claude-Code-style multi-agent coding-agent dashboard. `dotz-core` is the axum server + dotz's OWN agent runtime (no third-party agent SDK) on 127.0.0.1:4317; `src-tauri` is the thin WebView2 shell with signed cross-device auto-update; the `web/` vanilla-JS cyberbrutalist UI binds over REST + WebSocket. (The legacy Electron/Fastify/pi-SDK TypeScript app was REMOVED 2026-06-24 -- there is no more `src/*.ts`, no npm typecheck; do NOT reintroduce it.) Make additive, high-leverage improvements: fix real bugs, harden the axum server / WebSocket event stream / Tauri lifecycle, improve agent/session reliability, memory (`ort` embeddings), the sandbox, the browser controller, error handling, and operator UX. GROWTH IS IN SCOPE (operator decision 2026-07-01): when the day's backlog item is a growth goal, improve the ORGANIC public surface instead of code \u2014 README (screenshots, quickstart, feature tour), docs, examples, release notes for the auto-updater releases, GitHub description/topics \u2014 free/organic only, no paid services or ad spend, and never degrade the code to do it. Keep every change green under the gate `cargo test -p dotz-core`, and add a Rust test (`#[test]` / `#[cfg(test)]`) covering your change in the repo's own framework when the change is code. Match the existing Rust style; do NOT add heavy dependencies or architectural layers (ponytail/simplicity-first) -- delete over add. Keep changes in `dotz-core` unless the shell is genuinely the right place. A truthful null beats a fabricated improvement -- never claim an edit you did not write.",
         "pipeline": {
             "plan": false,
@@ -195,6 +201,10 @@
         "interval": 420,
         "max_iterations": 0,
         "reasoning": "xhigh",
+        "freshness": {
+            "no_objective": true,
+            "comment": "2026-07-07 (Phase A.2): solomon-improving-solomon is a CODE-QUALITY lane -- its objective today is 'one real, high-leverage improvement to the RSI control plane, cargo test green', NOT a settled real-world outcome that accumulates samples in a ledger. There is no honest tier-1 metric source to gate on: solomon has no tools/freshness.py and no settled-outcome db (the ops/CEO planes emit health probes, not an accumulating objective series). Marking this lane explicitly no_objective is the HONEST state -- fabricating a freshness emitter over its own green tests would be precisely the MONITORING-THEATER failure solomon's own goal warns against (a green internal signal standing in for a real outcome). no_objective + no cmd => freshness_cfg() returns None => byte-identical legacy behavior (never a false RED, never a fabricated park). If solomon's objective is ever reoriented to a real product/business metric (AI-CEO roadmap Phase C), replace this sentinel with a real emitter cmd."
+        },
         "pipeline": {
             "plan": false,
             "review": false,
