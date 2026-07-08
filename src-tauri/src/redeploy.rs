@@ -2,7 +2,8 @@
 //! mid-iteration kill.
 //!
 //! On a periodic check (wired into the watchdog sweep — see `watchdog::main`), if the running
-//! orchestrator's build sha is behind `origin/main` AND a rebuild is warranted:
+//! orchestrator's build sha is behind its remote default branch (`origin/HEAD`, resolved from git —
+//! never a hardcoded `main`) AND a rebuild is warranted:
 //!   (a) `cargo build --release` into a STAGING path (`target/release/<exe>.new.exe`, NOT the
 //!       locked live exe),
 //!   (b) wait for a genuine DRAIN WINDOW where NO lane is mid-ship AND no live-money lane has an
@@ -147,18 +148,24 @@ pub fn drain_window_now() -> bool {
 // BUILD-SHA-BEHIND DETECTION
 // --------------------------------------------------------------------------- //
 
-/// True iff Solomon's OWN checkout's HEAD is behind `origin/main` (a rebuild is warranted).
-/// `git fetch origin main` (best-effort), then `git rev-list --count HEAD..origin/main` > 0.
-/// Returns `None` when the repo / git / remote is unavailable so the caller no-ops (never forces a
-/// rebuild on uncertain state).
+/// True iff Solomon's OWN checkout's HEAD is behind its remote default branch (a rebuild is
+/// warranted). The default branch is resolved from git itself (`origin/HEAD`) rather than hardcoded
+/// `main`, so this is correct for a `master`-default checkout too (D0 self-honesty). `git fetch
+/// origin <default>` (best-effort), then `git rev-list --count HEAD..origin/<default>` > 0.
+/// Returns `None` when the repo / git / remote / default branch is unavailable so the caller no-ops
+/// (never forces a rebuild on uncertain state).
 pub fn build_behind_origin() -> Option<bool> {
     let repo = apptest_health::solomon_repo()?;
     let git = proc::which_git()?;
     let git = git.to_string_lossy().into_owned();
     let repo_s = repo.to_string_lossy().into_owned();
+    // Resolve the true remote default (origin/HEAD) — never hardcode main/master. If git can't
+    // resolve it (offline / no origin/HEAD), no-op rather than assume a branch that may not exist.
+    let default = registry::resolve_default_branch(&repo_s)?;
+    let origin_default = format!("origin/{default}");
     // Best-effort fetch — a stale ref makes "behind" a false negative (we no-op), which is safe.
     let _ = proc::run(
-        &[git.as_str(), "-C", repo_s.as_str(), "fetch", "origin", "main"],
+        &[git.as_str(), "-C", repo_s.as_str(), "fetch", "origin", default.as_str()],
         None,
         Some(Duration::from_secs(60)),
     );
@@ -169,7 +176,7 @@ pub fn build_behind_origin() -> Option<bool> {
             repo_s.as_str(),
             "rev-list",
             "--count",
-            "HEAD..origin/main",
+            &format!("HEAD..{origin_default}"),
         ],
         None,
         Some(Duration::from_secs(30)),

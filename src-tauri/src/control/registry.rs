@@ -372,6 +372,79 @@ pub fn project_pr_target_branch(repo: &Value) -> String {
     str_or(repo, "pr_target_branch", "main")
 }
 
+/// Resolve a repo's TRUE default branch from git itself — the remote's `origin/HEAD` symbolic ref —
+/// so no `"main"`/`"master"` is ever hardcoded per-repo. VERIFIED asymmetry the D0 self-honesty
+/// work exists to close: `origin/HEAD -> main` for solomon but `origin/HEAD -> master` for the
+/// kairos target, so any single hardcode is wrong for one repo. Tries, in order:
+///
+///   1. `git symbolic-ref --short refs/remotes/origin/HEAD` (local, no network) -> "origin/<name>",
+///      stripped to "<name>". This is the authoritative local record of the remote default.
+///   2. `git remote show origin` "HEAD branch: <name>" (may hit the network) as a fallback when the
+///      local `origin/HEAD` ref is missing (never populated, or pruned).
+///
+/// Returns `None` on any failure (no repo dir, no remote, git unavailable, indeterminate output) so
+/// the caller can degrade to config/`pr_target_branch` rather than silently assume a wrong branch.
+pub fn resolve_default_branch(path: &str) -> Option<String> {
+    if path.is_empty() || !Path::new(path).is_dir() {
+        return None;
+    }
+    // 1) local symbolic ref: the cheap, network-free, authoritative path.
+    if let Ok(r) = proc::run(
+        &[
+            "git",
+            "-C",
+            path,
+            "symbolic-ref",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+        None,
+        Some(std::time::Duration::from_secs(30)),
+    ) {
+        if r.code == 0 {
+            let out = r.stdout.trim();
+            // "origin/main" -> "main"; tolerate an already-stripped value defensively.
+            let name = out.strip_prefix("origin/").unwrap_or(out).trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    // 2) `git remote show origin` — parse the "HEAD branch: <name>" line. May touch the network,
+    // so it is the fallback, not the first choice.
+    if let Ok(r) = proc::run(
+        &["git", "-C", path, "remote", "show", "origin"],
+        None,
+        Some(std::time::Duration::from_secs(30)),
+    ) {
+        if r.code == 0 {
+            for line in r.stdout.lines() {
+                let t = line.trim();
+                if let Some(rest) = t.strip_prefix("HEAD branch:") {
+                    let name = rest.trim();
+                    // A detached/unknown remote reports "(unknown)" — not a usable branch.
+                    if !name.is_empty() && name != "(unknown)" {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The base branch to treat as this repo's integration target, resolved HONESTLY: the git remote's
+/// true default branch (`resolve_default_branch`) wins, so the control plane never hardcodes
+/// `main`/`master`; only when git can't resolve it (offline, no `origin/HEAD`, no remote) does it
+/// fall back to the repos.json `pr_target_branch` config, and finally the historical `"main"`
+/// default. `path` is the repo working dir; `repo` its repos.json row (for the config fallback).
+pub fn project_resolved_base_branch(repo: &Value, path: &str) -> String {
+    if let Some(b) = resolve_default_branch(path) {
+        return b;
+    }
+    project_pr_target_branch(repo)
+}
+
 /// Python `int(x or 0)` semantics for the interval/max_iterations getters: a falsy value -> 0;
 /// an int/float -> truncated toward zero; a numeric string -> parsed int; anything else -> 0
 /// (TypeError/ValueError branch). Floats and numeric strings with fractional parts truncate.
@@ -1056,6 +1129,87 @@ pub(crate) mod tests {
         assert_eq!(
             project_pr_target_branch(&json!({"pr_target_branch": "develop"})),
             "develop"
+        );
+    }
+
+    // ---- resolve_default_branch / project_resolved_base_branch (D0 dynamic default) ----
+    // The resolver reads git's REAL remote default (`origin/HEAD`), never a hardcoded name — the
+    // load-bearing fix for the verified asymmetry (solomon -> main, kairos -> master). Drives a real
+    // temp repo with a bare remote whose origin/HEAD is set to a NON-`main` branch, proving the
+    // resolver returns that branch (so a `master`-default repo is handled correctly).
+    #[test]
+    fn resolve_default_branch_reads_origin_head_not_a_hardcode() {
+        use std::process::Command;
+        let tag = format!(
+            "reg_dflt_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() % 1_000_000)
+                .unwrap_or(0)
+        );
+        let root = std::env::temp_dir().join(format!("solomon_{tag}"));
+        let remote = std::env::temp_dir().join(format!("solomon_{tag}_remote.git"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote);
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let st = Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed");
+        };
+        Command::new("git")
+            .args(["init", "--bare", &remote.to_string_lossy()])
+            .status()
+            .unwrap();
+        git(&["init"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "--allow-empty", "-m", "init"]);
+        // Force a NON-main default name so the assertion can't pass by hardcode coincidence.
+        git(&["branch", "-M", "trunk-xyz"]);
+        git(&["remote", "add", "origin", &remote.to_string_lossy()]);
+        git(&["push", "-u", "origin", "trunk-xyz"]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk-xyz",
+        ]);
+
+        let root_s = root.to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_default_branch(&root_s).as_deref(),
+            Some("trunk-xyz"),
+            "resolver must return git's real origin/HEAD default, not a hardcoded main/master"
+        );
+        // project_resolved_base_branch prefers the git-resolved default over a DIFFERENT config
+        // value — the config is only a fallback for when git can't resolve it.
+        let repo_row = json!({"name": "x", "pr_target_branch": "master"});
+        assert_eq!(
+            project_resolved_base_branch(&repo_row, &root_s),
+            "trunk-xyz",
+            "git-resolved default must win over the repos.json pr_target_branch"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote);
+    }
+
+    #[test]
+    fn resolve_default_branch_none_when_no_repo_or_remote() {
+        // A non-existent path -> None (caller degrades to config).
+        assert_eq!(resolve_default_branch("/no/such/repo/xyzzy"), None);
+        assert_eq!(resolve_default_branch(""), None);
+        // project_resolved_base_branch then falls back to the repos.json pr_target_branch — verified
+        // to preserve a `master` default (the kairos shape) when git can't resolve.
+        let repo_row = json!({"name": "kairos", "pr_target_branch": "master"});
+        assert_eq!(
+            project_resolved_base_branch(&repo_row, "/no/such/repo/xyzzy"),
+            "master",
+            "config fallback must preserve a master default when git can't resolve"
         );
     }
 

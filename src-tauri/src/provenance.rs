@@ -290,7 +290,16 @@ pub fn controller_clean() -> Result<(), String> {
     controller_clean_at(paths::here(), &solomon_base_branch())
 }
 
+/// The controller's own default/base branch, resolved HONESTLY: the git remote's true default
+/// (`origin/HEAD`) wins so this is never a hardcode that is wrong for a `master`-default repo; only
+/// when git can't resolve it does it fall back to the repos.json `solomon` row's `pr_target_branch`,
+/// then the historical `"main"`. VERIFIED: `origin/HEAD -> main` for solomon, but the same code path
+/// resolves `master` for the kairos target — a single hardcode could not have been right for both.
 fn solomon_base_branch() -> String {
+    let here = paths::here().to_string_lossy().into_owned();
+    if let Some(b) = registry::resolve_default_branch(&here) {
+        return b;
+    }
     for r in registry::load_repos() {
         if r.get("name").and_then(Value::as_str) == Some("solomon") {
             return registry::project_pr_target_branch(&r);

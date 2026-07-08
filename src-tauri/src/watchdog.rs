@@ -562,6 +562,7 @@ fn persistent_stop_cleared(
     base_clean: bool,
     base_pushed: bool,
     base_gate_green: bool,
+    controller_clean: bool,
 ) -> Option<&'static str> {
     match reason {
         "dirty_base_persistent" if base_clean => {
@@ -572,6 +573,13 @@ fn persistent_stop_cleared(
         }
         "base_gate_red_persistent" if base_gate_green => {
             Some("base gate green again — cleared base_gate_red_persistent stop")
+        }
+        // CONTROLLER SELF-HONESTY (D0): only clears once the controller tree is GENUINELY reconciled
+        // — on the resolved default branch AND clean AND pushed (exactly `controller_clean` == Ok).
+        // A page-only or surface-only path can NEVER satisfy this, so the stop clears strictly after
+        // a real merge-to-default + push.
+        "controller_off_base_persistent" if controller_clean => {
+            Some("controller tree reconciled (on-base + pushed + clean) — cleared controller_off_base_persistent stop")
         }
         _ => None,
     }
@@ -630,7 +638,10 @@ fn sweep_repo(
     {
         if let Some(reason) = hb.get("reason").and_then(Value::as_str) {
             let path = paths::repo_path(r);
-            let base = control::registry::project_pr_target_branch(r);
+            // Resolve the base branch HONESTLY (git remote default), falling back to repos.json's
+            // pr_target_branch — so the pushed check below is never asked against a wrong branch for
+            // a `master`-default repo (D0).
+            let base = control::registry::project_resolved_base_branch(r, &path);
             // For base_gate_red_persistent, run the gate to verify the operator's fix actually
             // landed; for dirty/unpushed, the cheap git checks suffice. Only run the gate when the
             // reason is base_gate_red_persistent (the gate is expensive, ~120 s worst case).
@@ -639,11 +650,19 @@ fn sweep_repo(
             } else {
                 false
             };
+            // For controller_off_base_persistent (solomon's OWN lane), re-observe the full
+            // controller-clean preflight — on-base + pushed + clean — so the stop clears strictly
+            // after a real reconcile. Only computed for that reason (git spawn) and only meaningful
+            // for the solomon lane, which is the only lane that writes that reason.
+            let controller_clean = reason == "controller_off_base_persistent"
+                && name == "solomon"
+                && crate::provenance::controller_clean().is_ok();
             let msg = persistent_stop_cleared(
                 reason,
                 base_is_clean(&path),
                 base_is_pushed(&path, &base),
                 gate_green,
+                controller_clean,
             );
             if let Some(m) = msg {
                 if let Some(ref d) = rt {
@@ -1436,12 +1455,12 @@ mod tests {
     fn persistent_stop_cleared_dirty_when_clean() {
         // dirty_base_persistent + base now clean -> cleared (byte-identical legacy message).
         assert_eq!(
-            persistent_stop_cleared("dirty_base_persistent", true, false, false),
+            persistent_stop_cleared("dirty_base_persistent", true, false, false, false),
             Some("base clean again — cleared dirty_base_persistent stop")
         );
         // still dirty -> leave the stop (do not thrash).
         assert_eq!(
-            persistent_stop_cleared("dirty_base_persistent", false, false, false),
+            persistent_stop_cleared("dirty_base_persistent", false, false, false, false),
             None
         );
     }
@@ -1450,12 +1469,12 @@ mod tests {
     fn persistent_stop_cleared_unpushed_when_pushed() {
         // unpushed_base_persistent + base no longer ahead of origin -> cleared.
         assert_eq!(
-            persistent_stop_cleared("unpushed_base_persistent", false, true, false),
+            persistent_stop_cleared("unpushed_base_persistent", false, true, false, false),
             Some("base pushed again — cleared unpushed_base_persistent stop")
         );
         // still ahead -> leave the stop.
         assert_eq!(
-            persistent_stop_cleared("unpushed_base_persistent", false, false, false),
+            persistent_stop_cleared("unpushed_base_persistent", false, false, false, false),
             None
         );
     }
@@ -1464,12 +1483,30 @@ mod tests {
     fn persistent_stop_cleared_gate_red_when_green() {
         // base_gate_red_persistent + base gate now green -> cleared.
         assert_eq!(
-            persistent_stop_cleared("base_gate_red_persistent", false, false, true),
+            persistent_stop_cleared("base_gate_red_persistent", false, false, true, false),
             Some("base gate green again — cleared base_gate_red_persistent stop")
         );
         // gate still red -> leave the stop (do not thrash).
         assert_eq!(
-            persistent_stop_cleared("base_gate_red_persistent", false, false, false),
+            persistent_stop_cleared("base_gate_red_persistent", false, false, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn persistent_stop_cleared_controller_off_base_when_reconciled() {
+        // controller_off_base_persistent + controller tree now reconciled -> cleared. This is the
+        // D0 self-honesty stop: it clears STRICTLY when controller_clean() is Ok (on-base + pushed
+        // + clean), never on a page-only path.
+        assert_eq!(
+            persistent_stop_cleared("controller_off_base_persistent", false, false, false, true),
+            Some("controller tree reconciled (on-base + pushed + clean) — cleared controller_off_base_persistent stop")
+        );
+        // still off-base/dirty/un-pushed (controller_clean still Err) -> leave the stop. Crucially,
+        // base_clean/base_pushed/base_gate_green being true is NOT enough — only the full
+        // controller_clean re-observation clears this reason.
+        assert_eq!(
+            persistent_stop_cleared("controller_off_base_persistent", true, true, true, false),
             None
         );
     }
@@ -1477,11 +1514,126 @@ mod tests {
     #[test]
     fn persistent_stop_cleared_ignores_other_reasons() {
         // a true operator Stop carries no reason marker -> never auto-cleared.
-        assert_eq!(persistent_stop_cleared("", true, true, true), None);
+        assert_eq!(persistent_stop_cleared("", true, true, true, true), None);
         assert_eq!(
-            persistent_stop_cleared("anything_else", true, true, true),
+            persistent_stop_cleared("anything_else", true, true, true, true),
             None
         );
+    }
+
+    // -------- D0: on-base + pushed is a START PRECONDITION for the controller's OWN lane --------
+    // Acceptance (e): a controller left off its DEFAULT branch with an un-pushed commit must be
+    // treated as NOT a valid start state, and only merging that work to the RESOLVED default branch
+    // + pushing satisfies the precondition. The default branch is resolved DYNAMICALLY from git
+    // (`registry::resolve_default_branch` -> origin/HEAD) — NOT a hardcoded "main"/"master" — so this
+    // test is correct whether the host git names the initial branch `main` or `master`. Drives real
+    // git over a bare remote; asserts the two building blocks the sweep's controller heal composes:
+    // `resolve_default_branch` (the dynamic name) and `base_is_pushed` (against that resolved name).
+    #[test]
+    fn controller_on_base_and_pushed_is_a_start_precondition_dynamic_default() {
+        use std::process::Command;
+        let tag = format!(
+            "wd_ctrl_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() % 1_000_000)
+                .unwrap_or(0)
+        );
+        let root = std::env::temp_dir().join(format!("solomon_{tag}"));
+        let remote = std::env::temp_dir().join(format!("solomon_{tag}_remote.git"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote);
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str], dir: &std::path::Path| {
+            let st = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed in {dir:?}");
+        };
+        // bare remote + a work repo pushed to it, so origin/HEAD is populated.
+        Command::new("git")
+            .args(["init", "--bare", &remote.to_string_lossy()])
+            .status()
+            .unwrap();
+        git(&["init"], &root);
+        git(&["config", "user.email", "t@t"], &root);
+        git(&["config", "user.name", "t"], &root);
+        git(&["commit", "--allow-empty", "-m", "init"], &root);
+        git(&["remote", "add", "origin", &remote.to_string_lossy()], &root);
+        // Push the CURRENT branch (whatever git named it) and record it as origin's default HEAD.
+        let cur = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        git(&["push", "-u", "origin", &cur], &root);
+        git(
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                &format!("refs/remotes/origin/{cur}"),
+            ],
+            &root,
+        );
+
+        let root_s = root.to_string_lossy().into_owned();
+        // The resolver returns the ACTUAL default — no hardcoded name — and it matches the branch
+        // git chose for us (main OR master, per host config). This is the load-bearing dynamic bit.
+        let default = control::registry::resolve_default_branch(&root_s)
+            .expect("origin/HEAD resolves the default branch");
+        assert_eq!(default, cur, "resolver must return git's real default branch");
+
+        // ON DEFAULT + PUSHED: the precondition is satisfied.
+        assert!(base_is_clean(&root_s), "fresh checkout is clean");
+        assert!(
+            base_is_pushed(&root_s, &default),
+            "on the resolved default with nothing ahead of origin -> pushed"
+        );
+
+        // OFF-BASE + UN-PUSHED: commit onto an rsi/* working branch (the live D0 failure shape).
+        git(&["checkout", "-b", "rsi/off-base-work"], &root);
+        git(&["commit", "--allow-empty", "-m", "operator: off-base work"], &root);
+        // The default branch itself is still level with origin, but HEAD is NOT the default, and the
+        // off-base commit is un-pushed — so this is NOT a valid controller start state. persistent
+        // stop policy must NOT clear a controller stop while the tree is unreconciled.
+        assert_ne!(cur, "rsi/off-base-work");
+        assert_eq!(
+            persistent_stop_cleared("controller_off_base_persistent", true, true, true, false),
+            None,
+            "an unreconciled controller tree must NOT clear its self-stop"
+        );
+
+        // RECONCILE: merge the off-base work to the resolved default and push it.
+        git(&["checkout", &default], &root);
+        git(&["merge", "--no-ff", "-m", "operator: merge off-base", "rsi/off-base-work"], &root);
+        // BEFORE pushing the merge, the default is ahead of origin -> pushed precondition UNMET.
+        assert!(
+            !base_is_pushed(&root_s, &default),
+            "an un-pushed merge leaves the default ahead of origin -> not pushed"
+        );
+        git(&["push", "origin", &default], &root);
+        // AFTER the real push, on-base + pushed is satisfied and the controller stop would clear.
+        assert!(
+            base_is_pushed(&root_s, &default),
+            "after the real push the default is level with origin -> pushed"
+        );
+        assert_eq!(
+            persistent_stop_cleared("controller_off_base_persistent", true, true, true, true),
+            Some("controller tree reconciled (on-base + pushed + clean) — cleared controller_off_base_persistent stop"),
+            "only a real reconcile (on-base + pushed + clean) clears the controller self-stop"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote);
     }
 
     // -------- sweep_repo: recover() is SKIPPED on the sweep that heals a persistent stop --------

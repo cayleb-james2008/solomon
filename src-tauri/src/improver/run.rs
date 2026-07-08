@@ -506,7 +506,12 @@ set this repo's PR-target branch to a real branch in Config."
     let persistent_self_stop = ctx.hb.get("status").and_then(Value::as_str) == Some("error")
         && matches!(
             ctx.hb.get("reason").and_then(Value::as_str),
-            Some("dirty_base_persistent" | "unpushed_base_persistent" | "base_gate_red_persistent")
+            Some(
+                "dirty_base_persistent"
+                    | "unpushed_base_persistent"
+                    | "base_gate_red_persistent"
+                    | "controller_off_base_persistent"
+            )
         );
     // A mid-loop key_shape_mismatch halt (above) wrote status=error with a last_summary beginning
     // "repos.json api_key for ..." — the same shape the startup guard writes and diagnose() keys

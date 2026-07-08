@@ -71,6 +71,27 @@ pub fn one_iteration(ctx: &mut Ctx) {
         .to_string();
     let base_branch = ctx.base_branch.clone();
 
+    // CONTROLLER SELF-HONESTY PRECONDITION (D0): before the destructive `checkout --force <base>`
+    // + `reset --hard` + `git clean` preflight below, the control plane's OWN lane must PROVE its
+    // tree is clean, on the resolved default branch, AND pushed. Otherwise that force-to-base would
+    // SILENTLY discard un-pushed off-base work (the live failure: solomon left on
+    // `rsi/kairos-novel-signal-lane` with an un-pushed D5 commit). This runs per-cycle (the run.rs
+    // gate is process-start only, so a mid-run drift would slip through) and self-stops IMMEDIATELY
+    // with a NAMED reason — no tolerance window, because a single force-reset already destroys the
+    // work. Only the controller's OWN repo is gated (`ctx.name == "solomon"`); managed TARGET lanes
+    // keep their existing dirty/unpushed base bails and the RUNG-0 reset heal path. This ADDS a
+    // start-precondition only — it never weakens KILL/blast-radius/skeptic/freshness.
+    if ctx.name == "solomon" {
+        if let Err(detail) = crate::provenance::controller_clean() {
+            escalation::note_controller_off_base_stop(ctx, &detail);
+            ctx.log(&format!(
+                "SELF-STOP: controller tree dirty/off-base/un-pushed — {detail} — writing STOP + \
+error heartbeat (merge to default + push, then Start)"
+            ));
+            return;
+        }
+    }
+
     // Stash hygiene: reconcile preflight stashes from prior iterations — drop agent-artifact-only
     // ones, preserve real swept work to solomon-recovered/* branches. Without this, 100s of
     // stashes accumulate and bury real work (337 observed on maki 2026-06-30).

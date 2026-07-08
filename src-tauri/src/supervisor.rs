@@ -417,7 +417,12 @@ pub fn diagnose(repo: &Value) -> Value {
         && !running
         && matches!(
             reason,
-            Some("dirty_base_persistent" | "unpushed_base_persistent" | "base_gate_red_persistent")
+            Some(
+                "dirty_base_persistent"
+                    | "unpushed_base_persistent"
+                    | "base_gate_red_persistent"
+                    | "controller_off_base_persistent"
+            )
         )
     {
         // The loop's three persistent-bail self-stops (escalation.rs): the runner wrote a STOP
@@ -679,11 +684,12 @@ fn suggested_steps(repo: &Value, cat: &str) -> Vec<String> {
         "persistent_self_stop" => vec![
             "The loop deliberately self-stopped after a persistent preflight failure — the loop's".into(),
             "last_summary (shown in the dashboard diagnosis) names the exact cause and the fix:".into(),
-            "  • dirty_base_persistent   — commit/stash/reset the dirty base tree".into(),
-            "  • unpushed_base_persistent — push or reset the base to origin".into(),
-            "  • base_gate_red_persistent — fix the gate command or the failing base tests".into(),
-            "Once the cause is fixed, press Start to resume (the watchdog auto-clears the first two".into(),
-            "once the git state heals)".into(),
+            "  • dirty_base_persistent          — commit/stash/reset the dirty base tree".into(),
+            "  • unpushed_base_persistent       — push or reset the base to origin".into(),
+            "  • base_gate_red_persistent       — fix the gate command or the failing base tests".into(),
+            "  • controller_off_base_persistent — merge the controller's off-base work to the default branch and push (or revert)".into(),
+            "Once the cause is fixed, press Start to resume (the watchdog auto-clears the git-state".into(),
+            "reasons — dirty/unpushed/controller-off-base — once the tree heals)".into(),
         ],
         _ => vec![cd, "git status".into()],
     }

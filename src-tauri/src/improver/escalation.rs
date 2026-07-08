@@ -481,6 +481,35 @@ the base, then Start to resume."
     true
 }
 
+/// CONTROLLER SELF-HONESTY self-stop (D0): the control plane's OWN lane refusing to iterate from a
+/// dirty / off-base / un-pushed tree. UNLIKE the counter-based base bails, this fires IMMEDIATELY
+/// with NO tolerance window: the very next preflight step is `git checkout --force <base>` +
+/// `reset --hard` + `git clean`, which would SILENTLY discard an un-pushed off-base commit (e.g. the
+/// D0 live failure — the controller left on `rsi/kairos-novel-signal-lane` carrying an un-pushed D5
+/// commit). Destroying the control plane's own work is exactly the "control plane exempts itself"
+/// dishonesty D0 closes, so a single off-base observation self-stops with a NAMED reason and hands
+/// the reconcile (merge-to-default + push) to a human, rather than papering over it. `detail` is the
+/// `provenance::controller_clean` failure reason (verbatim). Writes STOP + an error heartbeat with
+/// reason `controller_off_base_persistent`; the watchdog's `persistent_stop_cleared` re-observes
+/// `controller_clean` each sweep and only clears the stop once the tree is genuinely reconciled
+/// (on-base AND pushed AND clean) — a page-only path can never satisfy it.
+pub fn note_controller_off_base_stop(ctx: &mut Ctx, detail: &str) {
+    let _ = std::fs::create_dir_all(&ctx.runtime);
+    let _ = std::fs::write(&ctx.stop_path, "controller_off_base_persistent\n");
+    let detail_trunc: String = detail.chars().take(240).collect();
+    let last_summary = format!(
+        "Controller tree is dirty/off-base/un-pushed — {detail_trunc}. The control plane self-stops \
+rather than force-reset its OWN repo (which would discard un-pushed off-base work). Merge the work \
+to the default branch and push (or revert), then Start to resume."
+    );
+    ctx.heartbeat(json!({
+        "status": "error",
+        "phase": "preflight",
+        "reason": "controller_off_base_persistent",
+        "last_summary": last_summary,
+    }));
+}
+
 // --------------------------------------------------------------------------- #
 // the escalation ladder proper (run_improver ~1749-1878)
 // --------------------------------------------------------------------------- #
@@ -1365,6 +1394,32 @@ largest coherent slice that can be edited, tested, and shipped in one cycle"
         assert!(note_base_gate_red_bail(&mut c, true, "custom gate error: module not found"));
         let hb: Value = serde_json::from_str(&std::fs::read_to_string(&c.heartbeat_path).unwrap()).unwrap();
         assert!(hb["last_summary"].as_str().unwrap().starts_with("custom gate error: module not found"));
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    #[test]
+    fn note_controller_off_base_stop_writes_named_stop_immediately() {
+        // D0 controller self-honesty: UNLIKE the counter-based bails, this fires on the FIRST call
+        // (no tolerance window) because the very next preflight step would force-reset the tree and
+        // discard un-pushed off-base work. Writes STOP + an error heartbeat carrying the exact
+        // reason the watchdog's persistent_stop_cleared and run.rs's finally both key off.
+        let mut c = ctx_with_runtime("ctrl_offbase");
+        assert!(!c.stop_path.exists());
+        note_controller_off_base_stop(&mut c, "HEAD is 'rsi/x', not the base branch 'main'");
+        // STOP sentinel written immediately with the named reason.
+        assert!(c.stop_path.exists(), "controller off-base must self-stop on the first observation");
+        assert_eq!(
+            std::fs::read_to_string(&c.stop_path).unwrap(),
+            "controller_off_base_persistent\n"
+        );
+        let hb: Value =
+            serde_json::from_str(&std::fs::read_to_string(&c.heartbeat_path).unwrap()).unwrap();
+        assert_eq!(hb["status"], "error");
+        assert_eq!(hb["phase"], "preflight");
+        assert_eq!(hb["reason"], "controller_off_base_persistent");
+        // the failure detail is surfaced verbatim (truncated) so the operator sees the real cause
+        assert!(hb["last_summary"].as_str().unwrap().contains("rsi/x"));
+        assert!(hb["last_summary"].as_str().unwrap().contains("self-stops"));
         let _ = std::fs::remove_dir_all(&c.runtime);
     }
 
