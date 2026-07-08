@@ -14,6 +14,7 @@
 use crate::control::{locks, paths};
 use crate::improver::ctx::{now, Ctx};
 use crate::improver::{iteration, oneshot, park, phases};
+use crate::pecrt::bus;
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -462,36 +463,50 @@ set this repo's PR-target branch to a real branch in Config."
             clean_exit = true;
             break;
         }
-        // EVENT-DRIVEN WAKE + MAX-PARK FLOOR (RSI v3 WS5 #3; audit A.1): demote the blind fixed
-        // `interval` sleep to a bounded, event-aware park. The `continue_or_park` self-grade parks
-        // 0s after a productive ship (pick up the next ready item immediately) and otherwise parks
-        // at most `park::MAX_PARK_FLOOR_S` (5 min) — never the full 900s a lane like kairos was
-        // configured for. The 1s-granular loop still wakes instantly on an operator KILL/Stop, and
-        // now ALSO wakes early when the tier-1 objective gains new data during the park (the
-        // freshness ledger advancing), so a fresh sample is acted on without waiting out the floor.
+        // EVENT-DRIVEN WAKE + MAX-PARK FLOOR (RSI v3 WS5 #3; audit A.1; D9): demote the blind fixed
+        // `interval` sleep to a bounded, event-aware park. The `continue_or_park` self-grade
+        // (`park::park_decision`) still owns the productivity policy — park 0s after a productive
+        // ship (pick up the next ready item immediately) and otherwise park at most
+        // `park::MAX_PARK_FLOOR_S` (5 min), never the full 900s a lane like kairos was configured
+        // for. It yields the `plan.park_s` CEILING for this park.
+        //
+        // The inner 1s-granular POLL DECISION is now the shared `pecrt::bus` — the ONE wake-bus the
+        // whole fleet reasons on — instead of an ad-hoc per-lane loop. Each tick we hand the bus the
+        // current reading of every registered watcher and `bus::next_wake` returns the winning
+        // `WakeSource` (KILL is priority 0 and can never be outranked; the max-park floor is last).
+        // Registered watchers today: the operator KILL/Stop sentinel (`ctx.stop_path`) and the
+        // tier-1 freshness-ledger advance (`FreshData`). New watchers (settled-row sqlite ts,
+        // provider recovery, verdict append) plug into the SAME `sources` slice with zero change to
+        // the scheduling contract — the win of unifying on the bus. Scheduling is BYTE-IDENTICAL to
+        // the old loop for the Kill/FreshData/FloorElapsed cases: same check order (stop, then
+        // fresh), same 1s cadence, same `plan.park_s` sleep count before the floor.
+        //
+        // The bus is a scheduler-only wrapper: a wake decides WHEN the loop re-observes the world,
+        // never WHAT it may do. KILL stays fail-closed — a set stop sentinel wins every tick.
         let plan = park::park_decision(&ctx.hb, a.interval.max(1));
         if plan.park_s == 0 {
             ctx.log(&format!("no park ({}) — continuing immediately", plan.why));
         } else {
-            let before = park::read_freshness_mark(&ctx.runtime.join("freshness.json"));
-            let mut wake = park::WakeSource::FloorElapsed;
-            for _ in 0..plan.park_s {
-                if ctx.stop_path.exists() {
-                    wake = park::WakeSource::Kill;
-                    break;
-                }
-                if before.is_some()
-                    && park::has_fresh_data(
-                        before,
-                        park::read_freshness_mark(&ctx.runtime.join("freshness.json")),
-                    )
-                {
-                    wake = park::WakeSource::FreshData;
-                    break;
+            let freshness_ledger = ctx.runtime.join("freshness.json");
+            let before = park::read_freshness_mark(&freshness_ledger);
+            let mut elapsed_s: i64 = 0;
+            let wake = loop {
+                // Read every registered watcher THIS tick, in the historical check order (stop,
+                // then freshness), then let the bus pick the winner (KILL outranks all).
+                let kill_fired = ctx.stop_path.exists();
+                let fresh_fired = before.is_some()
+                    && park::has_fresh_data(before, park::read_freshness_mark(&freshness_ledger));
+                let sources = [
+                    bus::WatchSource::new(bus::WakeSource::Kill, kill_fired),
+                    bus::WatchSource::new(bus::WakeSource::FreshData, fresh_fired),
+                ];
+                if let Some(reason) = bus::next_wake(&sources, elapsed_s, plan.park_s) {
+                    break reason.source;
                 }
                 std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-            if wake != park::WakeSource::FloorElapsed {
+                elapsed_s += 1;
+            };
+            if wake != bus::WakeSource::FloorElapsed {
                 ctx.log(&format!("park woke early: {} ({})", wake.tag(), plan.why));
             }
         }
