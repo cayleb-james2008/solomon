@@ -526,6 +526,109 @@ pub fn project_sandbox(repo: &Value) -> Value {
 }
 
 // --------------------------------------------------------------------------- #
+// freshness disposition (Phase A.2) — the startup CONTRACT the fleet must satisfy
+// --------------------------------------------------------------------------- #
+//
+// Every fleet lane must have a HONEST freshness disposition so the improver never optimizes a
+// blind objective (freshness.rs failure catalog #1 "value-blind objective"): a lane is EITHER
+//   (a) explicitly `no_objective: true` — a documented sentinel: this lane has no settled
+//       real-world metric to gate on today (a code-quality lane), so freshness is off and the
+//       lane runs legacy (never a fabricated green, never a false RED); OR
+//   (b) a real emitter: `freshness.cmd` whose script FILE EXISTS on disk, resolved against the
+//       lane's repo `path`. A missing/wrong emitter path is the DOCUMENTED trap (sover code:
+//       "a wrong path makes a healthy lane read UNOBSERVABLE and halt forever") — it must be a
+//       loud contract failure, not a silent starve.
+// The startup contract test (`fleet_lanes_have_freshness_emitter_or_are_explicitly_no_objective`)
+// asserts exactly this over the REAL repos.json.
+
+/// A fleet lane's freshness disposition, classified from its repos.json row.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FreshnessDisposition {
+    /// No `freshness` block at all — legacy behavior, but for a FLEET lane this is a contract
+    /// hole (the operator neither configured an emitter nor declared the lane objective-free).
+    Absent,
+    /// `freshness: { no_objective: true, ... }` — the explicit "no settled metric today" sentinel.
+    NoObjective,
+    /// A real emitter cmd. `emitter` is the extracted script token (repo-relative), or None when
+    /// the cmd carries no resolvable `.py` script (a malformed emitter cmd).
+    Emitter {
+        cmd: String,
+        emitter: Option<String>,
+    },
+}
+
+/// Classify a repo row's freshness disposition. `no_objective: true` wins; else a non-empty
+/// `cmd` is an Emitter (with its extracted script); else Absent. Mirrors freshness.rs's own
+/// "empty/absent cmd => feature off" rule, but distinguishes the DELIBERATE no_objective sentinel
+/// from a plain hole so the contract test can require one or the other for every fleet lane.
+pub fn freshness_disposition(repo: &Value) -> FreshnessDisposition {
+    let f = match repo.get("freshness").and_then(Value::as_object) {
+        Some(o) => o,
+        None => return FreshnessDisposition::Absent,
+    };
+    if f.get("no_objective").map(Value::as_bool).unwrap_or(None) == Some(true) {
+        return FreshnessDisposition::NoObjective;
+    }
+    let cmd = f
+        .get("cmd")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if cmd.is_empty() {
+        // A freshness block with neither no_objective nor a cmd is a hole, not a valid emitter.
+        return FreshnessDisposition::Absent;
+    }
+    let emitter = emitter_script_from_cmd(&cmd);
+    FreshnessDisposition::Emitter { cmd, emitter }
+}
+
+/// Extract the emitter SCRIPT path from a freshness cmd: the first whitespace-separated token
+/// that looks like a script file (ends in `.py`, `.ps1`, `.js`, `.sh`, or `.exe`). The
+/// interpreter prefix (`python`, `.venv\Scripts\python`) and trailing args (`--freshness`) are
+/// skipped. Returns the token verbatim (repo-relative, native separators) or None when the cmd
+/// has no recognizable script token (a malformed emitter — the contract test treats that as a
+/// FAIL, same as a missing file: an unresolvable emitter cannot be verified to exist).
+pub fn emitter_script_from_cmd(cmd: &str) -> Option<String> {
+    const SCRIPT_EXTS: &[&str] = &[".py", ".ps1", ".js", ".sh"];
+    cmd.split_whitespace()
+        .find(|tok| {
+            let low = tok.to_ascii_lowercase();
+            SCRIPT_EXTS.iter().any(|e| low.ends_with(e))
+        })
+        .map(str::to_string)
+}
+
+/// Resolve a lane's emitter script to an absolute path under its repo `path`, and report whether
+/// the file exists on disk. Used by the startup contract test. Returns:
+///   - None: the lane is not an Emitter disposition (no emitter path to resolve), OR the emitter
+///     cmd had no recognizable script token (the caller reports that as a contract failure), OR
+///     the repo `path` is missing/empty (cannot resolve — also a failure for the caller).
+///   - Some((resolved_abs_path, exists)): the resolved absolute path and whether it exists.
+pub fn resolve_emitter_exists(repo: &Value) -> Option<(std::path::PathBuf, bool)> {
+    let emitter = match freshness_disposition(repo) {
+        FreshnessDisposition::Emitter {
+            emitter: Some(e), ..
+        } => e,
+        _ => return None,
+    };
+    let base = get(repo, "path").as_str().unwrap_or("").to_string();
+    if base.trim().is_empty() {
+        return None;
+    }
+    // Normalize the emitter's separators to the platform form before joining, so a
+    // Windows-style `tools\freshness.py` resolves on a POSIX CI box too.
+    let native = if cfg!(windows) {
+        emitter.replace('/', "\\")
+    } else {
+        emitter.replace('\\', "/")
+    };
+    let path = Path::new(&base).join(native);
+    let exists = path.exists();
+    Some((path, exists))
+}
+
+// --------------------------------------------------------------------------- #
 // set_repo_config
 // --------------------------------------------------------------------------- #
 
@@ -1283,6 +1386,239 @@ pub(crate) mod tests {
                 &json!({"sandbox": {"enabled": true, "launch": "npm run dev", "pages": ["/"]}})
             ),
             json!({"enabled": true, "launch": "npm run dev", "pages": ["/"]})
+        );
+    }
+
+    // ---- freshness disposition (Phase A.2) ----
+
+    #[test]
+    fn emitter_script_from_cmd_extracts_the_py_token() {
+        // the kairos template: interpreter prefix + script + trailing arg
+        assert_eq!(
+            emitter_script_from_cmd(".venv\\Scripts\\python tools\\fitness.py --freshness"),
+            Some("tools\\fitness.py".to_string())
+        );
+        // asmodeus: system python + script
+        assert_eq!(
+            emitter_script_from_cmd("python tools\\freshness.py"),
+            Some("tools\\freshness.py".to_string())
+        );
+        // sover: .venv python + posix-style script path
+        assert_eq!(
+            emitter_script_from_cmd(".venv/Scripts/python tools/freshness.py"),
+            Some("tools/freshness.py".to_string())
+        );
+        // other script kinds are recognized too
+        assert_eq!(
+            emitter_script_from_cmd("pwsh tools\\probe.ps1"),
+            Some("tools\\probe.ps1".to_string())
+        );
+        assert_eq!(
+            emitter_script_from_cmd("node scripts/fresh.js --json"),
+            Some("scripts/fresh.js".to_string())
+        );
+        // a cmd with NO recognizable script token -> None (the contract test treats this as a
+        // FAIL, exactly like a missing file: an unresolvable emitter cannot be verified).
+        assert_eq!(emitter_script_from_cmd("some-binary --emit"), None);
+        assert_eq!(emitter_script_from_cmd(""), None);
+    }
+
+    #[test]
+    fn freshness_disposition_classifies_the_three_states() {
+        // Absent: no freshness block at all
+        assert_eq!(
+            freshness_disposition(&json!({"name": "x"})),
+            FreshnessDisposition::Absent
+        );
+        // Absent: a freshness block with neither no_objective nor a cmd is a HOLE, not valid
+        assert_eq!(
+            freshness_disposition(&json!({"freshness": {"comment": "todo"}})),
+            FreshnessDisposition::Absent
+        );
+        assert_eq!(
+            freshness_disposition(&json!({"freshness": {"cmd": "   "}})),
+            FreshnessDisposition::Absent
+        );
+        // NoObjective: the explicit sentinel wins (even alongside stray keys)
+        assert_eq!(
+            freshness_disposition(
+                &json!({"freshness": {"no_objective": true, "comment": "code lane"}})
+            ),
+            FreshnessDisposition::NoObjective
+        );
+        // no_objective must be a real bool true, not truthy-ish
+        assert_eq!(
+            freshness_disposition(&json!({"freshness": {"no_objective": "yes"}})),
+            FreshnessDisposition::Absent
+        );
+        // Emitter: a real cmd, script extracted
+        assert_eq!(
+            freshness_disposition(&json!({"freshness": {"cmd": "python tools\\freshness.py"}})),
+            FreshnessDisposition::Emitter {
+                cmd: "python tools\\freshness.py".to_string(),
+                emitter: Some("tools\\freshness.py".to_string()),
+            }
+        );
+        // Emitter with a malformed (no-script) cmd: still an Emitter, but emitter=None
+        assert_eq!(
+            freshness_disposition(&json!({"freshness": {"cmd": "just-a-binary"}})),
+            FreshnessDisposition::Emitter {
+                cmd: "just-a-binary".to_string(),
+                emitter: None,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_emitter_exists_reports_presence_against_repo_path() {
+        // Build a temp "repo" with a tools/freshness.py so the resolver can find it.
+        let tag = format!(
+            "reg_emit_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() % 1_000_000)
+                .unwrap_or(0)
+        );
+        let repo = std::env::temp_dir().join(format!("solomon_{tag}"));
+        let tools = repo.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(tools.join("freshness.py"), "print('{}')").unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+
+        // present emitter -> Some((path, true))
+        let row = json!({
+            "path": repo_s,
+            "freshness": {"cmd": "python tools\\freshness.py"}
+        });
+        let (_p, exists) = resolve_emitter_exists(&row).expect("emitter disposition");
+        assert!(exists, "existing emitter must resolve to exists=true");
+
+        // missing emitter -> Some((path, false)) — the documented halt-forever trap the
+        // contract test must catch, not a silent starve.
+        let row_missing = json!({
+            "path": repo_s,
+            "freshness": {"cmd": "python tools\\does_not_exist.py"}
+        });
+        let (_p2, exists2) = resolve_emitter_exists(&row_missing).expect("emitter disposition");
+        assert!(!exists2, "missing emitter must resolve to exists=false");
+
+        // no_objective -> None (nothing to resolve)
+        assert_eq!(
+            resolve_emitter_exists(&json!({"path": repo_s, "freshness": {"no_objective": true}})),
+            None
+        );
+        // malformed cmd (no script token) -> None (caller reports as a contract failure)
+        assert_eq!(
+            resolve_emitter_exists(&json!({"path": repo_s, "freshness": {"cmd": "binary --x"}})),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Read the REAL operator repos.json (NOT `read_repos_json()`, which is pinned to a throwaway
+    /// temp HERE under `cargo test` — reading that would make the contract test pass VACUOUSLY on
+    /// an empty file, the exact monitoring-theater trap this test exists to prevent). Anchored at
+    /// compile time on CARGO_MANIFEST_DIR (…/solomon/src-tauri), whose parent is the solomon repo
+    /// root holding repos.json. Returns the raw JSON list.
+    fn read_real_repos_json() -> Vec<Value> {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repos = manifest
+            .parent()
+            .expect("CARGO_MANIFEST_DIR has a parent (the solomon repo root)")
+            .join("repos.json");
+        let bytes = std::fs::read(&repos).unwrap_or_else(|e| {
+            panic!(
+                "cannot read the real repos.json at {}: {e}",
+                repos.display()
+            )
+        });
+        let v: Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|e| panic!("repos.json is not valid JSON: {e}"));
+        match v {
+            Value::Array(a) => a,
+            _ => panic!("repos.json is not a JSON list"),
+        }
+    }
+
+    /// THE STARTUP CONTRACT (Phase A.2 acceptance b): every FLEET lane in the REAL repos.json is
+    /// EITHER explicitly `no_objective: true` OR has a `freshness.cmd` whose emitter SCRIPT exists
+    /// on disk (resolved against the lane's repo `path`). A missing/wrong emitter path FAILS this
+    /// test loudly — it does NOT let a healthy lane silently starve UNOBSERVABLE (the documented
+    /// sover/asmodeus trap). A fleet lane with NO freshness disposition at all also fails: the
+    /// operator must make an explicit honest choice for every lane.
+    ///
+    /// "Fleet lanes" = every NAMED row in repos.json (the nameless `autopilot` sentinel is skipped)
+    /// — the full operator-authored fleet, which is a superset of the autopilot `targets` (it also
+    /// covers a configured-but-not-currently-targeted lane like daedulus). Reads the operator's
+    /// LIVE repos.json so a future edit that points a lane at a nonexistent emitter is caught at
+    /// `cargo test` time, before it can silently halt a lane in production.
+    #[test]
+    fn fleet_lanes_have_freshness_emitter_or_are_explicitly_no_objective() {
+        let rows = read_real_repos_json();
+        let lanes: Vec<&Value> = rows
+            .iter()
+            .filter(|r| {
+                r.get("name")
+                    .and_then(Value::as_str)
+                    .map(|n| !n.is_empty())
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            !lanes.is_empty(),
+            "repos.json must contain at least one named fleet lane"
+        );
+
+        let mut failures: Vec<String> = Vec::new();
+        for row in lanes {
+            let name = row
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            match freshness_disposition(row) {
+                FreshnessDisposition::NoObjective => { /* explicit honest opt-out — OK */ }
+                FreshnessDisposition::Emitter {
+                    ref cmd,
+                    emitter: None,
+                } => {
+                    failures.push(format!(
+                        "{name}: freshness.cmd '{cmd}' has no recognizable emitter script (.py/.ps1/.js/.sh) — cannot verify it exists"
+                    ));
+                }
+                FreshnessDisposition::Emitter { .. } => {
+                    match resolve_emitter_exists(row) {
+                        Some((path, true)) => {
+                            let _ = path; // emitter file present — OK
+                        }
+                        Some((path, false)) => {
+                            failures.push(format!(
+                                "{name}: freshness emitter '{}' does NOT exist on disk — a wrong/missing emitter path makes a healthy lane read UNOBSERVABLE and halt forever (fix the path or mark the lane no_objective)",
+                                path.display()
+                            ));
+                        }
+                        None => {
+                            // Emitter disposition but unresolvable (missing/empty repo `path`).
+                            failures.push(format!(
+                                "{name}: has a freshness.cmd but no usable repo 'path' to resolve the emitter against"
+                            ));
+                        }
+                    }
+                }
+                FreshnessDisposition::Absent => {
+                    failures.push(format!(
+                        "{name}: fleet lane has NO freshness disposition — declare a real emitter (freshness.cmd) or mark it explicitly {{\"freshness\": {{\"no_objective\": true}}}} (a lane must never silently optimize a blind objective)"
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "fleet freshness contract violations (Phase A.2):\n  {}",
+            failures.join("\n  ")
         );
     }
 
