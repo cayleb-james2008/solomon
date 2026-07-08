@@ -56,7 +56,14 @@ const WARM_OUTCOMES_TAIL: usize = 8;
 fn warm_working_block(ctx: &Ctx) -> String {
     use crate::pecrt::warm::{LongTermAdapter, ObservationLog, WarmContext};
     let obs = ObservationLog::at(ctx.runtime.join("observations.jsonl"));
-    let long_term = LongTermAdapter::new(ctx.here.clone(), &ctx.name);
+    // ANCHOR: LongTermAdapter's contract (pecrt::warm) is that `here` == control::paths::here()
+    // (= Solomon), because that is where the ledgers actually live — outcomes at
+    // here()/runtime/outcomes.jsonl (ops/ledger.rs), and freshness/progress at
+    // ctx.runtime/{freshness,progress}.json == control/runtime/<name>/... (freshness.rs, progress.rs).
+    // ctx.here == paths::here().join("improver") == Solomon/improver (ctx.rs), which the writers never
+    // populate — anchoring there silently drops ALL ledger tails. Use ctx.control (== paths::here()),
+    // matching the CEO-side wiring (ceo.rs) which passes the same CONTROL anchor.
+    let long_term = LongTermAdapter::new(ctx.control.clone(), &ctx.name);
     let mut warm = WarmContext::new(obs, long_term);
     let rc = warm.reconstruct_context(WARM_OBS_TAIL, WARM_OUTCOMES_TAIL);
     let working = rc.working;
@@ -2427,6 +2434,57 @@ The following:";
         );
         // HARD-BOUNDED: the rendered working content can never exceed the working-tier byte cap.
         assert!(block.len() <= WORKING_MAX_BYTES + 512, "block stays bounded: {} bytes", block.len());
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    /// PINS the wrong-anchor fix (skeptic D11 blocker): the warm block must carry forward the
+    /// LONG-TERM outcome ledger tail, not just observations. The adapter reads outcomes from
+    /// `<CONTROL>/runtime/outcomes.jsonl` (ops/ledger.rs writes there via `paths::here()` == the
+    /// CONTROL anchor). Anchoring the adapter on `ctx.here` (== Solomon/improver) instead resolves a
+    /// path the writers never populate, so NO `outcome:` line appears — the bug this test forbids.
+    /// This asserts a seeded outcome row surfaces as an `outcome:` line; it FAILS on the old
+    /// `ctx.here` wiring and PASSES on the `ctx.control` fix.
+    #[test]
+    fn warm_working_block_carries_forward_long_term_outcome_ledger_tail_from_control_anchor() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut c = ctx();
+        // Hermetic, non-racing CONTROL anchor: a unique temp dir this test alone writes/reads. The
+        // adapter resolves outcomes at <control>/runtime/outcomes.jsonl (== ops/ledger.rs's writer
+        // path relative to the CONTROL root), so seeding there exercises the exact live wiring.
+        let control = std::env::temp_dir().join(format!(
+            "solomon_warm_control_{}_{}",
+            std::process::id(),
+            uniq
+        ));
+        let _ = std::fs::remove_dir_all(&control);
+        std::fs::create_dir_all(control.join("runtime")).unwrap();
+        c.control = control.clone();
+        // `ctx.here` is left DISTINCT from `ctx.control` (as in production: here == control/improver),
+        // so a regression back to the ctx.here anchor would read control/improver/runtime/... — empty
+        // — and drop the outcome tail, tripping the assertion below.
+        c.here = control.join("improver");
+
+        // Seed one settled outcome row at the CONTROL-anchored fleet outcomes ledger.
+        std::fs::write(
+            control.join("runtime").join("outcomes.jsonl"),
+            "{\"date\":\"2026-07-08\",\"repo\":\"testrepo\",\"metric_delta\":0.7,\"ships\":1}\n",
+        )
+        .unwrap();
+        // Also seed one observation so the block is non-empty regardless (isolates the outcome assert).
+        std::fs::create_dir_all(&c.runtime).unwrap();
+        let log = crate::pecrt::warm::ObservationLog::at(c.runtime.join("observations.jsonl"));
+        log.append_fact("2026-07-08", "prior cycle shipped PR #7 equity +0.05").unwrap();
+
+        let block = warm_working_block(&c);
+        assert!(
+            block.contains("outcome:") && block.contains("metric_delta"),
+            "the LONG-TERM outcome ledger tail must be carried forward (CONTROL anchor); \
+             a regression to the ctx.here anchor drops it. block:\n{block}"
+        );
+
+        let _ = std::fs::remove_dir_all(&control);
         let _ = std::fs::remove_dir_all(&c.runtime);
     }
 }
