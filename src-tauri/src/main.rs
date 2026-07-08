@@ -363,20 +363,31 @@ fn run_gui() {
     // bridge once the window is up). Every backend loop the GUI starts is bound to this job and dies
     // when the GUI process exits — closing the app shuts down its backend processes.
     control::proc::init_app_job();
+    // HOST-INDEPENDENT LIVENESS FLOOR (catalog #4): a DEDICATED, lightweight heartbeat thread — and
+    // ONLY the GUI host, never a headless subcommand or the out-of-band sentinel — stamps
+    // runtime/_engine_heartbeat.json on a fixed short cadence (HEARTBEAT_STAMP_INTERVAL_S, 30 s),
+    // decoupled from the potentially-slow watchdog sweep below. Its staleness is the true "the host is
+    // gone" signal the resurrector reads from the out-of-band sentinel sweep to relaunch a dead
+    // Solomon.exe. Keeping it on its OWN thread means heartbeat freshness tracks host-process liveness,
+    // not sweep-completion time: a sweep that blocks on fleet-wide git subprocesses can no longer age a
+    // live host's heartbeat past STALE_AFTER_S. catch_unwind keeps a stray panic from silently killing
+    // this liveness-critical loop (which would forge exactly the false-death it exists to prevent).
+    // See resurrector.rs.
+    std::thread::spawn(|| loop {
+        let _ = std::panic::catch_unwind(resurrector::stamp_engine_heartbeat);
+        std::thread::sleep(std::time::Duration::from_secs(
+            resurrector::HEARTBEAT_STAMP_INTERVAL_S,
+        ));
+    });
     // THE IN-APP WATCHDOG TICK (v2 Phase A): the every-2-min sweep lives INSIDE the visibly-open
     // Solomon.exe — crash-restart + RUNG-0 recovery + ops probes + incident notifications + the
     // CEO rhythm all ride it. The Solomon Sentinel scheduled task (tools/install_sentinel.ps1)
     // runs `solomon watchdog` every 5 minutes out-of-band; this GUI tick sweep remains as a
     // secondary layer. Renegotiated by the operator 2026-07-06 after the liveness autopsy
     // (GUI-tick-only liveness caused the 8h/25.5h watchdog gaps and 2+ day outages). The thread
-    // dies with the process; catch_unwind keeps one bad sweep from killing the tick.
+    // dies with the process; catch_unwind keeps one bad sweep from killing the tick. The engine
+    // heartbeat is stamped by the dedicated thread above, NOT here, so a slow sweep never delays it.
     std::thread::spawn(|| loop {
-        // HOST-INDEPENDENT LIVENESS FLOOR (catalog #4): the GUI/CEO host — and ONLY the GUI host, never
-        // a headless subcommand or the out-of-band sentinel — stamps runtime/_engine_heartbeat.json
-        // every tick. Its staleness is the true "the host is gone" signal the resurrector reads from
-        // the out-of-band sentinel sweep to relaunch a dead Solomon.exe. Stamp BEFORE the sweep so a
-        // slow/hanging sweep can never make a live host look dead. See resurrector.rs.
-        resurrector::stamp_engine_heartbeat();
         let _ = std::panic::catch_unwind(|| {
             let _ = watchdog::main();
         });
