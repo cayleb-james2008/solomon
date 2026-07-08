@@ -239,40 +239,56 @@ fn ceo_tick_fact(epoch_s: u64, plan_state: &str, summary_state: &str) -> String 
 // tick — the watchdog graft
 // --------------------------------------------------------------------------- //
 
-/// One CEO tick: blind-window notice (once per process), then the two day-gated jobs. Total —
-/// every failure path is caught and recorded; a CEO failure can never abort the watchdog sweep
-/// (the caller also wraps this in catch_unwind, matching the ops graft).
+/// One CEO tick, split into a FAST DETERMINISTIC CORE (always runs to completion) and a SLOW
+/// BEST-EFFORT TAIL (offloaded). The core is blind-window notice + warm reconstruct + the D11 warm
+/// append + the deterministic ops-RED/hygiene/scale grafts — all file-IO + bounded (git bounded at
+/// 30 s, notify bounded at 15 s), so it can NEVER wedge the 2-min sweep and the graft flag resets
+/// within milliseconds. The slow authority-bearing sub-grafts (the LLM morning plan, the LLM focus
+/// decomposition, the sover produce/post subprocess) are OFFLOADED to `ceo_slow_tail` on its own
+/// single-flighted thread, so a 250 s ollama call or a 600 s produce run can no longer (1) throttle
+/// the CEO graft by pinning `CEO_GRAFT_RUNNING` (the observed GUI symptom: the append landed once in
+/// ~25 min, 809 detached threads), nor (2) get killed mid-flight because the process exits before the
+/// append lands (the observed Sentinel symptom: the append landed ~1 in 10). The append now sits at
+/// the TOP of the core so it lands ASAP, and `watchdog::main` bounded-joins the core so the out-of-band
+/// `solomon watchdog` one-shot lands it before exit. Every gate + catch_unwind isolation is preserved
+/// — the tail re-runs the SAME gates against the SAME fresh snapshot; nothing here bypasses one.
 pub fn tick() {
-    blind_window_notice_once();
+    // ---------- FAST DETERMINISTIC CORE (always completes; resets CEO_GRAFT_RUNNING within ms) ----------
+    let _ = std::panic::catch_unwind(blind_window_notice_once);
 
     // WARM CARRY-FORWARD (D11): reconstruct the CEO thread's warm working context from its OWN prior
-    // observations + the ledger tails BEFORE the grafts run — the stable-prefix'd, prior-observation-
-    // carrying context that replaces cold re-derivation as the thread's identity. This is
-    // context/identity ONLY: it is NEVER read by a graft or a gate (those re-derive from the FRESH
-    // `ledger::snapshot()` below), and the STABLE_PREFIX inside it pins "scheduler, not authority" so
-    // it can carry forward no authority and no gate-bypass. Isolated in its own catch_unwind (like the
-    // grafts) so a warm-memory hiccup can never abort the watchdog sweep. The reconstructed context is
-    // intentionally not consumed by a downstream CEO LLM call yet (the morning plan builds its own
-    // prompt); the durable win of this wire is (a) the observable prefix cache-hit line and (b) the
-    // per-tick observation append below, which the NEXT tick reads back — the actual carry-forward.
+    // observations + the ledger tails — the stable-prefix'd, prior-observation-carrying context that
+    // replaces cold re-derivation as the thread's identity. This is context/identity ONLY: it is NEVER
+    // read by a graft or a gate (those re-derive from the FRESH `ledger::snapshot()` below), and the
+    // STABLE_PREFIX inside it pins "scheduler, not authority" so it can carry forward no authority and
+    // no gate-bypass. Isolated in its own catch_unwind so a warm-memory hiccup can never abort the sweep.
     let mut warm = ceo_warm();
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut logf = |m: &str| eprintln!("[ceo] {m}");
         let _ctx = ceo_warm_reconstruct(&mut warm, &mut logf);
     }));
 
-    // DETERMINISTIC ops-RED graft (v2, close-the-loop): every sweep, ensure each project whose
-    // OUTCOME probe is RED carries a targeted [ops-auto:<probe>] fix item atop its backlog —
-    // idempotent, no-LLM, cheap. This is what closes the open loop the LLM morning plan left:
-    // sover can be RED (no posts 37 h) yet, with only a once/day LLM plan, no fix is ever queued.
-    ops_red_backlog_graft();
+    // WARM CARRY-FORWARD (D11), the append half — the load-bearing per-sweep side effect, hoisted to
+    // the TOP of the core (right after the reconstruct it pairs with) so it lands ASAP: it is the
+    // SHORT-TERM write the NEXT tick's reconstruct reads back. It records THIS tick's day-gate state as
+    // read from disk; the day-gate WRITES now live in the offloaded tail, so this is the gate state as
+    // of the tick's start — still a valid dated first-order fact (the observation log is context/identity
+    // only, never a gate input, so a one-tick lag before "plan=done" surfaces is immaterial). Isolated
+    // so a warm-write hiccup can't skip the deterministic grafts below.
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    ceo_warm_append_tick(&warm, &today);
+
+    // DETERMINISTIC ops-RED graft (v2, close-the-loop): every sweep, ensure each project whose OUTCOME
+    // probe is RED carries a targeted [ops-auto:<probe>] fix item atop its backlog — idempotent, no-LLM,
+    // cheap. Now wrapped in its OWN catch_unwind (like the grafts below) so an ops-RED panic can't skip
+    // hygiene/scale or the tail spawn — the append above already landed regardless.
+    let _ = std::panic::catch_unwind(ops_red_backlog_graft);
 
     // GROWTH GRAFTS (every sweep, deterministic + bounded): (1) hygiene — report-only off-base/dirty
     // managed trees grafted into the lane backlog + a loud page on a NEW stranded off-base pair;
-    // (2) scale — one bounded reversible interval tightening across the fleet; (3) sover_boost — one
-    // extra produce/post one-shot to close the posts/day gap. Each is wrapped in its OWN catch_unwind
-    // (mirroring watchdog's per-graft isolation) so one graft's panic can't skip the next, and the
-    // scale/boost decisions read the SAME fresh snapshot+rollup morning_plan/ops_red_backlog_graft use.
+    // (2) scale — one bounded reversible interval tightening across the fleet. Each is wrapped in its
+    // OWN catch_unwind (mirroring watchdog's per-graft isolation) so one graft's panic can't skip the
+    // next, and the scale decision reads the SAME fresh snapshot+rollup the ops-RED graft / tail use.
     let snapshot = ledger::snapshot();
     let status: Value = std::fs::read(ops::outcomes::ops_status_path())
         .ok()
@@ -282,15 +298,63 @@ pub fn tick() {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         scale::maybe_scale_lanes(&snapshot, &status)
     }));
+
+    // ---------- SLOW BEST-EFFORT TAIL (offloaded; single-flighted; never blocks the core) ----------
+    // The slow authority-bearing sub-grafts run on their OWN thread so a 250 s ollama call or a 600 s
+    // produce/post subprocess can NEVER wedge the 2-min sweep or pin the CEO graft flag. Single-flighted
+    // (`CEO_SLOW_TAIL_RUNNING`): a still-running tail makes the next spawn a no-op, so slow tails can
+    // never accumulate (the 809-thread GUI leak). The tail reads the SAME fresh snapshot+status the core
+    // built. ALL GATES PRESERVED — see `ceo_slow_tail`.
+    spawn_ceo_slow_tail(move || ceo_slow_tail(snapshot, status));
+}
+
+/// The D11 warm append (the fast-core deterministic tail): read the CEO day-gate state from disk and
+/// append ONE dated first-order fact of this tick's plan/summary gate states to the observation log —
+/// the SHORT-TERM write the NEXT tick's `ceo_warm_reconstruct` reads back, so the second consecutive
+/// tick sees its own prior observation from the warm tier, not only a cold snapshot. `append_fact` is
+/// append-only + rejects prose-of-prose, so the log stays factual and bounded (the janitor reaps the
+/// `.jsonl` by the existing rules). Isolated in its own catch_unwind so a warm-write hiccup can never
+/// skip the rest of the core.
+fn ceo_warm_append_tick(warm: &WarmContext, today: &str) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let st = read_state();
+        let plan_state = tick_gate_state(st.get("plan"));
+        let summary_state = tick_gate_state(st.get("summary"));
+        let epoch_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let fact = ceo_tick_fact(epoch_s, &plan_state, &summary_state);
+        ceo_append_tick_observation(warm, today, &fact);
+    }));
+}
+
+/// The CEO's SLOW best-effort sub-grafts, run OFF the fast-core thread by `spawn_ceo_slow_tail`: the
+/// sover produce/post boost (a subprocess up to 600 s), the deep-work FOCUS decomposition (an LLM call
+/// up to 250 s, at most once/day per focus lane), and the day-gated morning plan (LLM) + evening
+/// summary. Each keeps its OWN catch_unwind isolation and its OWN gate — nothing here bypasses a gate or
+/// the warm invariant; it only moves the SLOW work off the tick thread so the deterministic core (incl.
+/// the D11 warm append) always lands and the CEO graft flag resets within milliseconds. Reads the SAME
+/// fresh snapshot+status the core built this sweep.
+fn ceo_slow_tail(snapshot: Value, status: Value) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         sover_boost::maybe_boost(&snapshot, &status)
     }));
     // DEEP-WORK FOCUS (Polsia): concentrate one top-leverage lane's next milestone into ordered
-    // [campaign] steps; the other lanes keep their health-only baseline above. Same fresh snapshot.
+    // [campaign] steps; the other lanes keep their health-only baseline. Same fresh snapshot.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         focus::maybe_focus(&snapshot, &status)
     }));
+    let _ = std::panic::catch_unwind(ceo_day_gates);
+}
 
+/// The two day-gated CEO jobs — the morning plan (LLM, >= 07:00) and the evening summary
+/// (deterministic, >= 20:00) — each attempt-capped + idempotent (see `should_attempt`). Runs in the
+/// SLOW TAIL because `morning_plan` makes an ollama call; it OWNS the `_ceo_state.json`
+/// read-modify-write for BOTH sections (single-flighted by the tail guard, so the two RMW cycles never
+/// race a second tail's). This is a verbatim move of the prior in-tick day-gate block — the gates are
+/// UNCHANGED.
+fn ceo_day_gates() {
     let now = chrono::Local::now();
     let today = now.format("%Y-%m-%d").to_string();
     let hour = now.hour();
@@ -327,24 +391,34 @@ pub fn tick() {
         st["summary"] = record_attempt(&sum_sec, &today, ok);
         write_state(&st);
     }
+}
 
-    // WARM CARRY-FORWARD (D11), the append half: record ONE dated first-order fact of this tick's
-    // decisions (the plan / summary gate states this tick landed on) to the CEO observation log. This
-    // is the SHORT-TERM write the NEXT tick's `ceo_warm_reconstruct` reads back — so the second
-    // consecutive tick sees its own prior observation from the warm tier, not only a cold snapshot.
-    // append_fact is append-only + rejects prose-of-prose, so the log stays factual and bounded (the
-    // janitor reaps the `.jsonl` by the existing rules). Isolated so a warm-write hiccup can't abort
-    // the sweep.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let plan_state = tick_gate_state(st.get("plan"));
-        let summary_state = tick_gate_state(st.get("summary"));
-        let epoch_s = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let fact = ceo_tick_fact(epoch_s, &plan_state, &summary_state);
-        ceo_append_tick_observation(&warm, &today, &fact);
-    }));
+/// Single-flight guard for the CEO slow best-effort tail — one tail thread at a time, so a slow
+/// ollama/produce run can never pile up detached threads (the observed 809-thread GUI leak).
+static CEO_SLOW_TAIL_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Reset the single-flight flag when the tail thread finishes (or panics) — mirrors watchdog's
+/// `GraftFlagGuard`, so a panicking tail can never wedge the flag true and starve every future tail.
+struct CeoSlowTailGuard;
+impl Drop for CeoSlowTailGuard {
+    fn drop(&mut self) {
+        CEO_SLOW_TAIL_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Spawn the CEO slow best-effort tail on its OWN thread — single-flighted + panic-isolated (mirrors
+/// `watchdog::spawn_watchdog_graft`). If a prior tail is still running (a slow ollama/produce call), the
+/// spawn is a NO-OP: every sub-graft gate is idempotent + retries next sweep, so skipping a busy sweep's
+/// tail is safe and slow tails can never accumulate. Returns immediately — the fast core never waits on it.
+fn spawn_ceo_slow_tail<F: FnOnce() + Send + 'static>(f: F) {
+    use std::sync::atomic::Ordering;
+    if CEO_SLOW_TAIL_RUNNING.swap(true, Ordering::SeqCst) {
+        return; // a prior tail is still running — skip (idempotent gates retry next sweep)
+    }
+    std::thread::spawn(move || {
+        let _guard = CeoSlowTailGuard;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    });
 }
 
 /// A compact one-token state for a day-gate section (`{"done": date}` / `{"gave_up": true}` /
@@ -2523,5 +2597,96 @@ mod tests {
         assert_eq!(tick_gate_state(Some(&json!({"done": "2026-07-08", "gave_up": true}))), "gave_up");
         assert_eq!(tick_gate_state(Some(&json!({"attempts_date": "2026-07-08", "attempts": 2}))), "attempts=2");
         assert_eq!(tick_gate_state(Some(&json!({}))), "pending");
+    }
+
+    // ===================================================================== #
+    // SCHEDULING FIX ACCEPTANCE: the D11 warm append (the fast CORE's tail)
+    // lands on a completed tick EVEN WHEN a slow authority-bearing sub-graft
+    // (focus ollama up to 250 s / sover produce up to 600 s) is still running.
+    // Before the fix those sub-grafts ran on the SAME thread as the append, so
+    // a slow one (a) starved the append and (b) pinned the CEO graft flag
+    // (observed live: the GUI appended once in ~25 min with 809 detached
+    // threads; the Sentinel landed ~1 in 10 before process teardown). The fix
+    // runs the append in the fast core and OFFLOADS the slow sub-grafts to a
+    // single-flighted tail. This proves all three load-bearing properties
+    // hermetically: the offload is non-blocking, the append landed, and the
+    // single-flight guard prevents a second tail from piling up.
+    // ===================================================================== #
+    #[test]
+    fn warm_append_lands_even_when_a_sub_graft_is_slow() {
+        use std::sync::atomic::{AtomicBool, Ordering as O};
+        use std::sync::{mpsc, Arc};
+        use std::time::{Duration, Instant};
+
+        // Unique obs path so this never races the shared _ceo log (Solomon's parallel-isolation
+        // convention is unique paths, not serialization).
+        let obs_path = unique_ceo_obs_path("slowtail");
+        let here = paths::here().to_path_buf();
+        let warm = ceo_warm_at(&obs_path, &here);
+
+        // (A) the fast core's append lands synchronously — the SAME primitive `ceo_warm_append_tick`
+        // uses. A distinctive epoch lets us find it back verbatim.
+        let fact = ceo_tick_fact(1_700_777_000, "pending", "pending");
+        ceo_append_tick_observation(&warm, "2026-07-08", &fact);
+
+        // Offload a DELIBERATELY-BLOCKING sub-graft (a slow focus/ollama stand-in) EXACTLY as `tick()`
+        // offloads the real slow tail. The fast core must NOT block on it.
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let t0 = Instant::now();
+        spawn_ceo_slow_tail(move || {
+            // blocks until released — models a 250 s focus decomposition still in flight.
+            let _ = release_rx.recv();
+        });
+        let spawn_elapsed = t0.elapsed();
+
+        // (1) NON-BLOCKING: the offload returned immediately — the slow sub-graft runs off-thread, so it
+        // can never wedge the 2-min sweep or the fast core.
+        assert!(
+            spawn_elapsed < Duration::from_secs(2),
+            "spawn_ceo_slow_tail must return immediately (slow sub-graft runs off-thread), took {spawn_elapsed:?}"
+        );
+        // The single-flight flag was set SYNCHRONOUSLY in the caller before the thread was spawned.
+        assert!(
+            CEO_SLOW_TAIL_RUNNING.load(O::SeqCst),
+            "the single-flight flag is held while the tail runs"
+        );
+
+        // (2) APPEND LANDED: the D11 warm append is present on this completed core, even though the
+        // sub-graft is STILL BLOCKED — proving the append no longer depends on the slow work finishing.
+        let obs_tail = warm.observations.tail(10);
+        assert!(
+            obs_tail.iter().any(|l| l.contains("t=1700777000")),
+            "the warm append must land on the completed core even while a sub-graft is slow: {obs_tail:?}"
+        );
+
+        // (3) SINGLE-FLIGHT: while the first tail is still blocked, a SECOND spawn is a NO-OP — its body
+        // never runs, so slow tails can never pile up (the observed 809-thread GUI leak). The swap is
+        // synchronous in the caller, so this is deterministic (no sleep/race): the second spawn's swap
+        // sees the flag already true and returns before spawning any thread.
+        let ran_second = Arc::new(AtomicBool::new(false));
+        let ran_second_w = ran_second.clone();
+        spawn_ceo_slow_tail(move || {
+            ran_second_w.store(true, O::SeqCst);
+        });
+        assert!(
+            !ran_second.load(O::SeqCst),
+            "a second slow tail must NOT start while one is running (single-flight — no thread pileup)"
+        );
+
+        // Release the blocked tail so its guard resets the flag; prove the guard actually resets it (a
+        // panicking/finished tail must never wedge the flag true and starve every future tail).
+        let _ = release_tx.send(());
+        for _ in 0..200 {
+            if !CEO_SLOW_TAIL_RUNNING.load(O::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !CEO_SLOW_TAIL_RUNNING.load(O::SeqCst),
+            "the tail guard must reset the single-flight flag when the tail finishes"
+        );
+
+        let _ = std::fs::remove_dir_all(obs_path.parent().unwrap());
     }
 }
