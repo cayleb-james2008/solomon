@@ -241,7 +241,9 @@ mod tests {
         assert_eq!(WakeSource::OpsChange.tag(), "ops_change");
         assert_eq!(WakeSource::ProviderRecovery.tag(), "provider_recovery");
         assert_eq!(WakeSource::FloorElapsed.tag(), "floor_elapsed");
-        // Cross-check the ACTUAL park enum so a rename there breaks this test.
+        // D9: `improver::park::WakeSource` is now a RE-EXPORT of this enum (the duplicate was
+        // retired), so `P` resolves to this same type — the two can no longer drift by construction.
+        // This pins that the shared path still names the identical variants + tags a park caller uses.
         use crate::improver::park::WakeSource as P;
         assert_eq!(WakeSource::Kill.tag(), P::Kill.tag());
         assert_eq!(WakeSource::FreshData.tag(), P::FreshData.tag());
@@ -381,5 +383,105 @@ mod tests {
     fn empty_sources_just_waits_out_the_floor() {
         assert_eq!(next_wake(&[], 10, 300), None);
         assert_eq!(next_wake(&[], 300, 300).unwrap().source, WakeSource::FloorElapsed);
+    }
+
+    // ---- live-loop drive model (D9): the exact tick loop run.rs runs on the bus ----
+
+    /// A zero-IO stand-in for the live loop's inner park: it polls `next_wake` once per simulated
+    /// tick, driving each registered watcher from a per-tick closure, and returns `(source, ticks)`
+    /// — the winning WakeSource and how many ticks elapsed before it won. This mirrors run.rs's park
+    /// block byte-for-byte in policy (build readings this tick -> next_wake -> stop or advance a
+    /// tick), with the real 1s sleeps removed so the test is instant and deterministic.
+    fn drive_park<F>(max_park: i64, mut readings_at: F) -> (WakeSource, i64)
+    where
+        F: FnMut(i64) -> Vec<WatchSource>,
+    {
+        let mut elapsed_s: i64 = 0;
+        loop {
+            let sources = readings_at(elapsed_s);
+            if let Some(reason) = next_wake(&sources, elapsed_s, max_park) {
+                return (reason.source, elapsed_s);
+            }
+            elapsed_s += 1;
+            // Guard against a runaway test if the floor logic ever regressed.
+            assert!(elapsed_s <= max_park + 5, "park never floored — next_wake floor regressed");
+        }
+    }
+
+    #[test]
+    fn synthetic_sqlite_row_event_wakes_the_loop_before_max_park() {
+        // A settled-row landed at tick 3 of a 300s park (a new SqliteRow observation). The live loop
+        // must wake on it EARLY — well before the max-park floor — not idle out the full ceiling.
+        let (source, ticks) = drive_park(300, |t| {
+            vec![
+                WatchSource::new(WakeSource::Kill, false),
+                WatchSource::new(WakeSource::FreshData, false),
+                // the settled-row watcher fires from tick 3 onward
+                WatchSource::new(WakeSource::SqliteRow, t >= 3),
+            ]
+        });
+        assert_eq!(source, WakeSource::SqliteRow, "a settled row must end the park");
+        assert_eq!(ticks, 3, "woke exactly when the row landed, not at the floor");
+        assert!(ticks < 300, "early wake — did not wait out max-park");
+    }
+
+    #[test]
+    fn synthetic_provider_recovery_event_wakes_the_loop_before_max_park() {
+        // A parked provider un-parks at tick 12 of a 300s park. The bus wakes the loop on the
+        // recovery instead of burning the whole floor.
+        let (source, ticks) = drive_park(300, |t| {
+            vec![
+                WatchSource::new(WakeSource::Kill, false),
+                WatchSource::new(WakeSource::ProviderRecovery, t >= 12),
+            ]
+        });
+        assert_eq!(source, WakeSource::ProviderRecovery);
+        assert_eq!(ticks, 12);
+        assert!(ticks < 300);
+    }
+
+    #[test]
+    fn kill_preempts_a_pending_event_at_priority_zero_mid_park() {
+        // At tick 5 BOTH a settled-row event AND an operator KILL are present in the same tick.
+        // KILL is priority 0 and MUST win — the loop responds to the stop, never to the lower-
+        // priority data event. (Fail-closed: a set KILL can never be outranked or delayed.)
+        let (source, ticks) = drive_park(300, |t| {
+            vec![
+                WatchSource::new(WakeSource::SqliteRow, t >= 5),
+                WatchSource::new(WakeSource::ProviderRecovery, t >= 5),
+                WatchSource::new(WakeSource::Kill, t >= 5),
+            ]
+        });
+        assert_eq!(source, WakeSource::Kill, "KILL must preempt the data events at priority 0");
+        assert_eq!(ticks, 5, "preempted on the first tick the KILL was present");
+    }
+
+    #[test]
+    fn kill_present_from_the_start_wins_on_the_first_tick() {
+        // A KILL already latched when the park begins ends the wait on tick 0, before any sleep —
+        // the strongest fail-closed guarantee (an operator stop is never slept through).
+        let (source, ticks) = drive_park(300, |_t| {
+            vec![
+                WatchSource::new(WakeSource::Kill, true),
+                WatchSource::new(WakeSource::FreshData, true),
+                WatchSource::new(WakeSource::SqliteRow, true),
+            ]
+        });
+        assert_eq!(source, WakeSource::Kill);
+        assert_eq!(ticks, 0, "KILL ends the park immediately, no ticks slept");
+    }
+
+    #[test]
+    fn no_events_floors_at_exactly_max_park() {
+        // With nothing firing, the drive model floors at exactly the ceiling — the byte-identical
+        // sleep count run.rs preserves (max_park sleeps, then FloorElapsed).
+        let (source, ticks) = drive_park(8, |_t| {
+            vec![
+                WatchSource::new(WakeSource::Kill, false),
+                WatchSource::new(WakeSource::FreshData, false),
+            ]
+        });
+        assert_eq!(source, WakeSource::FloorElapsed);
+        assert_eq!(ticks, 8, "floored at exactly max_park ticks");
     }
 }

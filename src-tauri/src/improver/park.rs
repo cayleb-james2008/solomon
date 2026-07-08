@@ -41,32 +41,20 @@ pub const MAX_PARK_FLOOR_S: i64 = 300;
 
 /// What ended (or would end) a park. Logged for observability and used to route the fleet-plane
 /// wake; the per-lane loop produces `Kill` / `FreshData` / `FloorElapsed`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WakeSource {
-    /// An operator KILL / Stop sentinel appeared — end the park now and let the loop exit.
-    Kill,
-    /// The tier-1 objective gained new data (freshness ledger advanced) since the park began.
-    FreshData,
-    /// An ops-plane verdict changed color (fleet-plane wake source; not produced per-lane here).
-    OpsChange,
-    /// A parked provider endpoint recovered / un-parked (fleet-plane wake source; budget ledger).
-    ProviderRecovery,
-    /// The max-park floor elapsed with no earlier event — the ordinary bounded-park timeout.
-    FloorElapsed,
-}
-
-impl WakeSource {
-    /// Stable snake_case tag for logs / events.
-    pub fn tag(self) -> &'static str {
-        match self {
-            WakeSource::Kill => "kill",
-            WakeSource::FreshData => "fresh_data",
-            WakeSource::OpsChange => "ops_change",
-            WakeSource::ProviderRecovery => "provider_recovery",
-            WakeSource::FloorElapsed => "floor_elapsed",
-        }
-    }
-}
+///
+/// D9: this is now a THIN RE-EXPORT of [`crate::pecrt::bus::WakeSource`], the shared fleet wake-bus
+/// taxonomy — NOT a separate duplicate enum. The bus taxonomy is a strict superset (it adds
+/// `FileAppend` / `SqliteRow` generalized watchers) whose first five variants and `.tag()` bytes are
+/// identical to the park taxonomy that lived here, so every existing `park::WakeSource::{Kill,
+/// FreshData, OpsChange, ProviderRecovery, FloorElapsed}` reference and `.tag()` call is unchanged.
+/// Retiring the duplicate makes the live loop and the bus reason on ONE enum, so they can never drift
+/// about what ends a wait. The live park loop (`run.rs`) now obtains its wake from `bus::next_wake`.
+///
+/// `allow(unused_imports)`: this re-export is the deliberate compatibility contract for any
+/// `park::WakeSource` caller — the live loop names `bus::WakeSource` directly, so nothing in the
+/// non-test binary references it through this path today (same pattern as `pecrt::mod`'s re-exports).
+#[allow(unused_imports)]
+pub use crate::pecrt::bus::WakeSource;
 
 /// The `continue_or_park` self-grade output: how long to park (seconds; 0 == continue immediately)
 /// and a short human reason for the log line.
