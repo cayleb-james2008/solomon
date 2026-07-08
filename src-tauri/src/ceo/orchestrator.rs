@@ -49,10 +49,12 @@
 //!     routes; it does not re-implement.
 #![allow(dead_code)]
 
+use crate::control::proc::RunOut;
 use crate::improver::ctx::Ctx;
 use crate::improver::{calibration, progress};
 use crate::pecrt::safety::{self, ScheduleRequest};
 use serde_json::{json, Value};
+use std::path::Path;
 
 // --------------------------------------------------------------------------- #
 // TaskKind — the CLOSED set of work the orchestrator can dispatch
@@ -187,6 +189,28 @@ impl EngineeringSpecialist {
             &provider,
             if model.is_empty() { None } else { Some(model.as_str()) },
         )
+    }
+
+    /// Run a coding session on the caller's ALREADY-CONFIGURED `ctx` — the live-iteration entrypoint
+    /// (D10). Unlike [`Specialist::run`], which builds a fresh Ctx for the stateless onboarding/D7
+    /// convenience paths, this preserves the live loop's per-cycle ctx mutations (escalation fallback
+    /// model, tier reasoning, plan-phase task text, beautify/solomon `system_md`) so the resulting
+    /// `pi::run_pi` call is BYTE-IDENTICAL to the pre-D10 inline call it replaces. It is the ONLY
+    /// place the live improver reaches `pi::run_pi`, so the dispatch gate (run by
+    /// [`dispatch_engineering_on_ctx`]) is the single audited chokepoint.
+    ///
+    /// This method itself is gate-free by design: it is `pub(crate)` and reached ONLY through
+    /// [`dispatch_engineering_on_ctx`], which runs the fail-closed [`Specialist::gate`] FIRST. It
+    /// carries NO authority the inline `pi::run_pi` did not — it is the same call, relocated behind
+    /// the specialist so the "pi only runs inside a Specialist" invariant holds.
+    pub(crate) fn run_pi_on_ctx(
+        &self,
+        ctx: &mut Ctx,
+        task: &str,
+        timeout: i64,
+        system_md: Option<&Path>,
+    ) -> RunOut {
+        crate::improver::pi::run_pi(ctx, task, timeout, system_md)
     }
 }
 
@@ -352,6 +376,52 @@ pub fn dispatch<S: Specialist>(specialist: &S, task: &Task, repo: &Value) -> Val
         return refusal;
     }
     specialist.run(task, repo)
+}
+
+/// D10 — the LIVE improver's implement-phase dispatch: route `one_iteration`'s coding session
+/// through the SAME fail-closed gate the onboarding path uses, then run `pi` on the caller's live
+/// `ctx` so behavior is byte-identical to the inline `pi::run_pi` this replaces.
+///
+/// This is the seam that closes Layer 1's live half: every improvement now flows through the
+/// constrained-Specialist gate (money_guard -> pecrt::safety, run FIRST), not around it. It adds
+/// ROUTING, never a bypass:
+///
+///   * A plain `Code` task on an ordinary engineering lane is NOT money-capable and does NOT name a
+///     governance target, so the gate returns `None` and the dispatch proceeds to `pi::run_pi` with
+///     the caller's EXACT `task`/`timeout`/`system_md` — the pre-D10 behavior, unchanged. (The
+///     downstream freshness/blast-radius/skeptic/KILL gates in `run_pi` and the ship path still
+///     decide the outcome; this seam decides nothing they did not already decide.)
+///   * A money-capable OR self-governance-mutating task kind is DENIED at the gate BEFORE any pi
+///     spawn — returned as `Err(refusal)` so the caller idles it out honestly (no token spent). This
+///     is the new chokepoint: a future Growth/Finance specialist selected by task kind would be
+///     admitted or refused HERE, at one audited point.
+///
+/// The `kind` is the closed [`TaskKind`] the caller attributes to this work (`TaskKind::Code` for
+/// the standard/beautify/solomon coding pass). `lane` defaults to `ctx.name`. Returns `Ok(RunOut)`
+/// on admission (the byte-identical pi result), `Err(refusal Value)` on a gate DENY.
+pub fn dispatch_engineering_on_ctx(
+    ctx: &mut Ctx,
+    repo: &Value,
+    kind: TaskKind,
+    task: &str,
+    timeout: i64,
+    system_md: Option<&Path>,
+) -> Result<RunOut, Value> {
+    let spec = EngineeringSpecialist::new();
+    let lane = ctx.name.clone();
+    // The dispatch envelope. `detail` is the fully-built task text (the caller has already appended
+    // the plan/calibration/value-focus directives, exactly as before) — the gate never inspects the
+    // detail, only the (kind, lane) pair, so passing the whole task is safe and keeps the pi call
+    // byte-identical.
+    let envelope = Task::new(kind, &lane, task);
+    // GATE FIRST — fail-closed. A DENY short-circuits with NO pi spawn (the money-out / governance
+    // HARD invariant). This is the SAME gate `dispatch()` and the onboarding path run.
+    if let Some(refusal) = spec.gate(&envelope, repo) {
+        return Err(refusal);
+    }
+    // Admitted: run pi on the LIVE ctx (byte-identical to the inline call). `pi::run_pi` is reached
+    // ONLY here, inside the specialist — the "pi runs only inside a Specialist" invariant.
+    Ok(spec.run_pi_on_ctx(ctx, task, timeout, system_md))
 }
 
 // --------------------------------------------------------------------------- #
@@ -1111,5 +1181,168 @@ mod tests {
                 assert!(crate::actions::ACTION_KINDS.contains(&k));
             }
         }
+    }
+
+    // ===================================================================== #
+    // D10 ACCEPTANCE: the LIVE improver's implement step now routes through
+    // `dispatch_engineering_on_ctx` — the SAME gate-first seam the onboarding
+    // path uses. A backlog Code task is DISPATCHED to the Engineering
+    // specialist (admitted -> pi call reached); a money/mutation-tagged kind is
+    // REFUSED at the gate BEFORE any pi spawn.
+    // ===================================================================== #
+
+    #[test]
+    fn d10_backlog_code_task_is_dispatched_to_engineering_specialist_through_the_live_seam() {
+        let _g = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+
+        // An isolated lane ctx (never the live runtime) on an ordinary engineering lane. A plain
+        // backlog Code task on this lane is neither money-capable nor a governance target, so the
+        // fail-closed gate ADMITS it and the dispatch reaches the Engineering specialist's pi call.
+        // No live pi exists in the test env, so run_pi returns an honest failed RunOut (rc != 0,
+        // empty stdout) — but never panics — which PROVES admission flowed through to the specialist.
+        let mut ctx = iso_ctx("sover");
+        let repo = plain_repo();
+        let out = dispatch_engineering_on_ctx(
+            &mut ctx,
+            &repo,
+            TaskKind::Code,
+            "implement the top backlog item as one small, tested change",
+            crate::improver::pi::TIMEOUT_IMPLEMENT,
+            None,
+        );
+        // Admitted -> Ok(RunOut): the coding session was dispatched to the Engineering specialist
+        // (the gate returned None; run_pi_on_ctx was reached). We assert the seam ADMITTED and
+        // returned a RunOut, not that pi succeeded (there is no pi binary in the test env).
+        assert!(
+            out.is_ok(),
+            "a plain backlog Code task on an ordinary lane must be ADMITTED at the gate and \
+             dispatched to the Engineering specialist (got a gate DENY): {out:?}"
+        );
+
+        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+    }
+
+    #[test]
+    fn d10_money_tagged_task_is_refused_at_the_gate_before_any_pi_spawn() {
+        let _g = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+
+        // A money-capable task kind attributed to the same live dispatch seam MUST be DENIED at the
+        // gate BEFORE any pi spawn — even on a whitelisted live-money lane (money-OUT is the HARD
+        // invariant, no lane exempts it). The Err(refusal) proves no pi was spawned (the Ok arm — the
+        // only arm that reaches run_pi_on_ctx — was never taken).
+        let mut ctx = iso_ctx("kairos");
+        for repo in [plain_repo(), kairos_repo()] {
+            for money_kind in ["withdraw", "transfer", "pay_invoice", "buy_ads", "send_money"] {
+                let verdict = dispatch_engineering_on_ctx(
+                    &mut ctx,
+                    &repo,
+                    TaskKind::Remediate(money_kind_static(money_kind)),
+                    "attempt a money-out under the guise of a coding task",
+                    crate::improver::pi::TIMEOUT_IMPLEMENT,
+                    None,
+                );
+                let refusal = verdict.expect_err(&format!(
+                    "money-capable kind '{money_kind}' on repo {repo} must be REFUSED at the gate \
+                     before any pi spawn"
+                ));
+                assert_eq!(refusal["ok"], false);
+                assert!(
+                    refusal["money_guard"] == json!(true)
+                        || refusal["error"]
+                            .as_str()
+                            .map(|e| e.to_lowercase().contains("denied"))
+                            .unwrap_or(false),
+                    "the refusal must be a fail-closed money-out DENY: {refusal}"
+                );
+            }
+        }
+
+        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+    }
+
+    #[test]
+    fn d10_self_governance_mutation_lane_is_refused_at_the_gate_before_any_pi_spawn() {
+        let _g = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+
+        // A dispatch whose lane names a self-governance surface (whitelist / cycle_budget / skeptic /
+        // blast-radius / kill / freshness) MUST be DENIED at the gate before any pi spawn — pecrt
+        // safety has NO allow arm for these targets. We drive the live seam with such a lane (ctx.name
+        // IS the lane) and assert Err(refusal) with pecrt_safety:true.
+        for gov_lane in [
+            "whitelist",
+            "cycle_budget",
+            "skeptic_bypass",
+            "blast_radius",
+            "kill_gate",
+            "freshness_gate",
+        ] {
+            let mut ctx = iso_ctx(gov_lane);
+            let verdict = dispatch_engineering_on_ctx(
+                &mut ctx,
+                &plain_repo(),
+                // Even a plain Code task cannot mutate a governance surface — the gate denies on the
+                // TARGET (lane), not the kind.
+                TaskKind::Code,
+                "attempt to widen a self-governance surface",
+                crate::improver::pi::TIMEOUT_IMPLEMENT,
+                None,
+            );
+            let refusal = verdict.expect_err(&format!(
+                "a dispatch targeting governance surface '{gov_lane}' must be REFUSED at the gate \
+                 before any pi spawn"
+            ));
+            assert_eq!(refusal["ok"], false);
+            assert_eq!(
+                refusal["pecrt_safety"], true,
+                "the DENY must come from the fail-closed pecrt safety gate (no allow arm): {refusal}"
+            );
+        }
+
+        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+    }
+
+    // ===================================================================== #
+    // D10 BYTE-IDENTITY GUARD: every REAL production lane must ADMIT a plain
+    // Code task at the gate — otherwise the new dispatch seam would spuriously
+    // fire the fail-closed DENY branch and silently kill a legitimate
+    // iteration. The gate matches governance targets by case-insensitive
+    // SUBSTRING, so this pins that no shipping lane name collides with one
+    // (a future lane rename into e.g. "*-tier" / "*kill*" is caught HERE).
+    // ===================================================================== #
+    #[test]
+    fn d10_every_production_lane_admits_a_plain_code_task_at_the_gate() {
+        let _g = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+
+        let eng = EngineeringSpecialist::new();
+        // The shipping lanes (repos.json). A rename that introduces a governance substring would make
+        // this fail — the intended tripwire.
+        for lane in ["maki", "sover", "asmodeus", "daedulus", "dotz", "solomon", "kairos"] {
+            // A plain Code task on the lane — the exact envelope the live seam builds each iteration.
+            let task = Task::new(TaskKind::Code, lane, "implement the top backlog item");
+            // The gate must ADMIT (None) so the dispatch proceeds to pi UNCHANGED. Probe against BOTH
+            // a legacy row and a live-money row to prove no lane/row combination is spuriously denied.
+            for repo in [plain_repo(), kairos_repo()] {
+                assert!(
+                    eng.gate(&task, &repo).is_none(),
+                    "production lane '{lane}' must ADMIT a plain Code task at the gate (byte-identical \
+                     to the pre-D10 inline pi call) — it was DENIED, which would silently kill a real \
+                     iteration on repo {repo}"
+                );
+            }
+        }
+
+        std::env::remove_var("SOLOMON_NOTIFY_OFF");
     }
 }
