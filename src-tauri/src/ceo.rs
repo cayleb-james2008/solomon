@@ -17,10 +17,16 @@
 //!     any ZERO-outcome flag or red probe is present). A project with zero posts / zero live
 //!     trades / a lane that never fired is flagged LOUDLY — silence is never success.
 //!
-//! Scheduling: rides the watchdog tick (visibly-open Solomon.exe) or the `solomon plan` /
-//! `solomon report` CLI. NO SCHEDULED TASK exists and none may be created (operator rule) — a
-//! closed Solomon.exe is an honest blind window, and the first tick after reopening notifies the
-//! operator how long ops was blind.
+//! Scheduling: the CEO rhythm itself has NO dedicated scheduled task — it rides the watchdog tick
+//! (visibly-open Solomon.exe) or the `solomon plan` / `solomon report` CLI, and the first tick after
+//! reopening notifies the operator how long ops was blind. What CHANGED (2026-07-06 liveness autopsy,
+//! catalog #4): the "no scheduled tasks" rule was RENEGOTIATED by the operator, because
+//! GUI-tick-only liveness was the proximate cause of the 8h/25.5h watchdog gaps and the 2+ day
+//! outages. The Solomon Sentinel scheduled task (tools/install_sentinel.ps1 -> `solomon watchdog`,
+//! every 5 min, out-of-band) now keeps the sweep alive, and the host-liveness floor (resurrector.rs)
+//! relaunches a DEAD Solomon.exe from that out-of-band sweep — so a closed host is no longer an
+//! unbounded blind window. The CEO rhythm still rides the host's tick; it just no longer depends on
+//! a human to keep that host open.
 #![allow(dead_code)]
 
 // Deterministic growth sub-planes wired into `tick`/`morning_plan`: fleet ROI ranking (allocate),

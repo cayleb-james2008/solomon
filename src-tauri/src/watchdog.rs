@@ -1178,6 +1178,16 @@ pub fn main() -> i32 {
         let now = Utc::now();
         standstill_alarm(newest_lane_age_s(now), running, snapshots.len(), now);
     });
+    // HOST-INDEPENDENT LIVENESS FLOOR (catalog #4): the standstill alarm above only PAGES when the
+    // fleet is dark — it never relaunches the GUI/CEO host that went down. This is the missing
+    // ACTUATION: read the engine-host heartbeat (stamped ONLY by the GUI tick, never by this
+    // out-of-band sentinel), and if it is stale beyond T AND the recorded host PID is gone, relaunch
+    // Solomon.exe and page ONCE (marker-deduped). A dead-man tripwire with no authority — it reads
+    // two files + the process table and spawns the SELF binary; it cannot trade/whitelist/budget or
+    // touch any gate. Runs on the out-of-band Solomon Sentinel sweep — the ONE path guaranteed to
+    // fire when the host is dead — and is a cheap no-op (heartbeat fresh -> Wait) when the host is up.
+    // catch_unwind mirrors the standstill alarm: a resurrector failure must never abort the sweep.
+    let _ = std::panic::catch_unwind(crate::resurrector::run);
     // CEO RHYTHM GRAFT (v2 Phase B): after the two-plane sweep, the day-gated morning plan +
     // evening verified-outcome summary (see ceo::tick — cheap no-op on all but two sweeps a day).
     // catch_unwind mirrors the ops graft: a CEO failure must never abort crash-recovery.
