@@ -30,6 +30,12 @@ pub mod focus;
 pub mod scale;
 pub mod sover_boost;
 
+// D4 Layer 1: the CEO orchestrator + constrained-specialist Task system. On each wake it maps a
+// diagnosis to a typed Task and DISPATCHES it to a constrained Specialist (today: the Engineering
+// specialist wrapping the pi coder); the EXISTING gates (money_guard, pecrt::safety, tiers
+// blast-radius) DECIDE. It holds no new authority — DISPATCHES only. See orchestrator.rs.
+pub mod orchestrator;
+
 use crate::control::{paths, proc};
 use crate::notify::{self, Notice};
 use crate::ops::{self, ledger};
