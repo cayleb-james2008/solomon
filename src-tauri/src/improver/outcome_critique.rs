@@ -850,7 +850,18 @@ mod tests {
         assert!(read_pending(&c).is_none());
         let p = ship_pending("settled_usd_15m", 3625, 1.5);
         write_pending(&c, &p);
-        assert_eq!(read_pending(&c), Some(p));
+        let got = read_pending(&c).expect("pending reads back");
+        // ponytail: a serde_json f64 write→read is not bit-exact under the default parser (it can
+        // land ~1 ULP off, e.g. 1783494581.550665 vs …47); ship_ts feeds only the 48h
+        // MAX_WAIT_SECS aging math, so tolerate sub-ms drift on it and compare every other field
+        // exactly via the derived PartialEq.
+        assert!(
+            (got.ship_ts - p.ship_ts).abs() < 1e-3,
+            "ship_ts round-trips within tolerance: got {} want {}",
+            got.ship_ts,
+            p.ship_ts
+        );
+        assert_eq!(got, Pending { ship_ts: got.ship_ts, ..p });
         clear_pending(&c);
         assert!(read_pending(&c).is_none());
     }
