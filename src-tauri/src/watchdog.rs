@@ -61,6 +61,16 @@ const HEALTH_K: usize = 3;
 /// operator the same day instead of after a multi-day post-mortem.
 const STANDSTILL_S: f64 = 3.0 * 3600.0;
 
+/// The out-of-band `solomon watchdog` one-shot (the 5-min Sentinel scheduled task) exits the instant
+/// `main()` returns — killing every detached graft thread. `main()` bounded-joins the CEO graft for at
+/// most this long so the Sentinel path RELIABLY lands the CEO fast core's side effects (the D11 warm
+/// append the carry-forward depends on) before exit. The core is deterministic + bounded (file IO +
+/// git bounded at 30 s + notify at 15 s) and normally finishes in well under a second, so this is only
+/// a ceiling for a pathological hang — on timeout `main()` proceeds and the thread dies with the
+/// process (Sentinel) or lingers single-flighted (GUI). The GUI tick (long-lived) already lets the core
+/// finish, so the join returns immediately there.
+const CEO_CORE_JOIN_TIMEOUT_S: u64 = 60;
+
 static CEO_GRAFT_RUNNING: AtomicBool = AtomicBool::new(false);
 static HOUSEKEEPING_GRAFT_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -1191,10 +1201,15 @@ pub fn main() -> i32 {
     // CEO RHYTHM GRAFT (v2 Phase B): after the two-plane sweep, the day-gated morning plan +
     // evening verified-outcome summary (see ceo::tick — cheap no-op on all but two sweeps a day).
     // catch_unwind mirrors the ops graft: a CEO failure must never abort crash-recovery.
-    spawn_watchdog_graft(&CEO_GRAFT_RUNNING, crate::ceo::tick);
+    // Capture the CEO graft handle so we can bounded-join its FAST deterministic core before main()
+    // returns (below). ceo::tick now runs a fast core (the D11 warm append + ops-RED/hygiene/scale) and
+    // OFFLOADS its slow LLM/produce sub-grafts to a single-flighted tail, so it returns within ms — the
+    // join lands the core on the out-of-band `solomon watchdog` one-shot (which exits the instant main()
+    // returns), and is a near-instant no-op on the long-lived GUI tick.
+    let ceo_graft = spawn_watchdog_graft(&CEO_GRAFT_RUNNING, crate::ceo::tick);
     // HOUSEKEEPING GRAFT (v2): day-gated (04:00) storage sweep — worktree prune, merged rsi/
     // branches, stale/oversized build dirs (see housekeeping.rs). Same isolation contract.
-    spawn_watchdog_graft(&HOUSEKEEPING_GRAFT_RUNNING, crate::housekeeping::tick);
+    let _ = spawn_watchdog_graft(&HOUSEKEEPING_GRAFT_RUNNING, crate::housekeeping::tick);
     // MANAGED-APP REDEPLOY GRAFT: close the "fix merged but never reaches the running app" deadlock
     // — rebuild+relaunch a managed repo's LIVE app binary when the deployed binary is stale (a
     // deploy-gap probe) AND the app is down (a process probe), but ONLY for a repo carrying a
@@ -1225,6 +1240,14 @@ pub fn main() -> i32 {
     // guard (redeploy_in_progress / deploy's cooldown marker), so spawning a checker thread every
     // tick is safe — the common case (nothing to do) returns almost immediately.
     std::thread::spawn(crate::redeploy::maybe_self_redeploy);
+    // SENTINEL LANDING (Sentinel-path fix): wait (bounded) for the CEO fast core to land its side
+    // effects — chiefly the D11 warm append the carry-forward reads back next wake — before we return.
+    // On the out-of-band `solomon watchdog` one-shot the process exits the instant main() returns,
+    // killing every detached graft thread; without this the CEO core (and its append) almost never
+    // lands from the Sentinel path. The core is fast + bounded, so this returns in milliseconds; the
+    // timeout only caps a pathological hang. Runs LAST so the deploy/self-redeploy checker threads above
+    // spawn concurrently first.
+    join_graft_bounded(ceo_graft, Duration::from_secs(CEO_CORE_JOIN_TIMEOUT_S));
     0
 }
 
@@ -1240,17 +1263,36 @@ impl Drop for GraftFlagGuard {
     }
 }
 
-fn spawn_watchdog_graft<F>(running: &'static AtomicBool, f: F)
+fn spawn_watchdog_graft<F>(running: &'static AtomicBool, f: F) -> Option<std::thread::JoinHandle<()>>
 where
     F: FnOnce() + Send + 'static,
 {
     if running.swap(true, Ordering::SeqCst) {
-        return;
+        return None; // already running — single-flight, no new thread
     }
-    std::thread::spawn(move || {
+    Some(std::thread::spawn(move || {
         let _guard = GraftFlagGuard(running);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    }))
+}
+
+/// Wait at most `timeout` for a spawned graft to finish. Rust threads can't be cancelled, so on
+/// timeout we leave the thread running and return: on the out-of-band `solomon watchdog` one-shot the
+/// thread dies with the process; on the long-lived GUI it is single-flighted, so it can't pile up.
+/// Used for the CEO graft so the Sentinel path lands the fast core's side effects before exit. Cheap
+/// in the common case (the fast core finishes in milliseconds); a `None` handle (graft was already
+/// single-flighted out) is a no-op.
+fn join_graft_bounded(handle: Option<std::thread::JoinHandle<()>>, timeout: Duration) {
+    let handle = match handle {
+        Some(h) => h,
+        None => return,
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = handle.join();
+        let _ = tx.send(());
     });
+    let _ = rx.recv_timeout(timeout);
 }
 
 /// Python f-string interpolation of a possibly-missing dict value (`res.get('pid')`, etc.). A JSON
