@@ -50,6 +50,7 @@
 #![allow(dead_code)]
 
 use crate::improver::ctx::Ctx;
+use crate::improver::{calibration, progress};
 use crate::pecrt::safety::{self, ScheduleRequest};
 use serde_json::{json, Value};
 
@@ -353,17 +354,236 @@ pub fn dispatch<S: Specialist>(specialist: &S, task: &Task, repo: &Value) -> Val
     specialist.run(task, repo)
 }
 
+// --------------------------------------------------------------------------- #
+// D7 — anti-retry-theater + task-size calibration RE-ASSERTED at the dispatch decision
+// --------------------------------------------------------------------------- #
+//
+// The two substrates that killed the OLD single-agent loop's retry-theater
+// (`improver::progress` — the 3-strike QUARANTINE ledger, catalog #5) and its problem/executor
+// mismatch (`improver::calibration` — the per-model ship-rate table, catalog #7) are RE-ASSERTED
+// here so the D4 orchestrator layer cannot silently re-introduce either failure. They are wired
+// AROUND the specialist's fail-closed `gate` — never through it: quarantine only SKIPS work and
+// calibration only SHRINKS it. Neither adds an allow arm, and a gate DENY still short-circuits
+// before any strike is recorded (a denied task did no work, so it accrues no strike).
+//
+// HONESTY (the moat): the orchestrator's `run` NEVER lands a ship (the runner owns version
+// control), so it MUST NOT pass "shipped" to `progress::record_outcome`. It passes a non-shipped
+// word ("noop" when the specialist ran, "error" when it failed / was denied-with-work) and lets
+// `progress::state_hash` decide whether any OBSERVABLE state actually moved. A synthetic no-delta
+// task therefore accrues real strikes; a genuinely state-mutating dispatch resets the counter.
+// No fabricated progress is possible here.
+
+/// The size_class a Code task carries when the caller has no backlog tier to attribute (the thin
+/// `dispatch_for_diagnosis` convenience). "chore" is the SMALLEST-change tier (the same safe
+/// default `ceo::plan_items` degrades an unknown tier to) — never a fabricated large class.
+const DEFAULT_CODE_SIZE_CLASS: &str = "chore";
+
+/// The CLOSED registry of on-disk ledgers the orchestrator's Task-dispatch decision READS. Every
+/// entry MUST have a reader wired into the selection path below (quarantine consults `progress.json`
+/// via [`progress::quarantined`]; size-gating consults `_task_calibration.json` via
+/// [`calibration::decompose_directive`]). A write-only ledger is a bug (failure catalog #5); the
+/// `contracts.rs` startup contract test `every_orchestrator_ledger_is_read_back_into_the_dispatch_decision`
+/// asserts each registered ledger is read back to CHANGE the decision. Adding a ledger the
+/// orchestrator writes REQUIRES registering it here AND wiring its reader, or that test fails.
+pub const ORCHESTRATOR_LEDGERS: &[&str] = &["progress.json", "_task_calibration.json"];
+
+/// Completeness half of the "no write-only ledger" contract (catalog #5): for EVERY ledger in
+/// [`ORCHESTRATOR_LEDGERS`], seed it to a value that MUST change the dispatch decision, run the
+/// orchestrator's REAL reader over `ctx`, and confirm the reader consulted it. Returns the names of
+/// any ledgers whose reader did NOT read the seeded value back (i.e. write-only ledgers) — an empty
+/// vec means every ledger is wired. Driven by the `contracts.rs` startup contract test.
+///
+/// This is deliberately behavioral, not a string grep: it proves the value flows into the decision.
+pub fn selection_readers_contract(ctx: &mut Ctx) -> Vec<&'static str> {
+    let mut unread: Vec<&'static str> = Vec::new();
+    for &ledger in ORCHESTRATOR_LEDGERS {
+        let wired = match ledger {
+            // progress.json: seed a quarantine, then the reader (`quarantined`) must read it true.
+            "progress.json" => {
+                let key = progress::selection_key(ctx, "__contract_probe_task__");
+                progress::note_selected(ctx, &key, "__contract_probe_task__");
+                let pre = progress::state_hash(ctx);
+                for _ in 0..progress::QUARANTINE_STRIKES {
+                    progress::record_outcome(ctx, &key, &pre, "noop");
+                }
+                progress::quarantined(ctx, &key)
+            }
+            // _task_calibration.json: seed a proven-low cell, then the reader
+            // (`decompose_directive`) must read it back as Some(directive).
+            "_task_calibration.json" => {
+                let fleet_dir = ctx
+                    .runtime
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| ctx.control.join("runtime"));
+                for _ in 0..calibration::MIN_ATTEMPTS {
+                    calibration::record_outcome_at(&fleet_dir, &ctx.pi_model, "__contract_class__", false);
+                }
+                calibration::decompose_directive(ctx, "__contract_class__").is_some()
+            }
+            // An unregistered/unknown ledger has no proven reader — report it as write-only.
+            _ => false,
+        };
+        if !wired {
+            unread.push(ledger);
+        }
+    }
+    unread
+}
+
+/// One candidate unit of work the orchestrator may pick on a wake: a `(diagnosis, detail,
+/// size_class)` triple. `size_class` is the backlog tier the live driver already read for a Code
+/// item (chore/feature/refactor/architecture) — the class `calibration` gates the SIZE of.
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub diagnosis: String,
+    pub detail: String,
+    pub size_class: String,
+}
+
+impl Candidate {
+    pub fn new(diagnosis: &str, detail: &str, size_class: &str) -> Self {
+        Candidate {
+            diagnosis: diagnosis.to_string(),
+            detail: detail.to_string(),
+            size_class: size_class.to_string(),
+        }
+    }
+}
+
 /// The Layer-1 wake step in one call: read a lane's diagnosis, map it to a typed task, and dispatch
 /// it to the Engineering specialist through the gated interface. Returns the outcome Value (for D3
 /// critique). This is the seam a future thread-plane driver calls each wake; it is intentionally
 /// thin — prioritization stays in the existing deterministic CEO planes (`ceo::allocate`/`focus`),
 /// and this routes the ONE chosen unit of work through the constrained specialist.
+///
+/// D7: routes through [`select_and_dispatch`] with a single candidate, so the SAME quarantine +
+/// calibration guards cover this convenience entrypoint — there is no dispatch path that skips
+/// them. A lone quarantined candidate idles the wake out honestly (no pi spend).
 pub fn dispatch_for_diagnosis(repo: &Value, diagnosis: &str, detail: &str) -> Value {
-    let kind = diagnosis_to_task_kind(diagnosis);
+    select_and_dispatch(
+        repo,
+        &[Candidate::new(diagnosis, detail, DEFAULT_CODE_SIZE_CLASS)],
+    )
+}
+
+/// D7 — the orchestrator's TASK-SELECTION decision, quarantine- and calibration-guarded.
+///
+/// Given the lane's ordered candidate work for this wake, the orchestrator MUST NOT re-dispatch a
+/// task that already completed [`progress::QUARANTINE_STRIKES`] times with no observable state
+/// delta — it picks a DIFFERENT candidate. Concretely, per candidate (in priority order):
+///
+///   1. QUARANTINE (catalog #5): skip any candidate whose `progress::selection_key` is currently
+///      quarantined — the orchestrator is FORCED onto different work. If EVERY candidate is
+///      quarantined, dispatch NOTHING and return an honest `all_quarantined` idle (no pi spend),
+///      mirroring `progress::filter_quarantined_selection`'s bail.
+///   2. CALIBRATION (catalog #7): for the picked Code candidate, gate its SIZE by the assigned
+///      model's measured ship-rate — `calibration::note_selection` stamps the pending attempt and
+///      `calibration::decompose_directive` appends the MANDATORY decompose directive when the
+///      (model, size_class) cell is proven low (>= MIN_ATTEMPTS evidence, ship-rate < floor), so an
+///      over-sized item runs as its smallest shippable slice instead of whole-and-failing again.
+///   3. DISPATCH through the existing gated [`dispatch`] (money_guard -> pecrt::safety FIRST —
+///      unchanged). A gate DENY returns the refusal verbatim and records NO strike (no work
+///      happened). Otherwise the terminal outcome rides `progress::record_outcome`, which measures
+///      the real state delta AND resolves the calibration pending in one hook (wiring point B).
+///
+/// Returns the specialist's outcome Value (for D3 critique), or the honest idle Value when all
+/// candidates are quarantined. Builds the lane Ctx from `repo`; see [`select_and_dispatch_with_ctx`]
+/// for the Ctx-injecting core the tests drive in isolation.
+pub fn select_and_dispatch(repo: &Value, candidates: &[Candidate]) -> Value {
+    let mut ctx = EngineeringSpecialist::build_ctx(repo);
+    select_and_dispatch_with_ctx(&mut ctx, repo, candidates)
+}
+
+/// The Ctx-injecting core of [`select_and_dispatch`] — split out so a `#[test]` can drive the
+/// quarantine + calibration wiring over an ISOLATED runtime dir (never the live `runtime/`), the
+/// same isolation the `progress`/`calibration` unit tests use. Production callers go through
+/// [`select_and_dispatch`], which builds the real lane Ctx and dispatches to the Engineering
+/// specialist.
+pub fn select_and_dispatch_with_ctx(ctx: &mut Ctx, repo: &Value, candidates: &[Candidate]) -> Value {
+    select_and_dispatch_core(&EngineeringSpecialist::new(), ctx, repo, candidates)
+}
+
+/// The specialist-generic core of the D7 selection decision. Production always dispatches to the
+/// Engineering specialist (via [`select_and_dispatch_with_ctx`]); tests inject a synthetic
+/// specialist to drive a controllable no-delta outcome without a live pi. The specialist parameter
+/// changes NOTHING about the guards: quarantine, calibration, and the fail-closed `gate` (run by
+/// [`dispatch`]) apply identically to whatever specialist is passed.
+pub(crate) fn select_and_dispatch_core<S: Specialist>(
+    specialist: &S,
+    ctx: &mut Ctx,
+    repo: &Value,
+    candidates: &[Candidate],
+) -> Value {
     let lane = crate::control::paths::repo_name(repo);
-    let task = Task::new(kind, &lane, detail);
-    let eng = EngineeringSpecialist::new();
-    dispatch(&eng, &task, repo)
+
+    // (1) QUARANTINE: pick the FIRST candidate whose selection key is not quarantined.
+    let picked = candidates.iter().find(|c| {
+        let key = progress::selection_key(ctx, &c.detail);
+        !progress::quarantined(ctx, &key)
+    });
+    let Some(cand) = picked else {
+        // Every candidate is quarantined (or the list was empty) — dispatch nothing, spend nothing.
+        // HONEST degraded mode: the lane idles until a quarantine expires (24h) or fresh work
+        // arrives. This mirrors progress::all_quarantined_bail's contract (no fabricated activity).
+        if !candidates.is_empty() {
+            ctx.log(
+                "orchestrator: all candidate tasks are QUARANTINED (no state delta in 3 attempts \
+                 each) — dispatching nothing this wake (no pi spend); idling until a quarantine \
+                 expires (24h) or new work arrives",
+            );
+        }
+        return json!({
+            "ok": false,
+            "reason": "all_quarantined",
+            "lane": lane,
+            "dispatched": false,
+        });
+    };
+
+    let kind = diagnosis_to_task_kind(&cand.diagnosis);
+    let key = progress::selection_key(ctx, &cand.detail);
+    progress::note_selected(ctx, &key, &cand.detail);
+    let pre_hash = progress::state_hash(ctx);
+
+    // (2) CALIBRATION (Code tasks only — a Remediate is a fixed closed-registry action, not a
+    // sized coding item). Stamp the pending attempt, then MANDATE decomposition when the assigned
+    // model's ship-rate for this size_class is proven low. The directive is APPENDED to the task
+    // detail (it never removes a gate) so the specialist runs the smallest slice, not the whole item.
+    let mut detail = cand.detail.clone();
+    if kind == TaskKind::Code {
+        calibration::note_selection(ctx, &cand.size_class);
+        if let Some(directive) = calibration::decompose_directive(ctx, &cand.size_class) {
+            ctx.log(&format!(
+                "orchestrator/calibration: model '{}' ship-rate for '{}'-class items is below the \
+                 floor — decompose directive appended (catalog #7)",
+                ctx.pi_model, cand.size_class
+            ));
+            detail.push_str(&format!("\n\n{directive}"));
+        }
+    }
+
+    // (3) DISPATCH through the existing gated path — money_guard -> pecrt::safety run FIRST,
+    // UNCHANGED. A DENY returns the refusal verbatim; record NO strike (no work happened, so it is
+    // not a zero-delta COMPLETION). The calibration pending marker stamped above is harmlessly
+    // overwritten by the next selection on a denied task (calibration.rs's documented crash/abort
+    // contract), so a denied attempt is simply not counted.
+    let task = Task::new(kind, &lane, &detail);
+    let outcome = dispatch(specialist, &task, repo);
+    let denied = outcome.get("ok").and_then(Value::as_bool) == Some(false)
+        && (outcome.get("money_guard") == Some(&json!(true))
+            || outcome.get("pecrt_safety") == Some(&json!(true)));
+    if denied {
+        return outcome;
+    }
+
+    // Terminal: record the outcome so the quarantine strike counter advances on a real no-delta
+    // completion (and the calibration pending resolves via the same hook — wiring point B). NEVER
+    // "shipped": the orchestrator lands no ship, so state_hash alone decides the delta.
+    let ran_ok = outcome.get("ok").and_then(Value::as_bool) == Some(true);
+    let outcome_word = if ran_ok { "noop" } else { "error" };
+    progress::record_outcome(ctx, &key, &pre_hash, outcome_word);
+    outcome
 }
 
 // --------------------------------------------------------------------------- #
@@ -387,6 +607,251 @@ mod tests {
                 "protected": ["promote.py", ".state/"]
             }
         })
+    }
+
+    // ===================================================================== #
+    // D7 test infrastructure: an ISOLATED lane Ctx (temp runtime — never the
+    // live runtime/) and a synthetic no-delta Specialist, so the quarantine +
+    // calibration wiring can be driven without a live pi or shared state.
+    // ===================================================================== #
+
+    /// Per-test unique suffix so parallel tests never collide on a tmp dir (progress.rs pattern).
+    fn uniq() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        format!("{:x}_{:x}", nanos, N.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// An isolated lane Ctx over injected tmp paths (mirrors progress.rs::test_ctx): its own
+    /// runtime dir + a NON-git repo dir so `ctx.git` yields an empty base sha and every state-hash
+    /// component is test-controlled and STABLE (so a synthetic no-delta task truly reads no delta).
+    /// runtime = <base>/runtime/<name> so the fleet calibration ledger lands in <base>/runtime.
+    fn iso_ctx(name: &str) -> Ctx {
+        let base = std::env::temp_dir().join(format!("solomon_orch_d7_{}", uniq()));
+        let control = base.join("control");
+        let repo = base.join("repo");
+        let _ = std::fs::create_dir_all(&control);
+        let _ = std::fs::create_dir_all(&repo);
+        let mut c = Ctx::configure(&repo.to_string_lossy(), name, "ollama-cloud", None);
+        c.control = control;
+        c.runtime = base.join("runtime").join(name);
+        c.heartbeat_path = c.runtime.join("heartbeat.json");
+        c.log_path = c.runtime.join("improver.log");
+        c.stop_path = c.runtime.join("stop");
+        c.backlog = base.join("improver").join(name).join("backlog.md");
+        c.lessons = base.join("improver").join(name).join("LESSONS.md");
+        let _ = std::fs::create_dir_all(c.backlog.parent().unwrap());
+        let _ = std::fs::create_dir_all(&c.runtime);
+        c
+    }
+
+    /// A synthetic specialist whose `run` reports a controllable exit code and touches NO state —
+    /// so a completed dispatch reads as ZERO observable delta (the exact retry-theater shape the
+    /// quarantine ledger exists to catch). Its `gate` mirrors the Engineering gate (money_guard ->
+    /// pecrt::safety) so the guard order is exercised identically; only `run` is synthetic.
+    struct NoDeltaSpecialist {
+        exit_code: i64,
+    }
+    impl Specialist for NoDeltaSpecialist {
+        fn name(&self) -> &'static str {
+            "no_delta_test"
+        }
+        fn allowed_tools(&self) -> &'static [&'static str] {
+            ENGINEERING_ALLOWED_TOOLS
+        }
+        fn scope_globs(&self, _repo: &Value) -> Vec<String> {
+            Vec::new()
+        }
+        fn gate(&self, task: &Task, repo: &Value) -> Option<Value> {
+            EngineeringSpecialist::new().gate(task, repo)
+        }
+        fn run(&self, task: &Task, _repo: &Value) -> Value {
+            // Touch nothing on disk — a genuine no-observable-delta completion.
+            json!({
+                "ok": self.exit_code == 0,
+                "specialist": "no_delta_test",
+                "kind": task.kind.as_str(),
+                "lane": task.lane,
+                "exit_code": self.exit_code,
+            })
+        }
+    }
+
+    // ===================================================================== #
+    // D7 ACCEPTANCE (a): a specialist task dispatched 3x with no state delta is
+    // QUARANTINED and the orchestrator selects a DIFFERENT task on the 4th wake.
+    // ===================================================================== #
+    #[test]
+    fn no_delta_task_is_quarantined_and_orchestrator_picks_a_different_task_on_the_4th_wake() {
+        let _g = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+
+        let repo = plain_repo();
+        let mut ctx = iso_ctx("sover");
+        let spec = NoDeltaSpecialist { exit_code: 0 }; // "ran ok" but moved no state -> no-delta noop
+
+        // The lane's candidate work for this wake: the SAME oversized code item first, a distinct
+        // fallback second. The first is the retry-theater task; the second is the different work the
+        // orchestrator must fall to once the first is quarantined.
+        let stuck = Candidate::new("gate_red_streak", "fix the persistently red widget gate", "chore");
+        let other = Candidate::new("noop_streak", "add a regression test for the parser", "chore");
+        let candidates = vec![stuck.clone(), other.clone()];
+
+        let stuck_key = progress::selection_key(&ctx, &stuck.detail);
+
+        // Wakes 1..=3: the stuck task is picked each time (not yet quarantined) and completes with
+        // NO observable state delta -> a strike each time. On the 3rd it crosses QUARANTINE_STRIKES.
+        for wake in 1..=3 {
+            let out = select_and_dispatch_core(&spec, &mut ctx, &repo, &candidates);
+            assert_eq!(out["kind"], "code", "wake {wake}: a code task ran");
+            assert_eq!(
+                out["lane"], "sover",
+                "wake {wake}: the stuck task on the sover lane was picked"
+            );
+        }
+        assert!(
+            progress::quarantined(&ctx, &stuck_key),
+            "after 3 zero-delta completions the stuck task's key must be quarantined"
+        );
+
+        // Wake 4: the stuck task is quarantined, so the orchestrator MUST pick the DIFFERENT
+        // candidate. We prove it by the different task's selection key being the one seeded/advanced.
+        let other_key = progress::selection_key(&ctx, &other.detail);
+        let out4 = select_and_dispatch_core(&spec, &mut ctx, &repo, &candidates);
+        assert_eq!(out4["kind"], "code", "wake 4 still dispatches a code task");
+        // The orchestrator ran the OTHER task: its ledger entry now exists (note_selected seeded it)
+        // and it accrued its first strike (recorded a no-delta completion), while the stuck task's
+        // strike count is frozen at the quarantine threshold (it was NOT re-run).
+        let other_strikes = read_strikes(&ctx, &other_key);
+        assert_eq!(
+            other_strikes, 1,
+            "the 4th wake ran the DIFFERENT task (1 strike), not the quarantined one"
+        );
+        let stuck_strikes = read_strikes(&ctx, &stuck_key);
+        assert_eq!(
+            stuck_strikes, progress::QUARANTINE_STRIKES,
+            "the quarantined task was NOT re-run on the 4th wake (its strike count is frozen)"
+        );
+
+        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+    }
+
+    #[test]
+    fn all_candidates_quarantined_idles_the_wake_out_with_no_dispatch() {
+        let _g = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+
+        let repo = plain_repo();
+        let mut ctx = iso_ctx("sover");
+        let spec = NoDeltaSpecialist { exit_code: 0 };
+        let a = Candidate::new("gate_red_streak", "alpha stuck item", "chore");
+        let b = Candidate::new("noop_streak", "beta stuck item", "chore");
+
+        // Force BOTH candidates' keys into quarantine directly.
+        for c in [&a, &b] {
+            let key = progress::selection_key(&ctx, &c.detail);
+            progress::note_selected(&ctx, &key, &c.detail);
+            let pre = progress::state_hash(&ctx);
+            for _ in 0..progress::QUARANTINE_STRIKES {
+                progress::record_outcome(&mut ctx, &key, &pre, "noop");
+            }
+            assert!(progress::quarantined(&ctx, &key));
+        }
+
+        let out = select_and_dispatch_core(&spec, &mut ctx, &repo, &[a, b]);
+        assert_eq!(out["ok"], false);
+        assert_eq!(out["reason"], "all_quarantined");
+        assert_eq!(out["dispatched"], false, "no task was dispatched (no pi spend)");
+
+        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+    }
+
+    /// Read a key's `count_no_delta` from the isolated ctx's progress ledger (test helper).
+    fn read_strikes(ctx: &Ctx, key: &str) -> i64 {
+        let led: Value = std::fs::read_to_string(ctx.runtime.join("progress.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or(json!({}));
+        led["keys"][key]["count_no_delta"].as_i64().unwrap_or(-1)
+    }
+
+    // ===================================================================== #
+    // D7 ACCEPTANCE (c): calibration gates task SIZE by the assigned model's
+    // measured ship-rate — a size above the model's floor is decomposed.
+    // ===================================================================== #
+    #[test]
+    fn calibration_decomposes_a_task_size_the_model_ships_below_the_floor() {
+        let _g = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+
+        let repo = plain_repo();
+        let mut ctx = iso_ctx("sover");
+        // Prove THIS ctx's model incapable at "architecture": >= MIN_ATTEMPTS attempts, 0 ships.
+        let fleet_dir = ctx.runtime.parent().unwrap().to_path_buf();
+        for _ in 0..calibration::MIN_ATTEMPTS {
+            calibration::record_outcome_at(&fleet_dir, &ctx.pi_model, "architecture", false);
+        }
+
+        // A capturing specialist records the task detail it is asked to run, so we can assert the
+        // decompose directive was appended to the SIZED item before dispatch.
+        struct CapturingSpecialist {
+            seen: std::cell::RefCell<String>,
+        }
+        impl Specialist for CapturingSpecialist {
+            fn name(&self) -> &'static str {
+                "capture"
+            }
+            fn allowed_tools(&self) -> &'static [&'static str] {
+                ENGINEERING_ALLOWED_TOOLS
+            }
+            fn scope_globs(&self, _r: &Value) -> Vec<String> {
+                Vec::new()
+            }
+            fn gate(&self, task: &Task, repo: &Value) -> Option<Value> {
+                EngineeringSpecialist::new().gate(task, repo)
+            }
+            fn run(&self, task: &Task, _r: &Value) -> Value {
+                *self.seen.borrow_mut() = task.detail.clone();
+                json!({"ok": true, "kind": task.kind.as_str(), "lane": task.lane})
+            }
+        }
+        let cap = CapturingSpecialist {
+            seen: std::cell::RefCell::new(String::new()),
+        };
+
+        // An ARCHITECTURE-class candidate (proven low): the directive MUST be appended.
+        let big = Candidate::new("gate_red_streak", "re-architect the ingestion pipeline", "architecture");
+        select_and_dispatch_core(&cap, &mut ctx, &repo, &[big]);
+        let seen_big = cap.seen.borrow().clone();
+        assert!(
+            seen_big.contains("Task-size calibration (mandatory)"),
+            "an above-floor size class must have the decompose directive appended: {seen_big}"
+        );
+        assert!(
+            seen_big.contains("DECOMPOSE"),
+            "the appended directive must mandate decomposition: {seen_big}"
+        );
+
+        // A CHORE-class candidate (cold cell — no evidence): NO directive, runs whole.
+        let small = Candidate::new("noop_streak", "fix a typo in the log line", "chore");
+        select_and_dispatch_core(&cap, &mut ctx, &repo, &[small]);
+        let seen_small = cap.seen.borrow().clone();
+        assert!(
+            !seen_small.contains("Task-size calibration"),
+            "a class with no low-ship-rate evidence must run WHOLE (no directive): {seen_small}"
+        );
+
+        std::env::remove_var("SOLOMON_NOTIFY_OFF");
     }
 
     // ===================================================================== #

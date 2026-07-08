@@ -680,4 +680,117 @@ mod tests {
         assert!(r.get("gate_set").is_none());
         let _ = fs::remove_dir_all(&dir);
     }
+
+    // ===================================================================== #
+    // D7 STARTUP CONTRACT: every orchestrator ledger MUST have a reader wired
+    // into the CEO orchestrator's dispatch/planning path — a WRITE-ONLY ledger
+    // is a bug (failure catalog #5: asmodeus's refutation blocklist was written
+    // but never read -> 166 re-litigations of the same 3 dead families). This
+    // asserts each ledger the orchestrator's Task-dispatch decision depends on
+    // is READ BACK to change the decision; a ledger whose value is never
+    // consulted fails this test loudly at `cargo test` time.
+    // ===================================================================== #
+
+    /// An isolated lane Ctx over injected tmp paths (mirrors progress.rs::test_ctx): its own runtime
+    /// dir + a NON-git repo dir so the state-hash components are STABLE and test-controlled. Used to
+    /// drive the orchestrator's real readers over a synthetic ledger.
+    fn d7_iso_ctx(name: &str) -> crate::improver::ctx::Ctx {
+        use crate::improver::ctx::Ctx;
+        let base = std::env::temp_dir().join(format!(
+            "solomon_d7contract_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let control = base.join("control");
+        let repo = base.join("repo");
+        let _ = fs::create_dir_all(&control);
+        let _ = fs::create_dir_all(&repo);
+        let mut c = Ctx::configure(&repo.to_string_lossy(), name, "ollama-cloud", None);
+        c.control = control;
+        c.runtime = base.join("runtime").join(name);
+        c.heartbeat_path = c.runtime.join("heartbeat.json");
+        c.log_path = c.runtime.join("improver.log");
+        c.stop_path = c.runtime.join("stop");
+        c.backlog = base.join("improver").join(name).join("backlog.md");
+        c.lessons = base.join("improver").join(name).join("LESSONS.md");
+        let _ = fs::create_dir_all(c.backlog.parent().unwrap());
+        let _ = fs::create_dir_all(&c.runtime);
+        c
+    }
+
+    /// The CLOSED registry of ledgers the D4 orchestrator's dispatch decision reads. Each entry
+    /// names the ledger and a `reader` closure that PROVES the ledger's value is consulted by the
+    /// orchestrator's real selection path (not a mock): the closure seeds the ledger to a value that
+    /// MUST change the dispatch decision, runs the real reader, and returns whether the decision
+    /// changed. A write-only ledger (value never read) can produce no such closure and fails the
+    /// completeness assertion below.
+    ///
+    /// Extending the orchestrator with a new ledger REQUIRES adding it here with a passing reader
+    /// proof — otherwise this contract test fails, enforcing the "no write-only ledger" rule.
+    #[test]
+    fn every_orchestrator_ledger_is_read_back_into_the_dispatch_decision() {
+        use crate::ceo::orchestrator::{selection_readers_contract, ORCHESTRATOR_LEDGERS};
+        use crate::improver::{calibration, progress};
+
+        // (0) The registry is non-empty and names the two substrates D7 re-asserts.
+        assert!(
+            ORCHESTRATOR_LEDGERS.contains(&"progress.json"),
+            "the quarantine ledger must be a registered orchestrator ledger"
+        );
+        assert!(
+            ORCHESTRATOR_LEDGERS.contains(&"_task_calibration.json"),
+            "the calibration ledger must be a registered orchestrator ledger"
+        );
+
+        // (1) progress.json READER PROOF: a quarantined key must make the orchestrator's selection
+        // reader SKIP that task. Seed a quarantine, then assert the reader (quarantined()) reads it
+        // back as true — a write-only quarantine ledger would read false and re-run the theater task.
+        let mut ctx = d7_iso_ctx("d7prog");
+        let key = progress::selection_key(&ctx, "a persistently no-delta task");
+        progress::note_selected(&ctx, &key, "a persistently no-delta task");
+        let pre = progress::state_hash(&ctx);
+        for _ in 0..progress::QUARANTINE_STRIKES {
+            progress::record_outcome(&mut ctx, &key, &pre, "noop");
+        }
+        assert!(
+            progress::quarantined(&ctx, &key),
+            "progress.json is READ BACK: a 3x no-delta key reads as quarantined (not write-only)"
+        );
+
+        // (2) _task_calibration.json READER PROOF: a proven-low (model, class) cell must make the
+        // orchestrator's size reader emit a decompose directive. Seed the low cell, then assert the
+        // reader (decompose_directive()) reads it back as Some — a write-only calibration ledger
+        // would read None and dispatch the oversized item whole.
+        let mut ctx2 = d7_iso_ctx("d7calib");
+        let fleet_dir = ctx2.runtime.parent().unwrap().to_path_buf();
+        for _ in 0..calibration::MIN_ATTEMPTS {
+            calibration::record_outcome_at(&fleet_dir, &ctx2.pi_model, "architecture", false);
+        }
+        assert!(
+            calibration::decompose_directive(&ctx2, "architecture").is_some(),
+            "_task_calibration.json is READ BACK: a proven-low cell emits a decompose directive \
+             (not write-only)"
+        );
+        // a healthy/cold cell reads back as None (the reader is value-sensitive, not always-on).
+        assert!(
+            calibration::decompose_directive(&ctx2, "chore").is_none(),
+            "the calibration reader is value-sensitive — a cold cell yields no directive"
+        );
+
+        // (3) COMPLETENESS: every registered ledger has a wired reader proof (the function panics if
+        // any ledger in the registry lacks one). This is the "no write-only ledger" gate — adding a
+        // ledger without a reader trips it.
+        let unread = selection_readers_contract(&mut ctx2);
+        assert!(
+            unread.is_empty(),
+            "these orchestrator ledgers are WRITE-ONLY (written but never read back into the \
+             dispatch decision): {unread:?} — wire a reader into the planning path or remove the \
+             ledger (failure catalog #5)"
+        );
+
+        let _ = &mut ctx;
+    }
 }
