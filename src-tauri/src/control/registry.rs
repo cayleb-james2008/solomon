@@ -750,6 +750,88 @@ pub fn set_repo_config(
     }
 }
 
+/// D8 onboarding: upsert a repos.json row for a NEWLY-ONBOARDED local project in ONE atomic write,
+/// setting the onboarding-specific keys `set_repo_config` does not cover (`path`, `freshness`,
+/// `api_key` env-name, `goal`, `gate`, `provider`). This is the ZERO-hand-editing writer: the
+/// onboarding path calls it so the operator never edits repos.json by hand. RMW the whole list,
+/// preserve every untouched key on an existing row, atomic write.
+///
+///   * `freshness` — the seeded freshness block. Per D1's rule the caller passes EITHER an
+///     `{"cmd": ...}` block (only when its emitter script was VERIFIED present on disk) OR the honest
+///     `{"no_objective": true}` sentinel (when no real emitter exists) — so this writer never seeds a
+///     blind objective. Passed verbatim; `None` leaves any existing `freshness` untouched.
+///   * `api_key` — the API-KEY ENV NAME (e.g. "OLLAMA_API_KEY"), stored under `api_key`. Never a
+///     secret value: the onboarding contract is (path + api-key-ENV), and the env var is resolved at
+///     run time exactly like every other lane's key.
+///
+/// A NEW row is created with `name`, `branch_prefix: "rsi/"`, and `path`; `error` on a corrupt
+/// repos.json (refuse to clobber). Returns `{ok:true, created:bool}` / `{ok:false, error}`.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_onboarded_repo(
+    name: &str,
+    path: &str,
+    gate: &str,
+    goal: Option<&str>,
+    provider: Option<&str>,
+    api_key_env: Option<&str>,
+    freshness: Option<&Value>,
+) -> Value {
+    if name.is_empty() {
+        return json!({"ok": false, "error": "name required"});
+    }
+    if path.trim().is_empty() {
+        return json!({"ok": false, "error": "path required"});
+    }
+    let mut entries = match read_repos_for_write() {
+        Ok(e) => e,
+        Err(error) => return json!({"ok": false, "error": error}),
+    };
+
+    let idx = entries
+        .iter()
+        .position(|r| r.is_object() && r.get("name").and_then(Value::as_str) == Some(name));
+    let created = idx.is_none();
+    let pos = match idx {
+        Some(i) => i,
+        None => {
+            let mut obj = Map::new();
+            obj.insert("name".to_string(), Value::String(name.to_string()));
+            obj.insert("branch_prefix".to_string(), Value::String("rsi/".to_string()));
+            entries.push(Value::Object(obj));
+            entries.len() - 1
+        }
+    };
+
+    {
+        let entry = entries[pos]
+            .as_object_mut()
+            .expect("matched/created entry is an object");
+        entry.insert("path".to_string(), Value::String(path.to_string()));
+        if !gate.is_empty() {
+            entry.insert("gate".to_string(), Value::String(gate.to_string()));
+        }
+        if let Some(g) = goal {
+            entry.insert("goal".to_string(), Value::String(g.trim().to_string()));
+        }
+        if let Some(p) = provider {
+            if !p.is_empty() {
+                entry.insert("provider".to_string(), Value::String(p.to_string()));
+            }
+        }
+        if let Some(k) = api_key_env {
+            entry.insert("api_key".to_string(), Value::String(k.to_string()));
+        }
+        if let Some(f) = freshness {
+            entry.insert("freshness".to_string(), f.clone());
+        }
+    }
+
+    match write_repo_entries(&entries) {
+        Ok(()) => json!({"ok": true, "created": created}),
+        Err(e) => json!({"ok": false, "error": e.to_string()}),
+    }
+}
+
 // --------------------------------------------------------------------------- #
 // connect / add / parse
 // --------------------------------------------------------------------------- #

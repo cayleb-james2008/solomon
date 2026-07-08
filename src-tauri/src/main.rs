@@ -184,7 +184,7 @@ fn run_headless(args: &[String]) -> i32 {
 
 fn usage() {
     eprintln!(
-        "usage: solomon state | autopilot-state | autopilot-wake [name] | autopilot-pause | supervise [name] | serve-health [port] | probe [name] | plan | report | watchdog"
+        "usage: solomon state | autopilot-state | autopilot-wake [name] | autopilot-pause | supervise [name] | serve-health [port] | probe [name] | plan | report | watchdog | onboard <project-path> <API_KEY_ENV> [--goal \"<north star>\"] [--provider <p>] [--no-cycle]"
     );
 }
 
@@ -200,6 +200,17 @@ fn is_autopilot_subcommand(sub: Option<&str>) -> bool {
                 | "fleet-drain"
         )
     )
+}
+
+/// Read a `--flag value` pair out of an argv slice: the value immediately following the first
+/// occurrence of `flag`, or None when the flag is absent / has no following value. Used by the
+/// `onboard` subcommand for its optional `--goal` / `--provider` flags.
+fn flag_value(argv: &[String], flag: &str) -> Option<String> {
+    argv.iter()
+        .position(|a| a == flag)
+        .and_then(|i| argv.get(i + 1))
+        .filter(|v| !v.starts_with("--"))
+        .cloned()
 }
 
 /// app.serve_health: a tiny stdlib HTTP server on 127.0.0.1 serving the health payload as JSON on
@@ -338,6 +349,34 @@ fn main() {
             ceo::morning_plan()
         } else {
             ceo::evening_summary()
+        };
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        let ok = out.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+    // `solomon onboard <project-path> <API_KEY_ENV> [--goal "<north star>"] [--provider <p>]
+    //  [--no-cycle]` — D8 Layer-3 plug-and-play onboarding: bring a never-before-managed LOCAL
+    // project into the fleet from (path + api-key-ENV) ALONE. Stack auto-detected, freshness
+    // objective seeded (emitter verified present per D1's rule, else the honest no_objective
+    // sentinel), an ISOLATED runtime/<name>/ provisioned, the repos.json row WRITTEN (zero
+    // hand-editing), and ONE gated cycle run. Headless; dispatch before the GUI. Exit 0 on ok, 1 on
+    // failure. (The api-key ARG is an ENV NAME, never a secret value — the value stays in the env.)
+    if argv.first().map(String::as_str) == Some("onboard") {
+        let path = argv.get(1).cloned().unwrap_or_default();
+        let api_key_env = argv.get(2).cloned().unwrap_or_default();
+        let goal = flag_value(&argv, "--goal");
+        let provider = flag_value(&argv, "--provider");
+        let run_cycle = !argv.iter().any(|a| a == "--no-cycle");
+        let out = if path.is_empty() || api_key_env.is_empty() {
+            json!({"ok": false, "error": "usage: solomon onboard <project-path> <API_KEY_ENV> [--goal \"<north star>\"] [--provider <p>] [--no-cycle]"})
+        } else {
+            ceo::onboard::onboard_project(
+                &path,
+                &api_key_env,
+                goal.as_deref(),
+                provider.as_deref(),
+                run_cycle,
+            )
         };
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         let ok = out.get("ok").and_then(Value::as_bool).unwrap_or(false);

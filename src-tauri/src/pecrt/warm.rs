@@ -345,7 +345,9 @@ impl LongTermAdapter {
 /// return the last `n` non-empty lines. A giant append-only ledger costs O(bytes-of-the-tail) IO, not
 /// O(whole file) — the property acceptance criterion (a) requires. Missing/unreadable file => empty.
 /// Never returns more than `n`. Shared by the observation-log tail and the long-term outcomes tail.
-fn read_last_lines(path: &Path, n: usize) -> Vec<String> {
+/// `pub(crate)`: the D8 cross-project wins reader (`ceo::wins`) reuses this exact bounded tail rather
+/// than re-implementing a whole-file read of the outcomes ledger.
+pub(crate) fn read_last_lines(path: &Path, n: usize) -> Vec<String> {
     use std::io::{Read, Seek, SeekFrom};
     if n == 0 {
         return Vec::new();
