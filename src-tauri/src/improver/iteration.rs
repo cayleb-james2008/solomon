@@ -25,7 +25,8 @@ use serde_json::{json, Value};
 
 use crate::improver::ctx::{self, Ctx};
 use crate::improver::{
-    backlog, build_sem, escalation, freshness, gates, gitops, phases, pi, progress, ship, visual,
+    backlog, build_sem, escalation, freshness, gates, gitops, outcome_critique, phases, pi,
+    progress, ship, visual,
 };
 
 use regex::Regex;
@@ -53,6 +54,16 @@ pub fn one_iteration(ctx: &mut Ctx) {
     if freshness::short_circuit(ctx) {
         return;
     }
+
+    // OUTCOME-CRITIQUE (D3, Layer 2): downstream of the freshness objective — the cycle is
+    // proceeding because the tier-1 metric gained new data, so this is exactly when to grade a
+    // PRIOR shipped change against that same fresh metric. If a pending critique is in flight and
+    // the metric turned its settled window enough to grade honestly, this records a SIGNED
+    // metric_delta to runtime/<lane>/outcome_critique.jsonl and down-weights a value-blind backlog
+    // family. No-op — and NO probe cost — when nothing is pending (the common case). Never grades
+    // on a green test: the honesty floor inside refuses a delta unless the metric is observable AND
+    // gained real settled rows.
+    outcome_critique::resolve_due(ctx);
 
     // branch = "rsi/beautify-<stamp>" / "rsi/solomon-<stamp>" / "rsi/iter-<stamp>"
     let stamp = ctx::stamp();
@@ -478,6 +489,18 @@ Then stop."
                  decompose directive appended (catalog #7)",
                 ctx.pi_model
             ));
+            t.push_str(&format!("\n\n{directive}"));
+        }
+        // OUTCOME-CRITIQUE VALUE-FOCUS (D3, feedback into backlog prioritization): when this item's
+        // backlog family is DEMOTED (a prior shipped-green change of it moved the tier-1 metric
+        // zero-or-negative), append a mandatory value-focus directive so the agent targets the
+        // SETTLED metric, not a green gate. The family key is the progress-ledger selection key set
+        // by filter_quarantined_selection above; empty on the beautify/solomon lanes (no directive).
+        if let Some(directive) = outcome_critique::value_focus_directive(ctx, &progress_key) {
+            ctx.log(
+                "outcome-critique: selected item's family is DEMOTED (prior shipped-green non-win) \
+— value-focus directive appended (grade the metric, not the tests)",
+            );
             t.push_str(&format!("\n\n{directive}"));
         }
         // PLAN phase.
@@ -1161,6 +1184,16 @@ data or a secret to the PUBLIC repo; fix the change to exclude it."
         } else {
             backlog::mark_backlog_done(ctx, &goal);
             escalation::clear_failure_state(ctx, &goal);
+            // OUTCOME-CRITIQUE (D3, Layer 2): a real LANDED ship of the NAMED item is the ONLY
+            // terminal that opens an outcome critique — sample the lane's tier-1 metric NOW (ship
+            // baseline) and stamp a pending; a later fresh cycle grades the SIGNED delta once the
+            // metric gains real settled rows. Keyed to the progress-ledger selection key as the
+            // backlog FAMILY (so a value-blind approach is down-weighted, not a single item), and
+            // to the landed base sha as the change_id. Inert for a no_objective lane (no freshness
+            // cfg => note_ship no-ops). Gated identically to mark_backlog_done above — a deviated,
+            // blocked, or reverted terminal never opens a critique it cannot honestly grade.
+            let change_id = gitops::head_sha(ctx);
+            outcome_critique::note_ship(ctx, &change_id, &progress_key);
         }
     }
     ctx.heartbeat(json!({

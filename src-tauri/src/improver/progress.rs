@@ -277,7 +277,24 @@ pub struct Selection {
 /// AFTER any defer (the defer rewrites the backlog, which is a state-hash component).
 pub fn filter_quarantined_selection(ctx: &mut Ctx, goal: String, tier: String) -> Option<Selection> {
     let key = selection_key(ctx, &goal);
+    // OUTCOME-CRITIQUE DOWN-WEIGHT (D3, wiring point A): the top item's backlog FAMILY (its
+    // selection key) is DEMOTED when a prior shipped-green change of that family moved the tier-1
+    // metric zero-or-negative (a value-blind NON-WIN). A demotion is SOFTER than a quarantine (a
+    // hard skip) — it never idles the lane out and never strands a lane's only work by deferring it.
+    // The demotion is fed back into item selection through the mandatory value-focus directive
+    // iteration.rs appends at task-build time (outcome_critique::value_focus_directive, keyed on
+    // this same selection key): the agent is told this approach shipped green but did not move the
+    // settled metric, and must target the metric or pivot. Here we only LOG the demotion so it is
+    // observable in the loop's own record; the quarantine (hard-skip) flow below is unchanged and
+    // always takes precedence over a demotion.
     if !quarantined(ctx, &key) {
+        if crate::improver::outcome_critique::family_demoted(ctx, &key) {
+            ctx.log(&format!(
+                "progress: top backlog item '{}' family is DEMOTED (outcome-critique NON-WIN, key \
+{key}) — running with a mandatory value-focus directive (grade the metric, not the tests)",
+                head_chars(&goal, 60)
+            ));
+        }
         let pre_hash = state_hash(ctx);
         note_selected(ctx, &key, &goal);
         return Some(Selection { goal, tier, key, pre_hash });
@@ -666,6 +683,57 @@ mod tests {
         assert!(last_item_line.contains("alpha"), "alpha sits at the bottom: {last_item_line}");
         // and NOT the all_quarantined bail
         assert_ne!(hb_str(&c, "reason"), "all_quarantined");
+    }
+
+    // ---- D3 OUTCOME-CRITIQUE DOWN-WEIGHT: a demoted family still runs but is logged + directed ----
+
+    #[test]
+    fn demoted_family_still_selects_its_item_but_logs_the_downweight() {
+        // A demotion is a DOWN-WEIGHT, never a hard skip or a destructive defer: the demoted item
+        // still runs (so a lane is never stranded), the demotion is LOGGED (observable), and the
+        // real down-weight is the value-focus directive iteration.rs appends at task-build time.
+        let mut c = test_ctx();
+        std::fs::write(&c.backlog, TWO_ITEM_BACKLOG).unwrap();
+        let (g1, t1) = backlog::top_backlog_item(&c).unwrap();
+        assert!(g1.starts_with("alpha"), "got: {g1}");
+        crate::improver::outcome_critique::record_family_outcome(
+            &c,
+            &selection_key(&c, &g1),
+            crate::improver::outcome_critique::Verdict::NonWin,
+        );
+        let sel = filter_quarantined_selection(&mut c, g1.clone(), t1)
+            .expect("a demoted item still runs (down-weight, not a block)");
+        assert_eq!(sel.goal, g1, "the demoted item still runs — a demotion never strands a lane");
+        assert_ne!(hb_str(&c, "reason"), "all_quarantined", "a demotion never idles the lane out");
+        // the backlog is NOT destructively deferred by a demotion (unlike a quarantine)
+        let text = std::fs::read_to_string(&c.backlog).unwrap();
+        assert!(!text.contains("(deferred"), "a demotion must not defer the item: {text}");
+        // the demotion IS observable in the loop's log
+        let log = std::fs::read_to_string(&c.log_path).unwrap_or_default();
+        assert!(log.contains("family is DEMOTED"), "demotion logged: {log}");
+    }
+
+    #[test]
+    fn value_focus_directive_fires_for_a_demoted_family() {
+        // acceptance (b): the down-weight is observable in item selection — the value-focus directive
+        // (appended to the task by iteration.rs) fires for a demoted family and not for a fresh one.
+        let c = test_ctx();
+        std::fs::write(&c.backlog, TWO_ITEM_BACKLOG).unwrap();
+        let (g1, _t1) = backlog::top_backlog_item(&c).unwrap();
+        let key = selection_key(&c, &g1);
+        assert!(
+            crate::improver::outcome_critique::value_focus_directive(&c, &key).is_none(),
+            "a fresh family gets no directive"
+        );
+        crate::improver::outcome_critique::record_family_outcome(
+            &c,
+            &key,
+            crate::improver::outcome_critique::Verdict::NonWin,
+        );
+        let d = crate::improver::outcome_critique::value_focus_directive(&c, &key)
+            .expect("a demoted family gets the value-focus directive");
+        assert!(d.contains("grade the metric, not the tests"), "{d}");
+        assert!(d.contains("settled metric"), "{d}");
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub mod freshness;
 pub mod park;
 pub mod budget;
 pub mod calibration;
+pub mod outcome_critique;
 pub mod progress;
 pub mod ship;
 pub mod tiers;
