@@ -301,9 +301,9 @@
             {
                 "id": "process",
                 "kind": "process",
-                "process_name": "python.exe",
+                "process_name": "pythonw.exe",
                 "path_contains": "projects\\kairos",
-                "comment": "The live trader fleet (app.py / maker.py / maker_hourly.py / strategist.py) all run as python.exe from the kairos .venv, ExecutablePath under projects\\kairos. ANY live instance reads green; the whole family absent reads red (product process down). Matched by NAME + EXECUTABLE-PATH, never PID (PIDs recycle)."
+                "comment": "The live trader fleet (app.py / maker.py / maker_hourly.py / strategist.py) all run as pythonw.exe (windowless) from the kairos .venv, ExecutablePath under projects\\kairos. ANY live instance reads green; the whole family absent reads red (product process down). Matched by NAME + EXECUTABLE-PATH, never PID (PIDs recycle). Updated from python.exe to pythonw.exe 2026-07-09 after the relaunch switched to windowless mode."
             },
             {
                 "id": "outcome_streak",
