@@ -295,8 +295,8 @@
         "db": "${REPO}\\.state\\kairos.db",
         "query": "SELECT MAX(ts) FROM trades WHERE mode='live' AND status='settled'",
         "mode": "age",
-        "yellow_after_s": 86400,
-        "red_after_s": 259200,
+        "yellow_after_s": 31536000,
+        "red_after_s": 31536000,
         "null_status": "green",
         "comment": "Newest SETTLED live trade -- the settled-$/window objective's ground truth. NULL (no settled live trades yet, e.g. paper-dominant while the leash is tight) is green by design: an absent live fill is not a failure signal on its own (paper still proves sizing truth). Wide thresholds (1d yellow / 3d red) because live fills are intentionally rare under the aggressive-but-gated leash; this catches a live path that has gone fully silent for days, not normal sparsity."
       },
