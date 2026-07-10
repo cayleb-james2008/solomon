@@ -627,11 +627,50 @@ fn sweep_repo(
         .map(|d| d.join("stop").exists())
         .unwrap_or(false);
     let running = control::locks::is_running(r);
-    let hb = control::heartbeat::read_heartbeat(r).unwrap_or_else(|| json!({}));
+    let mut hb = control::heartbeat::read_heartbeat(r).unwrap_or_else(|| json!({}));
     // Set true when THIS sweep healed a persistent-bail self-stop (persistent_stop_cleared removed
     // the sentinel + should_restart relaunched the loop). When healed, the RUNG-0 recover() pass
     // below is SKIPPED for this repo on this sweep — see the heal block + the recover guard.
     let mut healed = false;
+
+    // Stale-heartbeat recovery (2026-07-10 MoA): when the improver process died silently (the PID
+    // is dead, the lock is gone) but the heartbeat is frozen at "iterating"/"sleeping"/"idle",
+    // the autopilot's plan_jobs sees a live-phase status and won't re-queue the lane as
+    // `implement` — it thinks a job is already running. Clear the frozen heartbeat to "stopped"
+    // so the next sweep's diagnose() sees a clean exit + plan_jobs queues `implement`. This is
+    // the RUNG-0 reversible path: we only touch the heartbeat (a state file), never the repo.
+    // Guard: only fire when the heartbeat is STALE (updated_at > 3x the lane interval) so a
+    // slow-but-live iteration (the pi agent is still working, just hasn't written in a while)
+    // is NOT mistaken for a dead process. The `is_running` check already confirmed the PID is
+    // dead; the age guard adds a second safety margin.
+    if !running {
+        let status = hb.get("status").and_then(Value::as_str).unwrap_or("");
+        if status == "iterating" || status == "sleeping" || status == "idle" {
+            let interval = crate::control::registry::project_interval(r);
+            let stale_threshold = (3.0 * interval as f64).max(paths::LOCK_LIVE_FLOOR_S);
+            let hb_age = control::heartbeat::heartbeat_age(&hb);
+            let is_stale = hb_age.map(|a| a > stale_threshold).unwrap_or(false);
+            if is_stale {
+                if let Some(rt) = &rt {
+                    let hb_path = rt.join("heartbeat.json");
+                    if hb_path.exists() {
+                        let mut fixed = hb.clone();
+                        if let Value::Object(ref mut o) = fixed {
+                            o.insert("status".into(), json!("stopped"));
+                            o.insert("phase".into(), Value::Null);
+                            if let Some(Value::Object(ref mut pio)) = o.get_mut("pi") {
+                                pio.insert("status".into(), json!("exited"));
+                                pio.insert("exit_code".into(), json!(-1));
+                            }
+                            let _ = std::fs::write(&hb_path, serde_json::to_vec(&fixed).unwrap_or_default());
+                            actions.push(format!("{name} stale-heartbeat: cleared frozen '{status}' -> 'stopped' (dead PID, age {:.0}s)", hb_age.unwrap_or(0.0)));
+                            hb = fixed;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Anti-wedge: the runner self-stops on a PERSISTENTLY dirty / un-pushed / gate-RED base (STOP
     // sentinel + status=error + a reason marker) so it doesn't spin forever — but that sentinel
