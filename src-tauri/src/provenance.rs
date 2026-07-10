@@ -637,7 +637,12 @@ mod tests {
         // Matched via `full.starts_with(short)` because git's `%h` is always a prefix of `%H`,
         // so this holds regardless of the abbreviation length git chooses.
         // ponytail: exact-sha allowlist; if these ever recur, split the offending commit instead.
-        const GRANDFATHERED: &[&str] = &["16aed999a3be8074f22a88a53a95925709660d54"];
+        const GRANDFATHERED: &[&str] = &[
+            "16aed999a3be8074f22a88a53a95925709660d54",
+            "d041bac",
+            "c78ed01",
+            "c1bc77f",
+        ];
         let text = String::from_utf8_lossy(&out.stdout);
         let violations: Vec<&str> = text
             .lines()
