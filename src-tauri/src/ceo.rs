@@ -1523,6 +1523,34 @@ pub(crate) fn ollama_chat(model: &str, system: &str, user: &str) -> Result<Strin
             return Ok(c.to_string());
         }
     }
+    // Reasoning-model fallback (2026-07-09 MoA brain): Ollama Cloud reasoning models (kimi-k2.7-code,
+    // deepseek-v4-pro, glm-5.2 with reasoning_effort) return the answer in `reasoning_content` /
+    // `reasoning` when `content` is empty. Without this fallback every MoA worker call on a
+    // reasoning model returns Err("no message content") and the brain degrades to the pre-MoA
+    // single-model baseline — the MoA brain becomes a no-op. Try the OpenAI-compatible
+    // `reasoning_content` first, then the Ollama-native `reasoning`.
+    if let Some(c) = v
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("reasoning_content"))
+        .and_then(Value::as_str)
+    {
+        if !c.trim().is_empty() {
+            return Ok(c.to_string());
+        }
+    }
+    if let Some(c) = v
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("reasoning"))
+        .and_then(Value::as_str)
+    {
+        if !c.trim().is_empty() {
+            return Ok(c.to_string());
+        }
+    }
     Err(format!(
         "no message content in response: {}",
         r.stdout.chars().take(200).collect::<String>()
