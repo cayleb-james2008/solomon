@@ -15,6 +15,7 @@
 
 pub mod ctx;
 pub mod pi;
+pub mod brain;
 pub mod gitops;
 pub mod gates;
 pub mod build_sem;

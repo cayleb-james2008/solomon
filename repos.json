@@ -8,8 +8,21 @@
             "model": "glm-5.2",
             "max_concurrent_agent_calls": 1,
             "cooldown_s": 86400,
-            "daily_call_budget": 40,
+            "daily_call_budget": 500,
             "adaptive_phase_policy": "cheap_by_default_deep_on_red_noop_critical_or_campaign",
+            "brain": {
+                "enabled": true,
+                "aggregator": "glm-5.2",
+                "verifier": "glm-5.2",
+                "workers": {
+                    "plan": "kimi-k2.7-code",
+                    "implement": "deepseek-v4-pro",
+                    "ideate": "minimax-m2.7",
+                    "probe": "minimax-m2.7"
+                },
+                "layers": 2,
+                "fallback_provider": "openrouter"
+            },
             "targets": [
                 "sover",
                 "dotz",
