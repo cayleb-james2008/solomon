@@ -41,8 +41,12 @@ use crate::improver::pi;
 const WEEK_S: u64 = 604_800;
 /// Calls per endpoint per window when an endpoint is first seen. Conservative: the reserve-headroom
 /// rule refuses to PLAN a call past this, so an unknown endpoint can never be driven to a hard 429
-/// storm by the fleet itself.
-const DEFAULT_WINDOW_CAP: u64 = 500;
+/// storm by the fleet itself. Raised 2026-07-09 from 500/week to 3500/week per operator decision
+/// (D4: "500/day" intent = 500 x 7 = 3500/week per endpoint). The existing park_until /
+/// consecutive_429 exponential backoff handles real Ollama Cloud 429s; this is Solomon's own
+/// reserve-headroom rule, not an Ollama limit. With the MoA brain (4 models, ~5 calls/iteration),
+/// 3500/week x 4 endpoints = 14000 calls/week = ~2800 iterations/week across 6 lanes.
+const DEFAULT_WINDOW_CAP: u64 = 3500;
 /// First 429 park (seconds): 15 minutes.
 const PARK_BASE_S: u64 = 900;
 /// Park ceiling (seconds): 6 hours — explicitly NOT Gen-2's 86400s blanket.
@@ -881,7 +885,7 @@ mod tests {
         let now = unix_now();
         assert_eq!(preflight_at(&dir, "new-prov", "new-model", now), Decision::Proceed);
         let ep = read_ep(&dir, "new-prov", "new-model");
-        assert_eq!(ep["window_cap_calls"], json!(500));
+        assert_eq!(ep["window_cap_calls"], json!(3500));
         assert_eq!(ep["spent_calls"], json!(0));
         assert_eq!(ep["park_until"], json!(0));
         assert_eq!(ep["consecutive_429"], json!(0));

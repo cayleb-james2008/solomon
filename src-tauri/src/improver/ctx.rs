@@ -262,6 +262,13 @@ pub struct Ctx {
     pub sandbox_config: Value, // None -> Null
     pub vision_model: String,
 
+    // ---- MoA brain feature flag (Slice 3, RSI_MOA_PLAN §2.5) ----
+    /// True when the autopilot `brain.enabled` flag is set in repos.json — the iteration loop
+    /// routes the implement dispatch through `brain::run_moa_iteration` instead of the pre-MoA
+    /// single-model `dispatch_engineering_on_ctx`. Default `false` keeps byte-identical pre-MoA
+    /// behavior (the rollback); refreshed each iteration alongside the pipeline toggles.
+    pub moa_enabled: bool,
+
     // ---- mutable state ----
     pub hb: Value, // the _hb heartbeat OBJECT
     pub halted: bool,
@@ -400,6 +407,9 @@ impl Ctx {
             sandbox_config: Value::Null,
             vision_model: String::new(),
 
+            // MoA brain flag default — pre-MoA single-model path (the rollback).
+            moa_enabled: false,
+
             // mutable state defaults
             hb: Value::Object(hb),
             halted: false,
@@ -487,6 +497,15 @@ impl Ctx {
         self.plan_enabled = py_bool(pipe.get("plan"));
         self.ideate_enabled = py_bool(pipe.get("ideate"));
         self.reflect_enabled = py_bool(pipe.get("reflect"));
+
+        // MoA brain flag (Slice 3, RSI_MOA_PLAN §2.5): the autopilot `brain.enabled` sentinel in
+        // repos.json — refreshed each iteration so an operator flip takes effect mid-loop. Default
+        // false keeps the pre-MoA single-model path (the rollback). A missing/torn autopilot or
+        // brain block stays false.
+        self.moa_enabled = crate::control::registry::autopilot_config()
+            .pointer("/brain/enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         // _hb["model"] = PI_MODEL
         self.hb_set("model", json!(self.pi_model));

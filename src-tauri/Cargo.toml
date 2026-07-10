@@ -22,6 +22,13 @@ regex = "1"
 # bundled so no system sqlite3 is required; opened SQLITE_OPEN_READ_ONLY only — never a write path.
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# MoA brain (Slice 3, RSI_MOA_PLAN §2): the MoA workers reuse the proven `ollama_chat` curl path
+# (ponytail: reuse, don't reinvent) — no async-openai/reqwest/tokio-runtime dependency needed.
+# The brain.rs module orchestrates Layer-1 (plan/ideate) + Layer-2 (aggregate) sequentially via
+# ollama_chat; the implementer worker runs through the EXISTING pi::run_pi (real diff, real gate).
+# async-openai is reserved for a future streaming/parallel-fan-out Phase 2 if the sync path proves
+# too slow. See docs/RSI_MOA_RESEARCH.md §3.3 for the async-openai alternative.
+
 [dev-dependencies]
 # test fixtures only: set file mtimes for the file_age probe's golden vectors
 filetime = "0.2"

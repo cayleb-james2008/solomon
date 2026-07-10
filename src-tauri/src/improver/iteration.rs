@@ -602,11 +602,20 @@ Then stop."
     // routing, never a bypass: the downstream freshness/blast-radius/skeptic/KILL/ship gates still
     // decide every action.
     let repo_row = gitops::repo_row(ctx, &ctx.name.clone());
+    // MoA brain (Slice 3, RSI_MOA_PLAN §2): when ctx.moa_enabled, synthesize a multi-model plan
+    // BEFORE the implement dispatch. The brain is UPSTREAM of the gate — it produces a richer
+    // task for the implementer; the dispatch + gate + anti-gaming + ship path run UNCHANGED after.
+    // When disabled (the default + the rollback flag), the raw `task` is passed byte-identical.
+    let moa_task = if ctx.moa_enabled {
+        crate::improver::brain::run_moa_plan(ctx, &task)
+    } else {
+        task.clone()
+    };
     let p = match crate::ceo::orchestrator::dispatch_engineering_on_ctx(
         ctx,
         &repo_row,
         crate::ceo::orchestrator::TaskKind::Code,
-        &task,
+        &moa_task,
         implement_timeout,
         system_md.as_deref(),
     ) {

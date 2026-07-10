@@ -1455,7 +1455,7 @@ fn parse_daily_target(north_star: &str) -> Option<i64> {
 /// One chat completion over Ollama Cloud via curl.exe (no HTTP client dependency; TLS handled by
 /// the OS curl, same guarded-spawn contract as every other subprocess). The API key rides a
 /// curl `-H @file` headers file under runtime/ (gitignored) — never argv, never a log line.
-fn ollama_chat(model: &str, system: &str, user: &str) -> Result<String, String> {
+pub(crate) fn ollama_chat(model: &str, system: &str, user: &str) -> Result<String, String> {
     let key = notify::env_value("OLLAMA_API_KEY").ok_or("no OLLAMA_API_KEY in .env")?;
     let rt = paths::here().join("runtime");
     let _ = std::fs::create_dir_all(&rt);
