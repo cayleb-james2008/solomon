@@ -181,6 +181,37 @@ fn load_skill(repo: &str, role: &str) -> String {
     std::fs::read_to_string(&p).unwrap_or_default()
 }
 
+/// Emit a MoA-brain event to `runtime/autopilot_events.jsonl` so the proof-hour criterion A
+/// (MoA brain firing) has real instrumentation — the skeptic found the brain had NO observability,
+/// which allowed the lead to misattribute budget-ledger increments to a MoA call that never ran.
+/// One JSON line per layer transition: {event, repo, layer, model, status, reason, ts}.
+fn moa_event(repo: &str, layer: u8, model: &str, status: &str, reason: &str) {
+    let p = crate::control::paths::here()
+        .join("runtime")
+        .join("autopilot_events.jsonl");
+    let line = serde_json::json!({
+        "event": "moa_layer",
+        "repo": repo,
+        "layer": layer,
+        "model": model,
+        "status": status,
+        "reason": reason,
+        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    });
+    let _ = (|| -> std::io::Result<()> {
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)?;
+        writeln!(f, "{line}")?;
+        Ok(())
+    })();
+}
+
 // --------------------------------------------------------------------------- #
 // run_moa_iteration — the orchestrator (integration point B)
 // --------------------------------------------------------------------------- #
@@ -212,12 +243,16 @@ pub fn run_moa_plan(ctx: &mut Ctx, task: &str) -> String {
         "MoA Layer-1: planner worker ({plan_model})"
     ));
     let plan_text = match spawn_worker(&plan_model, PLAN_PROMPT, &plan_skill, task, Some(ctx)) {
-        Ok(p) => p,
+        Ok(p) => {
+            moa_event(&lane, 1, &plan_model, "ok", "planner returned a plan");
+            p
+        }
         Err(e) => {
             // Degraded: planner failed -> run the implementer with the raw task (pre-MoA baseline).
             ctx.log(&format!(
                 "MoA Layer-1 planner failed ({e}); degrading to raw-task implementer (pre-MoA baseline)"
             ));
+            moa_event(&lane, 1, &plan_model, "failed", &e);
             return task.to_string();
         }
     };
@@ -236,6 +271,7 @@ pub fn run_moa_plan(ctx: &mut Ctx, task: &str) -> String {
     match spawn_worker(&cfg.aggregator, "", &agg_skill, &agg_user, Some(ctx)) {
         Ok(synth) => {
             ctx.log("MoA: synthesized plan ready for implementer");
+            moa_event(&lane, 2, &cfg.aggregator, "ok", "synthesized plan");
             synth
         }
         Err(e) => {
@@ -246,6 +282,7 @@ pub fn run_moa_plan(ctx: &mut Ctx, task: &str) -> String {
             ctx.log(&format!(
                 "MoA aggregator failed ({e}); handing raw task + advisory plan to implementer"
             ));
+            moa_event(&lane, 2, &cfg.aggregator, "failed", &e);
             format!("{task}\n\n--- Advisory plan (MoA planner, aggregator failed) ---\n{plan_text}")
         }
     }
