@@ -53,3 +53,6 @@ web/assets/_exe_icon_verify.png
 
 # transient rename-aside artifacts while a running/recorded exe is being swapped
 /Solomon.exe.*
+
+# Churn file written by the watchdog each sweep — gitignored so the controller-clean preflight stops tripping
+improver/kairos/hypothesis-ledger.md
