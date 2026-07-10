@@ -375,7 +375,8 @@ mod tests {
         let cfg = BrainConfig::from_autopilot();
         // The repo's repos.json HAS the brain block (added in Slice 5), so this asserts the shape
         // rather than the disabled state. The disabled path is exercised by the fallback tests below.
-        assert!(cfg.enabled || !cfg.enabled); // shape compiles + reads without panic
+        // The config reads without panic + has a non-empty aggregator (the default or the brain block).
+        let _ = &cfg;
         assert!(!cfg.aggregator.is_empty());
     }
 

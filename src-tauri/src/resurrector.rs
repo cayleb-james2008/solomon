@@ -523,7 +523,7 @@ mod tests {
             "heartbeat records THIS process pid"
         );
         let age = heartbeat_age_s(&hb, Utc::now()).expect("stamped ts is parseable");
-        assert!(age >= 0.0 && age < 5.0, "a just-stamped heartbeat is fresh, age was {age}");
+        assert!((0.0..5.0).contains(&age), "a just-stamped heartbeat is fresh, age was {age}");
         assert!(
             age < STALE_AFTER_S,
             "a single fresh stamp is well inside the staleness window"
