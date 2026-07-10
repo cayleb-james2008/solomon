@@ -611,6 +611,18 @@ Then stop."
     } else {
         task.clone()
     };
+    // MoA implementer model override (2026-07-09): the brain's `workers.implement` model
+    // (deepseek-v4-pro) must be the model the pi agent runs under — NOT the repo's default
+    // (glm-5.2). Save/restore ctx.pi_model around the dispatch so ONLY the MoA implementer
+    // call uses deepseek; the rest of the iteration (gate, ship, heartbeat) sees the repo model.
+    let moa_impl_model = crate::improver::brain::implementer_model();
+    let saved_pi_model = ctx.pi_model.clone();
+    if ctx.moa_enabled {
+        if let Some(m) = &moa_impl_model {
+            ctx.pi_model = m.clone();
+            ctx.log(&format!("MoA implementer: overriding pi_model {saved_pi_model} -> {m}"));
+        }
+    }
     let p = match crate::ceo::orchestrator::dispatch_engineering_on_ctx(
         ctx,
         &repo_row,
@@ -619,12 +631,16 @@ Then stop."
         implement_timeout,
         system_md.as_deref(),
     ) {
-        Ok(run_out) => run_out,
+        Ok(run_out) => {
+            if ctx.moa_enabled {
+                ctx.pi_model = saved_pi_model.clone();
+            }
+            run_out
+        }
         Err(refusal) => {
-            // Gate DENY — fail-closed, NO pi spawn, NO token spent. On a normal engineering lane a
-            // plain code task is never denied; this is the defensive branch that fires only if a
-            // money-out / self-governance surface were ever attributed to a coding task. Idle it out
-            // honestly (record a non-op, drop the branch), exactly as a refused non-op would.
+            if ctx.moa_enabled {
+                ctx.pi_model = saved_pi_model.clone();
+            }
             let why = refusal
                 .get("error")
                 .and_then(Value::as_str)

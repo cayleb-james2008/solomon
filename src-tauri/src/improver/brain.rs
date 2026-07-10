@@ -97,6 +97,17 @@ impl BrainConfig {
     }
 }
 
+/// The configured implementer model (deepseek-v4-pro) for the pi-model override in iteration.rs.
+/// Returns None if the brain is disabled or the implementer worker is unset — the caller leaves
+/// ctx.pi_model unchanged in that case (the repo's default model).
+pub fn implementer_model() -> Option<String> {
+    let cfg = BrainConfig::from_autopilot();
+    if !cfg.enabled {
+        return None;
+    }
+    cfg.workers.implement
+}
+
 // --------------------------------------------------------------------------- #
 // System prompts (const — the role contracts; research §1.2 + plan §2.3)
 // --------------------------------------------------------------------------- #
@@ -237,8 +248,10 @@ pub fn run_moa_plan(ctx: &mut Ctx, task: &str) -> String {
         .clone()
         .unwrap_or_else(|| cfg.aggregator.clone());
     let plan_skill = load_skill(&lane, "plan");
+    let ideate_model = cfg.workers.ideate.clone();
+    let ideate_skill = load_skill(&lane, "ideate");
 
-    // Layer 1 — planner (kimi-k2.7-code). Read-only proposal.
+    // Layer 1a — planner (kimi-k2.7-code). Read-only proposal.
     ctx.log(&format!(
         "MoA Layer-1: planner worker ({plan_model})"
     ));
@@ -248,7 +261,6 @@ pub fn run_moa_plan(ctx: &mut Ctx, task: &str) -> String {
             p
         }
         Err(e) => {
-            // Degraded: planner failed -> run the implementer with the raw task (pre-MoA baseline).
             ctx.log(&format!(
                 "MoA Layer-1 planner failed ({e}); degrading to raw-task implementer (pre-MoA baseline)"
             ));
@@ -257,16 +269,39 @@ pub fn run_moa_plan(ctx: &mut Ctx, task: &str) -> String {
         }
     };
 
-    // (Slice 4 will add the ideator worker here via a second spawn_worker + fold into Layer-2 input.)
+    // Layer 1b — ideator (minimax-m3). Divergent alternative proposals. Runs sequentially after the
+    // planner (v1; parallel tokio::join! is the Phase-2 upgrade). If the ideator fails, the
+    // aggregator synthesizes from the planner output alone (degraded n=1 — still MoA-Lite).
+    let ideate_text = if let Some(im) = &ideate_model {
+        ctx.log(&format!("MoA Layer-1: ideator worker ({im})"));
+        match spawn_worker(im, IDEATE_PROMPT, &ideate_skill, task, Some(ctx)) {
+            Ok(t) => {
+                moa_event(&lane, 1, im, "ok", "ideator returned alternatives");
+                Some(t)
+            }
+            Err(e) => {
+                ctx.log(&format!(
+                    "MoA Layer-1 ideator failed ({e}); aggregator will use planner output only (n=1)"
+                ));
+                moa_event(&lane, 1, im, "failed", &e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    // Layer 2 — aggregator (glm-5.2) with the Aggregate-and-Synthesize prompt.
+    // Layer 2 — aggregator (glm-5.2) with the Aggregate-and-Synthesize prompt over BOTH Layer-1
+    // outputs (plan + ideate) when both are present, or just the plan when the ideator failed.
     ctx.log(&format!(
         "MoA Layer-2: aggregator ({}) synthesizing plan",
         cfg.aggregator
     ));
-    let agg_user = format!(
-        "{AGGREGATE_SYNTHESIZE_PROMPT}\n\nResponses from models:\n1. [Plan]: {plan_text}"
-    );
+    let layer1_inputs = match &ideate_text {
+        Some(it) => format!("1. [Plan]: {plan_text}\n2. [Ideate]: {it}"),
+        None => format!("1. [Plan]: {plan_text}"),
+    };
+    let agg_user = format!("{AGGREGATE_SYNTHESIZE_PROMPT}\n\nResponses from models:\n{layer1_inputs}");
     let agg_skill = load_skill(&lane, "aggregate");
     match spawn_worker(&cfg.aggregator, "", &agg_skill, &agg_user, Some(ctx)) {
         Ok(synth) => {
@@ -275,10 +310,6 @@ pub fn run_moa_plan(ctx: &mut Ctx, task: &str) -> String {
             synth
         }
         Err(e) => {
-            // Degraded (N1 fix): aggregator failed -> hand the ORIGINAL rich task (which already
-            // carries repo context, warm-working block, calibration directives from iteration.rs)
-            // to the implementer, with the planner output appended as an advisory plan block — not
-            // plan_text alone (a plan is not an actionable task). Never fabricate.
             ctx.log(&format!(
                 "MoA aggregator failed ({e}); handing raw task + advisory plan to implementer"
             ));

@@ -17,8 +17,8 @@
                 "workers": {
                     "plan": "kimi-k2.7-code",
                     "implement": "deepseek-v4-pro",
-                    "ideate": "minimax-m2.7",
-                    "probe": "minimax-m2.7"
+                    "ideate": "minimax-m3",
+                    "probe": "minimax-m3"
                 },
                 "layers": 2,
                 "fallback_provider": "openrouter"
