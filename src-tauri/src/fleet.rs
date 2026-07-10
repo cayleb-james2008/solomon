@@ -493,6 +493,13 @@ fn plan_jobs(
             });
             continue;
         };
+        // Skip paused lanes — a per-lane `paused` sentinel means "hands off this lane for the
+        // automated sweep". Without this, a paused proof_required lane blocks the queue (once()
+        // picks jobs.first() and the non-AI proof_required job completes instantly, cycling
+        // through the paused lanes without ever reaching the implement jobs behind them).
+        if paths::runtime_dir(repo).map(|d| d.join("paused").exists()).unwrap_or(false) {
+            continue;
+        }
         let diag = supervisor::diagnose(repo);
         let diag_cat = diag.get("category").and_then(Value::as_str).unwrap_or("ok");
         let ops_project = ops_payload
