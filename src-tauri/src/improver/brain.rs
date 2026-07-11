@@ -307,14 +307,14 @@ pub fn run_moa_plan(ctx: &mut Ctx, task: &str) -> String {
         Ok(synth) => {
             ctx.log("MoA: synthesized plan ready for implementer");
             moa_event(&lane, 2, &cfg.aggregator, "ok", "synthesized plan");
-            format!("{synth}\n\n--- MoA anti-gaming directive ---\nNEVER add #[skip], #[ignore], pytest.mark.skip, @skipif, @xfail, or any test-skip/xfail marker. NEVER delete, weaken, or comment out an existing test to make the gate pass. The runner's anti-gaming scan detects skip markers in the diff and REVERTS the entire iteration — you gain nothing by skipping a test. If a test fails, FIX the code, not the test.")
+            format!("{synth}\n\n--- MoA directives ---\n1. NEVER add #[skip], #[ignore], pytest.mark.skip, @skipif, @xfail, or any test-skip/xfail marker. NEVER delete, weaken, or comment out an existing test to make the gate pass. The runner's anti-gaming scan detects skip markers in the diff and REVERTS the entire iteration. If a test fails, FIX the code, not the test.\n2. For Rust repos: your code MUST pass `cargo clippy --workspace --all-targets -- -D warnings` with ZERO warnings. Common clippy lints to avoid: overly_complex_bool_expr (use `assert!(!x)` not `assert!(x || !x)`), manual_range_contains (use `(a..b).contains(&v)` not `v >= a && v < b`), needless_range_loop (use iterators), redundant_closure (use `f` not `|x| f(x)`). Run `cargo clippy` mentally before writing each line.")
         }
         Err(e) => {
             ctx.log(&format!(
                 "MoA aggregator failed ({e}); handing raw task + advisory plan to implementer"
             ));
             moa_event(&lane, 2, &cfg.aggregator, "failed", &e);
-            format!("{task}\n\n--- Advisory plan (MoA planner, aggregator failed) ---\n{plan_text}\n\n--- MoA anti-gaming directive ---\nNEVER add #[skip], #[ignore], pytest.mark.skip, @skipif, @xfail, or any test-skip/xfail marker. NEVER delete, weaken, or comment out an existing test to make the gate pass. The runner's anti-gaming scan detects skip markers in the diff and REVERTS the entire iteration. If a test fails, FIX the code, not the test.")
+            format!("{task}\n\n--- Advisory plan (MoA planner, aggregator failed) ---\n{plan_text}\n\n--- MoA directives ---\n1. NEVER add #[skip], #[ignore], pytest.mark.skip, @skipif, @xfail, or any test-skip/xfail marker. NEVER delete, weaken, or comment out an existing test to make the gate pass. The runner's anti-gaming scan detects skip markers in the diff and REVERTS the entire iteration.\n2. For Rust repos: your code MUST pass `cargo clippy --workspace --all-targets -- -D warnings` with ZERO warnings. Common clippy lints to avoid: overly_complex_bool_expr, manual_range_contains (use `(a..b).contains(&v)`), needless_range_loop, redundant_closure. Run `cargo clippy` mentally before writing each line.")
         }
     }
 }
