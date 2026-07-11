@@ -93,9 +93,9 @@
         "freshness": {
             "cmd": ".venv\\Scripts\\python tools\\freshness.py",
             "min_new_samples": 1,
-            "hard": true,
-            "max_starve_cycles": 16,
-            "comment": "2026-07-07: park the CODE improver when GGG gained no new PUBLISHED reel since the last decision -- reads the live post_registry.json (operator/live-app truth), never a self-reported heartbeat. Sover's youtube publish_recency RED is a real-world outcome the code improver cannot move, so it should PARK (zero token spend) here instead of burning a glm-5.2 call every sweep; the ops plane keeps that RED paging the operator separately. Escape valve: after 16 starved cycles ONE non-metric upkeep cycle runs (max_starve_cycles floored to >=1 in freshness.rs; NEVER set <=0). Emitter path %LOCALAPPDATA%\\Sover\\data\\ggg\\post_registry.json is verified present; a missing registry halts UNOBSERVABLE (paged), which is the honest signal."
+            "hard": false,
+            "max_starve_cycles": 4,
+            "comment": "2026-07-10: changed hard=true to hard=false so code improvements still run when starved (operator wants full autonomy, not evidence-gated halts). max_starve_cycles=4 means after 4 starved cycles, a non-metric upkeep cycle runs. The freshness gate still parks when there's genuinely no data, but it doesn't block code improvements when the operator wants the loop running."
         },
         "interval": 120,
         "max_iterations": 0,
@@ -134,9 +134,9 @@
         "freshness": {
             "cmd": "python tools\\freshness.py",
             "min_new_samples": 1,
-            "hard": true,
-            "max_starve_cycles": 16,
-            "comment": "2026-07-07: park the CODE improver when there is no new SETTLED LIVE fill since the last decision -- capital velocity is the objective, and a closed live trade in asmodeus.db (operator/live-app truth) is exactly the evidence that should unlock the next code cycle; a self-reported heartbeat could be forged, a real live fill cannot. The emitter reads the 'trades' table (NOT the intermittently-corrupt 'equity' table) so a malformed equity image does not falsely halt the lane UNOBSERVABLE. A readable db with zero live fills => observable:true/n_samples:0 => PARK (skip), not RED. A missing/corrupt db or missing trades table => observable:false => TIER-1 RED (paged). Uses system 'python' (asmodeus has no repo .venv; the scrubbed improver env preserves PATH). Escape valve: after 16 starved cycles ONE non-metric upkeep cycle runs (max_starve_cycles floored to >=1 in freshness.rs; NEVER set <=0)."
+            "hard": false,
+            "max_starve_cycles": 4,
+            "comment": "2026-07-10: changed hard=true to hard=false so code improvements still run when starved (operator wants full autonomy, not evidence-gated halts). max_starve_cycles=4 means after 4 starved cycles, a non-metric upkeep cycle runs."
         },
         "interval": 180,
         "max_iterations": 0,
