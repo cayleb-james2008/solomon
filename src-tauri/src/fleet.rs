@@ -185,15 +185,35 @@ pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
         return json!({"ok": true, "actions": ["daily call budget reached; provider cooling down"], "cooldown": cooldown_value(&st)});
     }
 
-    let Some(job) = jobs.first().cloned() else {
+    // Round-robin dispatch (2026-07-11): pick the FIRST AI job that is NOT the last-dispatched lane,
+    // so a single high-priority lane doesn't hog the dispatch slot every sweep. Falls back to
+    // jobs.first() when there's only one AI job or the rotation wraps around.
+    let last_dispatched = st
+        .get("last_dispatched")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let ai_jobs: Vec<&Job> = jobs.iter().filter(|j| j.requires_ai).collect();
+    let pick: &Job = if ai_jobs.len() > 1 {
+        ai_jobs
+            .iter()
+            .find(|j| j.name != last_dispatched)
+            .copied()
+            .unwrap_or(ai_jobs[0])
+    } else {
+        jobs.first().unwrap_or(&jobs[0])
+    };
+    let job = pick.clone();
+    if jobs.is_empty() {
         st["active"] = Value::Null;
         st["last_result"] =
             json!({"ts": now(), "outcome": "complete", "summary": "no queued autopilot work"});
         let _ = write_state(&st);
         return json!({"ok": true, "actions": [], "queue": []});
-    };
+    }
 
     st["active"] = job_value(&job);
+    st["last_dispatched"] = json!(job.name.clone());
     let _ = write_state(&st);
     append_event(
         &json!({"event": "job_started", "repo": job.name, "kind": job.kind, "requires_ai": job.requires_ai}),
