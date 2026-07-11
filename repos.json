@@ -24,12 +24,12 @@
                 "fallback_provider": "openrouter"
             },
             "targets": [
-                "maki",
-                "solomon",
                 "sover",
-                "dotz",
                 "asmodeus",
-                "daedulus"
+                "dotz",
+                "daedulus",
+                "solomon",
+                "maki"
             ]
         }
     },
