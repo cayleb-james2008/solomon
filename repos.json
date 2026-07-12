@@ -165,6 +165,22 @@
             "review": true,
             "ideate": false,
             "reflect": false
+        },
+        "live_deploy": {
+            "rebuild": [
+                "cargo",
+                "build",
+                "--release"
+            ],
+            "launch": [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "scripts\u0007smodeus_keepalive.ps1"
+            ],
+            "cooldown_s": 3600
         }
     },
     {
