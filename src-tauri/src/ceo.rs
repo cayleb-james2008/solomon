@@ -340,6 +340,11 @@ fn ceo_slow_tail(snapshot: Value, status: Value) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         sover_boost::maybe_boost(&snapshot, &status)
     }));
+    // GROWTH SEAM (D12 / Phase B): the every-sweep hook the growth-content composer fills — today a
+    // no-op; the GrowthSpecialist dispatch plumbing behind it is already gated + tested.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::ceo::growth::maybe_draft_growth_content(&snapshot, &status)
+    }));
     // DEEP-WORK FOCUS (Polsia): concentrate one top-leverage lane's next milestone into ordered
     // [campaign] steps; the other lanes keep their health-only baseline. Same fresh snapshot.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

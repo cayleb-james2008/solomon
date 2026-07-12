@@ -575,6 +575,16 @@ pub fn dispatch_growth_publish(repo: &Value, detail: &str) -> Value {
     crate::ceo::orchestrator::dispatch(&GrowthSpecialist::new(), &task, repo)
 }
 
+/// The every-sweep growth-content hook, ridden on `ceo_slow_tail` (the D12/Phase-B SEAM). Currently a
+/// deliberate NO-OP: the gated dispatch plumbing above (`dispatch_growth_content` /
+/// `dispatch_growth_publish`) is fully built, but an every-sweep caller needs an HONEST trigger — a
+/// planner-composed content directive (morning-plan/focus output), never a static daily fact (that
+/// would be the busywork the eval-park doctrine forbids). The composer that fills this: pick the one
+/// public lane whose planner output carries a growth directive, day-gate + stamp-first exactly like
+/// `sover_boost`, and dispatch under the PERSONA RULE (authored as the project's own brand — never the
+/// operator's personal name).
+pub fn maybe_draft_growth_content(_snapshot: &serde_json::Value, _status: &serde_json::Value) {}
+
 // --------------------------------------------------------------------------- #
 // tests — the D12 acceptance contracts
 // --------------------------------------------------------------------------- #
