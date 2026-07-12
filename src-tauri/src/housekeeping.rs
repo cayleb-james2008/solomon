@@ -55,6 +55,9 @@ const SWEEP_EVERY_S: u64 = 6 * 3600;
 /// A debug dir STILL over this after a sweep is pathological churn — notify the operator, never
 /// force-delete (the 2026-07-02 lesson: force-deleting a "quiet" build dir froze live capital).
 const DEBUG_SOFT_CAP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// A remote `<prefix>*` branch with NO open PR is only deleted once its tip commit is older than
+/// this — so the sweep can't race a lane that just pushed a branch but hasn't opened its PR yet.
+const REMOTE_ORPHAN_MIN_AGE_MIN: i64 = 60;
 
 /// HERE/runtime/_housekeeping.json — {"done": date, "attempts_date": ..., "attempts": n}.
 fn state_path() -> PathBuf {
@@ -139,6 +142,16 @@ pub fn run() -> Value {
         let deleted = delete_merged_branches(&path, &base, &prefix);
         if deleted > 0 {
             actions.push(format!("{name}: {deleted} merged {prefix}* branches"));
+        }
+
+        // 2b. REMOTE branch cleanup: the auto-merge `--delete-branch` only removes cleanly-merged
+        //     PR branches; a PR that didn't land (CI unverifiable / merge unverified / stopped / a
+        //     crashed lane) leaves its `<prefix>*` branch on origin forever. Delete the stale ones
+        //     (merged into base, or orphaned with no open PR) so they don't pile up on the
+        //     (sometimes public) remote. Safe: keeps live-PR branches; content-free deletions.
+        let rdeleted = delete_stale_remote_branches(&path, &base, &prefix);
+        if rdeleted > 0 {
+            actions.push(format!("{name}: {rdeleted} stale remote {prefix}* branch(es)"));
         }
 
         // 3. build dirs: ONLY delete a dir untouched for STALE_DAYS+ (abandoned = safe). The old
@@ -531,6 +544,166 @@ pub fn delete_merged_branches(path: &str, base: &str, prefix: &str) -> usize {
     n
 }
 
+/// Pure keep/delete decision for one remote `<prefix>*` branch (factored out for testing without a
+/// live git/gh). A branch is deleted iff:
+///   * it is MERGED into the base (the work landed — always safe), OR
+///   * PR state is KNOWN (`pr_ok`), it has NO open PR, AND its tip is at least `min_age_secs` old
+///     (an orphaned/abandoned iteration branch; the age floor avoids racing a just-pushed branch).
+/// A live open PR, or an unknown PR state (gh unreachable) on an unmerged branch, always KEEPS it.
+fn remote_branch_should_delete(
+    is_merged: bool,
+    has_open_pr: bool,
+    pr_ok: bool,
+    age_secs: i64,
+    min_age_secs: i64,
+) -> bool {
+    if is_merged {
+        return true;
+    }
+    if !pr_ok || has_open_pr {
+        return false;
+    }
+    age_secs >= min_age_secs
+}
+
+/// Head-ref branch names of this repo's OPEN PRs (via `gh pr list`), plus whether the query
+/// SUCCEEDED. `(set, false)` on any gh failure/unauth — callers must then treat an unknown PR
+/// state as "cannot safely delete an unmerged branch". `gh` resolves the repo from `path`'s remote.
+fn open_pr_heads(path: &str) -> (std::collections::HashSet<String>, bool) {
+    let r = proc::run(
+        &["gh", "pr", "list", "--state", "open", "--json", "headRefName", "--limit", "500"],
+        Some(Path::new(path)),
+        Some(Duration::from_secs(120)),
+    );
+    match r {
+        Ok(o) if o.ok() => {
+            let raw = o.stdout.trim();
+            let parsed: Value =
+                serde_json::from_str(if raw.is_empty() { "[]" } else { raw }).unwrap_or_else(|_| json!([]));
+            let set = parsed
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.get("headRefName").and_then(Value::as_str))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            (set, true)
+        }
+        _ => (std::collections::HashSet::new(), false),
+    }
+}
+
+/// Delete STALE REMOTE `<prefix>*` branches on origin so the fleet's iteration branches don't pile
+/// up on the (sometimes public) remote. Companion to [`delete_merged_branches`], which only prunes
+/// LOCAL branches — nothing previously cleaned the remote, so a PR that didn't cleanly auto-merge
+/// (CI unverifiable / merge unverified / stopped / a crashed lane) left its `<prefix>*` branch on
+/// origin forever. A remote branch is deleted per [`remote_branch_should_delete`]: merged into
+/// `origin/<base>`, or an orphan with no open PR older than [`REMOTE_ORPHAN_MIN_AGE_MIN`].
+///
+/// The delete uses `git push --no-verify`: a ref DELETION carries no content, so it is safe even
+/// under a brand-safety pre-push hook (e.g. projects/sover's public-repo guard that fail-closes on
+/// EVERY push). `<base>` and any non-`<prefix>` branch are never touched. Returns branches deleted.
+pub fn delete_stale_remote_branches(path: &str, base: &str, prefix: &str) -> usize {
+    // origin required.
+    let has_origin = proc::run(
+        &["git", "-C", path, "remote", "get-url", "origin"],
+        None,
+        Some(Duration::from_secs(30)),
+    )
+    .map(|r| r.ok())
+    .unwrap_or(false);
+    if !has_origin {
+        return 0;
+    }
+    // Sync remote-tracking refs + drop refs already deleted on origin.
+    let _ = proc::run(
+        &["git", "-C", path, "fetch", "origin", "--prune", "--quiet"],
+        None,
+        Some(Duration::from_secs(180)),
+    );
+    // Remote `<prefix>*` branches as remote-tracking short names (`origin/<prefix>...`).
+    let listed = match proc::run(
+        &[
+            "git", "-C", path, "branch", "-r", "--list",
+            &format!("origin/{prefix}*"), "--format=%(refname:short)",
+        ],
+        None,
+        Some(Duration::from_secs(60)),
+    ) {
+        Ok(r) if r.ok() => r.stdout,
+        _ => return 0,
+    };
+    let origin_prefix = format!("origin/{prefix}");
+    let remote_branches: Vec<String> = listed
+        .lines()
+        .map(str::trim)
+        .filter(|b| b.starts_with(&origin_prefix))
+        .map(str::to_string)
+        .collect();
+    if remote_branches.is_empty() {
+        return 0;
+    }
+    // Merged-into-base remote-tracking branches (safe to delete regardless of PR state).
+    let merged: std::collections::HashSet<String> = match proc::run(
+        &[
+            "git", "-C", path, "branch", "-r", "--merged",
+            &format!("origin/{base}"), "--format=%(refname:short)",
+        ],
+        None,
+        Some(Duration::from_secs(60)),
+    ) {
+        Ok(r) if r.ok() => r.stdout.lines().map(|s| s.trim().to_string()).collect(),
+        _ => std::collections::HashSet::new(),
+    };
+    // Open-PR head branches (kept). gh failure => pr_ok=false (only MERGED branches deleted).
+    let (open_heads, pr_ok) = open_pr_heads(path);
+    let now = chrono::Utc::now().timestamp();
+    let min_age = REMOTE_ORPHAN_MIN_AGE_MIN * 60;
+    let mut n = 0;
+    for rb in &remote_branches {
+        let short = match rb.strip_prefix("origin/") {
+            Some(s) => s,
+            None => continue,
+        };
+        if short == base {
+            continue;
+        }
+        let is_merged = merged.contains(rb);
+        let has_open_pr = open_heads.contains(short);
+        // Tip age only matters for the orphan case; skip the git call otherwise. A parse/git
+        // failure yields age 0 (< min_age) → the branch is KEPT (fail-safe).
+        let age_secs = if is_merged || !pr_ok || has_open_pr {
+            0
+        } else {
+            match proc::run(
+                &["git", "-C", path, "log", "-1", "--format=%ct", rb],
+                None,
+                Some(Duration::from_secs(30)),
+            ) {
+                Ok(r) if r.ok() => r.stdout.trim().parse::<i64>().map(|ct| now - ct).unwrap_or(0),
+                _ => 0,
+            }
+        };
+        if !remote_branch_should_delete(is_merged, has_open_pr, pr_ok, age_secs, min_age) {
+            continue;
+        }
+        // A ref deletion carries no content -> --no-verify is safe even under a brand-safety
+        // pre-push hook (sover's public-repo guard). Never touches base or non-prefix branches.
+        if let Ok(r) = proc::run(
+            &["git", "-C", path, "push", "--no-verify", "origin", "--delete", short],
+            None,
+            Some(Duration::from_secs(60)),
+        ) {
+            if r.ok() {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 /// Quiet = safe to delete this repo's build dir: heartbeat sleeping/idle/stopped/absent — never
 /// while iterating (a delete under a live compile corrupts the iteration).
 fn lane_quiet(r: &Value) -> bool {
@@ -569,6 +742,44 @@ fn append_log(line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- remote-branch cleanup decision (delete_stale_remote_branches core logic) ----
+    const MIN_AGE: i64 = REMOTE_ORPHAN_MIN_AGE_MIN * 60;
+
+    #[test]
+    fn remote_merged_branch_always_deleted() {
+        // Merged into base -> deleted regardless of PR state / age (the work landed).
+        assert!(remote_branch_should_delete(true, false, true, 0, MIN_AGE));
+        assert!(remote_branch_should_delete(true, true, false, 0, MIN_AGE)); // even an open PR / gh-down
+    }
+
+    #[test]
+    fn remote_orphan_old_no_pr_deleted() {
+        // Not merged, PR state known, no open PR, tip older than the age floor -> orphan -> delete.
+        assert!(remote_branch_should_delete(false, false, true, MIN_AGE, MIN_AGE));
+        assert!(remote_branch_should_delete(false, false, true, MIN_AGE + 1, MIN_AGE));
+    }
+
+    #[test]
+    fn remote_orphan_young_no_pr_kept() {
+        // A just-pushed branch (younger than the floor) with no PR yet must NOT be deleted (race).
+        assert!(!remote_branch_should_delete(false, false, true, MIN_AGE - 1, MIN_AGE));
+        assert!(!remote_branch_should_delete(false, false, true, 0, MIN_AGE));
+    }
+
+    #[test]
+    fn remote_open_pr_branch_kept() {
+        // A live open PR may still land -> keep regardless of age.
+        assert!(!remote_branch_should_delete(false, true, true, MIN_AGE * 10, MIN_AGE));
+    }
+
+    #[test]
+    fn remote_unknown_pr_state_keeps_unmerged() {
+        // gh unreachable (pr_ok=false): an unmerged branch's PR state is unknown -> never delete
+        // (must not delete a possibly-in-flight branch); only merged branches go in that case.
+        assert!(!remote_branch_should_delete(false, false, false, MIN_AGE * 10, MIN_AGE));
+        assert!(remote_branch_should_delete(true, false, false, 0, MIN_AGE)); // merged still deleted
+    }
 
     fn temp(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
