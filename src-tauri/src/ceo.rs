@@ -1457,9 +1457,20 @@ fn parse_daily_target(north_star: &str) -> Option<i64> {
     digits.parse::<i64>().ok()
 }
 
+/// RAII cleanup for a temp file that must not outlive the call that created it. Drop runs on EVERY
+/// exit path (each `?`, early return, or panic), so the plaintext Bearer-key headers file cannot
+/// linger under runtime/ after ollama_chat returns — closing the credential-persistence hole.
+struct TempFileGuard(std::path::PathBuf);
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// One chat completion over Ollama Cloud via curl.exe (no HTTP client dependency; TLS handled by
 /// the OS curl, same guarded-spawn contract as every other subprocess). The API key rides a
-/// curl `-H @file` headers file under runtime/ (gitignored) — never argv, never a log line.
+/// curl `-H @file` headers file under runtime/ (gitignored) — never argv, never a log line. The
+/// headers file is wrapped in a TempFileGuard so the Bearer key is removed on every return path.
 pub(crate) fn ollama_chat(model: &str, system: &str, user: &str) -> Result<String, String> {
     let key = notify::env_value("OLLAMA_API_KEY").ok_or("no OLLAMA_API_KEY in .env")?;
     let rt = paths::here().join("runtime");
@@ -1484,6 +1495,9 @@ pub(crate) fn ollama_chat(model: &str, system: &str, user: &str) -> Result<Strin
         format!("Authorization: Bearer {key}\nContent-Type: application/json\n"),
     )
     .map_err(|e| e.to_string())?;
+    // From here every exit path (curl failure, parse failure, success) drops this guard, deleting the
+    // Bearer-key headers file — it must never persist under runtime/.
+    let _hdr_guard = TempFileGuard(hdr_path.clone());
     let hdr_arg = format!("@{}", hdr_path.display());
     let body_arg = format!("@{}", req_path.display());
     let args = [
@@ -1995,6 +2009,19 @@ pub fn next_watch(snapshot: &Value, status: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temp_file_guard_removes_file_on_drop() {
+        // The headers file carrying the plaintext Bearer key must not outlive ollama_chat. Proves the
+        // RAII guard deletes its file when dropped (every return path drops it).
+        let p = std::env::temp_dir().join("solomon_ceo_hdr_guard_test.txt");
+        std::fs::write(&p, "Authorization: Bearer secret\n").unwrap();
+        assert!(p.exists(), "precondition: file written");
+        {
+            let _g = TempFileGuard(p.clone());
+        } // guard drops here
+        assert!(!p.exists(), "guard must delete the headers file on drop");
+    }
 
     // ===================================================================== #
     // D8 ACCEPTANCE (b): the CROSS-PROJECT wins ledger is CONSULTED in the

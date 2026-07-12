@@ -346,8 +346,14 @@ pub fn diagnose(repo: &Value) -> Value {
         safe = false;
     } else if reason == Some("quota_error")
         || phase == Some("quota_error")
-        || crate::improver::pi::is_quota_error(summary)
+        || (status == Some("error") && crate::improver::pi::is_quota_error(summary))
     {
+        // Invariant (pi.rs:43 contract): is_quota_error is ONLY valid on stderr/errorMessage
+        // text, NEVER on the agent's assistant-authored `last_summary` prose. The reason/phase
+        // markers above are the genuine-outage signals iteration.rs always writes; the summary
+        // string-match is a fallback that may ONLY classify an error-status heartbeat. A healthy
+        // lane whose summary legitimately mentions "429"/"rate limit" (e.g. the asmodeus lane's
+        // seeded TradeLocker-429 work) must NOT be parked as a false quota_error.
         cat = "quota_error".into();
         ev = trunc_or(summary, 200, "provider quota/rate limit hit");
         rec = vec![
@@ -1627,6 +1633,66 @@ mod tests {
         let d = diagnose(&repo);
         assert_eq!(d["category"], "quota_error");
         assert_eq!(d["healthy"], false);
+        assert_eq!(d["auto_safe"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnose_healthy_summary_mentioning_429_is_not_quota_error() {
+        // pi.rs:43 contract: is_quota_error must never classify the agent's own assistant-authored
+        // summary. A healthy (non-error) lane whose last_summary legitimately reports rate-limit
+        // work (the asmodeus lane is seeded with "TradeLocker 429 storms") must NOT be parked.
+        let (dir, repo) = tmp_repo("quota_false_positive");
+        let fresh = (Utc::now() - chrono::Duration::seconds(10))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        write_hb(
+            &dir,
+            &json!({
+                "status": "sleeping",
+                "updated_at": fresh,
+                "last_summary": "added retry handling for 429 rate limit storms"
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_ne!(d["category"], "quota_error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnose_error_status_summary_still_detects_real_quota() {
+        // Real-outage path: iteration.rs may write status=error with the provider's rate-limit
+        // text in last_summary but no reason/phase marker. The status-gated string-match must
+        // still catch it.
+        let (dir, repo) = tmp_repo("quota_real_error");
+        write_hb(
+            &dir,
+            &json!({
+                "status": "error",
+                "last_summary": "Provider error: weekly usage limit reached for this account"
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], "quota_error");
+        assert_eq!(d["auto_safe"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnose_quota_marker_untouched_with_benign_summary() {
+        // The reason=quota_error marker (written on every genuine quota outcome) still classifies
+        // regardless of summary prose or status — the status gate only guards the string fallback.
+        let (dir, repo) = tmp_repo("quota_marker");
+        write_hb(
+            &dir,
+            &json!({
+                "status": "sleeping",
+                "reason": "quota_error",
+                "last_summary": "refactored the widget layout"
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], "quota_error");
         assert_eq!(d["auto_safe"], false);
         let _ = std::fs::remove_dir_all(&dir);
     }
