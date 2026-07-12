@@ -60,7 +60,12 @@ preemptive chokepoint (`src-tauri/src/money_guard.rs`), not merely stated in doc
 
 ## Quickstart
 
-All commands run from `src-tauri/`. The app is pure Rust — there is no Python venv or pytest suite.
+All commands run from `src-tauri/`. The shipped app is pure Rust — no Python venv, no pytest suite,
+no Python runtime dependency. One exception to "no Python in the repo": `pecrt.py` (repo root) is
+the doctrine-mandated decision-identical Python MIRROR of `src-tauri/src/pecrt/` — not a runtime
+component. Both implementations are pinned to `pecrt_golden.json` by a drift gate
+(`src-tauri/src/pecrt/drift.rs` in `cargo test`, plus `python pecrt.py` self-check); change shared
+constants only by updating both sides + the golden together.
 
 ```sh
 # Run the test gate (the gate every PR must pass)
@@ -87,9 +92,9 @@ solomon state | start <name> | stop <name> | supervise [name] | serve-health [po
 ```
 
 Operator configuration lives in `repos.json` (the managed lanes), `improver/<name>/AGENT.md` +
-`backlog.md` (each lane's contract), and `.env` (the Ollama Cloud API key for the improver). See
-`.env.example` for the key name. Secrets (`.env`, `.solomon.json`) and runtime state (`runtime/`,
-managed clones under `repos/`) are gitignored and never committed.
+`backlog.md` (each lane's contract), and `.env` (provider API keys + the ntfy notification topic —
+`.env.example` documents every key the code reads). Secrets (`.env`, `.solomon.json`) and runtime
+state (`runtime/`, managed clones under `repos/`) are gitignored and never committed.
 
 ## Layout
 
@@ -100,4 +105,6 @@ managed clones under `repos/`) are gitignored and never committed.
 - `web/` — the dashboard frontend (`index.html`, `app.js`, `styles.css`), served in-process.
 - `improver/` — per-lane agent contracts + backlogs (including `solomon/` for self-improvement).
 - `runtime/` — per-lane runtime state (locks, heartbeats, browser state); gitignored.
+- `pecrt.py` + `pecrt_golden.json` — the Python decision-mirror of `src-tauri/src/pecrt/` and the
+  shared golden constants both implementations must match (drift gate; see Quickstart note).
 - `docs/` — schemas and the AI-CEO architecture plan.

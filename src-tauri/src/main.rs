@@ -492,6 +492,38 @@ mod tests {
         assert_eq!(run_headless(&["frobnicate".to_string()]), 2);
     }
 
+    // Audit finding #07 (2026-07-12): the WebView CSP was `null` while the JS bridge is privileged
+    // (window.pywebview.api -> the `bridge` command -> api::dispatch, i.e. full git/gh/fs reach) and
+    // web/ is auto-modified by an LLM merge loop. This guard pins the restored CSP so a future
+    // auto-merge cannot silently regress it: csp must be a real policy string, default-src 'self',
+    // and script-src must NEVER carry 'unsafe-inline' (web/ has no inline handlers — all listeners
+    // are JS property assignments in app.js; the SHIM + __TAURI__ globals ride init scripts, which
+    // CSP does not govern, and Tauri appends its own script hashes at build time).
+    #[test]
+    fn webview_csp_is_restored_and_script_src_stays_strict() {
+        let conf_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json");
+        let raw = std::fs::read_to_string(conf_path).expect("read tauri.conf.json");
+        let conf: serde_json::Value = serde_json::from_str(&raw).expect("parse tauri.conf.json");
+        let csp = conf
+            .pointer("/app/security/csp")
+            .and_then(serde_json::Value::as_str)
+            .expect("app.security.csp must be a policy STRING, not null (audit finding #07)");
+        assert!(
+            csp.contains("default-src 'self'"),
+            "csp must anchor on default-src 'self': {csp}"
+        );
+        let script_src = csp
+            .split(';')
+            .map(str::trim)
+            .find(|d| d.starts_with("script-src"))
+            .expect("csp must pin an explicit script-src directive");
+        assert!(
+            !script_src.contains("'unsafe-inline'"),
+            "script-src must never allow 'unsafe-inline' — the bridge is privileged and web/ is \
+             LLM-auto-merged: {script_src}"
+        );
+    }
+
     #[test]
     fn autopilot_cli_commands_and_hidden_aliases_are_recognized() {
         for sub in [

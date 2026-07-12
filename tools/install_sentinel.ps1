@@ -1,22 +1,23 @@
 <#
 .SYNOPSIS
-Install / remove / query the Solomon Sentinel scheduled task.
+DEPRECATED — the Solomon Sentinel scheduled task violates the settled liveness doctrine.
+Only -Uninstall and -Status still work (to remove/inspect a historical task); install refuses.
 
 .DESCRIPTION
-The Sentinel is the out-of-band liveness layer (failure catalog #4: GUI-tick-only liveness caused
-the 8h/25.5h watchdog gaps and the 2+ day outages; the "no scheduled tasks" rule was renegotiated
-by the operator 2026-07-06 after the liveness autopsy). It runs `solomon.exe watchdog` every
-5 minutes as the current user (default run level), host-independent of the visibly-open GUI.
+LIVENESS DOCTRINE (operator, SETTLED — supersedes the 2026-07-06 "sentinel" renegotiation this
+script was born from): NO background processes and NO scheduled tasks, ever (no schtasks, no cron,
+no daemons). The watchdog lives INSIDE the visibly-open Solomon.exe (the run_gui tick thread,
+every 2 min, with a catch-up sweep the moment the app opens); Solomon.exe is launched manually by
+the operator, never auto-started. See README.md ("no scheduled task exists and none may be
+created — operator rule") and AGENTS.md ("Watchdog sweep").
 
-No start-in directory is needed: paths::here() in the exe walks up to 5 ancestors from the exe dir
-to the directory containing improver\, so the task resolves the operator data dir correctly from
-src-tauri\target\release\ or the repo root alike. Each run stamps runtime\_sentinel_heartbeat.json
-(dead-man visibility) and appends to runtime\_watchdog.out.log.
+This file is kept (rather than deleted) so the history of the 2026-07-06 renegotiation and the
+uninstall/query paths survive: if a "Solomon Sentinel" task still exists on a machine from that
+era, remove it with -Uninstall.
 
 .EXAMPLE
-powershell -File tools\install_sentinel.ps1            # install (or refresh) the task
-powershell -File tools\install_sentinel.ps1 -Uninstall # delete the task
-powershell -File tools\install_sentinel.ps1 -Status    # query the task
+powershell -File tools\install_sentinel.ps1 -Uninstall # delete a historical task (do this)
+powershell -File tools\install_sentinel.ps1 -Status    # query whether one still exists
 #>
 param(
     [switch]$Uninstall,
@@ -34,6 +35,11 @@ if ($Uninstall) {
     schtasks /Delete /F /TN "$TaskName"
     exit $LASTEXITCODE
 }
+
+# DEPRECATED install path: the settled operator doctrine forbids scheduled tasks/background
+# processes. The in-app watchdog tick (visible Solomon.exe) is the ONLY automatic sweep.
+Write-Error "DEPRECATED: installing the Solomon Sentinel scheduled task is forbidden by the settled liveness doctrine (no background processes / no schtasks; the watchdog lives inside the visible Solomon.exe). Use -Uninstall to remove a historical task, -Status to query."
+exit 1
 
 # Resolve the exe: the release build first, the repo-root production copy as fallback.
 $root = Split-Path -Parent $PSScriptRoot
