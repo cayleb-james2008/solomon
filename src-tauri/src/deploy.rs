@@ -178,6 +178,34 @@ fn live_deploy_argv(repo_cfg: &Value, field: &str) -> Option<Vec<String>> {
     }
 }
 
+/// Validate a launch argv BEFORE spending minutes on a rebuild. Fails loudly if any element carries
+/// an ASCII control character (exactly how the asmodeus `scripts...keepalive` corruption
+/// shipped — `\a` mangled into a JSON BEL escape) or names a script that does not exist on disk.
+/// An element is treated as a script path only if it ends in a known launcher extension
+/// (`.ps1`/`.bat`/`.cmd`/`.exe`, case-insensitive); such a path is resolved relative to `cwd` when
+/// not absolute. Non-path argv (flags, `-Command`, interpreter names) is intentionally skipped so a
+/// legitimate `pwsh -Command ...` launch is not rejected. Pure — safe to unit-test.
+fn launch_argv_sane(argv: &[String], cwd: &Path) -> Result<(), String> {
+    for a in argv {
+        if a.chars().any(|c| c.is_ascii_control()) {
+            return Err(format!("launch argv contains a control character: {a:?}"));
+        }
+        let lower = a.to_ascii_lowercase();
+        let is_script = lower.ends_with(".ps1")
+            || lower.ends_with(".bat")
+            || lower.ends_with(".cmd")
+            || lower.ends_with(".exe");
+        if is_script {
+            let p = Path::new(a);
+            let resolved = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
+            if !resolved.exists() {
+                return Err(format!("launch script not found: {}", resolved.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The repo's short HEAD sha (`git -C <path> rev-parse --short HEAD`), or "?" on any failure — used
 /// only for the operator page (from-SHA -> HEAD-SHA), never a gate.
 fn short_head(repo_path: &str) -> String {
@@ -215,6 +243,15 @@ fn maybe_redeploy_managed_app(repo_cfg: &Value) -> Result<(), String> {
         .ok_or_else(|| format!("{name}: live_deploy.rebuild missing/empty"))?;
     let launch = live_deploy_argv(repo_cfg, "launch")
         .ok_or_else(|| format!("{name}: live_deploy.launch missing/empty"))?;
+
+    // Validate the launch path BEFORE the ~30-minute rebuild: a mangled/missing launch script (the
+    // asmodeus BEL-corruption bug) otherwise wastes a full build, fails the launch, pages, and cools
+    // down for an hour — leaving the live app down. Fail loudly and page now instead.
+    if let Err(e) = launch_argv_sane(&launch, &cwd) {
+        let msg = format!("{name}: {e}");
+        page(&name, &head, false, &msg);
+        return Err(msg);
+    }
 
     // Rebuild the current HEAD in the repo cwd. Long timeout — a clean release build is minutes; a
     // timeout aborts the child and returns Err (no relaunch).
@@ -496,5 +533,49 @@ mod tests {
         assert_eq!(live_deploy_argv(&json!({"live_deploy": {"rebuild": []}}), "rebuild"), None);
         // no live_deploy at all -> None
         assert_eq!(live_deploy_argv(&json!({}), "rebuild"), None);
+    }
+
+    // -------- launch_argv_sane: reject the corruption class BEFORE a wasteful rebuild --------
+    #[test]
+    fn launch_argv_sane_rejects_control_chars() {
+        // Exactly the asmodeus bug shape: a BEL byte smuggled into the script path element.
+        let argv = vec![
+            "powershell".to_string(),
+            "-File".to_string(),
+            "scripts\u{0007}smodeus_keepalive.ps1".to_string(),
+        ];
+        let err = launch_argv_sane(&argv, Path::new(".")).unwrap_err();
+        assert!(err.contains("control character"), "got: {err}");
+    }
+
+    #[test]
+    fn launch_argv_sane_rejects_missing_script() {
+        let dir = std::env::temp_dir().join("deploy_launch_missing_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let argv = vec![
+            "powershell".to_string(),
+            "-File".to_string(),
+            "scripts\\does_not_exist.ps1".to_string(),
+        ];
+        let err = launch_argv_sane(&argv, &dir).unwrap_err();
+        assert!(err.contains("launch script not found"), "got: {err}");
+        assert!(err.contains("does_not_exist.ps1"), "err should name the path: {err}");
+    }
+
+    #[test]
+    fn launch_argv_sane_ok_when_script_exists() {
+        let dir = std::env::temp_dir().join("deploy_launch_ok_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let script = dir.join("start.ps1");
+        std::fs::write(&script, "# launcher").unwrap();
+        // Flags/interpreter names are skipped; the existing .ps1 (relative to cwd) resolves -> Ok.
+        let argv = vec![
+            "powershell".to_string(),
+            "-NoProfile".to_string(),
+            "-File".to_string(),
+            "start.ps1".to_string(),
+        ];
+        assert!(launch_argv_sane(&argv, &dir).is_ok());
+        let _ = std::fs::remove_file(&script);
     }
 }
