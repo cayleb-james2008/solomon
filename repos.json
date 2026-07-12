@@ -178,7 +178,7 @@
                 "-ExecutionPolicy",
                 "Bypass",
                 "-File",
-                "scripts\u0007smodeus_keepalive.ps1"
+                "C:/Users/Cayleb/Desktop/workspace/solomon/tools/asmodeus_keepalive.ps1"
             ],
             "cooldown_s": 3600
         }
