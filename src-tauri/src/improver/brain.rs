@@ -172,8 +172,12 @@ pub fn spawn_worker(
     match &res {
         Ok(_) => crate::improver::budget::record_success(ctx, &provider, model),
         Err(e) => {
-            // A 429/transport error -> record_quota parks this endpoint (never the fleet).
-            if e.contains("429") || e.contains("quota") || e.contains("rate limit") {
+            // A 429/transport/usage-limit error -> record_quota parks this endpoint (never the fleet).
+            // Route through the canonical classifier (pi::is_quota_error), NOT ad-hoc substrings: the
+            // 2026-07-03 no-op storm happened because the provider's "usage limit" wording slipped
+            // past hand-rolled checks. An Ollama 429 surfaces here as "no message content ... usage
+            // limit ..." — is_quota_error matches it; the old three substrings did not.
+            if crate::improver::pi::is_quota_error(e) {
                 crate::improver::budget::record_quota(ctx, &provider, model);
             }
         }
@@ -431,5 +435,18 @@ mod tests {
             // The disabled branch returns task unchanged — proven by code inspection.
             assert!(!cfg.enabled);
         }
+    }
+
+    #[test]
+    fn moa_worker_quota_error_string_is_classified() {
+        // Incident lineage: the 2026-07-03 no-op storm — an Ollama Cloud 429 surfaces from
+        // ollama_chat as `no message content in response: {... usage limit ...}`. The spawn_worker
+        // Err arm now routes through pi::is_quota_error, so this exact storm string MUST park the
+        // endpoint. The pre-fix three-substring check (429/quota/"rate limit") missed it.
+        let storm = "no message content in response: {\"error\":\"you have reached your weekly usage limit\"}";
+        assert!(
+            crate::improver::pi::is_quota_error(storm),
+            "the storm string must classify as a quota error so the MoA brain parks the endpoint"
+        );
     }
 }
