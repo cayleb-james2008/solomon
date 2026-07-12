@@ -574,6 +574,23 @@ def _selfcheck() -> int:
     check("Parking is PREFERRED" in STABLE_PREFIX, "prefix anti-compulsion clause")
     check(STABLE_PREFIX.endswith("[working context follows]\n"), "prefix tail")
 
+    # DRIFT GATE (audit #09): every shared decision constant must match the committed golden
+    # (pecrt_golden.json, sibling of this file). The Rust side pins the SAME golden in
+    # src-tauri/src/pecrt/drift.rs, so a one-sided edit on either implementation breaks a gate.
+    golden_path = Path(__file__).resolve().parent / "pecrt_golden.json"
+    check(golden_path.exists(), f"drift gate: {golden_path} missing")
+    if golden_path.exists():
+        g = json.loads(golden_path.read_text(encoding="utf-8"))
+        check(g.get("stable_prefix") == STABLE_PREFIX, "drift gate: STABLE_PREFIX != golden")
+        check(g.get("working_max_entries") == WORKING_MAX_ENTRIES, "drift gate: WORKING_MAX_ENTRIES != golden")
+        check(g.get("working_max_bytes") == WORKING_MAX_BYTES, "drift gate: WORKING_MAX_BYTES != golden")
+        check(g.get("summary_markers") == list(_SUMMARY_MARKERS), "drift gate: _SUMMARY_MARKERS != golden")
+        check(g.get("forbidden_targets") == list(FORBIDDEN_TARGETS), "drift gate: FORBIDDEN_TARGETS != golden")
+        check(
+            g.get("wake_priorities") == {s.tag: s.priority for s in WakeSource},
+            "drift gate: WakeSource priorities != golden",
+        )
+
     if failures:
         print(f"pecrt.py self-check: {len(failures)} FAILURE(S)")
         for f in failures:
