@@ -220,11 +220,25 @@ pub fn untracked_recovery_action(
 }
 
 /// run_improver._dirty_blocks_iteration (~876-883): whether a dirty tree must SKIP the iteration.
-/// ONLY a dirty BASE branch is protected operator work; a dirty rsi/* (or any non-base / detached)
-/// branch is a dead run's leftover the forced preflight clears. Pure.
+/// A dirty BASE branch is protected operator work (skip). A dirty branch that IS the lane's OWN
+/// throwaway `rsi/*` (prefix) branch is a dead run's leftover the forced preflight rightly clears.
+/// A dirty NON-base branch that is NOT one of the lane's own prefix branches is NOT covered here:
+/// repos.json lanes point at the operator's live checkouts (sover on `sover-refactor`, asmodeus on
+/// agent feature branches), so such WIP is stashed (recoverably) by the preflight guard BEFORE the
+/// force-checkout — see `nonbase_wip_needs_stash` and its use in iteration.rs — never cleared. Pure.
 pub fn dirty_blocks_iteration(ctx: &Ctx, dirty: bool, cur: &str, base: &str) -> bool {
     let _ = ctx; // pure over the three args; ctx for signature parity
     dirty && cur == base
+}
+
+/// Whether a dirty tree on the CURRENT branch is operator/agent WIP that the destructive preflight
+/// (`checkout --force <base>` + `reset --hard`) would SILENTLY destroy, and must therefore be
+/// stashed (recoverably) first. True iff the tree is dirty, the current branch is NOT the base
+/// branch, AND it is NOT one of the lane's OWN throwaway `prefix` (e.g. `rsi/`) branches. The lane's
+/// own prefix branches ARE disposable and keep the unconditional force-clear (this returns false for
+/// them). Base-branch dirt is handled by the separate base auto-recover, not here. Pure.
+pub fn nonbase_wip_needs_stash(dirty: bool, cur: &str, base: &str, prefix: &str) -> bool {
+    dirty && cur != base && !cur.starts_with(prefix)
 }
 
 // --------------------------------------------------------------------------- #
@@ -1180,6 +1194,99 @@ mod tests {
 
         // Cleanup.
         c.git(&["checkout", "--force", &c.base_branch], 10);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    // ---- nonbase_wip_needs_stash: the preflight guard predicate (pure) ----
+
+    /// Truth table: only a DIRTY, NON-base, NON-prefix branch needs a protective stash.
+    #[test]
+    fn nonbase_wip_needs_stash_truth_table() {
+        // dirty operator/agent WIP on a foreign feature branch -> protect it.
+        assert!(nonbase_wip_needs_stash(true, "sover-refactor", "main", "rsi/"));
+        // the lane's OWN throwaway branch -> disposable, force-clear (no stash).
+        assert!(!nonbase_wip_needs_stash(
+            true,
+            "rsi/iter-20260712",
+            "main",
+            "rsi/"
+        ));
+        // dirty BASE -> handled by the separate base auto-recover, not here.
+        assert!(!nonbase_wip_needs_stash(true, "main", "main", "rsi/"));
+        // clean foreign branch -> nothing to protect.
+        assert!(!nonbase_wip_needs_stash(false, "sover-refactor", "main", "rsi/"));
+    }
+
+    /// Behavior guard 1: a dirty TRACKED change on a FOREIGN feature branch (the state
+    /// `checkout --force <base>` + `reset --hard` would silently destroy) is recoverably stashed
+    /// before any force-checkout — the tree is left clean and the work survives in the stash list.
+    #[test]
+    fn dirty_foreign_branch_is_stashed_not_lost() {
+        let (mut c, dir) = real_repo_ctx();
+        // Create a foreign feature branch (NOT the lane's rsi/* prefix) with a committed tracked file.
+        c.git(&["checkout", "-b", "sover-refactor"], 10);
+        std::fs::write(dir.join("feature.py"), "x = 1\n").unwrap();
+        c.git(&["add", "-A"], 10);
+        c.git(&["commit", "--quiet", "-m", "feature base"], 10);
+        // Uncommitted tracked modification — reset --hard would destroy this.
+        std::fs::write(dir.join("feature.py"), "x = 1\ny = 2  # WIP\n").unwrap();
+
+        assert!(
+            nonbase_wip_needs_stash(tree_dirty(&c), "sover-refactor", &c.base_branch, "rsi/"),
+            "dirty foreign-branch WIP must be flagged for protection"
+        );
+        assert!(
+            auto_stash_base(&mut c, "rsi/iter-test"),
+            "the WIP must be stashed (recoverable), not clobbered"
+        );
+        assert!(
+            !tree_dirty(&c),
+            "tree must be clean after the protective stash so the force-checkout is safe"
+        );
+        let list = c.git(&["stash", "list"], 10).stdout;
+        assert!(
+            list.contains("solomon-auto-preflight"),
+            "the WIP must survive in a recoverable preflight stash: {list}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    /// Behavior guard 2: a dirty tree on the lane's OWN `rsi/*` branch is disposable — the
+    /// predicate returns false so the unconditional force-clear proceeds (no protective stash).
+    #[test]
+    fn dirty_own_prefix_branch_is_not_protected() {
+        let (c, dir) = real_repo_ctx();
+        c.git(&["checkout", "-b", "rsi/iter-20260712-abc"], 10);
+        std::fs::write(dir.join("README.md"), "# test\nscratch\n").unwrap(); // tracked dirt
+
+        assert!(tree_dirty(&c), "sanity: the own-branch tree is dirty");
+        assert!(
+            !nonbase_wip_needs_stash(tree_dirty(&c), "rsi/iter-20260712-abc", &c.base_branch, "rsi/"),
+            "the lane's own throwaway branch must NOT be stashed — force-clear is correct"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    /// Behavior guard 3 (regression): a dirty BASE branch is NOT handled by the new non-base guard
+    /// (predicate false), and the existing base auto-stash still fires and clears the tree.
+    #[test]
+    fn dirty_base_branch_still_uses_base_auto_stash() {
+        let (mut c, dir) = real_repo_ctx();
+        let base = c.base_branch.clone();
+        std::fs::write(dir.join("README.md"), "# test\nbase edit\n").unwrap(); // tracked dirt on base
+
+        assert!(
+            !nonbase_wip_needs_stash(tree_dirty(&c), &base, &base, "rsi/"),
+            "base-branch dirt is out of scope for the non-base guard"
+        );
+        assert!(
+            auto_stash_base(&mut c, &base),
+            "the existing base auto-stash must still fire on a dirty base"
+        );
+        assert!(!tree_dirty(&c), "base tree must be clean after the auto-stash");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&c.runtime);
     }
