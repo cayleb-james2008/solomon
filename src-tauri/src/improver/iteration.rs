@@ -197,6 +197,39 @@ consecutive preflight bails — writing STOP + error heartbeat (operator action 
     // Safe: only clears when no live git process is running.
     gitops::clear_stale_index_lock(ctx);
 
+    // PROTECT NON-BASE WIP: the preflight below force-resets to base and would SILENTLY destroy
+    // uncommitted tracked work on a dirty NON-base branch that is NOT one of the lane's own
+    // throwaway `rsi/*` branches. repos.json lanes point at the operator's LIVE checkouts (sover is
+    // worked on `sover-refactor`, asmodeus by concurrent agents on feature branches), so such WIP is
+    // real work, not a dead run's leftover. Stash it (recoverable + reconciled by
+    // reconcile_preflight_stashes) BEFORE the force-checkout, mirroring the base auto-recover above;
+    // if the stash fails, refuse+escalate rather than clobber the tree. The lane's OWN `rsi/*`
+    // (prefix) branches ARE disposable and keep the unconditional force-clear below (predicate
+    // returns false for them). The prefix is `rsi/` — the same literal the loop constructs its own
+    // `branch` from above (ctx does not carry the repo's configured branch_prefix).
+    if gitops::nonbase_wip_needs_stash(gitops::tree_dirty(ctx), &cur_branch, &base_branch, "rsi/") {
+        if gitops::auto_stash_base(ctx, &branch) {
+            ctx.log(&format!(
+                "auto-recover: dirty non-base branch '{cur_branch}' held uncommitted work — \
+stashed (recoverable) before force-checkout to '{base_branch}'"
+            ));
+        } else {
+            ctx.heartbeat(json!({
+                "status": "error",
+                "phase": "preflight",
+                "last_summary": format!(
+                    "Refusing to force-reset '{cur_branch}': uncommitted work could not be \
+stashed — commit or stash it manually (the loop won't clobber non-base work)."
+                ),
+            }));
+            ctx.log(&format!(
+                "SKIP iteration: could not stash dirty non-base branch '{cur_branch}' — refusing \
+to destroy uncommitted work"
+            ));
+            return;
+        }
+    }
+
     // Robust preflight: FORCE back to the base branch.
     let co = ctx.git(&["checkout", "--force", &base_branch], 120);
     if co.code != 0 {
