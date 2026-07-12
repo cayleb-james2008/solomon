@@ -177,7 +177,7 @@ pub struct ObservationLog {
 /// each line genuinely first-order is enforced primarily by the WRITER contract (lanes append one
 /// concrete event per finished cycle), with this tripwire as the mechanical backstop against the
 /// most common degradation shapes. Do not read it as a proof that no summary can ever land.
-const SUMMARY_MARKERS: &[&str] = &[
+pub(crate) const SUMMARY_MARKERS: &[&str] = &[
     // doubled-noun shapes (a digest of digests / summary of summaries)
     "summary of the summar",
     "summary of summar",
