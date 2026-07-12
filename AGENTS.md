@@ -21,14 +21,18 @@ without operator sign-off.
 
 ## Run / test / build
 
-All commands run in `src-tauri/`. The app is pure Rust now — there is no Python venv or pytest suite.
+All commands run in `src-tauri/`. The shipped app is pure Rust — no Python venv, no pytest suite, no
+Python runtime dependency. One exception to "no Python in the repo": `pecrt.py` (repo root) is the
+doctrine-mandated decision-identical Python MIRROR of `src-tauri/src/pecrt/`, held in lockstep with
+the Rust side by a drift gate (`pecrt_golden.json` + `src-tauri/src/pecrt/drift.rs` in `cargo test`,
+plus the `python pecrt.py` self-check). Never edit one side alone — update both + the golden together.
 
 - **Gate / tests:** `cargo test` in `src-tauri/` (≈400 unit tests in `#[cfg(test)]` modules).
 - **Dashboard:** `solomon.exe` with no args → the Tauri GUI (WebView2; frontend in `web/`).
 - **Build exe:** `cargo build --release` in `src-tauri/` → `src-tauri/target/release/solomon.exe`
   (copy to repo-root `Solomon.exe`); or the Tauri bundler for the NSIS installer.
 - **One RSI iteration (dry run):** `solomon run-improver --repo <path> --name <name> --once`.
-- **Watchdog sweep:** `solomon watchdog` on demand. The Solomon Sentinel scheduled task (`tools/install_sentinel.ps1`) runs `solomon watchdog` every 5 minutes out-of-band; the GUI tick sweep (every 2 min inside the open Solomon.exe) remains as a secondary layer. Renegotiated by the operator 2026-07-06 after the liveness autopsy. Each run stamps `runtime/_sentinel_heartbeat.json` (dead-man visibility) and rides the janitor (6h) + config-provenance tripwire + controller-clean preflight.
+- **Watchdog sweep:** `solomon watchdog` on demand. LIVENESS DOCTRINE (operator, SETTLED — supersedes the 2026-07-06 "sentinel" renegotiation): **no background processes and no scheduled tasks, ever** (no schtasks/cron/daemons). The watchdog lives INSIDE the visibly-open Solomon.exe — the run_gui tick thread sweeps every 2 min, and because the tick body runs before its first sleep, opening the app performs a catch-up sweep immediately. Solomon.exe is launched manually by the operator, never auto-started. `tools/install_sentinel.ps1` is DEPRECATED (its install path refuses and exits; `-Uninstall`/`-Status` remain for removing a historical task). Each sweep stamps `runtime/_sentinel_heartbeat.json` (dead-man visibility) and rides the janitor (6h) + config-provenance tripwire + controller-clean preflight.
 - **Ops / CEO planes (v2):** `solomon probe [name]` (ground-truth outcome probes, ops.json), `solomon plan` / `solomon report` (morning plan / evening verified-outcome summary; the day-gated automatic runs ride the watchdog tick). Incidents and reports push to the operator via ntfy + Windows toast (`NTFY_TOPIC` in `.env`).
 - **Other headless subcommands:** `solomon state | start <name> | stop <name> | supervise [name] | serve-health [port]` (see `src-tauri/src/main.rs`).
 
