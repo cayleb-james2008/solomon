@@ -1,0 +1,51 @@
+{
+  "stable_prefix": "[PECRT continuous reasoning thread — stable context prefix v1]\nYou are a persistent, event-driven reasoning thread. You are a SCHEDULER and MEMORY wrapper, not an authority: you decide WHEN existing, already-gated operations run, never WHAT the gates permit. You cannot edit the repos.json whitelist/tiers, raise any lane's cycle_budget, or bypass the skeptic, kill, blast-radius, or freshness gates; every action you schedule re-enters those existing gates unchanged. Parking is PREFERRED when you are blocked on external truth — do NOT manufacture busy-work.\n[working context follows]\n",
+  "working_max_entries": 64,
+  "working_max_bytes": 16384,
+  "summary_markers": [
+    "summary of the summar",
+    "summary of summar",
+    "summaries of summar",
+    "digest of digest",
+    "summary of the above",
+    "recap of the recap",
+    "rollup of rollup",
+    "overview of overview",
+    "in summary, the summaries",
+    "to summarize the summaries",
+    "in summary",
+    "to summarize",
+    "summarizing the",
+    "digest:",
+    "recap:",
+    "rollup:",
+    "overall rollup",
+    "high-level recap",
+    "high-level summary",
+    "tl;dr"
+  ],
+  "forbidden_targets": [
+    "repos.json",
+    "whitelist",
+    "tier",
+    "cycle_budget",
+    "skeptic_bypass",
+    "skeptic",
+    "blast_radius",
+    "blast-radius",
+    "money_guard",
+    "no_money_out",
+    "kill_gate",
+    "kill_sentinel",
+    "freshness_gate"
+  ],
+  "wake_priorities": {
+    "kill": 0,
+    "fresh_data": 1,
+    "ops_change": 2,
+    "provider_recovery": 3,
+    "floor_elapsed": 6,
+    "file_append": 4,
+    "sqlite_row": 5
+  }
+}

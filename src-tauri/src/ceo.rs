@@ -1467,12 +1467,97 @@ impl Drop for TempFileGuard {
     }
 }
 
-/// One chat completion over Ollama Cloud via curl.exe (no HTTP client dependency; TLS handled by
-/// the OS curl, same guarded-spawn contract as every other subprocess). The API key rides a
-/// curl `-H @file` headers file under runtime/ (gitignored) — never argv, never a log line. The
-/// headers file is wrapped in a TempFileGuard so the Bearer key is removed on every return path.
+/// Resolve the CEO/MoA chat transport from the AUTOPILOT provider config (repos.json sentinel),
+/// mirroring how the improver lanes resolve theirs (ctx.rs required_key / fleet.rs
+/// provider_key_ref). Audit finding #05 (2026-07-12): ollama_chat hardwired ollama.com +
+/// OLLAMA_API_KEY, so every CEO/MoA call silently broke whenever the fleet switched provider
+/// (e.g. the temporary OpenRouter switch). Returns (provider, endpoint, api-key FIELD — an
+/// env-var NAME per the repos.json contract, or a literal key). Unknown/absent provider falls
+/// back to the previous Ollama Cloud behavior so a missing/corrupt config can never brick the
+/// CEO. Pure over `cfg` for testability; ollama_chat feeds it registry::autopilot_config().
+fn chat_transport(cfg: &Value) -> (String, &'static str, String) {
+    let provider = cfg
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("ollama-cloud")
+        .to_string();
+    let (endpoint, default_key) = match provider.as_str() {
+        "openrouter" => (
+            "https://openrouter.ai/api/v1/chat/completions",
+            "OPENROUTER_API_KEY",
+        ),
+        _ => ("https://ollama.com/v1/chat/completions", "OLLAMA_API_KEY"),
+    };
+    let key_field = cfg
+        .get("api_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_key);
+    // autopilot_config() fills a missing api_key with the registry-wide default "OLLAMA_API_KEY"
+    // regardless of provider — under openrouter that combination can only be the default-fill (an
+    // Ollama key never authenticates against OpenRouter), so treat it as unset, not an override.
+    let key_field = if provider == "openrouter" && key_field == "OLLAMA_API_KEY" {
+        default_key
+    } else {
+        key_field
+    };
+    (provider, endpoint, key_field.to_string())
+}
+
+/// When the fleet provider is OpenRouter, an Ollama-native model id (no '/', e.g. the CEO_MODEL
+/// const "minimax-m3") cannot exist there — substitute the autopilot-configured model so the
+/// morning-plan/focus calls survive a provider switch. Provider-appropriate ids (OpenRouter ids
+/// always carry a "vendor/model" slash) pass through untouched, so the brain-block worker models
+/// stay exactly as configured. Under ollama-cloud the requested model is NEVER rewritten
+/// (byte-identical previous behavior).
+fn chat_model_for(cfg: &Value, provider: &str, requested: &str) -> String {
+    if provider == "openrouter" && !requested.contains('/') {
+        if let Some(m) = cfg
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|m| m.contains('/'))
+        {
+            return m.to_string();
+        }
+    }
+    requested.to_string()
+}
+
+/// True when the api_key FIELD is an env-var NAME (uppercase ASCII letters/digits/underscore,
+/// e.g. "OPENROUTER_API_KEY_2") rather than a literal secret — the same convention
+/// improver::ctx::Ctx::resolved_api_key uses for the per-repo field, kept in lockstep so the
+/// autopilot block and the repo blocks read identically.
+fn looks_like_env_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .next()
+            .map(|c| c.is_ascii_uppercase() || c == '_')
+            .unwrap_or(false)
+        && s.chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// One chat completion over the CONFIGURED fleet provider (Ollama Cloud or OpenRouter — resolved
+/// from the repos.json autopilot block by chat_transport, previous Ollama Cloud behavior as the
+/// fallback) via curl.exe (no HTTP client dependency; TLS handled by the OS curl, same
+/// guarded-spawn contract as every other subprocess). The name is historical — it predates the
+/// provider switch support. The API key rides a curl `-H @file` headers file under runtime/
+/// (gitignored) — never argv, never a log line. The headers file is wrapped in a TempFileGuard so
+/// the Bearer key is removed on every return path.
 pub(crate) fn ollama_chat(model: &str, system: &str, user: &str) -> Result<String, String> {
-    let key = notify::env_value("OLLAMA_API_KEY").ok_or("no OLLAMA_API_KEY in .env")?;
+    let cfg = crate::control::registry::autopilot_config();
+    let (provider, endpoint, key_field) = chat_transport(&cfg);
+    let model = chat_model_for(&cfg, &provider, model);
+    // Env-var NAME -> read it from Solomon/.env (the previous behavior), then the process env
+    // (a per-repo Ctx::apply_api_key override lands there). A literal key is used as-is.
+    let key = if looks_like_env_name(&key_field) {
+        notify::env_value(&key_field)
+            .or_else(|| std::env::var(&key_field).ok().filter(|v| !v.is_empty()))
+            .ok_or_else(|| format!("no {key_field} in .env"))?
+    } else {
+        key_field
+    };
     let rt = paths::here().join("runtime");
     let _ = std::fs::create_dir_all(&rt);
     let req_path = rt.join("_ceo_request.json");
@@ -1509,7 +1594,7 @@ pub(crate) fn ollama_chat(model: &str, system: &str, user: &str) -> Result<Strin
         hdr_arg.as_str(),
         "-d",
         body_arg.as_str(),
-        "https://ollama.com/v1/chat/completions",
+        endpoint,
     ];
     let r = proc::run(&args, None, Some(Duration::from_secs(250))).map_err(|e| e.to_string())?;
     if !r.ok() {
@@ -2009,6 +2094,84 @@ pub fn next_watch(snapshot: &Value, status: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===================================================================== #
+    // Audit finding #05 (2026-07-12): the CEO/MoA chat transport must follow
+    // the CONFIGURED autopilot provider, not a hardwired ollama.com +
+    // OLLAMA_API_KEY — the hardwiring broke every CEO/MoA call whenever the
+    // fleet switched provider (the temporary OpenRouter switch did exactly
+    // that). Pure-fn coverage of the resolution table + fallback contract.
+    // ===================================================================== #
+    #[test]
+    fn chat_transport_openrouter_resolves_endpoint_and_key() {
+        let cfg = json!({"provider": "openrouter", "api_key": "OPENROUTER_API_KEY"});
+        let (provider, endpoint, key_field) = chat_transport(&cfg);
+        assert_eq!(provider, "openrouter");
+        assert_eq!(endpoint, "https://openrouter.ai/api/v1/chat/completions");
+        assert_eq!(key_field, "OPENROUTER_API_KEY");
+    }
+
+    #[test]
+    fn chat_transport_default_is_previous_ollama_behavior() {
+        // Missing/unknown provider -> byte-identical previous behavior (Ollama Cloud), so a
+        // corrupt or absent autopilot block can never brick the CEO.
+        for cfg in [json!({}), json!({"provider": "ollama-cloud"}), json!({"provider": "???"})] {
+            let (_, endpoint, key_field) = chat_transport(&cfg);
+            assert_eq!(endpoint, "https://ollama.com/v1/chat/completions");
+            assert_eq!(key_field, "OLLAMA_API_KEY");
+        }
+    }
+
+    #[test]
+    fn chat_transport_honors_custom_key_env_name() {
+        // A numbered per-account key name (the multi-account ladder convention) is honored.
+        let cfg = json!({"provider": "openrouter", "api_key": "OPENROUTER_API_KEY_2"});
+        let (_, _, key_field) = chat_transport(&cfg);
+        assert_eq!(key_field, "OPENROUTER_API_KEY_2");
+    }
+
+    #[test]
+    fn chat_transport_openrouter_ignores_registry_default_ollama_key() {
+        // autopilot_config() default-fills api_key="OLLAMA_API_KEY" even when the operator only
+        // set provider=openrouter — that combination is the default-fill, not an override (an
+        // Ollama key never authenticates against OpenRouter).
+        let cfg = json!({"provider": "openrouter", "api_key": "OLLAMA_API_KEY"});
+        let (_, _, key_field) = chat_transport(&cfg);
+        assert_eq!(key_field, "OPENROUTER_API_KEY");
+    }
+
+    #[test]
+    fn chat_model_substitutes_ollama_native_id_under_openrouter() {
+        // CEO_MODEL ("minimax-m3") does not exist on OpenRouter — the configured autopilot model
+        // takes its place so the morning-plan/focus calls survive the provider switch.
+        let cfg = json!({"provider": "openrouter", "model": "tencent/hy3:free"});
+        assert_eq!(chat_model_for(&cfg, "openrouter", CEO_MODEL), "tencent/hy3:free");
+        // A provider-appropriate (slashed) id passes through untouched — brain-block models stay
+        // exactly as configured.
+        assert_eq!(chat_model_for(&cfg, "openrouter", "vendor/x:free"), "vendor/x:free");
+    }
+
+    #[test]
+    fn chat_model_never_rewritten_under_ollama_cloud() {
+        // Previous behavior preserved: under ollama-cloud the requested model is NEVER rewritten,
+        // even when the config carries an (irrelevant) slashed model.
+        let cfg = json!({"provider": "ollama-cloud", "model": "tencent/hy3:free"});
+        assert_eq!(chat_model_for(&cfg, "ollama-cloud", "minimax-m3"), "minimax-m3");
+        // And a slashless configured model can never be substituted in (nothing to gain).
+        let cfg2 = json!({"provider": "openrouter", "model": "glm-5.2"});
+        assert_eq!(chat_model_for(&cfg2, "openrouter", "minimax-m3"), "minimax-m3");
+    }
+
+    #[test]
+    fn looks_like_env_name_matches_ctx_convention() {
+        // Kept in lockstep with improver::ctx::Ctx::resolved_api_key: uppercase/digits/underscore
+        // = an env-var NAME; any lowercase/punctuation = a literal secret.
+        assert!(looks_like_env_name("OPENROUTER_API_KEY"));
+        assert!(looks_like_env_name("OLLAMA_API_KEY_2"));
+        assert!(!looks_like_env_name("sk-or-v1-abc123"));
+        assert!(!looks_like_env_name(""));
+        assert!(!looks_like_env_name("2KEY")); // must not start with a digit
+    }
 
     #[test]
     fn temp_file_guard_removes_file_on_drop() {

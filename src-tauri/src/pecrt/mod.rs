@@ -29,8 +29,10 @@
 //! bounds, the same event schema, the same deny/allow verdicts, the same stable-prefix bytes. The
 //! Python side exists so the pi-hosted agent and any tooling can reason about the SAME contract the
 //! native loop enforces. Where a decision is load-bearing, the Rust doc-comment and the Python
-//! docstring state it identically; a golden cross-check test (`stable_prefix_matches_python_contract`)
-//! pins the shared constant.
+//! docstring state it identically. DRIFT GATE (audit #09): both sides are pinned to the committed
+//! golden `pecrt_golden.json` (repo root) — the drift-gate tests (`src/pecrt/drift.rs`) enforce it on every `cargo test`
+//! (and run `python pecrt.py` when a launcher exists); pecrt.py's self-check enforces it on the
+//! Python side. Change a shared constant ONLY by updating both implementations + the golden together.
 //!
 //! ## What this module deliberately does NOT do
 //!
@@ -45,6 +47,7 @@
 #![allow(dead_code)]
 
 pub mod bus;
+mod drift; // dual-implementation drift gate: Rust <-> pecrt.py via pecrt_golden.json (audit #09)
 pub mod safety;
 pub mod warm;
 

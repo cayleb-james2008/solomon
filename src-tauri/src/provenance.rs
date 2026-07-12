@@ -642,6 +642,9 @@ mod tests {
             "d041bac",
             "c78ed01",
             "c1bc77f",
+            // 2026-07-12 wave-1 advisor commit (audit plan 009) merged into main with a
+            // "config(gate):" subject — real history, cannot be rewritten; recorded, not laundered.
+            "c3f22031e2b09fe206441f7c8a329465fb711bc6",
         ];
         let text = String::from_utf8_lossy(&out.stdout);
         let violations: Vec<&str> = text
