@@ -575,15 +575,372 @@ pub fn dispatch_growth_publish(repo: &Value, detail: &str) -> Value {
     crate::ceo::orchestrator::dispatch(&GrowthSpecialist::new(), &task, repo)
 }
 
-/// The every-sweep growth-content hook, ridden on `ceo_slow_tail` (the D12/Phase-B SEAM). Currently a
-/// deliberate NO-OP: the gated dispatch plumbing above (`dispatch_growth_content` /
-/// `dispatch_growth_publish`) is fully built, but an every-sweep caller needs an HONEST trigger — a
-/// planner-composed content directive (morning-plan/focus output), never a static daily fact (that
-/// would be the busywork the eval-park doctrine forbids). The composer that fills this: pick the one
-/// public lane whose planner output carries a growth directive, day-gate + stamp-first exactly like
-/// `sover_boost`, and dispatch under the PERSONA RULE (authored as the project's own brand — never the
-/// operator's personal name).
-pub fn maybe_draft_growth_content(_snapshot: &serde_json::Value, _status: &serde_json::Value) {}
+// --------------------------------------------------------------------------- #
+// The Phase-B GROWTH COMPOSER — fills the D12 seam (audit finding #12)
+// --------------------------------------------------------------------------- #
+
+/// Operator-identifying markers that must NEVER appear in a growth draft — the PERSONA RULE's
+/// deterministic deny filter. Drafts are authored under each project's OWN brand or its agent
+/// persona, never the operator's personal name (the repos.json per-lane PERSONA RULE sentences +
+/// the autopilot mission). Case-insensitive substring match, mirroring sover's `deny_terms`
+/// precedent; the entries are the git identity (user name, login) and the email local-part. The
+/// bare first name subsumes the longer forms — all three are kept explicit so a future edit of one
+/// cannot silently un-cover another.
+pub const OPERATOR_MARKERS: &[&str] = &["cayleb", "cayleb-james2008", "caylebalvarezjames"];
+
+/// Standalone operator name tokens, WORD-BOUNDARY matched (a bare substring check on "james"
+/// would trip on unrelated prefix-sharing words; a whole-word false positive still only drops a
+/// draft — fail-closed, safe direction).
+const OPERATOR_NAME_TOKENS: &[&str] = &["james", "alvarez"];
+
+/// Keywords that mark a planner backlog line as a GROWTH content directive (README / docs /
+/// examples / release-note / post / showcase work on a public lane). Deliberately heuristic: a
+/// false negative is a quiet day (safe); a false positive still only yields a gated local draft
+/// behind the money/pecrt gates (safe).
+const GROWTH_DIRECTIVE_KEYWORDS: &[&str] = &[
+    "readme",
+    "docs",
+    "example",
+    "release note",
+    "release-note",
+    "post",
+    "showcase",
+    "quickstart",
+    "growth",
+    "description",
+    "topics",
+];
+
+/// The growth copywriter's role contract: evidence-grounded, organic-only, persona-safe, STRICT
+/// JSON out. The PERSONA RULE is stated at the prompt level here AND enforced deterministically by
+/// [`violates_persona`] after the reply — prompt-level alone is a wish, the filter is the gate.
+const GROWTH_COMPOSER_PROMPT: &str = "You are the growth copywriter for ONE public software \
+    project. You are given the project's lane name (its BRAND), its north-star goal, today's \
+    planner growth directive, and its MEASURED 24h outcomes and velocity. Draft ONE piece of \
+    ORGANIC growth content that honestly advances the directive: a README improvement, a release \
+    note, or a short post. EVIDENCE RULE: every claim must be grounded in the measured outcomes \
+    provided — never invent traction, numbers, users, or results; if the numbers are small or \
+    null, write honest developer-facing copy about what the project DOES, not what it has \
+    'achieved'. PERSONA RULE: the content is authored under the project's own brand (the lane \
+    name) or its agent persona — NEVER the operator's personal name, handle, or email; do not \
+    mention or credit any human maintainer. Organic/free channels only — no paid placement, no ad \
+    copy, no calls to spend. Reply with STRICT JSON only: \
+    {\"kind\":\"readme|release_note|post\",\"title\":\"<one line>\",\"body\":\"<the draft copy>\"}";
+
+/// True iff `text` carries an operator-identifying marker (case-insensitive) — the deterministic
+/// persona deny filter. Pure — unit-tested against every marker.
+pub(crate) fn violates_persona(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    OPERATOR_MARKERS.iter().any(|m| lower.contains(m))
+        || lower
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|tok| OPERATOR_NAME_TOKENS.contains(&tok))
+}
+
+/// True iff a backlog line reads as a GROWTH content directive (keyword heuristic, pure).
+pub(crate) fn is_growth_directive(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    GROWTH_DIRECTIVE_KEYWORDS.iter().any(|k| lower.contains(k))
+}
+
+/// Find TODAY'S planner-composed growth directive in a lane's backlog (pure — unit-tested): the
+/// first OPEN (`- [ ]`), non-deferred line that is either today's ceo goal (carries
+/// `today_marker`, i.e. `(ceo <date>)`) or an open `[campaign:` step, AND reads as a growth
+/// directive. This is the HONEST trigger the D12 hook doc demands — planner output, never a
+/// static daily fact. Returns the line with the `- [ ]` prefix stripped, or None (a quiet day).
+pub(crate) fn growth_directive(backlog: &str, today_marker: &str) -> Option<String> {
+    backlog
+        .lines()
+        .map(str::trim)
+        .find(|l| {
+            l.starts_with("- [ ]")
+                && !l.contains("(deferred")
+                && (l.contains(today_marker) || l.contains("[campaign:"))
+                && is_growth_directive(l)
+        })
+        .map(|l| l.trim_start_matches("- [ ]").trim().to_string())
+}
+
+/// The public-lane eligibility predicate (pure — unit-tested): a lane is a compose candidate iff
+/// it has a resolvable name, an explicit `public: true` flag (repos.json; absent/false/non-bool =>
+/// private — asmodeus has no flag and daedulus is `false`, both excluded), a non-empty north star
+/// (morning_plan's "no north star = not a planned lane" rule), and its ops rollup is not RED
+/// (green-before-growth: don't market a dead engine; an ABSENT rollup is not red — drafting is
+/// local and harmless).
+pub(crate) fn eligible_repo(repo: &Value, north_star: &str, rollup: &Value) -> bool {
+    if paths::repo_name(repo).is_empty() {
+        return false;
+    }
+    if !repo.get("public").and_then(Value::as_bool).unwrap_or(false) {
+        return false;
+    }
+    if north_star.trim().is_empty() {
+        return false;
+    }
+    rollup.get("status").and_then(Value::as_str) != Some("red")
+}
+
+/// `runtime/<lane>/_growth_drafted_<YYYY-MM-DD>` — the per-lane per-day compose marker (a sibling
+/// of `sover_boost`'s `_last_boost`/`_boost_count_<date>` markers; inert, janitor-tolerated).
+fn growth_stamp_path(repo: &Value, date: &str) -> Option<PathBuf> {
+    paths::runtime_dir(repo).map(|d| d.join(format!("_growth_drafted_{date}")))
+}
+
+/// True iff this lane already consumed today's compose attempt (the stamp exists). A NAMELESS row
+/// can never be stamped, so it reads as already-drafted (never attempted) — fail-closed.
+pub(crate) fn already_drafted(repo: &Value, date: &str) -> bool {
+    growth_stamp_path(repo, date).map(|p| p.exists()).unwrap_or(true)
+}
+
+/// Atomically CLAIM the day's compose attempt: create the stamp with `create_new` so exactly one
+/// OS process (GUI tick vs Sentinel one-shot) wins the race — the loser sees `AlreadyExists` and
+/// moves on. Returns false when the claim was not won (already claimed, nameless lane, or any IO
+/// error — fail closed, skip the lane).
+fn claim_growth_stamp(repo: &Value, date: &str) -> bool {
+    use std::io::Write;
+    (|| -> std::io::Result<()> {
+        let p = growth_stamp_path(repo, date).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "nameless lane — no runtime dir")
+        })?;
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&p)?;
+        f.write_all(format!("attempt {ts}").as_bytes())
+    })()
+    .is_ok()
+}
+
+/// Overwrite the day stamp with a named outcome (`ok`, or a `skip:<reason>`) — the marker doubles
+/// as the skip log (best-effort, mirrors `sover_boost::stamp_boost`). The initial "attempt" claim
+/// goes through [`claim_growth_stamp`], which is the atomic cross-process gate.
+fn stamp_growth(repo: &Value, date: &str, note: &str) {
+    let _ = (|| -> std::io::Result<()> {
+        let p = growth_stamp_path(repo, date).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "nameless lane — no runtime dir")
+        })?;
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        std::fs::write(&p, format!("{note} {ts}"))?;
+        Ok(())
+    })();
+}
+
+/// Parse the composer's STRICT-JSON reply into (kind, title, body) — pure over the reply string
+/// (unit-tested on fixtures), via the same `extract_json` + `cap_line` seams the morning plan
+/// uses. An unknown `kind` degrades to "post" (a formatting nit, not a fabrication); a missing or
+/// blank `body` is None (a blank draft is the busywork the eval-park doctrine forbids). Title and
+/// body are flattened to single capped lines — the draft fact is one dated line.
+pub(crate) fn parse_growth_reply(reply: &str) -> Option<(String, String, String)> {
+    let parsed = super::extract_json(reply)?;
+    let kind = match parsed.get("kind").and_then(Value::as_str) {
+        Some(k @ ("readme" | "release_note" | "post")) => k.to_string(),
+        _ => "post".to_string(),
+    };
+    let title = super::cap_line(parsed.get("title").and_then(Value::as_str).unwrap_or(""), 120);
+    let body = super::cap_line(parsed.get("body").and_then(Value::as_str).unwrap_or(""), 800);
+    if body.is_empty() {
+        return None;
+    }
+    Some((kind, title, body))
+}
+
+/// Resolve the compose model from the brain config (pure — unit-tested): the ideate worker (the
+/// creative role) when the MoA brain is enabled, else the aggregator, else the CEO planner model.
+/// NEVER a hardcoded provider model id — under OpenRouter the provider-aware transport
+/// (`chat_model_for`) substitutes the configured autopilot model for an Ollama-native id, so every
+/// branch survives a provider switch.
+pub(crate) fn pick_growth_model(cfg: &crate::improver::brain::BrainConfig) -> String {
+    if cfg.enabled {
+        cfg.workers
+            .ideate
+            .clone()
+            .unwrap_or_else(|| cfg.aggregator.clone())
+    } else {
+        super::CEO_MODEL.to_string()
+    }
+}
+
+/// The every-sweep growth-content COMPOSER, ridden on `ceo_slow_tail` (the D12/Phase-B seam,
+/// audit finding #12): synthesize at most ONE gated, unpublished, persona-safe growth draft per
+/// PUBLIC lane per day — and at most ONE lane per tail invocation (the rest get later sweeps the
+/// same day, mirroring `MAX_BOOSTS_PER_SWEEP`). Lanes are visited priority-ordered
+/// (snapshot `projects.<name>.priority`, like the morning plan).
+///
+///   1. HONEST TRIGGER — a lane is composed ONLY when today's planner output (its `(ceo <date>)`
+///      backlog goal or an open `[campaign:` step) carries a growth directive. No directive => a
+///      quiet day; never a static daily fact. A backlog READ ERROR (improver mid-rewrite) skips
+///      the sweep without stamping — never interact with a half-written file.
+///   2. DAY-GATE, STAMP-FIRST — `runtime/<lane>/_growth_drafted_<date>` is written BEFORE the LLM
+///      call (exactly like `sover_boost::stamp_boost`), so a hung/failed compose consumes the
+///      day's attempt and the SECOND OS process running this tail (the Sentinel watchdog
+///      one-shot) cannot double-fire. LLM unavailability (quota/429/transport) degrades to a
+///      SILENT no-op with a named `skip:` reason recorded in the stamp marker — never a panic
+///      (the call site's catch_unwind is belt-and-suspenders), never a fabricated draft.
+///   3. EVIDENCE-GROUNDED — the compose payload's factual substrate is the outcomes-ledger
+///      `snapshot` this tail already holds (outcomes_24h + velocity + the anonymized prior-wins
+///      tally); the draft cites real numbers, never invented traction. No ledger re-read.
+///   4. PERSONA RULE — stated in the prompt AND enforced by the deterministic
+///      [`OPERATOR_MARKERS`] deny filter: a draft carrying an operator-identifying marker is
+///      refused (stamp kept — no retry storm). Drafts are authored under the project's own brand.
+///   5. DRAFT-ONLY — the composed content routes through `dispatch_growth_content` (gate-first:
+///      money_guard + pecrt::safety), landing as a GATED, unpublished, organic line in
+///      `runtime/<lane>/growth_drafts.jsonl`. The publish ladder (`dispatch_growth_publish`) is
+///      NEVER invoked from here — publishing stays on the operator's dry-run-first ladder.
+pub fn maybe_draft_growth_content(snapshot: &serde_json::Value, status: &serde_json::Value) {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today_marker = super::ceo_marker(&today);
+
+    // Lane inventory, priority-ordered by the ledger snapshot's priority (missing => last), name
+    // as the deterministic tiebreak — the same ordering discipline as morning_plan.
+    let mut rows: Vec<(i64, String, Value)> = crate::control::registry::read_repos_json()
+        .into_iter()
+        .filter_map(|r| {
+            let name = paths::repo_name(&r);
+            if name.is_empty() {
+                return None;
+            }
+            let prio = snapshot
+                .pointer(&format!("/projects/{name}/priority"))
+                .and_then(Value::as_i64)
+                .unwrap_or(i64::MAX);
+            Some((prio, name, r))
+        })
+        .collect();
+    rows.sort_by(|a, b| (a.0, a.1.as_str()).cmp(&(b.0, b.1.as_str())));
+
+    for (_prio, lane, repo) in rows {
+        // Cheap pre-check before any file IO: only explicit public lanes are candidates.
+        if !repo.get("public").and_then(Value::as_bool).unwrap_or(false) {
+            continue;
+        }
+        // North star: the operator's committed goal.md line, else the repos.json `goal` fallback.
+        let fallback = repo.get("goal").and_then(Value::as_str).unwrap_or("");
+        let goal_md = std::fs::read_to_string(super::goal_post_path(&lane)).ok();
+        let north_star = super::pick_goal_post(goal_md.as_deref(), fallback);
+        let rollup = status
+            .pointer(&format!("/projects/{lane}"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if !eligible_repo(&repo, &north_star, &rollup) {
+            continue;
+        }
+        if already_drafted(&repo, &today) {
+            continue; // day-gate: this lane already consumed today's compose attempt
+        }
+        // HONEST TRIGGER: today's planner-composed growth directive. Absent file => the planner
+        // has not routed growth here (quiet day); a read ERROR (mid-rewrite) => skip this sweep.
+        let backlog = match std::fs::read_to_string(super::backlog_path(&lane)) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let directive = match growth_directive(&backlog, &today_marker) {
+            Some(d) => d,
+            None => continue, // no growth directive today — no fabricated busywork
+        };
+        // STAMP FIRST — atomically claim the day's attempt BEFORE the slow LLM call (cross-process
+        // safe: the GUI tick and the Sentinel watchdog one-shot both run this tail; `create_new`
+        // guarantees exactly one winner even inside the check-to-claim window).
+        if !claim_growth_stamp(&repo, &today) {
+            continue; // the other process claimed this lane just now — same as seeing its stamp
+        }
+        compose_and_dispatch(&repo, &lane, &north_star, &directive, snapshot, &today);
+        return; // at most ONE lane composed per tail invocation
+    }
+}
+
+/// Compose ONE draft for the stamped lane and dispatch it through the gated GrowthSpecialist
+/// surface. Side-effectful (one LLM call via the provider-aware transport) — deliberately NOT
+/// unit-tested, per the `focus::decompose_campaign` precedent; everything around it is. Every
+/// failure path records a named outcome in the day stamp and returns silently (the stamp is
+/// already consumed — retry tomorrow, matching focus's one-attempt/day semantics).
+fn compose_and_dispatch(
+    repo: &Value,
+    lane: &str,
+    north_star: &str,
+    directive: &str,
+    snapshot: &Value,
+    today: &str,
+) {
+    let outcomes = snapshot
+        .pointer(&format!("/projects/{lane}"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let velocity = super::velocity_context(&outcomes, north_star);
+    let recent_wins = crate::ceo::wins::prior_wins();
+    let user = serde_json::to_string_pretty(&json!({
+        "lane": lane,
+        "brand": lane,
+        "north_star": north_star,
+        "directive": directive,
+        "outcomes_24h": outcomes,
+        "velocity": velocity,
+        "recent_wins": recent_wins,
+    }))
+    .unwrap_or_default();
+
+    // Model + skill resolved at call time (never hardcoded): the brain's creative worker when
+    // enabled, else the CEO model — the provider-aware transport handles the provider mapping.
+    // `ctx: None` short-circuits spawn_worker to the CEO chat path (no improver Ctx on this
+    // plane), matching the morning_plan / focus precedent at <=1 call/day/lane.
+    let model = pick_growth_model(&crate::improver::brain::BrainConfig::from_autopilot());
+    let skill = crate::improver::brain::load_skill(lane, "growth");
+    let reply = match crate::improver::brain::spawn_worker(
+        &model,
+        GROWTH_COMPOSER_PROMPT,
+        &skill,
+        &user,
+        None,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            // LLM unavailable (quota/429/transport/parked): a SILENT no-op — the stamp already
+            // consumed today's attempt; record the named skip reason and return. Never fabricate.
+            stamp_growth(
+                repo,
+                today,
+                &format!("skip:llm_unavailable {}", super::cap_line(&e, 160)),
+            );
+            return;
+        }
+    };
+    let (kind, title, body) = match parse_growth_reply(&reply) {
+        Some(t) => t,
+        None => {
+            stamp_growth(repo, today, "skip:unparseable_or_empty_reply");
+            return;
+        }
+    };
+    let detail = format!(
+        "[{kind}] {title} — {body} (directive: {})",
+        super::cap_line(directive, 200)
+    );
+    // The deterministic PERSONA gate — prompt-level rules are wishes; this is the enforcement. A
+    // violating draft is refused outright (stamp kept, no retry storm, nothing dispatched).
+    if violates_persona(&detail) {
+        stamp_growth(repo, today, "skip:persona_violation");
+        return;
+    }
+    let out = dispatch_growth_content(repo, &detail);
+    if out.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        stamp_growth(repo, today, "ok");
+        let _ = crate::notify::send(&crate::notify::Notice::report(
+            format!("Solomon: growth draft -> {lane}"),
+            format!(
+                "[{kind}] {title} (GATED, unpublished — review runtime/{lane}/growth_drafts.jsonl)"
+            ),
+        ));
+    } else {
+        stamp_growth(
+            repo,
+            today,
+            &format!("skip:dispatch_refused {}", super::cap_line(&out.to_string(), 160)),
+        );
+    }
+}
 
 // --------------------------------------------------------------------------- #
 // tests — the D12 acceptance contracts
@@ -1070,5 +1427,226 @@ mod tests {
         assert!(!is_publish_task("draft a README section"));
         assert!(!is_publish_task("publish the reel")); // the word 'publish' alone is not the marker
         assert!(!is_publish_task(""));
+    }
+
+    // ===================================================================== //
+    // Phase-B GROWTH COMPOSER (finding #12) — the pure cores + the day stamp
+    // ===================================================================== //
+
+    // ---- PERSONA RULE: the deterministic deny filter refuses every operator marker ----
+    #[test]
+    fn persona_filter_rejects_every_operator_marker_and_accepts_brand_copy() {
+        for m in OPERATOR_MARKERS {
+            assert!(
+                violates_persona(&format!("release announcement written by {m} today")),
+                "marker '{m}' must be refused"
+            );
+            assert!(
+                violates_persona(&m.to_uppercase()),
+                "the filter is case-insensitive: '{m}'"
+            );
+        }
+        // Standalone name tokens are word-boundary matched (review finding: the compound markers
+        // all contain "cayleb", leaving bare-surname drafts uncovered).
+        assert!(violates_persona("release notes reviewed by James today"));
+        assert!(violates_persona("maintained by Alvarez"));
+        // ...but prefix-sharing words do NOT trip the token filter.
+        assert!(!violates_persona("the jameson integration suite is green"));
+        // Brand copy passes: authored under the project's own name, no operator identifier.
+        assert!(!violates_persona(
+            "sover 0.4 — 3 verified reels/day now ship with URLs; quickstart moved to README"
+        ));
+        assert!(!violates_persona(""));
+        // A draft FACT built from a marker-carrying detail is refused too — the filter guards the
+        // exact text that would land in the drafts log.
+        let task = Task::new(TaskKind::Remediate("none"), "sover", "post authored by Cayleb");
+        assert!(violates_persona(&GrowthSpecialist::draft_fact(&task, 1_783_000_000)));
+    }
+
+    // ---- HONEST TRIGGER: growth-directive keyword detection ----
+    #[test]
+    fn growth_directive_keyword_detection() {
+        assert!(is_growth_directive("- [ ] [chore] refresh the README quickstart section"));
+        assert!(is_growth_directive("- [ ] [feature] draft release notes for v0.4"));
+        assert!(is_growth_directive("- [ ] add usage examples to docs"));
+        assert!(is_growth_directive("- [ ] [feature] publish a showcase post (organic)"));
+        assert!(!is_growth_directive("- [ ] [feature] fix the sqlite WAL checkpoint deadlock"));
+        assert!(!is_growth_directive("- [ ] [refactor] split the scheduler loop"));
+        assert!(!is_growth_directive(""));
+    }
+
+    // ---- HONEST TRIGGER: only TODAY'S planner line (or an open campaign step) fires ----
+    #[test]
+    fn growth_directive_picks_todays_planner_line_only() {
+        let marker = "(ceo 2026-07-13)";
+        let backlog = "- [ ] [feature] fix the sqlite WAL checkpoint deadlock (ceo 2026-07-13)\n\
+                       - [ ] [chore] refresh the README quickstart + badges (ceo 2026-07-13)\n\
+                       - [ ] [chore] polish the README intro (ceo 2026-07-01)\n";
+        let d = growth_directive(backlog, marker).expect("today's growth line is found");
+        assert!(d.contains("README quickstart"), "{d}");
+        assert!(!d.starts_with("- [ ]"), "the checkbox prefix is stripped: {d}");
+        // yesterday's ceo goal alone does NOT fire (stale directives are not today's plan)
+        assert!(growth_directive("- [ ] polish the README (ceo 2026-07-01)\n", marker).is_none());
+        // checked / deferred lines never fire
+        assert!(growth_directive("- [x] refresh the README (ceo 2026-07-13)\n", marker).is_none());
+        assert!(growth_directive(
+            "- [ ] refresh the README (ceo 2026-07-13)  (deferred: gave up)\n",
+            marker
+        )
+        .is_none());
+        // an OPEN campaign growth step fires regardless of the day it was planned
+        assert!(growth_directive(
+            "- [ ] [feature] [campaign:sover-2026-07-12] (step 2) write the showcase page (campaign 2026-07-12)\n",
+            marker
+        )
+        .is_some());
+        // ...but a non-growth campaign step does not
+        assert!(growth_directive(
+            "- [ ] [feature] [campaign:x] (step 1) refactor the scheduler loop (campaign 2026-07-12)\n",
+            marker
+        )
+        .is_none());
+        // empty backlog -> a quiet day
+        assert!(growth_directive("", marker).is_none());
+    }
+
+    // ---- PUBLIC-LANE SELECTION: public + north star + not RED, on the real repos.json shapes ----
+    #[test]
+    fn public_lane_selection_requires_public_flag_goal_and_not_red() {
+        let green = json!({"status": "green", "healthy": true});
+        let sover = json!({"name": "sover", "public": true});
+        assert!(eligible_repo(&sover, "Post 3 verified reels/day", &green));
+        // daedulus: explicitly public:false -> never composed
+        assert!(!eligible_repo(&json!({"name": "daedulus", "public": false}), "a goal", &green));
+        // asmodeus: NO public flag at all (private by omission; its goal forbids public exposure)
+        assert!(!eligible_repo(&json!({"name": "asmodeus"}), "capital velocity", &green));
+        // a non-bool public value is NOT public (fail-closed truthiness)
+        assert!(!eligible_repo(&json!({"name": "x", "public": "yes"}), "a goal", &green));
+        // no north star = not a planned lane = never composed
+        assert!(!eligible_repo(&sover, "   ", &green));
+        // RED lane: don't market a dead engine (green-before-growth)
+        assert!(!eligible_repo(&sover, "a goal", &json!({"status": "red"})));
+        // an ABSENT rollup entry is not red — drafting is local + harmless
+        assert!(eligible_repo(&sover, "a goal", &json!({})));
+        // a nameless row has no runtime dir and is never eligible
+        assert!(!eligible_repo(&json!({"public": true}), "a goal", &green));
+    }
+
+    // ---- DAY-GATE: stamp-first — a stamped lane is a same-day no-op even when compose failed ----
+    #[test]
+    fn growth_day_gate_is_stamp_first_and_same_day_idempotent() {
+        let repo = uniq_repo("stampfirst");
+        let date = "2026-07-13";
+        assert!(!already_drafted(&repo, date), "fresh lane is un-stamped");
+        // STAMP FIRST (the pre-LLM write): the day's attempt is claimed ATOMICALLY — the first
+        // claim wins, a second claim (the other OS process inside the same race window) loses.
+        assert!(claim_growth_stamp(&repo, date), "first claim wins the day");
+        assert!(!claim_growth_stamp(&repo, date), "second claim loses: create_new is the gate");
+        assert!(already_drafted(&repo, date), "the stamp gates the rest of the day");
+        // A NAMELESS row can never claim (fail closed).
+        assert!(!claim_growth_stamp(&json!({}), date));
+        // A failed compose OVERWRITES the note with a NAMED skip reason but keeps the gate closed
+        // (one attempt/day — an LLM outage must not retry every 2-minute sweep).
+        stamp_growth(&repo, date, "skip:llm_unavailable curl exit 22: 429");
+        assert!(already_drafted(&repo, date), "a failed compose still consumed the day");
+        let body =
+            std::fs::read_to_string(growth_stamp_path(&repo, date).expect("stamp path")).unwrap();
+        assert!(
+            body.starts_with("skip:llm_unavailable"),
+            "the named skip reason is recorded in the marker: {body}"
+        );
+        // a different day is un-stamped (the gate is per-day)
+        assert!(!already_drafted(&repo, "2026-07-14"));
+        // a NAMELESS row can never be stamped -> reads as already-drafted (never attempted)
+        assert!(already_drafted(&json!({}), date));
+        if let Some(p) = growth_stamp_path(&repo, date) {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    // ---- REPLY PARSING: strict JSON via extract_json/cap_line, honest degradation ----
+    #[test]
+    fn parse_growth_reply_extracts_strict_json_and_rejects_empty_body() {
+        let reply = "Here is the draft:\n```json\n{\"kind\":\"release_note\",\"title\":\"sover 0.4\",\
+                     \"body\":\"3 verified reels/day now ship with URLs.\\nQuickstart moved to the README.\"}\n```";
+        let (kind, title, body) = parse_growth_reply(reply).expect("fenced JSON parses");
+        assert_eq!(kind, "release_note");
+        assert_eq!(title, "sover 0.4");
+        assert!(!body.contains('\n'), "the body is flattened to one line: {body}");
+        assert!(body.contains("3 verified reels/day"));
+        // an unknown kind degrades to "post" (a formatting nit, never a dropped draft)
+        let (k2, ..) =
+            parse_growth_reply("{\"kind\":\"tweetstorm\",\"title\":\"t\",\"body\":\"b\"}").unwrap();
+        assert_eq!(k2, "post");
+        // a blank/missing body is None — a blank draft is busywork, never dispatched
+        assert!(parse_growth_reply("{\"kind\":\"post\",\"title\":\"t\",\"body\":\"  \"}").is_none());
+        assert!(parse_growth_reply("{\"kind\":\"post\",\"title\":\"t\"}").is_none());
+        assert!(parse_growth_reply("no json here at all").is_none());
+    }
+
+    // ---- MODEL RESOLUTION: config-resolved, never a hardcoded provider id ----
+    #[test]
+    fn growth_model_resolves_from_brain_config_never_hardcoded() {
+        use crate::improver::brain::{BrainConfig, Workers};
+        // brain enabled + ideate worker -> the creative role's configured model
+        let cfg = BrainConfig {
+            enabled: true,
+            aggregator: "vendor/agg:free".into(),
+            verifier: "v".into(),
+            workers: Workers {
+                ideate: Some("vendor/creative:free".into()),
+                ..Default::default()
+            },
+            layers: 2,
+        };
+        assert_eq!(pick_growth_model(&cfg), "vendor/creative:free");
+        // enabled, no ideate worker -> the aggregator
+        let cfg_no_ideate = BrainConfig {
+            workers: Workers::default(),
+            ..cfg.clone()
+        };
+        assert_eq!(pick_growth_model(&cfg_no_ideate), "vendor/agg:free");
+        // disabled -> the CEO planner model (the provider-aware transport's chat_model_for
+        // substitutes the configured autopilot model under OpenRouter — no hardwired provider id)
+        let cfg_off = BrainConfig {
+            enabled: false,
+            ..cfg
+        };
+        assert_eq!(pick_growth_model(&cfg_off), crate::ceo::CEO_MODEL);
+    }
+
+    // ---- END-TO-END (LLM seam skipped): a composed detail lands ONE gated dated draft line ----
+    #[test]
+    fn a_composed_draft_detail_lands_one_gated_dated_line() {
+        let _g = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+
+        let repo = uniq_repo("composed");
+        // The exact detail shape compose_and_dispatch builds from a parsed reply + the directive.
+        let detail = "[release_note] sover 0.4 — 3 verified reels/day now ship with URLs \
+                      (directive: [chore] refresh the README quickstart (ceo 2026-07-13))";
+        assert!(!violates_persona(detail), "brand copy passes the persona filter");
+
+        let out = dispatch_growth_content(&repo, detail);
+        assert_eq!(out["ok"], true, "the gated dispatch succeeds on an ordinary lane: {out}");
+        assert_eq!(out["gated"], true);
+        assert_eq!(out["published"], false, "draft-only — the publish ladder is never invoked");
+        assert_eq!(out["spent"], false);
+        let path = out["artifact_path"].as_str().expect("artifact path");
+        let body = std::fs::read_to_string(path).expect("drafts log exists");
+        assert_eq!(body.lines().count(), 1, "exactly ONE draft line landed: {body}");
+        let line = body.lines().next().unwrap();
+        assert!(line.contains('\t'), "the draft line is dated (iso-date TAB fact): {line}");
+        assert!(line.contains("[release_note] sover 0.4"), "{line}");
+        assert!(line.contains("[GATED, unpublished, organic]"), "{line}");
+
+        if let Some(dir) = std::path::Path::new(path).parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        std::env::remove_var("SOLOMON_NOTIFY_OFF");
     }
 }
