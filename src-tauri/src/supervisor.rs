@@ -419,6 +419,22 @@ pub fn diagnose(repo: &Value) -> Value {
                 .into(),
         ];
         safe = false;
+    } else if has_stop && !running && reason == Some("stranded_unmerged_branch_persistent") {
+        // Finding #61's stale-fork guard: a finished rsi/* / solomon-recovered/* branch is not an
+        // ancestor of the fork base and not visible upstream. Categorized APART from
+        // persistent_self_stop because the fix is a HUMAN reconcile (merge/ship/push/delete): the
+        // CEO plane maps persistent_self_stop to clear_escalation_and_retry, which deletes the
+        // STOP sentinel — for this deterministic condition that would thrash park→clear→re-park
+        // every preflight. This category routes to the deduped operator page instead.
+        cat = "stranded_unmerged_branch".into();
+        ev = trunc_or(summary, 200, "stranded finished rsi/* work found at preflight");
+        rec = vec![
+            "a finished rsi/* or solomon-recovered/* branch is not an ancestor of the fork base \
+             and not visible on origin — merge/ship/push it (or delete it if truly obsolete), \
+             then press Start"
+                .into(),
+        ];
+        safe = false;
     } else if has_stop
         && !running
         && matches!(
@@ -589,6 +605,7 @@ pub fn diagnose_categories() -> &'static [&'static str] {
         "base_out_of_band",
         "untracked_refusal",
         "persistent_self_stop",
+        "stranded_unmerged_branch",
         "stale_lock",
         "stop_lingering",
         "stuck",
@@ -696,6 +713,14 @@ fn suggested_steps(repo: &Value, cat: &str) -> Vec<String> {
             "  • controller_off_base_persistent — merge the controller's off-base work to the default branch and push (or revert)".into(),
             "Once the cause is fixed, press Start to resume (the watchdog auto-clears the git-state".into(),
             "reasons — dirty/unpushed/controller-off-base — once the tree heals)".into(),
+        ],
+        "stranded_unmerged_branch" => vec![
+            "A finished rsi/* or solomon-recovered/* branch is not an ancestor of the fork base".into(),
+            "and its work is not visible on origin — the loop refuses to fork past it (this is".into(),
+            "how daedulus silently lost 14 finished commits). Reconcile by hand:".into(),
+            "  • merge or ship the stranded branch (or push it so origin holds the work)".into(),
+            "  • or delete it deliberately if the work is truly obsolete".into(),
+            "then press Start (this stop is pinned — it is never auto-cleared)".into(),
         ],
         _ => vec![cd, "git status".into()],
     }
@@ -2007,6 +2032,28 @@ mod tests {
             d["category"], "persistent_self_stop",
             "persistent variant must stay persistent_self_stop"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnose_stranded_unmerged_branch_gets_own_category() {
+        // The finding-#61 guard's self-stop needs a HUMAN reconcile: it must NOT collapse into
+        // persistent_self_stop (whose CEO remediation clear_escalation_and_retry would delete the
+        // STOP sentinel and thrash park→clear→re-park on this deterministic condition).
+        let (dir, repo) = tmp_repo("stranded_cat");
+        std::fs::write(dir.join("stop"), "stranded_unmerged_branch_persistent\n").unwrap();
+        write_hb(
+            &dir,
+            &json!({
+                "status": "error",
+                "phase": "preflight",
+                "reason": "stranded_unmerged_branch_persistent",
+                "last_summary": "Stranded finished work: rsi/iter-x (ahead 14) — not an ancestor of the fork base."
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], "stranded_unmerged_branch");
+        assert_eq!(d["auto_safe"], false, "human reconcile — never auto-safe");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
