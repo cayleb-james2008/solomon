@@ -588,6 +588,11 @@ pub fn dispatch_growth_publish(repo: &Value, detail: &str) -> Value {
 /// cannot silently un-cover another.
 pub const OPERATOR_MARKERS: &[&str] = &["cayleb", "cayleb-james2008", "caylebalvarezjames"];
 
+/// Standalone operator name tokens, WORD-BOUNDARY matched (a bare substring check on "james"
+/// would trip on unrelated prefix-sharing words; a whole-word false positive still only drops a
+/// draft — fail-closed, safe direction).
+const OPERATOR_NAME_TOKENS: &[&str] = &["james", "alvarez"];
+
 /// Keywords that mark a planner backlog line as a GROWTH content directive (README / docs /
 /// examples / release-note / post / showcase work on a public lane). Deliberately heuristic: a
 /// false negative is a quiet day (safe); a false positive still only yields a gated local draft
@@ -627,6 +632,9 @@ const GROWTH_COMPOSER_PROMPT: &str = "You are the growth copywriter for ONE publ
 pub(crate) fn violates_persona(text: &str) -> bool {
     let lower = text.to_lowercase();
     OPERATOR_MARKERS.iter().any(|m| lower.contains(m))
+        || lower
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|tok| OPERATOR_NAME_TOKENS.contains(&tok))
 }
 
 /// True iff a backlog line reads as a GROWTH content directive (keyword heuristic, pure).
@@ -684,10 +692,29 @@ pub(crate) fn already_drafted(repo: &Value, date: &str) -> bool {
     growth_stamp_path(repo, date).map(|p| p.exists()).unwrap_or(true)
 }
 
-/// Write the day stamp with an outcome `note` (best-effort, mirrors `sover_boost::stamp_boost`).
-/// Called STAMP-FIRST (note "attempt") BEFORE the LLM call so a hung/failed compose consumes the
-/// day's attempt and the second OS process running this tail cannot double-fire; later overwrites
-/// record the named outcome (`ok`, or a `skip:<reason>`) — the marker doubles as the skip log.
+/// Atomically CLAIM the day's compose attempt: create the stamp with `create_new` so exactly one
+/// OS process (GUI tick vs Sentinel one-shot) wins the race — the loser sees `AlreadyExists` and
+/// moves on. Returns false when the claim was not won (already claimed, nameless lane, or any IO
+/// error — fail closed, skip the lane).
+fn claim_growth_stamp(repo: &Value, date: &str) -> bool {
+    use std::io::Write;
+    (|| -> std::io::Result<()> {
+        let p = growth_stamp_path(repo, date).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "nameless lane — no runtime dir")
+        })?;
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&p)?;
+        f.write_all(format!("attempt {ts}").as_bytes())
+    })()
+    .is_ok()
+}
+
+/// Overwrite the day stamp with a named outcome (`ok`, or a `skip:<reason>`) — the marker doubles
+/// as the skip log (best-effort, mirrors `sover_boost::stamp_boost`). The initial "attempt" claim
+/// goes through [`claim_growth_stamp`], which is the atomic cross-process gate.
 fn stamp_growth(repo: &Value, date: &str, note: &str) {
     let _ = (|| -> std::io::Result<()> {
         let p = growth_stamp_path(repo, date).ok_or_else(|| {
@@ -814,9 +841,12 @@ pub fn maybe_draft_growth_content(snapshot: &serde_json::Value, status: &serde_j
             Some(d) => d,
             None => continue, // no growth directive today — no fabricated busywork
         };
-        // STAMP FIRST — consume the day's attempt BEFORE the slow LLM call (cross-process safe:
-        // the GUI tick and the Sentinel watchdog one-shot both run this tail).
-        stamp_growth(&repo, &today, "attempt");
+        // STAMP FIRST — atomically claim the day's attempt BEFORE the slow LLM call (cross-process
+        // safe: the GUI tick and the Sentinel watchdog one-shot both run this tail; `create_new`
+        // guarantees exactly one winner even inside the check-to-claim window).
+        if !claim_growth_stamp(&repo, &today) {
+            continue; // the other process claimed this lane just now — same as seeing its stamp
+        }
         compose_and_dispatch(&repo, &lane, &north_star, &directive, snapshot, &today);
         return; // at most ONE lane composed per tail invocation
     }
@@ -1416,6 +1446,12 @@ mod tests {
                 "the filter is case-insensitive: '{m}'"
             );
         }
+        // Standalone name tokens are word-boundary matched (review finding: the compound markers
+        // all contain "cayleb", leaving bare-surname drafts uncovered).
+        assert!(violates_persona("release notes reviewed by James today"));
+        assert!(violates_persona("maintained by Alvarez"));
+        // ...but prefix-sharing words do NOT trip the token filter.
+        assert!(!violates_persona("the jameson integration suite is green"));
         // Brand copy passes: authored under the project's own name, no operator identifier.
         assert!(!violates_persona(
             "sover 0.4 — 3 verified reels/day now ship with URLs; quickstart moved to README"
@@ -1502,9 +1538,13 @@ mod tests {
         let repo = uniq_repo("stampfirst");
         let date = "2026-07-13";
         assert!(!already_drafted(&repo, date), "fresh lane is un-stamped");
-        // STAMP FIRST (the pre-LLM write): the day's attempt is consumed immediately.
-        stamp_growth(&repo, date, "attempt");
+        // STAMP FIRST (the pre-LLM write): the day's attempt is claimed ATOMICALLY — the first
+        // claim wins, a second claim (the other OS process inside the same race window) loses.
+        assert!(claim_growth_stamp(&repo, date), "first claim wins the day");
+        assert!(!claim_growth_stamp(&repo, date), "second claim loses: create_new is the gate");
         assert!(already_drafted(&repo, date), "the stamp gates the rest of the day");
+        // A NAMELESS row can never claim (fail closed).
+        assert!(!claim_growth_stamp(&json!({}), date));
         // A failed compose OVERWRITES the note with a NAMED skip reason but keeps the gate closed
         // (one attempt/day — an LLM outage must not retry every 2-minute sweep).
         stamp_growth(&repo, date, "skip:llm_unavailable curl exit 22: 429");
