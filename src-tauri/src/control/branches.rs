@@ -273,6 +273,7 @@ pub fn cleanup_worktrees(repo: &Value) -> Value {
         Err(e) => return json!({"ok": false, "error": e.to_string()}),
     }
     let mut removed: Vec<String> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
     let detached = cur == "HEAD"; // abbrev-ref is literal "HEAD" only when detached
     for b in local_rsi_branches(repo) {
         if b == cur {
@@ -297,17 +298,40 @@ pub fn cleanup_worktrees(repo: &Value) -> Value {
                 }
             }
         }
-        // branch -D b; returncode==0 -> removed. OSError -> swallowed (branch just not added).
-        match git_c(&git, &path, &["branch", "-D", &b]) {
-            Ok(r) => {
-                if r.code == 0 {
-                    removed.push(b);
-                }
+        // NEVER force-delete unmerged work that isn't visible upstream (audit finding #61's
+        // actual deletion vector — a finished 14-commit daedulus branch died to exactly this
+        // unconditional -D). Try `branch -d` first: git itself deletes only merged branches.
+        // If -d refuses, escalate to -D only when the tip is already contained in the branch's
+        // own origin copy (shipped/squash-merged remnants). Otherwise KEEP the branch — the
+        // preflight stale-fork guard will surface it loudly instead of it dying silently here.
+        match git_c(&git, &path, &["branch", "-d", &b]) {
+            Ok(r) if r.code == 0 => {
+                removed.push(b);
+                continue;
             }
-            Err(_) => { /* swallowed */ }
+            _ => {}
+        }
+        let on_origin = git_c(
+            &git,
+            &path,
+            &["merge-base", "--is-ancestor", &b, &format!("refs/remotes/origin/{b}")],
+        )
+        .map(|r| r.code == 0)
+        .unwrap_or(false);
+        if on_origin {
+            match git_c(&git, &path, &["branch", "-D", &b]) {
+                Ok(r) => {
+                    if r.code == 0 {
+                        removed.push(b);
+                    }
+                }
+                Err(_) => { /* swallowed */ }
+            }
+        } else {
+            kept.push(b); // unmerged + not upstream: stranded-work invariant — keep it
         }
     }
-    json!({"ok": true, "pruned": pruned, "removed": removed})
+    json!({"ok": true, "pruned": pruned, "removed": removed, "kept": kept})
 }
 
 // --------------------------------------------------------------------------- //

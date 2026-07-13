@@ -681,6 +681,134 @@ pub fn prune_stale_rsi_branches(ctx: &Ctx) -> i64 {
 }
 
 // --------------------------------------------------------------------------- #
+// stale-fork preflight guard (audit finding #61 — the daedulus 14-commit loss)
+// --------------------------------------------------------------------------- #
+
+/// A local `rsi/*` / `solomon-recovered/*` branch whose tip is NOT an ancestor of the fork base —
+/// finished work the next iteration would silently fork past. Detection output of
+/// [`stranded_unmerged_branches`]; the park-or-proceed policy is [`stranded_blocks_fork`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrandedBranch {
+    pub name: String,
+    /// commits in `<base>..<branch>` — always > 0 for a detected stranding ("work the base lacks").
+    pub ahead: i64,
+    /// every local commit of the branch is visible upstream (`refs/remotes/origin/<name>` exists
+    /// AND the local tip is an ancestor of it) — surfaced work, not a silent stranding.
+    pub on_origin: bool,
+}
+
+/// DETECTION half of the stale-fork preflight guard (audit finding #61): list every local `rsi/*`
+/// and `solomon-recovered/*` branch (except the current one) carrying commits the fork base LACKS
+/// (`rev-list --count <base>..<b>` > 0 — i.e. the tip is NOT an ancestor of the base, so the branch
+/// holds finished work "newer than the base" in CONTENT). `prune_stale_rsi_branches` already
+/// deletes fully-merged residue, so run this AFTER it: anything it returns is genuine unmerged work.
+///
+/// NOTE: wall-clock tip dates are deliberately NOT compared — after the daedulus incident the base
+/// tip (advisor merges, 2026-07-12) was NEWER by date than the stranded 14-commit tip (2026-07-11),
+/// so a date test would have stayed silent on the exact loss this guard exists to prevent.
+///
+/// A FAILED rev-list (misconfigured base, timeout) means merged-ness is UNKNOWN: the branch is
+/// skipped (fail-open) with a loud log — the pruner's never-force-delete invariant keeps the work
+/// safe either way, and the next preflight retries. The prefixes are the literals `rsi/` and
+/// `solomon-recovered/` (007 note: `Ctx` does not carry the configured `branch_prefix`; the loop
+/// hardcodes `rsi/` when constructing its own branches, and the stash sweep hardcodes
+/// `solomon-recovered/`).
+pub fn stranded_unmerged_branches(ctx: &Ctx) -> Vec<StrandedBranch> {
+    let cur = ctx
+        .git(&["rev-parse", "--abbrev-ref", "HEAD"], 120)
+        .stdout
+        .trim()
+        .to_string();
+    let out = ctx
+        .git(&["branch", "--list", "rsi/*", "solomon-recovered/*"], 120)
+        .stdout;
+    let has_remote = ctx.has_remote();
+    let mut found: Vec<StrandedBranch> = Vec::new();
+    for line in out.lines() {
+        // strip the current-branch '*' and the checked-out-in-another-worktree '+' markers
+        let b = line.trim_start_matches(['*', '+', ' ']).trim();
+        if b.is_empty() || b == cur {
+            continue;
+        }
+        let rl = ctx.git(
+            &["rev-list", "--count", &format!("{}..{}", ctx.base_branch, b)],
+            120,
+        );
+        if rl.code != 0 {
+            log_ro(
+                ctx,
+                &format!(
+                    "stale-fork guard: rev-list {}..{b} FAILED — merged-ness unknown, skipping {b} \
+this cycle (the pruner retains it; next preflight retries)",
+                    ctx.base_branch
+                ),
+            );
+            continue;
+        }
+        let ahead = rl.stdout.trim().parse::<i64>().unwrap_or(0);
+        if ahead <= 0 {
+            continue;
+        }
+        // Visible upstream = origin has the ref AND holds every local commit (a pushed-then-extended
+        // branch still counts as stranded: the newest work is local-only).
+        let on_origin = has_remote
+            && ctx
+                .git(
+                    &[
+                        "merge-base",
+                        "--is-ancestor",
+                        b,
+                        &format!("refs/remotes/origin/{b}"),
+                    ],
+                    120,
+                )
+                .code
+                == 0;
+        found.push(StrandedBranch {
+            name: b.to_string(),
+            ahead,
+            on_origin,
+        });
+    }
+    found
+}
+
+/// POLICY half of the stale-fork preflight guard: does this stranded branch BLOCK cutting a new
+/// iteration branch from the base? Pure and unit-testable.
+///
+///   * `ahead <= 0`  — not stranded, never blocks.
+///   * `on_origin`   — the work is visible upstream (pushed / open PR): surfaced, not silent.
+///     Forking past it is auditable on the remote, so it does not block.
+///   * `ship == "local"` + an `rsi/*` branch — a kept gate-green LOCAL-ship branch is this lane's
+///     deliberate ship product (see `ship::ship`), not a stranding; it never blocks. A
+///     `solomon-recovered/*` branch is swept OPERATOR work and blocks in every ship mode.
+///   * everything else blocks: finished commits the base lacks, invisible upstream — exactly the
+///     shape of the daedulus 14-commit loss (fork base frozen, finished branch unmerged, a later
+///     cleanup deleted it).
+///
+/// The `rsi/` prefix is the same string literal the loop builds its own branches from (007 note).
+pub fn stranded_blocks_fork(name: &str, ahead: i64, on_origin: bool, ship: &str) -> bool {
+    if ahead <= 0 || on_origin {
+        return false;
+    }
+    if ship == "local" && name.starts_with("rsi/") {
+        return false;
+    }
+    true
+}
+
+/// The stale-fork preflight guard proper: detection + policy, filtered to the branches that BLOCK
+/// forking a new iteration branch from `ctx.base_branch` under ship mode `ship`. Empty == safe to
+/// fork. `ship` is passed explicitly (not read from `ctx.ship`) so the caller can supply the
+/// CONFIG-LIVE effective ship mode.
+pub fn preflight_stranded_guard(ctx: &Ctx, ship: &str) -> Vec<StrandedBranch> {
+    stranded_unmerged_branches(ctx)
+        .into_iter()
+        .filter(|s| stranded_blocks_fork(&s.name, s.ahead, s.on_origin, ship))
+        .collect()
+}
+
+// --------------------------------------------------------------------------- #
 // staging + per-repo config (the public-repo leak guards)
 // --------------------------------------------------------------------------- #
 
@@ -1365,6 +1493,129 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    // ---- stale-fork preflight guard (finding #61): detection + policy ----
+
+    /// finding-#61 fixture: a stranded `rsi/*` branch (finished commits the base LACKS, invisible
+    /// upstream) TRIPS the guard for a shipping lane — the loop must refuse to fork past it. A
+    /// stranded `solomon-recovered/*` branch (swept operator work) trips too.
+    #[test]
+    fn stale_fork_guard_trips_on_stranded_unmerged_branch() {
+        let (c, dir) = real_repo_ctx();
+
+        // Stranded rsi/* branch: one finished commit unreachable from base, never pushed.
+        c.git(&["checkout", "-b", "rsi/iter-stranded"], 10);
+        std::fs::write(dir.join("finished.py"), "print('outis 2.0')\n").unwrap();
+        c.git(&["add", "-A"], 10);
+        c.git(&["commit", "--quiet", "-m", "finished but unshipped work"], 10);
+        c.git(&["checkout", "--force", &c.base_branch], 10);
+
+        // Stranded solomon-recovered/* branch: a swept-work commit unreachable from base.
+        c.git(&["checkout", "-b", "solomon-recovered/20260713-0"], 10);
+        std::fs::write(dir.join("swept.py"), "print('swept operator work')\n").unwrap();
+        c.git(&["add", "-A"], 10);
+        c.git(&["commit", "--quiet", "-m", "solomon-recovered: swept preflight work"], 10);
+        c.git(&["checkout", "--force", &c.base_branch], 10);
+
+        let detected = stranded_unmerged_branches(&c);
+        assert_eq!(detected.len(), 2, "both stranded branches detected: {detected:?}");
+        for s in &detected {
+            assert!(s.ahead > 0, "stranding means commits the base lacks: {s:?}");
+            assert!(!s.on_origin, "no remote in the fixture: {s:?}");
+        }
+
+        // Under an auto-merge (or pr/push) lane BOTH block the fork.
+        let blocking = preflight_stranded_guard(&c, "auto-merge");
+        assert_eq!(blocking.len(), 2, "guard must trip on both: {blocking:?}");
+        assert!(blocking.iter().any(|s| s.name == "rsi/iter-stranded"));
+        assert!(blocking.iter().any(|s| s.name == "solomon-recovered/20260713-0"));
+
+        // Under ship=local the kept rsi/* branch is the lane's deliberate product (never blocks),
+        // but swept OPERATOR work still blocks.
+        let blocking_local = preflight_stranded_guard(&c, "local");
+        assert_eq!(
+            blocking_local.len(),
+            1,
+            "ship=local exempts kept rsi/* branches only: {blocking_local:?}"
+        );
+        assert_eq!(blocking_local[0].name, "solomon-recovered/20260713-0");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    /// finding-#61 silence: when every rsi/* branch tip IS an ancestor of the fork base (fully
+    /// merged / pointing at base), the guard stays SILENT — no false parks on healthy residue.
+    #[test]
+    fn stale_fork_guard_silent_when_all_ancestors() {
+        let (c, dir) = real_repo_ctx();
+
+        // An rsi/* branch pointing AT the base tip (ancestor, zero commits ahead).
+        c.git(&["branch", "rsi/iter-at-base"], 10);
+        // An rsi/* branch at an OLDER base commit (still an ancestor).
+        std::fs::write(dir.join("advance.py"), "x = 1\n").unwrap();
+        c.git(&["add", "-A"], 10);
+        c.git(&["commit", "--quiet", "-m", "advance base"], 10);
+        let parent = c.git(&["rev-parse", "HEAD~1"], 10).stdout.trim().to_string();
+        c.git(&["branch", "rsi/iter-behind", &parent], 10);
+
+        assert!(
+            stranded_unmerged_branches(&c).is_empty(),
+            "ancestor branches are not stranded"
+        );
+        for ship in ["auto-merge", "pr", "push", "local"] {
+            assert!(
+                preflight_stranded_guard(&c, ship).is_empty(),
+                "guard must stay silent for ship={ship}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    /// finding-#61 fail-open: a FAILED rev-list (misconfigured base) means merged-ness is UNKNOWN —
+    /// the guard must NOT park the lane on it (the pruner's never-force-delete invariant keeps the
+    /// work safe; the next preflight retries with a healed base).
+    #[test]
+    fn stale_fork_guard_skips_branch_when_rev_list_fails() {
+        let (mut c, dir) = real_repo_ctx();
+
+        c.git(&["checkout", "-b", "rsi/iter-unknowable"], 10);
+        std::fs::write(dir.join("work.py"), "y = 2\n").unwrap();
+        c.git(&["add", "-A"], 10);
+        c.git(&["commit", "--quiet", "-m", "unmerged work"], 10);
+        c.git(&["checkout", "--force", &c.base_branch], 10);
+        c.base_branch = "does-not-exist-base".to_string();
+
+        assert!(
+            stranded_unmerged_branches(&c).is_empty(),
+            "unknown merged-ness must not be reported as stranded (fail-open, loud log)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    /// finding-#61 policy vectors (pure): on_origin exempts (surfaced upstream), ship=local exempts
+    /// only the lane's own literal `rsi/*` prefix, solomon-recovered/* blocks in every mode,
+    /// ahead<=0 never blocks.
+    #[test]
+    fn stranded_blocks_fork_policy_vectors() {
+        // the daedulus shape: finished rsi/* commits, invisible upstream, shipping lane -> BLOCK
+        assert!(stranded_blocks_fork("rsi/iter-x", 14, false, "auto-merge"));
+        assert!(stranded_blocks_fork("rsi/iter-x", 1, false, "pr"));
+        assert!(stranded_blocks_fork("rsi/iter-x", 1, false, "push"));
+        // visible upstream (pushed / open PR) -> surfaced, not silent -> no block
+        assert!(!stranded_blocks_fork("rsi/iter-x", 14, true, "auto-merge"));
+        // ship=local keeps gate-green rsi/* branches by design -> no block
+        assert!(!stranded_blocks_fork("rsi/iter-x", 3, false, "local"));
+        // swept OPERATOR work blocks even on a local lane
+        assert!(stranded_blocks_fork("solomon-recovered/20260713-0", 1, false, "local"));
+        assert!(stranded_blocks_fork("solomon-recovered/20260713-0", 1, false, "auto-merge"));
+        // not ahead -> never stranded
+        assert!(!stranded_blocks_fork("rsi/iter-x", 0, false, "auto-merge"));
     }
 
     /// git-worktree-2/5 (conservative retention): a preflight stash carrying REAL tracked-only

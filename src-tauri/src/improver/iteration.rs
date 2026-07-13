@@ -387,6 +387,35 @@ push failed ({pu_err}). Reconcile with origin; managed repos change only via gat
             "branch hygiene: pruned {pruned} stale rsi/* branch(es) before this iteration"
         ));
     }
+
+    // STALE-FORK PREFLIGHT GUARD (audit finding #61 — the daedulus 14-commit loss): anything that
+    // SURVIVED the prune above with commits the fork base LACKS is finished work the `checkout -B`
+    // below would silently fork past — the exact topology that stranded the 14-commit Outis-2.0
+    // branch (every later iteration re-forked from a frozen ancestor until a cleanup deleted the
+    // unmerged branch). Refuse LOUDLY instead: self-stop with a named reason and hand the reconcile
+    // (merge/ship/push, or a deliberate delete) to the operator. Kept gate-green branches on a
+    // ship=local lane and work already visible on origin are exempt (surfaced, not silent — see
+    // gitops::stranded_blocks_fork). The ship mode is read CONFIG-LIVE (live_ship, argv fallback)
+    // so an auto_push flip applies to the guard on this very cycle. The prefixes are the string
+    // literals "rsi/" + "solomon-recovered/" (007 note: Ctx does not carry the configured
+    // branch_prefix; the loop and the stash sweep hardcode them when constructing branches).
+    let ship_live = ctx.live_ship().unwrap_or_else(|| ctx.ship.clone());
+    let stranded = gitops::preflight_stranded_guard(ctx, &ship_live);
+    if !stranded.is_empty() {
+        let desc = stranded
+            .iter()
+            .map(|s| format!("{} (+{} commit(s) not on {base_branch})", s.name, s.ahead))
+            .collect::<Vec<_>>()
+            .join(", ");
+        escalation::note_stranded_branch_stop(ctx, &desc);
+        ctx.log(&format!(
+            "SELF-STOP: stranded unmerged branch(es) whose tip is not an ancestor of \
+'{base_branch}': {desc} — refusing to fork a new iteration branch past finished work (writing \
+STOP + error heartbeat; reconcile the branch(es), then Start)"
+        ));
+        return;
+    }
+
     if ctx.git(&["checkout", "-B", &branch], 120).code != 0 {
         ctx.heartbeat(json!({
             "status": "error",

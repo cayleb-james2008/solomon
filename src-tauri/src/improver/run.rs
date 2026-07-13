@@ -526,6 +526,7 @@ set this repo's PR-target branch to a real branch in Config."
                     | "unpushed_base_persistent"
                     | "base_gate_red_persistent"
                     | "controller_off_base_persistent"
+                    | "stranded_unmerged_branch_persistent"
             )
         );
     // A mid-loop key_shape_mismatch halt (above) wrote status=error with a last_summary beginning

@@ -352,8 +352,13 @@ pub fn diagnosis_to_task_kind(diagnosis: &str) -> TaskKind {
         // an unobservable metric, GitHub not wired, or an unknown error) still maps to an EXECUTABLE
         // task: the deduped operator page. That is an ACTION (it notifies + records), never a silent
         // dead end — the failure-mode-#3 guarantee is "maps to an executable task", not "auto-heals".
+        // stranded_unmerged_branch (finding #61) belongs here too: the fix is a HUMAN reconcile of
+        // finished work — clear_escalation_and_retry would un-pin the STOP sentinel and thrash
+        // park→clear→re-park on a condition that re-trips deterministically every preflight.
         "no_key" | "key_shape_mismatch" | "gh_not_ready" | "metric_unobservable"
-        | "unknown_error" => TaskKind::Remediate("page_operator_deduped"),
+        | "stranded_unmerged_branch" | "unknown_error" => {
+            TaskKind::Remediate("page_operator_deduped")
+        }
 
         // Any category not enumerated above still gets an executable task (the deduped page) rather
         // than a panic or a dead end. The closure test guarantees every KNOWN diagnosis is mapped

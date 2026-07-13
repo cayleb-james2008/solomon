@@ -510,6 +510,35 @@ to the default branch and push (or revert), then Start to resume."
     }));
 }
 
+/// STALE-FORK preflight self-stop (audit finding #61 — the daedulus 14-commit loss): the lane found
+/// a stranded `rsi/*` / `solomon-recovered/*` branch whose tip is NOT an ancestor of the fork base
+/// and whose work is NOT visible upstream (see `gitops::preflight_stranded_guard`), and REFUSES to
+/// cut a new iteration branch that would silently fork past finished work. Like the D0 controller
+/// stop this fires IMMEDIATELY with NO tolerance window: the condition is deterministic (it would
+/// re-trip every cycle), and every silent cycle re-forks from the stale base — exactly how daedulus
+/// kept re-forking from a frozen ancestor for ~20 iterations while the finished 14-commit branch sat
+/// unmerged until a cleanup deleted it. `detail` names the stranded branch(es) + ahead counts.
+/// Writes STOP + an error heartbeat with reason `stranded_unmerged_branch_persistent`; the watchdog
+/// leaves an unknown-reason stop pinned (no auto-clear), so a human reconciles (merge/ship/push or
+/// deliberately delete the branch) and presses Start.
+pub fn note_stranded_branch_stop(ctx: &mut Ctx, detail: &str) {
+    let _ = std::fs::create_dir_all(&ctx.runtime);
+    let _ = std::fs::write(&ctx.stop_path, "stranded_unmerged_branch_persistent\n");
+    let detail_trunc: String = detail.chars().take(300).collect();
+    let last_summary = format!(
+        "Stranded finished work: {detail_trunc} — not an ancestor of the fork base and not visible \
+on origin, so cutting a new rsi/* branch would silently fork past it. The loop self-stops rather \
+than strand it further. Reconcile: merge/ship the branch (or push it, or delete it if truly \
+obsolete), then Start to resume."
+    );
+    ctx.heartbeat(json!({
+        "status": "error",
+        "phase": "preflight",
+        "reason": "stranded_unmerged_branch_persistent",
+        "last_summary": last_summary,
+    }));
+}
+
 // --------------------------------------------------------------------------- #
 // the escalation ladder proper (run_improver ~1749-1878)
 // --------------------------------------------------------------------------- #
@@ -1419,6 +1448,31 @@ largest coherent slice that can be edited, tested, and shipped in one cycle"
         assert_eq!(hb["reason"], "controller_off_base_persistent");
         // the failure detail is surfaced verbatim (truncated) so the operator sees the real cause
         assert!(hb["last_summary"].as_str().unwrap().contains("rsi/x"));
+        assert!(hb["last_summary"].as_str().unwrap().contains("self-stops"));
+        let _ = std::fs::remove_dir_all(&c.runtime);
+    }
+
+    #[test]
+    fn note_stranded_branch_stop_writes_named_stop_immediately() {
+        // finding #61 stale-fork guard: like the D0 controller stop, fires on the FIRST observation
+        // (deterministic condition — it would re-trip every cycle while the stranded branch exists)
+        // with the exact reason marker run.rs's finally and the supervisor's persistent_self_stop
+        // diagnose key off.
+        let mut c = ctx_with_runtime("stranded");
+        assert!(!c.stop_path.exists());
+        note_stranded_branch_stop(&mut c, "rsi/iter-20260711T003141Z (+14 commit(s) not on master)");
+        assert!(c.stop_path.exists(), "a stranded branch must self-stop on the first observation");
+        assert_eq!(
+            std::fs::read_to_string(&c.stop_path).unwrap(),
+            "stranded_unmerged_branch_persistent\n"
+        );
+        let hb: Value =
+            serde_json::from_str(&std::fs::read_to_string(&c.heartbeat_path).unwrap()).unwrap();
+        assert_eq!(hb["status"], "error");
+        assert_eq!(hb["phase"], "preflight");
+        assert_eq!(hb["reason"], "stranded_unmerged_branch_persistent");
+        // the stranded branch is named verbatim so the operator knows exactly what to reconcile
+        assert!(hb["last_summary"].as_str().unwrap().contains("rsi/iter-20260711T003141Z"));
         assert!(hb["last_summary"].as_str().unwrap().contains("self-stops"));
         let _ = std::fs::remove_dir_all(&c.runtime);
     }
