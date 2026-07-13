@@ -428,6 +428,7 @@ pub fn diagnose(repo: &Value) -> Value {
                     | "unpushed_base_persistent"
                     | "base_gate_red_persistent"
                     | "controller_off_base_persistent"
+                    | "stranded_unmerged_branch_persistent"
             )
         )
     {
@@ -694,6 +695,7 @@ fn suggested_steps(repo: &Value, cat: &str) -> Vec<String> {
             "  • unpushed_base_persistent       — push or reset the base to origin".into(),
             "  • base_gate_red_persistent       — fix the gate command or the failing base tests".into(),
             "  • controller_off_base_persistent — merge the controller's off-base work to the default branch and push (or revert)".into(),
+            "  • stranded_unmerged_branch_persistent — a finished rsi/* or solomon-recovered/* branch is not an ancestor of the fork base; merge/ship/push it (or delete it if truly obsolete)".into(),
             "Once the cause is fixed, press Start to resume (the watchdog auto-clears the git-state".into(),
             "reasons — dirty/unpushed/controller-off-base — once the tree heals)".into(),
         ],
