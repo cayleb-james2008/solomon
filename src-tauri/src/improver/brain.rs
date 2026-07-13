@@ -187,7 +187,9 @@ pub fn spawn_worker(
 
 /// Load a skill file from `improver/<repo>/skills/<role>.md`. Missing file -> empty string (graceful,
 /// byte-identical to "no skill injected"). Operator-editable without recompile (research §3.4 note 5).
-fn load_skill(repo: &str, role: &str) -> String {
+/// pub(crate): the CEO growth composer (`ceo::growth`) loads a per-lane `growth.md` through the same
+/// seam so the skill path can never drift between the improver and CEO planes.
+pub(crate) fn load_skill(repo: &str, role: &str) -> String {
     let p = crate::control::paths::here()
         .join("improver")
         .join(repo)

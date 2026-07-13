@@ -340,8 +340,9 @@ fn ceo_slow_tail(snapshot: Value, status: Value) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         sover_boost::maybe_boost(&snapshot, &status)
     }));
-    // GROWTH SEAM (D12 / Phase B): the every-sweep hook the growth-content composer fills — today a
-    // no-op; the GrowthSpecialist dispatch plumbing behind it is already gated + tested.
+    // GROWTH SEAM (D12 / Phase B): the every-sweep growth-content COMPOSER — at most ONE gated,
+    // unpublished, persona-safe draft per public lane per day (honest planner-directive trigger,
+    // stamp-first day gate, draft-only; the publish ladder is never invoked from here).
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::ceo::growth::maybe_draft_growth_content(&snapshot, &status)
     }));
