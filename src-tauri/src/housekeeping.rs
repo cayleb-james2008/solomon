@@ -549,6 +549,7 @@ pub fn delete_merged_branches(path: &str, base: &str, prefix: &str) -> usize {
 ///   * it is MERGED into the base (the work landed — always safe), OR
 ///   * PR state is KNOWN (`pr_ok`), it has NO open PR, AND its tip is at least `min_age_secs` old
 ///     (an orphaned/abandoned iteration branch; the age floor avoids racing a just-pushed branch).
+///
 /// A live open PR, or an unknown PR state (gh unreachable) on an unmerged branch, always KEEPS it.
 fn remote_branch_should_delete(
     is_merged: bool,
