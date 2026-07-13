@@ -11,6 +11,7 @@
 //!   * `pecrt.py`'s self-check asserts the SAME equality on the Python side (runs whenever the
 //!     mirror runs; the test below also invokes it via `python`/`py` when a launcher exists, so a
 //!     machine with Python gets the full cross-impl check inside `cargo test`).
+//!
 //! A change to either side without updating the golden (and therefore the other side) breaks a gate.
 
 #[cfg(test)]
