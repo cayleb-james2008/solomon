@@ -22,10 +22,11 @@ use std::os::windows::process::CommandExt;
 const STATE_FILE: &str = "autopilot_state.json";
 const EVENTS_FILE: &str = "autopilot_events.jsonl";
 const LOCK_FILE: &str = "autopilot.lock";
+const LOCK_FILE_1: &str = "autopilot.lock.1";
 const PROOF_FILE: &str = "autopilot_proof.json";
 const LEGACY_STATE_FILE: &str = "fleet_state.json";
 const LEGACY_PROOF_FILE: &str = "fleet_proof.json";
-const DEFAULT_RUN_TIMEOUT_S: u64 = 14_400;
+const DEFAULT_RUN_TIMEOUT_S: u64 = 3_600;
 
 /// Consecutive autopilot sweeps a lane must be `proof_required` before the watchdog's
 /// autopilot recover pass is allowed to force a stop→ideate→restart heal on it. This is the
@@ -36,7 +37,7 @@ const DEFAULT_RUN_TIMEOUT_S: u64 = 14_400;
 /// exponential backoff caps the force-cycle. 3 sweeps ≈ 15 min at the 5-min sentinel cadence.
 pub const STUCK_SWEEP_THRESHOLD: u64 = 3;
 
-/// Consecutive `proof_required` outcomes after which a lane is parked in a 24h cooldown and a
+/// Consecutive `proof_required` outcomes after which a lane is parked in a 4h cooldown and a
 /// `needs_human_spec` need is filed instead of dispatching another inert proof_required job. This
 /// kills retry theater: a lane diagnosed unhealthy with `auto_safe != true` re-fires the same
 /// non-mutating `proof_required` job every ~5-min sweep forever (the dotz 53:1 proof_required:implement
@@ -45,10 +46,11 @@ pub const STUCK_SWEEP_THRESHOLD: u64 = 3;
 /// real fix instead of the loop spinning on a corpse. The cooldown clears the moment the lane
 /// produces a non-proof_required outcome (it moved), same as `bump_stuck_counter` clears `stuck`.
 pub const PROOF_COOLDOWN_THRESHOLD: u64 = 3;
-/// The proof_required cooldown window: 24h. Long enough to break the retry loop and force a human
-/// spec; short enough that a genuinely-stuck lane re-surfaces (rather than being silently parked
-/// forever). Matched to the operator's "open Solomon, review the need, spec a fix" cadence.
-pub const PROOF_COOLDOWN_S: i64 = 86_400;
+/// The proof_required cooldown window: 4h (lowered from 24h — a wedged lane should re-surface
+/// the same day, not vanish for a day). Long enough to break the retry loop and force a human
+/// spec; short enough that a genuinely-stuck lane re-surfaces rather than being silently parked
+/// forever. Matched to the operator's "open Solomon, review the need, spec a fix" cadence.
+pub const PROOF_COOLDOWN_S: i64 = 14_400;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Job {
@@ -81,7 +83,7 @@ pub fn state() -> Value {
     }
     let repos = registry::load_repos();
     let ops_payload = read_ops_payload();
-    let jobs = plan_jobs(&repos, &cfg, &ops_payload, &st, None);
+    let jobs = plan_jobs(&repos, &cfg, &ops_payload, &mut st, None, false);
     st["ok"] = Value::Bool(true);
     st["queue"] = Value::Array(jobs.iter().map(job_value).collect());
     st["proofs"] = proof_records();
@@ -129,8 +131,8 @@ pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
     if cfg.get("mode").and_then(Value::as_str) != Some("single_agent") {
         return json!({"ok": false, "error": "autopilot mode is not single_agent"});
     }
-    if max_concurrent(&cfg) != 1 {
-        return json!({"ok": false, "error": "single_agent requires max_concurrent_agent_calls=1"});
+    if max_concurrent(&cfg) > 2 {
+        return json!({"ok": false, "error": "single_agent requires max_concurrent_agent_calls <= 2"});
     }
     let _lease = match acquire_lock() {
         Ok(Some(l)) => l,
@@ -147,7 +149,7 @@ pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
         st["active"] = Value::Null;
         st["ts"] = json!(now());
         st["config"] = public_config(&cfg);
-        let jobs = plan_jobs(&repos, &cfg, &ops_payload, &st, only_name);
+        let jobs = plan_jobs(&repos, &cfg, &ops_payload, &mut st, only_name, false);
         st["queue"] = Value::Array(jobs.iter().map(job_value).collect());
         let _ = write_state(&st);
         append_event(&json!({"event": "autopilot_paused"}));
@@ -158,7 +160,7 @@ pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
             "state": st,
         });
     }
-    let jobs = plan_jobs(&repos, &cfg, &ops_payload, &st, only_name);
+    let jobs = plan_jobs(&repos, &cfg, &ops_payload, &mut st, only_name, true);
     let mut actions = Vec::<String>::new();
     st["ts"] = json!(now());
     st["queue"] = Value::Array(jobs.iter().map(job_value).collect());
@@ -202,6 +204,13 @@ pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
     // Round-robin dispatch (2026-07-11): pick the FIRST AI job that is NOT the last-dispatched lane,
     // so a single high-priority lane doesn't hog the dispatch slot every sweep. Falls back to
     // jobs.first() when there's only one AI job or the rotation wraps around.
+    if jobs.is_empty() {
+        st["active"] = Value::Null;
+        st["last_result"] =
+            json!({"ts": now(), "outcome": "complete", "summary": "no queued autopilot work"});
+        let _ = write_state(&st);
+        return json!({"ok": true, "actions": [], "queue": []});
+    }
     let last_dispatched = st
         .get("last_dispatched")
         .and_then(Value::as_str)
@@ -215,16 +224,9 @@ pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
             .copied()
             .unwrap_or(ai_jobs[0])
     } else {
-        jobs.first().unwrap_or(&jobs[0])
+        jobs.first().expect("jobs is non-empty (checked above)")
     };
     let job = pick.clone();
-    if jobs.is_empty() {
-        st["active"] = Value::Null;
-        st["last_result"] =
-            json!({"ts": now(), "outcome": "complete", "summary": "no queued autopilot work"});
-        let _ = write_state(&st);
-        return json!({"ok": true, "actions": [], "queue": []});
-    }
 
     st["active"] = job_value(&job);
     st["last_dispatched"] = json!(job.name.clone());
@@ -272,8 +274,9 @@ pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
         &job.name,
         outcome_str == "proof_required" || outcome_str == "needs_human_spec",
     );
+    let ops_payload2 = read_ops_payload();
     st["queue"] = Value::Array(
-        plan_jobs(&repos, &cfg, &read_ops_payload(), &st, only_name)
+        plan_jobs(&repos, &cfg, &ops_payload2, &mut st, only_name, false)
             .iter()
             .map(job_value)
             .collect(),
@@ -527,8 +530,9 @@ fn plan_jobs(
     repos: &[Value],
     cfg: &Value,
     ops_payload: &Value,
-    st: &Value,
+    st: &mut Value,
     only_name: Option<&str>,
+    emit_proofs: bool,
 ) -> Vec<Job> {
     let targets: Vec<String> = only_name
         .map(|n| vec![n.to_string()])
@@ -672,6 +676,39 @@ fn plan_jobs(
             let _ = cd; // (the verdict's extra carries the diagnosis; the cooldown is in state)
         }
         if kind == "complete" {
+            continue;
+        }
+        // DISPATCH-BYPASS for inert proof_required (Fix 4): a proof_required job does NO mutation
+        // — it only surfaces a blocker. On the `once()` dispatch path (emit_proofs=true), emit its
+        // proof record as a side effect here and `continue` so the dispatch slot is freed for an
+        // actual implement/AI job behind it. The `needs_human_spec` escalation still queues (it
+        // carries the operator-facing need). The `state()` display path (emit_proofs=false) still
+        // queues proof_required so the dashboard shows the blocker.
+        if kind == "proof_required" && emit_proofs {
+            let ops_project = ops_payload
+                .get("projects")
+                .and_then(|p| p.get(&name))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let job = Job {
+                name: name.clone(),
+                kind: "proof_required".into(),
+                state: "proof_required".into(),
+                priority,
+                requires_ai: false,
+                reason: reason.to_string(),
+                next_action: next_action.to_string(),
+            };
+            let _ = proof(
+                &job,
+                "proof_required",
+                &reason,
+                Some(json!({"ops": ops_project})),
+                Some(repo),
+            );
+            // Bump the stuck counter inline so the proof cooldown + watchdog force-heal still arm
+            // even though the job was never dispatched to finish_non_ai_job.
+            bump_stuck_counter(st, &name, true);
             continue;
         }
         if kind == "cooldown" {
@@ -938,11 +975,27 @@ fn proof_records() -> Value {
 fn acquire_lock() -> Result<Option<AutopilotLease>, String> {
     let dir = paths::here().join("runtime");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    acquire_lock_at(dir.join(LOCK_FILE))
+    // Multi-slot single-flight (max_concurrent_agent_calls=2): try the primary slot first, then
+    // the secondary. Up to 2 concurrent `once()` calls may run; a 3rd is a single-flight no-op.
+    let primary = dir.join(LOCK_FILE);
+    let secondary = dir.join(LOCK_FILE_1);
+    let max = max_concurrent(&registry::autopilot_config()).max(1) as usize;
+    if max >= 2 {
+        if let Some(l) = acquire_lock_at(primary.clone())? {
+            return Ok(Some(l));
+        }
+        if let Some(l) = acquire_lock_at(secondary)? {
+            return Ok(Some(l));
+        }
+        Ok(None)
+    } else {
+        acquire_lock_at(primary)
+    }
 }
 
 fn autopilot_lock_live() -> bool {
-    autopilot_lock_live_at(&paths::here().join("runtime").join(LOCK_FILE))
+    let dir = paths::here().join("runtime");
+    autopilot_lock_live_at(&dir.join(LOCK_FILE)) || autopilot_lock_live_at(&dir.join(LOCK_FILE_1))
 }
 
 fn autopilot_lock_live_at(path: &Path) -> bool {
@@ -1349,6 +1402,8 @@ fn max_concurrent(cfg: &Value) -> i64 {
     cfg.get("max_concurrent_agent_calls")
         .and_then(Value::as_i64)
         .unwrap_or(1)
+        .max(1)
+        .min(2)
 }
 
 fn cfg_targets(cfg: &Value) -> Vec<String> {
@@ -1510,8 +1565,8 @@ mod tests {
             json!({"status": "red", "reasons": ["publish_recency=red"]}),
         );
         let ops = json!({"projects": Value::Object(projects)});
-        let st = json!({"manual_queue": []});
-        let jobs = plan_jobs(&repos, &cfg, &ops, &st, None);
+        let mut st = json!({"manual_queue": []});
+        let jobs = plan_jobs(&repos, &cfg, &ops, &mut st, None, false);
         assert_eq!(jobs[0].name, a);
         assert_eq!(jobs[0].kind, "implement");
         assert!(jobs[0].requires_ai);
@@ -1542,8 +1597,9 @@ mod tests {
             std::slice::from_ref(&repo),
             &cfg,
             &json!({"projects": {}}),
-            &json!({}),
+            &mut json!({}),
             None,
+            false,
         );
         assert_eq!(jobs[0].kind, "cooldown");
         assert!(!jobs[0].requires_ai);
@@ -1576,8 +1632,9 @@ mod tests {
             std::slice::from_ref(&repo),
             &cfg,
             &json!({"projects": {"autopilot_stale": {"status": "green"}}}),
-            &json!({}),
+            &mut json!({}),
             None,
+            false,
         );
         assert_eq!(jobs[0].kind, "implement");
         assert!(jobs[0].requires_ai);
@@ -1640,9 +1697,9 @@ mod tests {
         projects.insert(noop.clone(), json!({"status": "red", "reasons": ["noop_streak=red"]}));
         projects.insert(ai.clone(), json!({"status": "red", "reasons": ["publish_recency=red"]}));
         let ops = json!({"projects": Value::Object(projects)});
-        let st = json!({"manual_queue": []});
+        let mut st = json!({"manual_queue": []});
 
-        let jobs = plan_jobs(&[noop_repo, ai_repo], &cfg, &ops, &st, None);
+        let jobs = plan_jobs(&[noop_repo, ai_repo], &cfg, &ops, &mut st, None, false);
 
         // Precondition sanity: both jobs planned, both at priority 10, and the no-op really is
         // a non-AI proof_required job (the absorbing head the deadlock spun on).
@@ -1863,7 +1920,7 @@ mod tests {
     // ===================================================================== #
     //
     // After PROOF_COOLDOWN_THRESHOLD (3) consecutive inert proof_required sweeps, a lane is parked
-    // for PROOF_COOLDOWN_S (24h) and a `needs_human_spec` need is filed instead of dispatching
+    // for PROOF_COOLDOWN_S (4h) and a `needs_human_spec` need is filed instead of dispatching
     // another inert proof_required job. The cooldown clears when the lane produces a real (non
     // proof_required / non needs_human_spec) outcome.
 
@@ -1987,7 +2044,7 @@ mod tests {
 
         // ACTIVE cooldown: until in the future.
         let future = Utc::now() + ChronoDuration::seconds(3600);
-        let st = json!({
+        let mut st = json!({
             "manual_queue": [],
             "proof_cooldowns": {
                 name.clone(): {
@@ -2001,8 +2058,9 @@ mod tests {
             std::slice::from_ref(&repo),
             &cfg,
             &json!({"projects": {}}),
-            &st,
+            &mut st,
             None,
+            false,
         );
         let job = jobs.iter().find(|j| j.name == name).expect("job planned");
         assert_eq!(
@@ -2023,7 +2081,7 @@ mod tests {
 
         // EXPIRED cooldown (until in the past): proof_required re-fires (the lane is no longer parked).
         let past = Utc::now() - ChronoDuration::seconds(3600);
-        let st_expired = json!({
+        let mut st_expired = json!({
             "manual_queue": [],
             "proof_cooldowns": {name.clone(): {"until": past.format("%Y-%m-%dT%H:%M:%SZ").to_string()}}
         });
@@ -2031,8 +2089,9 @@ mod tests {
             std::slice::from_ref(&repo),
             &cfg,
             &json!({"projects": {}}),
-            &st_expired,
+            &mut st_expired,
             None,
+            false,
         );
         let job = jobs.iter().find(|j| j.name == name).expect("job planned");
         assert_eq!(

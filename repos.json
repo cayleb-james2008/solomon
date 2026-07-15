@@ -6,7 +6,7 @@
             "provider": "ollama-cloud",
             "api_key": "OLLAMA_API_KEY",
             "model": "glm-5.2",
-            "max_concurrent_agent_calls": 1,
+            "max_concurrent_agent_calls": 2,
             "cooldown_s": 86400,
             "daily_call_budget": 500,
             "adaptive_phase_policy": "cheap_by_default_deep_on_red_noop_critical_or_campaign",
