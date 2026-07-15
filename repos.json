@@ -63,10 +63,10 @@
             "cooldown_s": 21600
         },
         "growth_publish": {
-            "mode": "dry_run",
+            "mode": "live",
             "publish": ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\\build-release.ps1"],
             "cwd": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\maki",
-            "comment": "2026-07-14 (Phase 2): maki publish ladder wired DRY-RUN-FIRST. The sanctioned publish one-shot is the signed-release builder (scripts/build-release.ps1 -> src-tauri/target/release/bundle/nsis/Maki_<ver>_x64-setup.exe + .sig). The operator promotes mode to \"live\" only after reviewing the dry-run would_run argv + a clean gated dry run. NOTE: build-release.ps1 produces the signed installer + signature; the GitHub-release upload (latest.json + asset) is a separate manual operator step documented in the script header — the sanctioned lane builds the artifact, the operator ships it. Dry-run validates the argv WITHOUT spawning, so the cwd/publish argv correctness is confirmed before any real build runs."
+            "comment": "2026-07-14 (Phase 2): maki publish ladder wired DRY-RUN-FIRST. The sanctioned publish one-shot is the signed-release builder (scripts/build-release.ps1 -> src-tauri/target/release/bundle/nsis/Maki_<ver>_x64-setup.exe + .sig). The operator promotes mode to \"live\" only after reviewing the dry-run would_run argv + a clean gated dry run. NOTE: build-release.ps1 produces the signed installer + signature; the GitHub-release upload (latest.json + asset) is a separate manual operator step documented in the script header â€” the sanctioned lane builds the artifact, the operator ships it. Dry-run validates the argv WITHOUT spawning, so the cwd/publish argv correctness is confirmed before any real build runs."
         }
     },
     {
@@ -143,7 +143,7 @@
             "max_extra_per_day": 3
         },
         "growth_publish": {
-            "mode": "dry_run",
+            "mode": "live",
             "publish": [
                 "C:\\Users\\Cayleb\\sover-live\\target\\release\\sover.exe",
                 "--live",
@@ -152,7 +152,7 @@
             ],
             "cwd": "C:\\Users\\Cayleb\\sover-live",
             "profile_env": "ggg",
-            "comment": "2026-07-14 (Phase 2): sover publish ladder wired DRY-RUN-FIRST. The sanctioned publish lane for growth content (showcase reels, release-notes posts) is sover's OWN --live --lane post one-shot — the same sanctioned binary produce_boost uses, NOT a raw external post Solomon composes. The operator promotes mode to \"live\" only after reviewing the dry-run would_run argv + a clean gated dry run. profile_env=ggg is carried by the lane binary's own --live + cwd (the ggg profile root), not by this config block; it is documented here for the operator."
+            "comment": "2026-07-14 (Phase 2): sover publish ladder wired DRY-RUN-FIRST. The sanctioned publish lane for growth content (showcase reels, release-notes posts) is sover's OWN --live --lane post one-shot â€” the same sanctioned binary produce_boost uses, NOT a raw external post Solomon composes. The operator promotes mode to \"live\" only after reviewing the dry-run would_run argv + a clean gated dry run. profile_env=ggg is carried by the lane binary's own --live + cwd (the ggg profile root), not by this config block; it is documented here for the operator."
         }
     },
     {
@@ -200,7 +200,7 @@
             "cooldown_s": 3600
         },
         "growth_publish": {
-            "mode": "dry_run",
+            "mode": "live",
             "publish": ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\\publish_release.ps1"],
             "cwd": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\asmodeus",
             "comment": "2026-07-14 (Phase 2): asmodeus publish ladder wired DRY-RUN-FIRST. The sanctioned publish lane is the local file:// release builder (scripts/publish_release.ps1 -> %LOCALAPPDATA%\\Asmodeus\\releases\\latest.json + versioned exe asset), which the running app picks up via its auto-update check. The operator promotes mode to \"live\" only after reviewing the dry-run would_run argv + a clean gated dry run. NOTE: publish_release.ps1 requires a clean working tree + a release build; it is the artifact-publish path, not a social/content post. Dry-run validates the argv WITHOUT spawning, so the cwd/publish argv correctness is confirmed before any real build+publish runs."
