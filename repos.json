@@ -27,7 +27,6 @@
                 "sover",
                 "asmodeus",
                 "dotz",
-                "daedulus",
                 "solomon",
                 "maki"
             ]
@@ -62,6 +61,12 @@
             "min_interval_s": 90,
             "step_s": 15,
             "cooldown_s": 21600
+        },
+        "growth_publish": {
+            "mode": "dry_run",
+            "publish": ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\\build-release.ps1"],
+            "cwd": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\maki",
+            "comment": "2026-07-14 (Phase 2): maki publish ladder wired DRY-RUN-FIRST. The sanctioned publish one-shot is the signed-release builder (scripts/build-release.ps1 -> src-tauri/target/release/bundle/nsis/Maki_<ver>_x64-setup.exe + .sig). The operator promotes mode to \"live\" only after reviewing the dry-run would_run argv + a clean gated dry run. NOTE: build-release.ps1 produces the signed installer + signature; the GitHub-release upload (latest.json + asset) is a separate manual operator step documented in the script header — the sanctioned lane builds the artifact, the operator ships it. Dry-run validates the argv WITHOUT spawning, so the cwd/publish argv correctness is confirmed before any real build runs."
         }
     },
     {
@@ -136,6 +141,18 @@
             "profile_env": "ggg",
             "cooldown_s": 3600,
             "max_extra_per_day": 3
+        },
+        "growth_publish": {
+            "mode": "dry_run",
+            "publish": [
+                "C:\\Users\\Cayleb\\sover-live\\target\\release\\sover.exe",
+                "--live",
+                "--lane",
+                "post"
+            ],
+            "cwd": "C:\\Users\\Cayleb\\sover-live",
+            "profile_env": "ggg",
+            "comment": "2026-07-14 (Phase 2): sover publish ladder wired DRY-RUN-FIRST. The sanctioned publish lane for growth content (showcase reels, release-notes posts) is sover's OWN --live --lane post one-shot — the same sanctioned binary produce_boost uses, NOT a raw external post Solomon composes. The operator promotes mode to \"live\" only after reviewing the dry-run would_run argv + a clean gated dry run. profile_env=ggg is carried by the lane binary's own --live + cwd (the ggg profile root), not by this config block; it is documented here for the operator."
         }
     },
     {
@@ -181,27 +198,13 @@
                 "C:/Users/Cayleb/Desktop/workspace/solomon/tools/asmodeus_keepalive.ps1"
             ],
             "cooldown_s": 3600
-        }
-    },
-    {
-        "name": "daedulus",
-        "branch_prefix": "rsi/",
-        "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\daedulus",
-        "provider": "ollama-cloud",
-        "model": "glm-5.2",
-        "api_key": "OLLAMA_API_KEY",
-        "ship": "auto-merge",
-        "pr_target_branch": "master",
-        "gate": "cargo test",
-        "interval": 600,
-        "max_iterations": 0,
-        "reasoning": "xhigh",
-        "freshness": {
-            "no_objective": true,
-            "comment": "2026-07-07 (Phase A.2): daedulus (the Outis model-training control plane) is a CODE-QUALITY + PACED-TRAINING lane -- its objective today is reliability/upkeep plus a strictly-paced retrain decision ('no retrain warranted' is an explicit success), NOT a settled outcome that accumulates fresh samples every cycle. Its catalog/runs/eval artifacts exist, but a real freshness emitter (e.g. 'new champion promotion' or 'new benchmark row') does not exist on disk, and daedulus has NO repo .venv to run a Python probe. Marking this lane explicitly no_objective is the HONEST state -- pointing freshness.cmd at a nonexistent emitter would make a healthy lane read UNOBSERVABLE and halt forever (the documented sover/asmodeus trap), and fabricating a green would be the fake-green failure the gate exists to kill. no_objective + no cmd => freshness_cfg() returns None => byte-identical legacy behavior. Reorient to a real training-outcome emitter under AI-CEO roadmap Phase C (grade against the outis-core score, not green tests)."
         },
-        "goal": "DAEDALUS NORTH STAR: autonomously and HONESTLY drive the Outis model-training control plane (this lane replaces the retired daedalus-outis-trainer routine, which the operator disabled 2026-07-01). Each iteration: read catalog/training_catalog.json, runs/, and the latest run/benchmark JSONs, then decide whether a training run is genuinely warranted -- data meaningfully broader/cleaner than the reigning baseline AND hardware actually free (RAM headroom, see below). PACING RULE (hard): never trigger training more than once per several hours and never on unchanged data (v16/v17 regressed from rapid retraining at the same small budget); an explicit 'no retrain warranted: <reason>' in the iteration summary is a SUCCESS, not a cop-out noop. When a retrain IS warranted, drive it through the repo's own CLI (prepare / plan / train / eval / overnight) and gate promotion on the strict outis-core grader: promote only if the score beats the reigning champion AND there is no safety regression. On non-training iterations, make ONE real reliability/codebase improvement -- the standing top blocker is RAM starvation killing runs (0xC0000005 crashes at ~1GB free; window-min preflight gates landed 2026-07-01 -- extend them): memory management, preflight windows, crash forensics, run resumability. 0 paid services; training stays local-only. PONYTAIL STYLE: the laziest solution that fully works; delete over add. A truthful null beats a fabricated improvement.",
-        "public": false
+        "growth_publish": {
+            "mode": "dry_run",
+            "publish": ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\\publish_release.ps1"],
+            "cwd": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\asmodeus",
+            "comment": "2026-07-14 (Phase 2): asmodeus publish ladder wired DRY-RUN-FIRST. The sanctioned publish lane is the local file:// release builder (scripts/publish_release.ps1 -> %LOCALAPPDATA%\\Asmodeus\\releases\\latest.json + versioned exe asset), which the running app picks up via its auto-update check. The operator promotes mode to \"live\" only after reviewing the dry-run would_run argv + a clean gated dry run. NOTE: publish_release.ps1 requires a clean working tree + a release build; it is the artifact-publish path, not a social/content post. Dry-run validates the argv WITHOUT spawning, so the cwd/publish argv correctness is confirmed before any real build+publish runs."
+        }
     },
     {
         "name": "dotz",

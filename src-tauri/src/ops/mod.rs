@@ -20,6 +20,7 @@
 //! blind window since the previous ops_status.json.
 #![allow(dead_code)]
 
+pub mod fleet_ledger;
 pub mod ledger;
 pub mod outcomes;
 pub mod probe;

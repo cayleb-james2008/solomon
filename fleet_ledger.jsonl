@@ -1,0 +1,7 @@
+{"project":"_schema","ts":"2026-07-15T00:00:00Z","revenue_usd":0.0,"cost_usd":0.0,"source":"_schema","note":"fleet revenue ledger — schema: {project, ts, revenue_usd, cost_usd, source, note}. project=_schema rows are documentation, not data."}
+{"project":"sover","ts":"2026-07-15T00:00:00Z","revenue_usd":0.0,"cost_usd":0.0,"source":"manual","note":"baseline — $0"}
+{"project":"solomon","ts":"2026-07-15T00:00:00Z","revenue_usd":0.0,"cost_usd":0.0,"source":"manual","note":"baseline — $0"}
+{"project":"asmodeus","ts":"2026-07-15T00:00:00Z","revenue_usd":0.0,"cost_usd":0.0,"source":"manual","note":"baseline — $0"}
+{"project":"dotz","ts":"2026-07-15T00:00:00Z","revenue_usd":0.0,"cost_usd":0.0,"source":"manual","note":"baseline — $0"}
+{"project":"maki","ts":"2026-07-15T00:00:00Z","revenue_usd":0.0,"cost_usd":0.0,"source":"manual","note":"baseline — $0"}
+{"project":"pantheon","ts":"2026-07-15T00:00:00Z","revenue_usd":0.0,"cost_usd":0.0,"source":"manual","note":"baseline — $0"}

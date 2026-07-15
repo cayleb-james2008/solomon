@@ -36,6 +36,20 @@ const DEFAULT_RUN_TIMEOUT_S: u64 = 14_400;
 /// exponential backoff caps the force-cycle. 3 sweeps ≈ 15 min at the 5-min sentinel cadence.
 pub const STUCK_SWEEP_THRESHOLD: u64 = 3;
 
+/// Consecutive `proof_required` outcomes after which a lane is parked in a 24h cooldown and a
+/// `needs_human_spec` need is filed instead of dispatching another inert proof_required job. This
+/// kills retry theater: a lane diagnosed unhealthy with `auto_safe != true` re-fires the same
+/// non-mutating `proof_required` job every ~5-min sweep forever (the dotz 53:1 proof_required:implement
+/// ratio was this). After PROOF_COOLDOWN_THRESHOLD consecutive no-ops, the lane is parked for
+/// PROOF_COOLDOWN_S and surfaced as a `needs_human_spec` need (kind "decision") — the operator specs a
+/// real fix instead of the loop spinning on a corpse. The cooldown clears the moment the lane
+/// produces a non-proof_required outcome (it moved), same as `bump_stuck_counter` clears `stuck`.
+pub const PROOF_COOLDOWN_THRESHOLD: u64 = 3;
+/// The proof_required cooldown window: 24h. Long enough to break the retry loop and force a human
+/// spec; short enough that a genuinely-stuck lane re-surfaces (rather than being silently parked
+/// forever). Matched to the operator's "open Solomon, review the need, spec a fix" cadence.
+pub const PROOF_COOLDOWN_S: i64 = 86_400;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Job {
     name: String,
@@ -244,15 +258,19 @@ pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
     st["active"] = Value::Null;
     st["last_result"] = result.clone();
     // Per-lane stuck counter (time-decay for the watchdog's autopilot recover pass). A lane whose
-    // fleet outcome is `proof_required` produced NO mutation this sweep (finish_non_ai_job's
-    // proof_required arm is inert) — increment. Any other outcome (shipped/blocked/complete/
-    // cooldown/etc.) means the lane moved, so clear the entry. The watchdog reads this via
-    // `stuck_sweeps` and only force-heals a lane stuck >= STUCK_SWEEP_THRESHOLD sweeps. Purely
-    // additive state key; read_state/write_state round-trip arbitrary JSON.
+    // fleet outcome is `proof_required` OR `needs_human_spec` produced NO mutation this sweep (both
+    // are inert non-AI arms — `proof_required` surfaces a blocker; `needs_human_spec` is the parked
+    // cooldown state) — increment. Any other outcome (shipped/blocked/complete/cooldown/etc.) means
+    // the lane moved, so clear the entry (and the proof_required cooldown via bump_stuck_counter).
+    // The watchdog reads `stuck_sweeps` and only force-heals a lane stuck >= STUCK_SWEEP_THRESHOLD
+    // sweeps. While a lane is parked in the proof_required cooldown, its stuck streak PERSISTS so
+    // the watchdog's force-heal ladder still sees the full window. Purely additive state key;
+    // read_state/write_state round-trip arbitrary JSON.
+    let outcome_str = result.get("outcome").and_then(Value::as_str).unwrap_or("");
     bump_stuck_counter(
         &mut st,
         &job.name,
-        result.get("outcome").and_then(Value::as_str) == Some("proof_required"),
+        outcome_str == "proof_required" || outcome_str == "needs_human_spec",
     );
     st["queue"] = Value::Array(
         plan_jobs(&repos, &cfg, &read_ops_payload(), &st, only_name)
@@ -477,6 +495,30 @@ fn finish_non_ai_job(job: &Job, repos: &[Value], ops_payload: &Value) -> Value {
             ),
             repo,
         ),
+        // needs_human_spec: a lane parked by the proof_required cooldown. Inert (like
+        // proof_required) — it surfaces the need to the dashboard/operator without mutating the
+        // repo. The outcome is "needs_human_spec" so `bump_stuck_counter` treats it as a
+        // non-proof_required outcome and CLEARS the stuck counter + cooldown only when the lane
+        // actually moves; while parked, the stuck counter keeps its streak (the watchdog's
+        // force-heal ladder still sees the full window). Filing the need here = reporting it; the
+        // operator specs the real fix and wakes the lane. The message uses the threshold constant
+        // (not a second read_state call) so finish_non_ai_job stays IO-free in this arm — the exact
+        // consecutive count is in the persisted autopilot_state.json the dashboard already reads.
+        "needs_human_spec" => proof(
+            job,
+            "needs_human_spec",
+            &job.reason,
+            Some(json!({
+                "ops": ops_payload.get("projects").and_then(|p| p.get(&job.name)).cloned().unwrap_or(Value::Null),
+                "need_kind": "decision",
+                "need": format!(
+                    "lane '{0}' parked: {1} consecutive proof_required sweeps without a mutation. \
+                     Review the blocker, spec a real fix, then wake the lane.",
+                    job.name, PROOF_COOLDOWN_THRESHOLD
+                ),
+            })),
+            repo,
+        ),
         _ => proof(job, "complete", &job.reason, None, repo),
     }
 }
@@ -547,7 +589,8 @@ fn plan_jobs(
         if manual_hit {
             priority = 1;
         }
-        let (kind, state, requires_ai, reason, next_action) = if diag_cat == "quota_error"
+        let (mut kind, mut state, mut requires_ai, mut reason, mut next_action) = if diag_cat
+            == "quota_error"
             && quota_heartbeat_matches_config(repo, cfg)
         {
             (
@@ -608,6 +651,26 @@ fn plan_jobs(
                 "hold",
             )
         };
+        // proof_required COOLDOWN (kill retry theater): a lane parked for PROOF_COOLDOWN_S after
+        // PROOF_COOLDOWN_THRESHOLD consecutive inert proof_required sweeps emits a
+        // `needs_human_spec` need (kind "decision") INSTEAD of another inert proof_required job.
+        // The operator reviews the need and specs a real fix; the loop stops spinning on a corpse.
+        // An EXPIRED cooldown (until <= now) lets the proof_required job re-fire (and re-arm on the
+        // next threshold crossing) — a genuinely-stuck lane re-surfaces rather than being parked
+        // forever. The `stuck` counter is NOT cleared here (it keeps counting so the watchdog's
+        // force-heal ladder still sees the full streak); only the job KIND changes.
+        if kind == "proof_required" && proof_cooldown_active_at(st, &name, Utc::now()) {
+            let cd = proof_cooldown_entry(st, &name).cloned().unwrap_or(Value::Null);
+            kind = "needs_human_spec".into();
+            state = "needs_human_spec".into();
+            requires_ai = false;
+            reason = "lane hit PROOF_COOLDOWN_THRESHOLD consecutive proof_required sweeps without a \
+                      mutation; parked for a human spec — retry theater killed"
+                .into();
+            next_action = "review the blocker, spec a real fix, then wake the lane".into();
+            // Surface the cooldown in the job reason so the dashboard shows WHY it is parked.
+            let _ = cd; // (the verdict's extra carries the diagnosis; the cooldown is in state)
+        }
         if kind == "complete" {
             continue;
         }
@@ -950,6 +1013,12 @@ fn write_state(st: &Value) -> std::io::Result<()> {
 /// the lane's sweep count (it took no mutating action this sweep); otherwise remove the entry (the
 /// lane moved, so it is no longer stuck). The schema is owned here so the state stays consistent;
 /// the watchdog reads it read-only via `stuck_sweeps`. Best-effort: never panics on a malformed map.
+///
+/// Also maintains the proof_required COOLDOWN: when a lane's consecutive count reaches
+/// PROOF_COOLDOWN_THRESHOLD, `arm_proof_cooldown` parks it for PROOF_COOLDOWN_S (kills retry
+/// theater — `plan_jobs` then emits a `needs_human_spec` need instead of another inert
+/// proof_required). On any non-proof_required outcome, both `stuck` and `proof_cooldowns` are
+/// cleared (the lane moved, so it is no longer stuck NOR parked).
 fn bump_stuck_counter(st: &mut Value, name: &str, is_proof_required: bool) {
     if !st.get("stuck").map(Value::is_object).unwrap_or(false) {
         st["stuck"] = json!({});
@@ -964,9 +1033,23 @@ fn bump_stuck_counter(st: &mut Value, name: &str, is_proof_required: bool) {
             .and_then(|e| e.get("sweeps"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        stuck.insert(name.to_string(), json!({"sweeps": prev + 1, "ts": now()}));
+        let next = prev + 1;
+        stuck.insert(name.to_string(), json!({"sweeps": next, "ts": now()}));
+        // Arm the proof_required cooldown at the threshold — one shot per threshold crossing. A
+        // lane already parked (until in the future) keeps its existing `until` (no double-arm);
+        // a lane whose cooldown EXPIRED re-arms here on the next threshold crossing.
+        if next >= PROOF_COOLDOWN_THRESHOLD {
+            let already_active = proof_cooldown_active_at(st, name, Utc::now());
+            if !already_active {
+                arm_proof_cooldown(st, name, next, Utc::now());
+            }
+        }
     } else {
         stuck.remove(name);
+        // The lane moved (shipped/blocked/complete/cooldown) — clear any proof_required park so
+        // it is not held past its recovery. `bump_stuck_counter` is called AFTER the job runs, so a
+        // lane that was parked and then produced a real outcome is un-parked immediately.
+        clear_proof_cooldown(st, name);
     }
 }
 
@@ -1002,6 +1085,85 @@ pub fn reset_stuck_sweeps(name: &str) -> std::io::Result<()> {
     }
     st["ts"] = json!(now());
     write_state(&st)
+}
+
+// --------------------------------------------------------------------------- //
+// proof_required COOLDOWN — kill retry theater
+// --------------------------------------------------------------------------- //
+//
+// A lane that fires `proof_required` (the inert non-AI arm) PROOF_COOLDOWN_THRESHOLD sweeps in a
+// row is parked for PROOF_COOLDOWN_S and surfaced as a `needs_human_spec` need. The state lives in
+// `autopilot_state.json` under `st["proof_cooldowns"][name] = {"until": <iso>, "armed_at": <iso>,
+// "consecutive": N}` so it round-trips with the existing read_state/write_state. The pure helpers
+// below are unit-tested; `plan_jobs` gates the proof_required branch on `proof_cooldown_active`.
+
+/// Read a lane's proof_required cooldown entry from autopilot state. None when the lane is not
+/// parked (entry absent) or the state is unreadable. Pure (no IO): the caller passes the state it
+/// already read. The persisted-state callers use `read_state`; tests pass a fixture.
+fn proof_cooldown_entry<'a>(st: &'a Value, name: &str) -> Option<&'a Value> {
+    st.get("proof_cooldowns")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get(name))
+}
+
+/// True iff the lane is within an ACTIVE proof_required cooldown (the `until` stamp is in the
+/// future). An expired cooldown (until <= now) returns false — the caller may re-arm it on the
+/// next threshold crossing. Pure: the caller passes `now_utc` so tests are deterministic.
+fn proof_cooldown_active_at(st: &Value, name: &str, now_utc: DateTime<Utc>) -> bool {
+    let Some(entry) = proof_cooldown_entry(st, name) else {
+        return false;
+    };
+    let Some(until) = entry
+        .get("until")
+        .and_then(Value::as_str)
+        .and_then(parse_ts)
+    else {
+        return false;
+    };
+    until > now_utc
+}
+
+/// True iff the lane is within an ACTIVE proof_required cooldown (the `until` stamp is in the
+/// future). Production helper — reads the persisted autopilot state and uses wall-clock now. The
+/// `plan_jobs` gate uses the pure `proof_cooldown_active_at` (it already holds the state); this
+/// public helper is the query seam for the dashboard / `solomon state` CLI to surface a parked lane
+/// (analogous to `stuck_sweeps`). Best-effort: an unreadable state returns false (no cooldown).
+#[allow(dead_code)]
+pub fn proof_cooldown_active(name: &str) -> bool {
+    let cfg = registry::autopilot_config();
+    proof_cooldown_active_at(&read_state(&cfg), name, Utc::now())
+}
+
+/// Arm or refresh a lane's proof_required cooldown in the IN-MEMORY state: set
+/// `proof_cooldowns[name] = {"until": now+PROOF_COOLDOWN_S, "armed_at": now, "consecutive": N}`.
+/// Called by `bump_stuck_counter` when a lane's consecutive proof_required count reaches
+/// PROOF_COOLDOWN_THRESHOLD. Pure (no IO): mutates the passed-in state; `write_state` persists it.
+fn arm_proof_cooldown(st: &mut Value, name: &str, consecutive: u64, now_utc: DateTime<Utc>) {
+    if !st.get("proof_cooldowns").map(Value::is_object).unwrap_or(false) {
+        st["proof_cooldowns"] = json!({});
+    }
+    let Some(m) = st.get_mut("proof_cooldowns").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let until = now_utc + ChronoDuration::seconds(PROOF_COOLDOWN_S);
+    m.insert(
+        name.to_string(),
+        json!({
+            "until": until.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "armed_at": now_utc.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "consecutive": consecutive,
+            "reason": "proof_required retry theater — parked for a human spec",
+        }),
+    );
+}
+
+/// Clear a lane's proof_required cooldown in the IN-MEMORY state (the lane moved — produced a
+/// non-proof_required outcome). Pure (no IO): mutates the passed-in state. No-op when absent.
+/// Called by `bump_stuck_counter` on any non-proof_required outcome alongside clearing `stuck`.
+fn clear_proof_cooldown(st: &mut Value, name: &str) {
+    if let Some(m) = st.get_mut("proof_cooldowns").and_then(Value::as_object_mut) {
+        m.remove(name);
+    }
 }
 
 fn append_event(event: &Value) {
@@ -1694,5 +1856,389 @@ mod tests {
         drop(third);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ===================================================================== #
+    // proof_required COOLDOWN — kill retry theater
+    // ===================================================================== #
+    //
+    // After PROOF_COOLDOWN_THRESHOLD (3) consecutive inert proof_required sweeps, a lane is parked
+    // for PROOF_COOLDOWN_S (24h) and a `needs_human_spec` need is filed instead of dispatching
+    // another inert proof_required job. The cooldown clears when the lane produces a real (non
+    // proof_required / non needs_human_spec) outcome.
+
+    #[test]
+    fn proof_cooldown_active_reads_until_stamp() {
+        // No entry -> not active.
+        let st = json!({});
+        assert!(!proof_cooldown_active_at(&st, "dotz", Utc::now()));
+        // until in the future -> active.
+        let future = Utc::now() + ChronoDuration::seconds(3600);
+        let st = json!({
+            "proof_cooldowns": {
+                "dotz": {"until": future.format("%Y-%m-%dT%H:%M:%SZ").to_string(), "consecutive": 3}
+            }
+        });
+        assert!(proof_cooldown_active_at(&st, "dotz", Utc::now()));
+        // until in the past -> expired (not active) — the lane may re-fire proof_required.
+        let past = Utc::now() - ChronoDuration::seconds(3600);
+        let st = json!({
+            "proof_cooldowns": {
+                "dotz": {"until": past.format("%Y-%m-%dT%H:%M:%SZ").to_string(), "consecutive": 3}
+            }
+        });
+        assert!(!proof_cooldown_active_at(&st, "dotz", Utc::now()));
+        // a different lane -> not active for the asked lane.
+        let st = json!({
+            "proof_cooldowns": {
+                "sover": {"until": future.format("%Y-%m-%dT%H:%M:%SZ").to_string(), "consecutive": 3}
+            }
+        });
+        assert!(!proof_cooldown_active_at(&st, "dotz", Utc::now()));
+        // malformed until (not a timestamp) -> not active.
+        let st = json!({"proof_cooldowns": {"dotz": {"until": "not-a-ts"}}});
+        assert!(!proof_cooldown_active_at(&st, "dotz", Utc::now()));
+    }
+
+    #[test]
+    fn arm_proof_cooldown_sets_until_now_plus_window() {
+        let mut st = json!({});
+        let now = Utc::now();
+        arm_proof_cooldown(&mut st, "dotz", 3, now);
+        let until = proof_cooldown_entry(&st, "dotz")
+            .and_then(|e| e.get("until"))
+            .and_then(Value::as_str)
+            .and_then(parse_ts)
+            .expect("until stamp parses");
+        let secs = (until - now).num_seconds();
+        assert!(
+            (PROOF_COOLDOWN_S - 5..=PROOF_COOLDOWN_S + 5).contains(&secs),
+            "until is now+PROOF_COOLDOWN_S (±5s rounding), got {secs}s"
+        );
+        assert_eq!(st["proof_cooldowns"]["dotz"]["consecutive"], json!(3));
+        assert_eq!(
+            st["proof_cooldowns"]["dotz"]["reason"],
+            json!("proof_required retry theater — parked for a human spec")
+        );
+    }
+
+    #[test]
+    fn clear_proof_cooldown_removes_entry() {
+        let mut st = json!({"proof_cooldowns": {"dotz": {"until": "2099-01-01T00:00:00Z"}}});
+        clear_proof_cooldown(&mut st, "dotz");
+        assert!(st.get("proof_cooldowns").unwrap().get("dotz").is_none());
+        // clearing an absent lane is a no-op.
+        clear_proof_cooldown(&mut st, "never_parked");
+    }
+
+    // The core retry-theater kill: 3 consecutive proof_required sweeps arm the cooldown; the 4th
+    // sweep emits a `needs_human_spec` job (kind changed) instead of another inert proof_required.
+    #[test]
+    fn bump_stuck_counter_arms_cooldown_at_threshold_and_needs_human_spec_blocks_4th() {
+        let mut st = json!({});
+        // 3 consecutive proof_required sweeps — the 3rd arms the cooldown.
+        bump_stuck_counter(&mut st, "dotz", true);
+        assert!(!proof_cooldown_active_at(&st, "dotz", Utc::now()), "1st: not parked yet");
+        bump_stuck_counter(&mut st, "dotz", true);
+        assert!(!proof_cooldown_active_at(&st, "dotz", Utc::now()), "2nd: not parked yet");
+        bump_stuck_counter(&mut st, "dotz", true);
+        assert!(
+            proof_cooldown_active_at(&st, "dotz", Utc::now()),
+            "3rd: parked for the cooldown window (retry theater killed)"
+        );
+        assert_eq!(st["stuck"]["dotz"]["sweeps"], 3);
+
+        // While parked, a needs_human_spec outcome (the parked lane's job kind) is TREATED AS STILL
+        // STUCK — the streak persists and the cooldown stays armed (not cleared).
+        bump_stuck_counter(&mut st, "dotz", true); // outcome == "needs_human_spec" → still stuck
+        assert!(
+            proof_cooldown_active_at(&st, "dotz", Utc::now()),
+            "parked lane stays parked across needs_human_spec sweeps (streak persists)"
+        );
+        assert_eq!(st["stuck"]["dotz"]["sweeps"], 4);
+
+        // The lane eventually MOVES (shipped/blocked/complete) — stuck + cooldown both clear.
+        bump_stuck_counter(&mut st, "dotz", false);
+        assert!(!proof_cooldown_active_at(&st, "dotz", Utc::now()), "cleared on a real move");
+        assert!(st.get("stuck").unwrap().get("dotz").is_none());
+    }
+
+    // plan_jobs gates the proof_required branch on the cooldown: a lane with an ACTIVE cooldown gets
+    // a `needs_human_spec` job (not another inert proof_required); an EXPIRED cooldown re-fires.
+    #[test]
+    fn plan_jobs_emits_needs_human_spec_when_proof_cooldown_active() {
+        // Drive a lane into a non-AI proof_required diagnosis (status=error, auto_safe!=true).
+        let name = format!("cooldown_lane_{}", std::process::id());
+        let repo = json!({"name": name.clone(), "path": format!("C:/p/{name}")});
+        let rt = paths::runtime_dir(&repo).unwrap();
+        let _ = std::fs::remove_dir_all(&rt);
+        std::fs::create_dir_all(&rt).unwrap();
+        std::fs::write(
+            rt.join("heartbeat.json"),
+            serde_json::to_string(&json!({
+                "status": "error",
+                "reason": "needs_goal",
+                "last_summary": "no north-star GOAL and no actionable backlog",
+                "updated_at": now(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // ACTIVE cooldown: until in the future.
+        let future = Utc::now() + ChronoDuration::seconds(3600);
+        let st = json!({
+            "manual_queue": [],
+            "proof_cooldowns": {
+                name.clone(): {
+                    "until": future.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                    "consecutive": 3
+                }
+            }
+        });
+        let cfg = json!({"provider": "openrouter", "targets": [name.clone()]});
+        let jobs = plan_jobs(
+            std::slice::from_ref(&repo),
+            &cfg,
+            &json!({"projects": {}}),
+            &st,
+            None,
+        );
+        let job = jobs.iter().find(|j| j.name == name).expect("job planned");
+        assert_eq!(
+            job.kind, "needs_human_spec",
+            "an ACTIVE cooldown emits a needs_human_spec need, not another inert proof_required"
+        );
+        assert!(!job.requires_ai, "needs_human_spec is a non-AI inert need");
+        assert!(
+            job.reason.contains("PROOF_COOLDOWN_THRESHOLD"),
+            "the need reason names the retry-theater kill: {reason}",
+            reason = job.reason
+        );
+        assert!(
+            job.next_action.contains("spec a real fix"),
+            "the next action tells the operator to spec a real fix: {next}",
+            next = job.next_action
+        );
+
+        // EXPIRED cooldown (until in the past): proof_required re-fires (the lane is no longer parked).
+        let past = Utc::now() - ChronoDuration::seconds(3600);
+        let st_expired = json!({
+            "manual_queue": [],
+            "proof_cooldowns": {name.clone(): {"until": past.format("%Y-%m-%dT%H:%M:%SZ").to_string()}}
+        });
+        let jobs = plan_jobs(
+            std::slice::from_ref(&repo),
+            &cfg,
+            &json!({"projects": {}}),
+            &st_expired,
+            None,
+        );
+        let job = jobs.iter().find(|j| j.name == name).expect("job planned");
+        assert_eq!(
+            job.kind, "proof_required",
+            "an EXPIRED cooldown lets proof_required re-fire (lane re-surfaces, not parked forever)"
+        );
+
+        let _ = std::fs::remove_dir_all(rt);
+    }
+
+    // ===================================================================== #
+    // FLEET-HEALTH PROBE — proof_required/implement ratio over 24h
+    // ===================================================================== #
+    //
+    // The retry-theater detector at the FLEET level: proof_required / implement over a 24h window
+    // from the autopilot event log. >1.5 -> yellow, >2.5 -> red. Pure: the caller passes the event
+    // lines + window boundary so the test is deterministic (no IO, no wall-clock coupling).
+
+    /// Count `{"event":"job_finished","job":<job>,"outcome":<outcome>}` events in `lines` whose `ts`
+    /// falls within `(since, now]` (inclusive of since, exclusive of now — the last second is the
+    /// caller's `now`). Lines that fail to parse are skipped (lenient, same as the probe evaluators).
+    /// Pure — unit-tested over fixture lines.
+    pub fn count_job_finished(lines: &[&str], since: DateTime<Utc>, now: DateTime<Utc>, job: &str, outcome: &str) -> u64 {
+        let mut n = 0u64;
+        for line in lines {
+            let rec: Value = match serde_json::from_str(line.trim()) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if rec.get("event").and_then(Value::as_str) != Some("job_finished") {
+                continue;
+            }
+            if rec.get("job").and_then(Value::as_str) != Some(job) {
+                continue;
+            }
+            if rec.get("outcome").and_then(Value::as_str) != Some(outcome) {
+                continue;
+            }
+            let Some(t) = rec.get("ts").and_then(Value::as_str).and_then(parse_ts) else {
+                continue;
+            };
+            if t > since && t <= now {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// The fleet-health probe: proof_required / implement ratio over a 24h window. Returns the
+    /// (ratio, proof_count, implement_count). implement == 0 -> ratio is None (no denominator — the
+    /// probe reports unobservable, not a fabricated green). Pure — the caller passes the event lines
+    /// + the now boundary. This is the computation the `cmd`-kind ops.json probe runs via a thin
+    /// PowerShell wrapper (see ops.json solomon proof_ratio probe) AND the unit-tested pure core.
+    pub fn proof_implement_ratio(lines: &[&str], now: DateTime<Utc>) -> Option<f64> {
+        let since = now - ChronoDuration::hours(24);
+        let proof = count_job_finished(lines, since, now, "proof_required", "proof_required") as f64;
+        let implement_shipped =
+            count_job_finished(lines, since, now, "implement", "shipped") as f64;
+        // An implement run that reverted also lands as proof_required (fleet.rs:401). To measure the
+        // "retry theater" ratio honestly we count ALL implement job_finished events (the AI jobs that
+        // actually ran, whether they shipped or reverted) as the denominator — the theater is the loop
+        // spinning on inert proof_required WITHOUT running implement jobs. The pure counter counts by
+        // (job, outcome); here we sum the implement outcomes that mean "an AI run actually happened".
+        let implement_reverted =
+            count_job_finished(lines, since, now, "implement", "proof_required") as f64;
+        let implement_blocked = count_job_finished(lines, since, now, "implement", "blocked") as f64;
+        let implement = implement_shipped + implement_reverted + implement_blocked;
+        if implement == 0.0 {
+            return None;
+        }
+        Some(proof / implement)
+    }
+
+    #[test]
+    fn proof_implement_ratio_red_at_3_5_to_1() {
+        // A 24h window with 3.5:1 proof_required:implement (e.g. 7 proof_required, 2 implement shipped)
+        // -> ratio 3.5 -> RED (exceeds 2.5).
+        let now = Utc::now();
+        let lines: Vec<String> = (0..7)
+            .map(|i| {
+                serde_json::to_string(&json!({
+                    "event": "job_finished",
+                    "repo": "dotz",
+                    "job": "proof_required",
+                    "outcome": "proof_required",
+                    "ts": (now - ChronoDuration::seconds(600 + i * 60))
+                        .format("%Y-%m-%dT%H:%M:%SZ")
+                        .to_string(),
+                }))
+                .unwrap()
+            })
+            .chain((0..2).map(|i| {
+                serde_json::to_string(&json!({
+                    "event": "job_finished",
+                    "repo": "maki",
+                    "job": "implement",
+                    "outcome": "shipped",
+                    "ts": (now - ChronoDuration::seconds(300 + i * 60))
+                        .format("%Y-%m-%dT%H:%M:%SZ")
+                        .to_string(),
+                }))
+                .unwrap()
+            }))
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let ratio = proof_implement_ratio(&refs, now).expect("ratio computed");
+        assert!((ratio - 3.5).abs() < 1e-9, "ratio is 3.5 (7 proof / 2 implement): {ratio}");
+        assert!(ratio > 2.5, "3.5:1 is RED (>2.5)");
+    }
+
+    #[test]
+    fn proof_implement_ratio_yellow_at_2_to_1() {
+        let now = Utc::now();
+        // 4 proof_required, 2 implement -> 2.0 -> YELLOW (>1.5, <=2.5).
+        let lines: Vec<String> = (0..4)
+            .map(|i| {
+                serde_json::to_string(&json!({
+                    "event": "job_finished", "repo": "dotz", "job": "proof_required",
+                    "outcome": "proof_required",
+                    "ts": (now - ChronoDuration::seconds(600 + i * 60))
+                        .format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                })).unwrap()
+            })
+            .chain((0..2).map(|i| {
+                serde_json::to_string(&json!({
+                    "event": "job_finished", "repo": "maki", "job": "implement",
+                    "outcome": "shipped",
+                    "ts": (now - ChronoDuration::seconds(300 + i * 60))
+                        .format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                })).unwrap()
+            }))
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let ratio = proof_implement_ratio(&refs, now).expect("ratio computed");
+        assert!((ratio - 2.0).abs() < 1e-9, "ratio is 2.0: {ratio}");
+        assert!(ratio > 1.5 && ratio <= 2.5, "2.0:1 is YELLOW (>1.5, <=2.5)");
+    }
+
+    #[test]
+    fn proof_implement_ratio_green_at_1_to_1() {
+        let now = Utc::now();
+        // 1 proof_required, 1 implement shipped -> 1.0 -> GREEN (<=1.5).
+        let lines = vec![
+            serde_json::to_string(&json!({
+                "event": "job_finished", "repo": "dotz", "job": "proof_required",
+                "outcome": "proof_required",
+                "ts": (now - ChronoDuration::seconds(600)).format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            })).unwrap(),
+            serde_json::to_string(&json!({
+                "event": "job_finished", "repo": "maki", "job": "implement",
+                "outcome": "shipped",
+                "ts": (now - ChronoDuration::seconds(300)).format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            })).unwrap(),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let ratio = proof_implement_ratio(&refs, now).expect("ratio computed");
+        assert!((ratio - 1.0).abs() < 1e-9, "ratio is 1.0: {ratio}");
+        assert!(ratio <= 1.5, "1.0:1 is GREEN (<=1.5)");
+    }
+
+    #[test]
+    fn proof_implement_ratio_none_when_no_implement_in_window() {
+        let now = Utc::now();
+        // 5 proof_required, 0 implement -> None (no denominator — unobservable, not a fake green).
+        let lines: Vec<String> = (0..5)
+            .map(|i| {
+                serde_json::to_string(&json!({
+                    "event": "job_finished", "repo": "dotz", "job": "proof_required",
+                    "outcome": "proof_required",
+                    "ts": (now - ChronoDuration::seconds(600 + i * 60))
+                        .format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                })).unwrap()
+            })
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        assert_eq!(
+            proof_implement_ratio(&refs, now),
+            None,
+            "no implement jobs in window -> None (unobservable), not a fabricated 0 or green"
+        );
+    }
+
+    #[test]
+    fn proof_implement_ratio_excludes_events_outside_24h_window() {
+        let now = Utc::now();
+        // An old proof_required (30h ago) is OUTSIDE the 24h window; only the fresh ones count.
+        let lines = vec![
+            serde_json::to_string(&json!({
+                "event": "job_finished", "repo": "dotz", "job": "proof_required",
+                "outcome": "proof_required",
+                "ts": (now - ChronoDuration::hours(30)).format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            })).unwrap(),
+            serde_json::to_string(&json!({
+                "event": "job_finished", "repo": "dotz", "job": "proof_required",
+                "outcome": "proof_required",
+                "ts": (now - ChronoDuration::seconds(600)).format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            })).unwrap(),
+            serde_json::to_string(&json!({
+                "event": "job_finished", "repo": "maki", "job": "implement",
+                "outcome": "shipped",
+                "ts": (now - ChronoDuration::seconds(300)).format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            })).unwrap(),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let ratio = proof_implement_ratio(&refs, now).expect("ratio computed");
+        // 1 proof (the 30h-old one excluded) / 1 implement = 1.0
+        assert!((ratio - 1.0).abs() < 1e-9, "window excludes the 30h-old event: {ratio}");
     }
 }
