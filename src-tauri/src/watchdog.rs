@@ -73,6 +73,12 @@ const CEO_CORE_JOIN_TIMEOUT_S: u64 = 60;
 
 static CEO_GRAFT_RUNNING: AtomicBool = AtomicBool::new(false);
 static HOUSEKEEPING_GRAFT_RUNNING: AtomicBool = AtomicBool::new(false);
+/// Single-flight guard for the autopilot dispatch graft — one `fleet::once()` at a time, so a
+/// slow AI job (the ~30-min run-improver subprocess) can never pile up detached threads. With
+/// max_concurrent_agent_calls=2 the fleet's own AutopilotLease allows a 2nd concurrent job; this
+/// guard just prevents the TICK itself from stacking a 3rd dispatch while the first two are still
+/// running. Mirrors `spawn_ceo_slow_tail` / `spawn_watchdog_graft`.
+static AUTOPILOT_DISPATCH_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// monitor.DISABLED — global kill-switch path: HERE/runtime/_watchdog.disabled.
 fn disabled_path() -> std::path::PathBuf {
@@ -264,17 +270,17 @@ pub fn lane_health(running: bool, history: &[Value], k: usize) -> Option<String>
 fn sweep_autopilot(auto_push_flag: bool) -> Value {
     let repos = control::registry::load_repos();
     let snapshots = crate::fleet::sweep_snapshots(&repos);
-    let out = crate::fleet::once(auto_push_flag, None);
-    let mut actions: Vec<Value> = out
-        .get("actions")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    // OFFLOAD the autopilot dispatch (fleet::once) to a detached, single-flighted thread so the
+    // watchdog tick returns immediately — the AI job (a ~30-min run-improver subprocess) no longer
+    // blocks the 60s tick. The fleet's own AutopilotLease (max_concurrent_agent_calls=2) governs how
+    // many concurrent jobs actually run; this single-flight guard just prevents the TICK from
+    // stacking a 3rd dispatch while the first two are still running. Mirrors `spawn_ceo_slow_tail`
+    // (ceo.rs) and `spawn_watchdog_graft` below. If a prior dispatch is still running, the new tick
+    // skips dispatch but STILL runs the watchdog's other duties (crash-restart, recover heal).
+    let dispatch_actions = spawn_autopilot_dispatch(auto_push_flag);
+    let mut actions: Vec<Value> = dispatch_actions;
     if actions.is_empty() {
-        let state = out
-            .get("state")
-            .cloned()
-            .unwrap_or_else(crate::fleet::state);
+        let state = crate::fleet::state();
         let queued = state
             .get("queue")
             .and_then(Value::as_array)
@@ -297,7 +303,35 @@ fn sweep_autopilot(auto_push_flag: bool) -> Value {
     for a in heal_actions {
         actions.push(json!(a));
     }
-    json!({"ts": now(), "disabled": false, "actions": actions, "snapshots": snapshots, "autopilot": out.clone(), "fleet": out})
+    json!({"ts": now(), "disabled": false, "actions": actions, "snapshots": snapshots, "autopilot": crate::fleet::state(), "fleet": crate::fleet::state()})
+}
+
+/// Spawn the autopilot dispatch (`fleet::once`) on its OWN detached, single-flighted thread —
+/// mirrors `spawn_ceo_slow_tail` (ceo.rs). If a prior dispatch is still running (a slow AI job),
+/// the spawn is a NO-OP: the fleet's AutopilotLease governs concurrency (max 2); this guard just
+/// prevents the 60s tick from stacking a 3rd dispatch. Returns immediately with a placeholder
+/// action so the watchdog line records that a dispatch was attempted (or skipped as single-flighted).
+fn spawn_autopilot_dispatch(auto_push_flag: bool) -> Vec<Value> {
+    if AUTOPILOT_DISPATCH_RUNNING.swap(true, Ordering::SeqCst) {
+        return vec![json!("autopilot dispatch skipped (prior dispatch still running)")];
+    }
+    std::thread::spawn(move || {
+        let _guard = AutopilotDispatchGuard;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = crate::fleet::once(auto_push_flag, None);
+        }));
+    });
+    vec![json!("autopilot dispatched")]
+}
+
+/// Reset the single-flight flag when the autopilot dispatch thread finishes (or panics) — mirrors
+/// `GraftFlagGuard`, so a panicking dispatch can never wedge the flag true and starve every future
+/// dispatch.
+struct AutopilotDispatchGuard;
+impl Drop for AutopilotDispatchGuard {
+    fn drop(&mut self) {
+        AUTOPILOT_DISPATCH_RUNNING.store(false, Ordering::SeqCst);
+    }
 }
 
 /// The autopilot force-heal pass (production wiring). Reads the real autopilot targets and the

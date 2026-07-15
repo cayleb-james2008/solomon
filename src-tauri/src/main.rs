@@ -428,7 +428,7 @@ fn run_gui() {
             resurrector::HEARTBEAT_STAMP_INTERVAL_S,
         ));
     });
-    // THE IN-APP WATCHDOG TICK (v2 Phase A): the every-2-min sweep lives INSIDE the visibly-open
+    // THE IN-APP WATCHDOG TICK (v2 Phase A): the every-60s sweep lives INSIDE the visibly-open
     // Solomon.exe — crash-restart + RUNG-0 recovery + ops probes + incident notifications + the
     // CEO rhythm all ride it. The Solomon Sentinel scheduled task (tools/install_sentinel.ps1)
     // runs `solomon watchdog` every 5 minutes out-of-band; this GUI tick sweep remains as a
@@ -436,11 +436,14 @@ fn run_gui() {
     // (GUI-tick-only liveness caused the 8h/25.5h watchdog gaps and 2+ day outages). The thread
     // dies with the process; catch_unwind keeps one bad sweep from killing the tick. The engine
     // heartbeat is stamped by the dedicated thread above, NOT here, so a slow sweep never delays it.
+    // 2026-07-14: lowered from 120s to 60s (the autopilot dispatch is offloaded to a detached
+    // single-flighted thread, so the tick no longer blocks on the AI job — a faster tick catches
+    // crashed lanes and ops-RED states sooner without stacking dispatches).
     std::thread::spawn(|| loop {
         let _ = std::panic::catch_unwind(|| {
             let _ = watchdog::main();
         });
-        std::thread::sleep(std::time::Duration::from_secs(120));
+        std::thread::sleep(std::time::Duration::from_secs(60));
     });
     tauri::Builder::default()
         // single-instance MUST be registered FIRST (Tauri 2 requirement) so it runs before other

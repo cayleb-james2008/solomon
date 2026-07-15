@@ -888,10 +888,11 @@ pub fn phase_run_pi(
 }
 
 // re-export the timeout constants verbatim from the source so callers don't re-derive them.
-/// run_pi default timeout (implement). Raised from 1800s (30 min) to 3600s (60 min) so slower
-/// OpenRouter models (owl-alpha, nemotron free tier) have enough time to complete a real coding
-/// task. The prior 30-min ceiling timed out every free-tier model before it could finish.
-pub const TIMEOUT_IMPLEMENT: i64 = 3600;
+/// run_pi default timeout (implement). Lowered from 3600s (60 min) to 1800s (30 min) — a wedged
+/// implement job should not hold an autopilot slot for an hour; the prior 60-min ceiling (raised
+/// for slow free-tier models) starved the fleet on one stuck job. The deep-tier budget
+/// (TIMEOUT_DEEP=5400s) still covers genuinely large architecture slices.
+pub const TIMEOUT_IMPLEMENT: i64 = 1800;
 /// deep-tier (architecture / ordered [campaign]) implement timeout — a genuinely large, multi-file
 /// slice needs more than the standard wall before it is killed and reverted to a noop (the 3600s
 /// guillotine). run_improver had no equivalent; this is Solomon's deep-work budget lever.
@@ -1149,7 +1150,7 @@ add extra usage: https://ollama.com/settings (ref: c708135e-d4a9-484f-ac43-02478
     // ---- timeout constant parity with the source ----
     #[test]
     fn timeout_constants_match_source() {
-        assert_eq!(TIMEOUT_IMPLEMENT, 3600);
+        assert_eq!(TIMEOUT_IMPLEMENT, 1800);
         assert_eq!(TIMEOUT_BEAUTIFY, 900);
         assert_eq!(TIMEOUT_PHASE_600, 600);
         assert_eq!(TIMEOUT_PHASE_400, 400);

@@ -139,12 +139,19 @@ const VERIFY_PROMPT: &str = "You are the Solomon adversarial verifier. You are g
 /// `record_call` + `record_success`/`record_quota` so the MoA workers share the fleet's reserve-
 /// headroom rail (no untracked spend, no 429 storm). The provider key is `ctx.pi_provider`
 /// (matches pi.rs — "maki-cloud" for the ollama-cloud autopilot provider, per ctx.rs:48).
+///
+/// `ctx: Option<&Ctx>` (read-only) — the parallel MoA Layer-1 (planner + ideator concurrently)
+/// needs both workers to share the Ctx without aliasing `&mut`. The only `&mut` use the prior
+/// `Option<&mut Ctx>` had was `ctx.log()`; this uses the read-only `log_worker` slice (print +
+/// LOG-file append, dropping the in-memory `hb["log_tail"]` push) — the same pattern gitops::log_ro
+/// uses. The budget ledger is file-backed and takes `&Ctx`, so two concurrent workers record their
+/// spend through the same atomic file without contention. None falls back to the CEO chat path.
 pub fn spawn_worker(
     model: &str,
     system_prompt_s: &str,
     skill_k: &str,
     task_t: &str,
-    ctx: Option<&mut Ctx>,
+    ctx: Option<&Ctx>,
 ) -> Result<String, String> {
     let system = if skill_k.trim().is_empty() {
         system_prompt_s.to_string()
@@ -155,7 +162,7 @@ pub fn spawn_worker(
         return crate::ceo::ollama_chat(model, &system, task_t);
     };
     let provider = ctx.pi_provider.clone();
-    ctx.log(&format!("MoA worker ({provider}:{model})"));
+    log_worker(ctx, &format!("MoA worker ({provider}:{model})"));
     // Budget preflight — same ledger pi.rs uses. Parked -> Err (caller degrades to raw task /
     // planner output, never a fabricated success). This is the reserve-headroom rail: the MoA
     // brain cannot burn the operator's Ollama Cloud quota untracked.
@@ -183,6 +190,16 @@ pub fn spawn_worker(
         }
     }
     res
+}
+
+/// The read-only slice of `ctx.log` for `&Ctx` MoA workers (print + append to the LOG file), the
+/// same pattern as `gitops::log_ro`. Drops the `hb["log_tail"]` push (which needs `&mut`) so two
+/// concurrent Layer-1 workers can share the Ctx read-only without aliasing. The log file + stdout
+/// still get every line; only the in-memory heartbeat ring buffer misses the MoA worker lines.
+fn log_worker(ctx: &Ctx, msg: &str) {
+    let line = format!("{} {}", crate::improver::ctx::now(), msg);
+    println!("{line}");
+    ctx.runtime_append(&ctx.log_path, &line);
 }
 
 /// Load a skill file from `improver/<repo>/skills/<role>.md`. Missing file -> empty string (graceful,
@@ -257,11 +274,42 @@ pub fn run_moa_plan(ctx: &mut Ctx, task: &str) -> String {
     let ideate_model = cfg.workers.ideate.clone();
     let ideate_skill = load_skill(&lane, "ideate");
 
-    // Layer 1a — planner (kimi-k2.7-code). Read-only proposal.
+    // Layer 1 — planner (kimi-k2.7-code) + ideator (minimax-m3) run CONCURRENTLY. They are
+    // independent (each reads the same task + its own skill; neither depends on the other's
+    // output), so the Phase-2 upgrade from the v1 sequential comment is `std::thread::scope` —
+    // both workers borrow `&*ctx` read-only (spawn_worker takes `Option<&Ctx>`), and the scope
+    // joins both before the aggregator runs. The planner failure is HARD (degrade to raw task,
+    // pre-MoA baseline); the ideator failure is SOFT (aggregator synthesizes from the planner
+    // output alone — degraded n=1, still MoA-Lite). Budget ledger is file-backed so concurrent
+    // record_call/record_quota through the same atomic file is race-free.
     ctx.log(&format!(
-        "MoA Layer-1: planner worker ({plan_model})"
+        "MoA Layer-1: planner ({plan_model}) + ideator ({}) concurrent",
+        ideate_model.as_deref().unwrap_or("none")
     ));
-    let plan_text = match spawn_worker(&plan_model, PLAN_PROMPT, &plan_skill, task, Some(ctx)) {
+    // Re-borrow ctx as a shared `&Ctx` so BOTH scoped threads can capture it read-only without
+    // moving the `&mut Ctx` (which is not Copy). The `&mut Ctx` is recovered after the scope.
+    let ctx_ref: &Ctx = &*ctx;
+    let ideate_model_for_closure = ideate_model.clone();
+    let plan_model_for_closure = plan_model.clone();
+    let (plan_result, ideate_result) = std::thread::scope(|scope| {
+        let plan_handle = scope.spawn(move || {
+            spawn_worker(&plan_model_for_closure, PLAN_PROMPT, &plan_skill, task, Some(ctx_ref))
+        });
+        let ideate_handle = scope.spawn(move || {
+            ideate_model_for_closure.as_ref().map(|im| {
+                spawn_worker(im, IDEATE_PROMPT, &ideate_skill, task, Some(ctx_ref))
+            })
+        });
+        let plan_result = plan_handle
+            .join()
+            .unwrap_or_else(|_| Err("planner thread panicked".to_string()));
+        let ideate_result = ideate_handle
+            .join()
+            .unwrap_or(None);
+        (plan_result, ideate_result)
+    });
+
+    let plan_text = match plan_result {
         Ok(p) => {
             moa_event(&lane, 1, &plan_model, "ok", "planner returned a plan");
             p
@@ -275,26 +323,22 @@ pub fn run_moa_plan(ctx: &mut Ctx, task: &str) -> String {
         }
     };
 
-    // Layer 1b — ideator (minimax-m3). Divergent alternative proposals. Runs sequentially after the
-    // planner (v1; parallel tokio::join! is the Phase-2 upgrade). If the ideator fails, the
-    // aggregator synthesizes from the planner output alone (degraded n=1 — still MoA-Lite).
-    let ideate_text = if let Some(im) = &ideate_model {
-        ctx.log(&format!("MoA Layer-1: ideator worker ({im})"));
-        match spawn_worker(im, IDEATE_PROMPT, &ideate_skill, task, Some(ctx)) {
-            Ok(t) => {
-                moa_event(&lane, 1, im, "ok", "ideator returned alternatives");
-                Some(t)
-            }
-            Err(e) => {
-                ctx.log(&format!(
-                    "MoA Layer-1 ideator failed ({e}); aggregator will use planner output only (n=1)"
-                ));
-                moa_event(&lane, 1, im, "failed", &e);
-                None
-            }
+    // The ideator is SOFT — a failure degrades to n=1 (planner-only), not a hard return.
+    let ideate_text = match ideate_result {
+        Some(Ok(t)) => {
+            let im = ideate_model.as_deref().unwrap_or("ideator");
+            moa_event(&lane, 1, im, "ok", "ideator returned alternatives");
+            Some(t)
         }
-    } else {
-        None
+        Some(Err(e)) => {
+            let im = ideate_model.as_deref().unwrap_or("ideator");
+            ctx.log(&format!(
+                "MoA Layer-1 ideator failed ({e}); aggregator will use planner output only (n=1)"
+            ));
+            moa_event(&lane, 1, im, "failed", &e);
+            None
+        }
+        None => None, // no ideate model configured
     };
 
     // Layer 2 — aggregator (glm-5.2) with the Aggregate-and-Synthesize prompt over BOTH Layer-1
@@ -309,7 +353,7 @@ pub fn run_moa_plan(ctx: &mut Ctx, task: &str) -> String {
     };
     let agg_user = format!("{AGGREGATE_SYNTHESIZE_PROMPT}\n\nResponses from models:\n{layer1_inputs}");
     let agg_skill = load_skill(&lane, "aggregate");
-    match spawn_worker(&cfg.aggregator, "", &agg_skill, &agg_user, Some(ctx)) {
+    match spawn_worker(&cfg.aggregator, "", &agg_skill, &agg_user, Some(&*ctx)) {
         Ok(synth) => {
             ctx.log("MoA: synthesized plan ready for implementer");
             moa_event(&lane, 2, &cfg.aggregator, "ok", "synthesized plan");
@@ -355,7 +399,7 @@ pub fn run_moa_verifier(ctx: &mut Ctx, committed_diff: &str) -> String {
     }
     let lane = ctx.name.clone();
     let verify_skill = load_skill(&lane, "verify");
-    match spawn_worker(&cfg.verifier, VERIFY_PROMPT, &verify_skill, committed_diff, Some(ctx)) {
+    match spawn_worker(&cfg.verifier, VERIFY_PROMPT, &verify_skill, committed_diff, Some(&*ctx)) {
         Ok(v) => v,
         Err(e) => {
             ctx.log(&format!(
