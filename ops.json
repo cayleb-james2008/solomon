@@ -177,33 +177,9 @@
         ]
     },
     {
-        "name": "daedulus",
-        "priority": 3,
-        "comment": "Probe-only for Phase 1. Best-effort: runtime\\daedulus has no history.jsonl/heartbeat.json yet (verified 2026-07-01) \u2014 both probes report yellow 'unobservable' until the lane runs, by design.",
-        "probes": [
-            {
-                "id": "outcome_streak",
-                "kind": "jsonl_tail",
-                "file": "runtime\\daedulus\\history.jsonl",
-                "field": "status",
-                "mode": "streak",
-                "want": "shipped",
-                "last_n": 5
-            },
-            {
-                "id": "heartbeat_fresh",
-                "kind": "json_field",
-                "file": "runtime\\daedulus\\heartbeat.json",
-                "path": "updated_at",
-                "mode": "age",
-                "yellow_after_s": 21600,
-                "red_after_s": 86400
-            }
-        ]
-    },
-    {
         "name": "dotz",
         "priority": 4,
+        "comment": "2026-07-14 (Phase 2): removed the heartbeat_fresh probe — dotz is a DESKTOP APP, not a daemon. It does not run continuously, so it cannot produce a fresh heartbeat.json updated_at while closed. The probe expected age < 24h (red_after_s: 86400), which is impossible for a desktop app only open during use — it read a false RED forever (162 consecutive, age 54.8h) over a healthy lane. The lane's real outcome signal is outcome_streak (shipped iterations in history.jsonl); that stays. If dotz is ever reoriented to a daemon/always-on service, re-add a heartbeat probe then.",
         "probes": [
             {
                 "id": "outcome_streak",
@@ -213,15 +189,6 @@
                 "mode": "streak",
                 "want": "shipped",
                 "last_n": 5
-            },
-            {
-                "id": "heartbeat_fresh",
-                "kind": "json_field",
-                "file": "runtime\\dotz\\heartbeat.json",
-                "path": "updated_at",
-                "mode": "age",
-                "yellow_after_s": 21600,
-                "red_after_s": 86400
             }
         ]
     },
@@ -268,9 +235,19 @@
                 "file": "runtime\\_monitor.jsonl",
                 "field": "ts",
                 "mode": "age",
-                "yellow_after_s": 600,
-                "red_after_s": 1800,
-                "comment": "The watchdog appends here every ~2min while Solomon.exe is open; stale while the app is closed is the honest blind-window signal."
+                "yellow_after_s": 3600,
+                "red_after_s": 10800,
+                "comment": "2026-07-14 (Phase 2): widened from yellow>600s/red>1800s to yellow>3600s/red>10800s. Solomon is a DESKTOP APP the operator opens intermittently — the old 30min RED threshold false-alarmed every time the operator closed it for >30min (the normal idle state), reading RED 5 consecutive over a 2.9h gap that was just 'app closed'. The watchdog appends here every ~2min while Solomon.exe is OPEN; stale while closed is the honest blind-window signal. 1h yellow / 3h red catches a genuinely-stuck-open sweep (tick thread died) within 3h without noising on normal 'app closed for an hour'. If solomon is ever run as an always-on daemon, tighten this back to the 10min/30min cadence."
+            },
+            {
+                "id": "proof_ratio",
+                "kind": "cmd",
+                "command": "powershell -NoProfile -Command \"$lines = Get-Content 'runtime\\autopilot_events.jsonl' -ErrorAction SilentlyContinue; if (-not $lines) { Write-Output '0'; exit 0 }; $now = Get-Date; $since = $now.AddHours(-24); $proof = 0; $impl = 0; foreach ($l in $lines) { try { $r = $l | ConvertFrom-Json } catch { continue }; if ($r.event -ne 'job_finished') { continue }; if ([DateTime]$r.ts -le $since) { continue }; if ($r.job -eq 'proof_required' -and $r.outcome -eq 'proof_required') { $proof++ }; if ($r.job -eq 'implement' -and ($r.outcome -eq 'shipped' -or $r.outcome -eq 'proof_required' -or $r.outcome -eq 'blocked')) { $impl++ } }; if ($impl -eq 0) { Write-Output '0' } else { Write-Output ([math]::Round($proof / $impl, 2)) }\"",
+                "mode": "number",
+                "yellow_at": 1.5,
+                "red_at": 2.5,
+                "timeout_s": 30,
+                "comment": "2026-07-14 (Phase 2): the fleet-health proof_required/implement ratio over a 24h window from autopilot_events.jsonl. >1.5 -> yellow (the loop is spinning on inert proof_required more than it runs real implement jobs), >2.5 -> red (retry theater — e.g. the 3.57:1 fleet-wide and 53:1 dotz ratios that prompted the proof_required cooldown). 0 (or no implement jobs in window) -> green (no denominator = no theater). The pure core (fleet::proof_implement_ratio) is unit-tested in cargo test; this cmd probe is the ops-plane surface that exposes it on the dashboard / `solomon probe`. The PowerShell is a thin reader: it counts job_finished events in the 24h window by (job, outcome) exactly as the Rust core does."
             }
         ]
     }

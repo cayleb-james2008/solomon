@@ -295,6 +295,16 @@ fn main() {
     if !argv.is_empty() {
         attach_parent_console();
     }
+    // FAIL-CLOSED BOOT CHECK (Phase 0.1): the fleet-wide revenue ledger
+    // (fleet_ledger.jsonl) is the "Money Truth" file — without it Solomon cannot
+    // prove $0 or $1. If the file is MISSING we auto-provision it with the schema
+    // header; if the path is UNWRITABLE we REFUSE TO START (a Solomon that cannot
+    // record revenue must not run — the same fail-closed doctrine as money_guard).
+    // This runs BEFORE any subcommand dispatch so EVERY entry point is gated.
+    if let Err(e) = ops::fleet_ledger::ensure_exists() {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
     // `solomon run-improver ...` — the native per-repo RSI loop runner. Dispatch BEFORE run_gui so no
     // window is created (this is a headless long-running process), and exit with its return code.
     if argv.first().map(String::as_str) == Some("run-improver") {
