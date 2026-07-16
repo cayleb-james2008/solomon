@@ -274,6 +274,12 @@ pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
         &job.name,
         outcome_str == "proof_required" || outcome_str == "needs_human_spec",
     );
+    // SURFACE-ONCE bookkeeping: this dispatch just filed the lane's needs_human_spec need (the
+    // proof record + job_finished event — the one operator notification). Record it so plan_jobs
+    // parks identical re-dispatches (see nhs_already_surfaced) instead of starving real jobs.
+    if job.kind == "needs_human_spec" && outcome_str == "needs_human_spec" {
+        mark_nhs_surfaced(&mut st, &job.name, &job.reason);
+    }
     let ops_payload2 = read_ops_payload();
     st["queue"] = Value::Array(
         plan_jobs(&repos, &cfg, &ops_payload2, &mut st, only_name, false)
@@ -325,6 +331,12 @@ pub fn wake(auto_push: bool, only_name: Option<&str>) -> Value {
     let cfg = registry::autopilot_config();
     let mut st = read_state(&cfg);
     st["paused"] = Value::Bool(false);
+    // HUMAN ACK: an explicit per-lane wake un-parks the lane's surfaced needs_human_spec need —
+    // the operator reviewed/spec'd it, so the need re-checks the lane's current state and (if it
+    // still holds) re-surfaces exactly once instead of staying silently parked.
+    if let Some(n) = only_name {
+        clear_nhs_surfaced(&mut st, n);
+    }
     st["ts"] = json!(now());
     st["config"] = public_config(&cfg);
     let _ = write_state(&st);
@@ -709,6 +721,19 @@ fn plan_jobs(
             next_action = "review the blocker, spec a real fix, then wake the lane".into();
             // Surface the cooldown in the job reason so the dashboard shows WHY it is parked.
             let _ = cd; // (the verdict's extra carries the diagnosis; the cooldown is in state)
+        }
+        // needs_human_spec SURFACE-ONCE PARK (dispatch path only, both routes above): a need that
+        // was already surfaced with this exact fingerprint is NOT re-enqueued — re-dispatching the
+        // identical inert job every sweep at red priority (10) starved every queued real job (30)
+        // indefinitely (the asmodeus ~90-120s re-dispatch loop). The stuck streak still bumps
+        // inline (identical accounting to a dispatched needs_human_spec, same as the
+        // proof_required emit-bypass below) so the watchdog force-heal ladder keeps its window.
+        // The display path (emit_proofs=false) still queues it so the dashboard shows the park;
+        // a changed fingerprint (lane state changed), a real outcome (bump_stuck_counter clears),
+        // or an explicit per-lane wake (human ack) re-surfaces the need once.
+        if kind == "needs_human_spec" && emit_proofs && nhs_already_surfaced(st, &name, reason) {
+            bump_stuck_counter(st, &name, true);
+            continue;
         }
         if kind == "complete" {
             continue;
@@ -1136,8 +1161,11 @@ fn bump_stuck_counter(st: &mut Value, name: &str, is_proof_required: bool) {
         stuck.remove(name);
         // The lane moved (shipped/blocked/complete/cooldown) — clear any proof_required park so
         // it is not held past its recovery. `bump_stuck_counter` is called AFTER the job runs, so a
-        // lane that was parked and then produced a real outcome is un-parked immediately.
+        // lane that was parked and then produced a real outcome is un-parked immediately. The
+        // surfaced needs_human_spec marker clears with it: a lane that moved gets a fresh
+        // surfacing if it ever wedges again.
         clear_proof_cooldown(st, name);
+        clear_nhs_surfaced(st, name);
     }
 }
 
@@ -1250,6 +1278,60 @@ fn arm_proof_cooldown(st: &mut Value, name: &str, consecutive: u64, now_utc: Dat
 /// Called by `bump_stuck_counter` on any non-proof_required outcome alongside clearing `stuck`.
 fn clear_proof_cooldown(st: &mut Value, name: &str) {
     if let Some(m) = st.get_mut("proof_cooldowns").and_then(Value::as_object_mut) {
+        m.remove(name);
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// needs_human_spec SURFACE-ONCE park — kill dispatch starvation
+// --------------------------------------------------------------------------- //
+//
+// A `needs_human_spec` job is inert (files the need, mutates nothing) but planned at the lane's
+// ops priority — a red lane's need outranks (10) every queued real job (30/70). Because `once()`
+// picks `jobs.first()` whenever there are <= 1 AI jobs, the SAME need re-dispatched every sweep
+// starved the queue indefinitely (audit 2026-07-16: asmodeus needs_human_spec re-ran every
+// ~90-120s for hours while dotz's no-AI maintenance and the solomon implement job never ran).
+// The fix: surface each need ONCE (the first dispatch files the proof + event — the operator
+// notification), then PARK it — `plan_jobs` skips re-enqueueing the identical need on the
+// dispatch path until the lane's state changes (the need fingerprint — its reason — differs),
+// the lane moves (bump_stuck_counter clears the entry), or a human acks via an explicit per-lane
+// wake (wake() clears the entry). The state lives in `st["nhs_surfaced"][name] =
+// {"at": <iso>, "fingerprint": <job reason>}` and round-trips with read_state/write_state. The
+// `state()` display path still plans the need every poll so the dashboard keeps showing WHY the
+// lane is parked.
+
+/// True iff this lane's `needs_human_spec` need was ALREADY surfaced with the SAME fingerprint
+/// (the job's reason string — diagnose evidence for the structural route, the fixed park message
+/// for the cooldown route). A different fingerprint means the lane's state changed: re-surface
+/// once. Pure (no IO): the caller passes the state it already read.
+fn nhs_already_surfaced(st: &Value, name: &str, fingerprint: &str) -> bool {
+    st.get("nhs_surfaced")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get(name))
+        .and_then(|e| e.get("fingerprint"))
+        .and_then(Value::as_str)
+        == Some(fingerprint)
+}
+
+/// Record that a lane's `needs_human_spec` need was surfaced (its job dispatched and filed the
+/// proof/need). Called by `once()` after the dispatch. Pure (no IO): mutates the passed-in state.
+fn mark_nhs_surfaced(st: &mut Value, name: &str, fingerprint: &str) {
+    if !st.get("nhs_surfaced").map(Value::is_object).unwrap_or(false) {
+        st["nhs_surfaced"] = json!({});
+    }
+    if let Some(m) = st.get_mut("nhs_surfaced").and_then(Value::as_object_mut) {
+        m.insert(
+            name.to_string(),
+            json!({"at": now(), "fingerprint": fingerprint}),
+        );
+    }
+}
+
+/// Un-park a lane's surfaced `needs_human_spec` need so the next occurrence re-surfaces once.
+/// Called when the lane moves (`bump_stuck_counter`'s clear arm) and on an explicit per-lane
+/// `wake()` (the human ack). Pure (no IO). No-op when absent.
+fn clear_nhs_surfaced(st: &mut Value, name: &str) {
+    if let Some(m) = st.get_mut("nhs_surfaced").and_then(Value::as_object_mut) {
         m.remove(name);
     }
 }
@@ -2227,6 +2309,135 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(stuck_rt);
         let _ = std::fs::remove_dir_all(retry_rt);
+    }
+
+    // ===================================================================== #
+    // needs_human_spec SURFACE-ONCE park — kill dispatch starvation
+    // ===================================================================== #
+    //
+    // Audit 2026-07-16: the asmodeus needs_human_spec job (requires_ai=false, priority 10)
+    // re-dispatched every ~90-120s forever, each finishing instantly as a no-op — and priority 10
+    // beat the queued priority-30 real jobs (dotz maintenance, solomon implement), which starved
+    // indefinitely. Once surfaced, the identical need must NOT re-enqueue on the dispatch path.
+
+    #[test]
+    fn nhs_surface_once_helpers_roundtrip() {
+        let mut st = json!({});
+        assert!(!nhs_already_surfaced(&st, "asmodeus", "fp1"), "nothing surfaced yet");
+        mark_nhs_surfaced(&mut st, "asmodeus", "fp1");
+        assert!(nhs_already_surfaced(&st, "asmodeus", "fp1"), "identical need is parked");
+        assert!(
+            !nhs_already_surfaced(&st, "asmodeus", "fp2"),
+            "a CHANGED fingerprint (lane state changed) re-surfaces"
+        );
+        assert!(!nhs_already_surfaced(&st, "dotz", "fp1"), "per-lane, not global");
+        clear_nhs_surfaced(&mut st, "asmodeus");
+        assert!(!nhs_already_surfaced(&st, "asmodeus", "fp1"), "cleared = re-surfaces once");
+        clear_nhs_surfaced(&mut st, "never_marked"); // no-op, never panics
+    }
+
+    #[test]
+    fn bump_stuck_counter_real_move_clears_nhs_surfaced() {
+        let mut st = json!({});
+        mark_nhs_surfaced(&mut st, "dotz", "fp");
+        bump_stuck_counter(&mut st, "dotz", true); // inert sweep: park persists
+        assert!(nhs_already_surfaced(&st, "dotz", "fp"));
+        bump_stuck_counter(&mut st, "dotz", false); // the lane moved
+        assert!(
+            !nhs_already_surfaced(&st, "dotz", "fp"),
+            "a real outcome un-parks the surfaced need"
+        );
+    }
+
+    // The starvation kill itself: on the DISPATCH path a surfaced needs_human_spec is skipped
+    // (its stuck streak still bumps inline) so the queue's real jobs get the dispatch slot; the
+    // DISPLAY path still shows it; a changed fingerprint re-surfaces it.
+    #[test]
+    fn plan_jobs_parks_surfaced_needs_human_spec_on_dispatch_path() {
+        // Structural nhs lane (the asmodeus shape): stop sentinel + stranded reason, !running.
+        let parked = format!("nhs_parked_lane_{}", std::process::id());
+        let parked_repo = json!({"name": parked.clone(), "path": format!("C:/p/{parked}")});
+        let parked_rt = paths::runtime_dir(&parked_repo).unwrap();
+        let _ = std::fs::remove_dir_all(&parked_rt);
+        std::fs::create_dir_all(&parked_rt).unwrap();
+        std::fs::write(parked_rt.join("stop"), "stranded_unmerged_branch_persistent\n").unwrap();
+        std::fs::write(
+            parked_rt.join("heartbeat.json"),
+            serde_json::to_string(&json!({
+                "status": "error",
+                "phase": "preflight",
+                "reason": "stranded_unmerged_branch_persistent",
+                "last_summary": "Stranded finished work: rsi/iter-x (+1 commit(s) not on main) — not an ancestor of the fork base.",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // A healthy lane behind it whose implement job was starving.
+        let real = format!("nhs_real_lane_{}", std::process::id());
+        let real_repo = json!({"name": real.clone(), "path": format!("C:/p/{real}")});
+        let real_rt = paths::runtime_dir(&real_repo).unwrap();
+        let _ = std::fs::remove_dir_all(&real_rt);
+        std::fs::create_dir_all(&real_rt).unwrap();
+
+        let cfg = json!({"provider": "openrouter", "targets": [parked.clone(), real.clone()]});
+        let repos = [parked_repo, real_repo];
+        let ops = json!({"projects": {}});
+
+        // Sweep 1 (dispatch path, nothing surfaced yet): the need IS planned — the one surfacing.
+        let mut st = json!({"manual_queue": []});
+        let jobs = plan_jobs(&repos, &cfg, &ops, &mut st, None, true);
+        let need = jobs
+            .iter()
+            .find(|j| j.name == parked && j.kind == "needs_human_spec")
+            .expect("first sweep surfaces the need once");
+        // once() marks the surfacing after the dispatch — simulate exactly that.
+        mark_nhs_surfaced(&mut st, &parked, &need.reason);
+
+        // Sweep 2 (dispatch path): the identical need is PARKED; the real job gets the slot.
+        let before = st["stuck"][&parked]["sweeps"].as_u64().unwrap_or(0);
+        let jobs = plan_jobs(&repos, &cfg, &ops, &mut st, None, true);
+        assert!(
+            !jobs.iter().any(|j| j.name == parked),
+            "a surfaced need must not re-enqueue on the dispatch path: {jobs:?}"
+        );
+        assert!(
+            jobs.iter().any(|j| j.name == real && j.kind == "implement"),
+            "the starved real job now heads the queue: {jobs:?}"
+        );
+        assert_eq!(
+            st["stuck"][&parked]["sweeps"].as_u64().unwrap_or(0),
+            before + 1,
+            "the parked lane's stuck streak still bumps (watchdog window intact)"
+        );
+
+        // Display path (emit_proofs=false): the dashboard still shows the parked need.
+        let jobs = plan_jobs(&repos, &cfg, &ops, &mut st, None, false);
+        assert!(
+            jobs.iter().any(|j| j.name == parked && j.kind == "needs_human_spec"),
+            "the display path keeps showing WHY the lane is parked: {jobs:?}"
+        );
+
+        // The lane's state changes (different stranding => different diagnose evidence/reason):
+        // the need re-surfaces exactly once.
+        std::fs::write(
+            parked_rt.join("heartbeat.json"),
+            serde_json::to_string(&json!({
+                "status": "error",
+                "phase": "preflight",
+                "reason": "stranded_unmerged_branch_persistent",
+                "last_summary": "Stranded finished work: rsi/iter-OTHER (+3 commit(s) not on main) — not an ancestor of the fork base.",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let jobs = plan_jobs(&repos, &cfg, &ops, &mut st, None, true);
+        assert!(
+            jobs.iter().any(|j| j.name == parked && j.kind == "needs_human_spec"),
+            "a changed fingerprint (lane state changed) re-surfaces the need once: {jobs:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(parked_rt);
+        let _ = std::fs::remove_dir_all(real_rt);
     }
 
     // ===================================================================== #
