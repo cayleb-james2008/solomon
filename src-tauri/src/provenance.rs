@@ -309,7 +309,11 @@ fn solomon_base_branch() -> String {
 }
 
 /// Path-parameterized core of [`controller_clean`] so tests drive clean/dirty/off-branch tmp repos.
-fn controller_clean_at(root: &Path, expected_branch: &str) -> Result<(), String> {
+/// `pub(crate)`: the supervisor's stale-error revalidation reuses this EXACT check (clean tree +
+/// on-base + not ahead of upstream) to re-derive whether a persisted dirty-tree / out-of-band-base
+/// heartbeat error still reproduces before re-asserting it — same probe, so the clear can never
+/// disagree with the preflight that wrote the error.
+pub(crate) fn controller_clean_at(root: &Path, expected_branch: &str) -> Result<(), String> {
     let root_s = root.to_string_lossy().into_owned();
     let st = proc::run(
         &["git", "-C", &root_s, "status", "--porcelain"],

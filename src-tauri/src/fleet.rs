@@ -566,7 +566,17 @@ fn plan_jobs(
         if paths::runtime_dir(repo).map(|d| d.join("paused").exists()).unwrap_or(false) {
             continue;
         }
-        let diag = supervisor::diagnose(repo);
+        let mut diag = supervisor::diagnose(repo);
+        // STALE-ERROR REVALIDATION (dispatch path only): a persisted heartbeat error of a
+        // re-checkable git-state class (dirty tree / out-of-band base / stranded branch) is
+        // re-run against the repo before the scheduler routes on it — a condition that no longer
+        // reproduces is cleared to idle (the 2026-07-15 solomon self-lane wedge: 'controller tree
+        // dirty — 3 commit(s) not on origin/main' persisted a day past main==origin/main, parking
+        // the lane on proof_required forever). Gated to emit_proofs so the frequent state()
+        // display path stays file-only; the display self-corrects after the next dispatch sweep.
+        if emit_proofs && supervisor::revalidate_persisted_error(repo, &diag).is_some() {
+            diag = supervisor::diagnose(repo); // re-read the now-idle heartbeat (file-only, cheap)
+        }
         let diag_cat = diag.get("category").and_then(Value::as_str).unwrap_or("ok");
         let ops_project = ops_payload
             .get("projects")
