@@ -37,20 +37,27 @@ const DEFAULT_RUN_TIMEOUT_S: u64 = 3_600;
 /// exponential backoff caps the force-cycle. 3 sweeps ≈ 15 min at the 5-min sentinel cadence.
 pub const STUCK_SWEEP_THRESHOLD: u64 = 3;
 
-/// Consecutive `proof_required` outcomes after which a lane is parked in a 4h cooldown and a
-/// `needs_human_spec` need is filed instead of dispatching another inert proof_required job. This
-/// kills retry theater: a lane diagnosed unhealthy with `auto_safe != true` re-fires the same
-/// non-mutating `proof_required` job every ~5-min sweep forever (the dotz 53:1 proof_required:implement
-/// ratio was this). After PROOF_COOLDOWN_THRESHOLD consecutive no-ops, the lane is parked for
-/// PROOF_COOLDOWN_S and surfaced as a `needs_human_spec` need (kind "decision") — the operator specs a
-/// real fix instead of the loop spinning on a corpse. The cooldown clears the moment the lane
-/// produces a non-proof_required outcome (it moved), same as `bump_stuck_counter` clears `stuck`.
+/// Consecutive `proof_required` outcomes after which a lane's autonomous RE-SPEC engages instead of
+/// dispatching another inert proof_required job. This kills retry theater: a lane diagnosed
+/// unhealthy with `auto_safe != true` re-fires the same non-mutating `proof_required` job every
+/// ~5-min sweep forever (the dotz 53:1 proof_required:implement ratio was this). After
+/// PROOF_COOLDOWN_THRESHOLD consecutive no-ops the cooldown arms; `plan_jobs` then routes the lane to
+/// a BOUNDED autonomous diversification (a gated AI iteration at a FRESH, DIFFERENT approach via the
+/// MoA brain) instead of parking for a human — see DIVERSIFY_DAILY_CAP. The cooldown clears the
+/// moment the lane produces a non-proof_required outcome (it moved), same as `bump_stuck_counter`.
 pub const PROOF_COOLDOWN_THRESHOLD: u64 = 3;
-/// The proof_required cooldown window: 4h (lowered from 24h — a wedged lane should re-surface
-/// the same day, not vanish for a day). Long enough to break the retry loop and force a human
-/// spec; short enough that a genuinely-stuck lane re-surfaces rather than being silently parked
-/// forever. Matched to the operator's "open Solomon, review the need, spec a fix" cadence.
+/// The proof_required cooldown window: 4h. Long enough to break the inert retry loop; short enough
+/// that a genuinely-stuck lane re-surfaces the same day. It now paces the AUTONOMOUS diversification
+/// (re-arm on the next threshold crossing) rather than a human-spec park.
 pub const PROOF_COOLDOWN_S: i64 = 14_400;
+
+/// Per-lane-per-day cap on AUTONOMOUS diversification (re-spec) implement iterations. A lane that
+/// would otherwise be parked for a human spec instead gets up to this many gated AI attempts at a
+/// FRESH, DIFFERENT approach per day (the MoA brain's own anti-thrash forces a different goal, never
+/// the identical failing change); past it the lane backs off to low-frequency autonomous retry —
+/// never a human park, never infinite spend. Small by design; `daily_call_budget` is the fleet-wide
+/// spend ceiling on top of this.
+pub const DIVERSIFY_DAILY_CAP: u64 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Job {
@@ -677,49 +684,53 @@ fn plan_jobs(
                 "hold",
             )
         };
-        // TERMINAL PARK (kill retry theater at the SOURCE): a lane whose diagnosis is a
-        // STRUCTURALLY stuck condition — a stranded/unmerged branch, a self-stopped or hung loop
-        // process, an un-pushed / untracked-blocked base — is HUMAN-SPEC-REQUIRED, not retry-later.
-        // Route it DIRECTLY to the terminal `needs_human_spec` state so `proof_required` is NEVER
-        // chosen for it. This PRECEDES the proof_required cooldown below, which only rate-limits and
-        // RE-FIRES the identical inert proof_required job every PROOF_COOLDOWN_S: for a condition no
-        // loop iteration can clear — nothing the scheduler does merges the branch, kills the PID, or
-        // pushes the base — re-surfacing the same corpse on cooldown expiry is pure theater. A
-        // CONFIG/TRANSIENT blocker (missing key/goal, provider quota, a stale gate, an exhausted
-        // backlog) is NOT structural and keeps the proof_required → cooldown → needs_human_spec
-        // ladder, so a self-clearing condition re-enters the queue rather than being parked forever.
-        // No inline stuck bump here: unlike the proof_required emit-bypass below (which is `continue`d
-        // before finish_non_ai_job), a needs_human_spec job flows to the shared post-dispatch bump in
-        // `once()`, exactly as the cooldown-parked needs_human_spec does — streak accounting is
-        // identical, and the routing above is purely category-driven (it never reads the streak).
-        if kind == "proof_required" && supervisor::is_structurally_stuck(diag_cat) {
-            kind = "needs_human_spec";
-            state = "needs_human_spec";
-            requires_ai = false;
-            // `reason` already holds diagnose()'s evidence (set in the proof_required arm) — keep it
-            // so the operator sees the SPECIFIC structural cause (which branch / which PID / which
-            // base), not a generic park message.
-            next_action = "reconcile the structural blocker (merge/push the stranded branch, kill \
-                           the hung improver PID, or push/clean the base), then wake the lane";
-        }
-        // proof_required COOLDOWN (kill retry theater): a lane parked for PROOF_COOLDOWN_S after
-        // PROOF_COOLDOWN_THRESHOLD consecutive inert proof_required sweeps emits a
-        // `needs_human_spec` need (kind "decision") INSTEAD of another inert proof_required job.
-        // The operator reviews the need and specs a real fix; the loop stops spinning on a corpse.
-        // An EXPIRED cooldown (until <= now) lets the proof_required job re-fire (and re-arm on the
-        // next threshold crossing) — a genuinely-stuck lane re-surfaces rather than being parked
-        // forever. The `stuck` counter is NOT cleared here (it keeps counting so the watchdog's
-        // force-heal ladder still sees the full streak); only the job KIND changes.
-        if kind == "proof_required" && proof_cooldown_active_at(st, &name, Utc::now()) {
-            let cd = proof_cooldown_entry(st, &name).cloned().unwrap_or(Value::Null);
-            kind = "needs_human_spec";
-            state = "needs_human_spec";
-            requires_ai = false;
-            reason = "lane hit PROOF_COOLDOWN_THRESHOLD consecutive proof_required sweeps without a \
-                      mutation; parked for a human spec — retry theater killed";
-            next_action = "review the blocker, spec a real fix, then wake the lane";
-            // Surface the cooldown in the job reason so the dashboard shows WHY it is parked.
-            let _ = cd; // (the verdict's extra carries the diagnosis; the cooldown is in state)
+        // AUTONOMOUS RE-SPEC (operator directive: NO human park). A lane that would otherwise be
+        // parked for a human spec — either STRUCTURALLY stuck (stranded/unmerged branch, hung PID,
+        // un-pushed base) OR hit the proof_required COOLDOWN (PROOF_COOLDOWN_THRESHOLD consecutive
+        // inert proof_required sweeps) — instead gets a BOUNDED autonomous diversification: dispatch
+        // a gated AI implement iteration that tries a FRESH, DIFFERENT approach via the MoA brain
+        // (whose own anti-thrash/escalation forces a different goal — never the identical failing
+        // change), capped at DIVERSIFY_DAILY_CAP per lane per day. Past the cap, BACK OFF to
+        // low-frequency autonomous retry (the inert proof_required emit-bypass below — no LLM spend,
+        // rate-limited by the cooldown cadence, re-attempting when the daily count resets). Never a
+        // human park, never infinite spend. Anti-gaming stays intact: the gated implement can never
+        // merge a bad change (the RSI gates + the improver's hypothesis/freshness/progress ledgers
+        // police fake metric progress); fleet only decides to keep ATTEMPTING autonomously rather
+        // than waiting on a human. `needs_human_spec` is never chosen.
+        // Holds the diversify/backoff reason string; assigned (and `reason` re-pointed at it) only on
+        // the would_park path, so it must outlive the borrow until `jobs.push` below.
+        let diversify_reason: String;
+        let would_park = kind == "proof_required"
+            && (supervisor::is_structurally_stuck(diag_cat)
+                || proof_cooldown_active_at(st, &name, Utc::now()));
+        if would_park {
+            let today = today_local();
+            if diversify_count(st, &name, &today) < DIVERSIFY_DAILY_CAP {
+                bump_diversify_count(st, &name, &today);
+                let n = diversify_count(st, &name, &today);
+                kind = "implement";
+                state = "queued";
+                requires_ai = true;
+                // `reason` still carries diagnose()'s evidence (from the proof_required arm); frame it
+                // as a diversification attempt so the dashboard shows WHY an AI iteration is running.
+                diversify_reason = format!(
+                    "autonomous diversification {n}/{DIVERSIFY_DAILY_CAP} (no human park): repeated \
+                     proof_required — trying a FRESH, DIFFERENT approach via the MoA brain, not the \
+                     identical failing change. Blocker: {reason}"
+                );
+                reason = &diversify_reason;
+                next_action = "run one gated RSI iteration taking a DIFFERENT approach from the prior \
+                               failing change; the RSI gates still decide (no fake progress)";
+            } else {
+                // Daily diversification budget spent — BACK OFF to low-frequency autonomous retry:
+                // keep proof_required (the inert emit-bypass below — no LLM spend, rate-limited) and
+                // re-attempt diversification when the daily count resets. NEVER a human park.
+                diversify_reason = format!(
+                    "diversification budget spent for today ({DIVERSIFY_DAILY_CAP}/day) — backing off \
+                     to low-frequency autonomous retry (no human park). Blocker: {reason}"
+                );
+                reason = &diversify_reason;
+            }
         }
         // needs_human_spec SURFACE-ONCE PARK (dispatch path only, both routes above): a need that
         // was already surfaced with this exact fingerprint is NOT re-enqueued — re-dispatching the
@@ -1127,10 +1138,10 @@ fn write_state(st: &Value) -> std::io::Result<()> {
 /// the watchdog reads it read-only via `stuck_sweeps`. Best-effort: never panics on a malformed map.
 ///
 /// Also maintains the proof_required COOLDOWN: when a lane's consecutive count reaches
-/// PROOF_COOLDOWN_THRESHOLD, `arm_proof_cooldown` parks it for PROOF_COOLDOWN_S (kills retry
-/// theater — `plan_jobs` then emits a `needs_human_spec` need instead of another inert
-/// proof_required). On any non-proof_required outcome, both `stuck` and `proof_cooldowns` are
-/// cleared (the lane moved, so it is no longer stuck NOR parked).
+/// PROOF_COOLDOWN_THRESHOLD, `arm_proof_cooldown` arms it for PROOF_COOLDOWN_S (kills retry
+/// theater — `plan_jobs` then routes the lane to a BOUNDED autonomous diversification instead of
+/// another inert proof_required, never a human park). On any non-proof_required outcome, both
+/// `stuck` and `proof_cooldowns` are cleared (the lane moved, so it is no longer stuck NOR parked).
 fn bump_stuck_counter(st: &mut Value, name: &str, is_proof_required: bool) {
     if !st.get("stuck").map(Value::is_object).unwrap_or(false) {
         st["stuck"] = json!({});
@@ -1207,7 +1218,8 @@ pub fn reset_stuck_sweeps(name: &str) -> std::io::Result<()> {
 // --------------------------------------------------------------------------- //
 //
 // A lane that fires `proof_required` (the inert non-AI arm) PROOF_COOLDOWN_THRESHOLD sweeps in a
-// row is parked for PROOF_COOLDOWN_S and surfaced as a `needs_human_spec` need. The state lives in
+// row arms this cooldown; `plan_jobs` then routes the lane to a BOUNDED autonomous diversification
+// (a gated AI attempt at a fresh approach), never a human park. The state lives in
 // `autopilot_state.json` under `st["proof_cooldowns"][name] = {"until": <iso>, "armed_at": <iso>,
 // "consecutive": N}` so it round-trips with the existing read_state/write_state. The pure helpers
 // below are unit-tested; `plan_jobs` gates the proof_required branch on `proof_cooldown_active`.
@@ -1278,6 +1290,42 @@ fn arm_proof_cooldown(st: &mut Value, name: &str, consecutive: u64, now_utc: Dat
 fn clear_proof_cooldown(st: &mut Value, name: &str) {
     if let Some(m) = st.get_mut("proof_cooldowns").and_then(Value::as_object_mut) {
         m.remove(name);
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// autonomous diversification budget — the bounded no-human-park re-spec counter
+// --------------------------------------------------------------------------- //
+//
+// `st["diversify"][name] = {"date": <YYYY-MM-DD>, "count": N}` — the per-lane-per-day count of
+// autonomous diversification (re-spec) implement iterations. Bounds the no-human-park re-spec to
+// DIVERSIFY_DAILY_CAP gated AI attempts per lane per day; a new day resets the budget. Round-trips
+// with read_state/write_state like `stuck`/`proof_cooldowns`.
+
+/// Local calendar date (`YYYY-MM-DD`) — the per-day diversification budget key.
+fn today_local() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+/// A lane's diversification count for `today` from the passed state (pure). 0 when absent or the
+/// stored date is not `today` (a new day resets the budget).
+fn diversify_count(st: &Value, name: &str, today: &str) -> u64 {
+    st.get("diversify")
+        .and_then(|d| d.get(name))
+        .filter(|e| e.get("date").and_then(Value::as_str) == Some(today))
+        .and_then(|e| e.get("count").and_then(Value::as_u64))
+        .unwrap_or(0)
+}
+
+/// Increment (or start, resetting on a new day) the lane's diversification count for `today`. Bounds
+/// autonomous re-spec spend to DIVERSIFY_DAILY_CAP per lane per day.
+fn bump_diversify_count(st: &mut Value, name: &str, today: &str) {
+    if !st.get("diversify").map(Value::is_object).unwrap_or(false) {
+        st["diversify"] = json!({});
+    }
+    let next = diversify_count(st, name, today) + 1;
+    if let Some(m) = st.get_mut("diversify").and_then(Value::as_object_mut) {
+        m.insert(name.to_string(), json!({"date": today, "count": next}));
     }
 }
 
@@ -2144,10 +2192,10 @@ mod tests {
         clear_proof_cooldown(&mut st, "never_parked");
     }
 
-    // The core retry-theater kill: 3 consecutive proof_required sweeps arm the cooldown; the 4th
-    // sweep emits a `needs_human_spec` job (kind changed) instead of another inert proof_required.
+    // The core retry-theater kill: 3 consecutive proof_required sweeps arm the cooldown (which then
+    // paces the bounded autonomous diversification in plan_jobs); the streak persists while parked.
     #[test]
-    fn bump_stuck_counter_arms_cooldown_at_threshold_and_needs_human_spec_blocks_4th() {
+    fn bump_stuck_counter_arms_cooldown_at_threshold_and_persists_streak() {
         let mut st = json!({});
         // 3 consecutive proof_required sweeps — the 3rd arms the cooldown.
         bump_stuck_counter(&mut st, "dotz", true);
@@ -2161,12 +2209,12 @@ mod tests {
         );
         assert_eq!(st["stuck"]["dotz"]["sweeps"], 3);
 
-        // While parked, a needs_human_spec outcome (the parked lane's job kind) is TREATED AS STILL
-        // STUCK — the streak persists and the cooldown stays armed (not cleared).
-        bump_stuck_counter(&mut st, "dotz", true); // outcome == "needs_human_spec" → still stuck
+        // A further inert proof_required (backoff) sweep keeps the lane STUCK — the streak persists
+        // and the cooldown stays armed (not cleared) so the diversification cadence holds.
+        bump_stuck_counter(&mut st, "dotz", true); // another inert proof_required → still stuck
         assert!(
             proof_cooldown_active_at(&st, "dotz", Utc::now()),
-            "parked lane stays parked across needs_human_spec sweeps (streak persists)"
+            "parked lane stays parked across inert proof_required sweeps (streak persists)"
         );
         assert_eq!(st["stuck"]["dotz"]["sweeps"], 4);
 
@@ -2176,10 +2224,11 @@ mod tests {
         assert!(st.get("stuck").unwrap().get("dotz").is_none());
     }
 
-    // plan_jobs gates the proof_required branch on the cooldown: a lane with an ACTIVE cooldown gets
-    // a `needs_human_spec` job (not another inert proof_required); an EXPIRED cooldown re-fires.
+    // plan_jobs gates the proof_required branch on the cooldown: a lane with an ACTIVE cooldown is
+    // DIVERSIFIED (a bounded gated AI attempt), never parked for a human; past the daily cap it backs
+    // off to inert proof_required; an EXPIRED cooldown re-fires proof_required.
     #[test]
-    fn plan_jobs_emits_needs_human_spec_when_proof_cooldown_active() {
+    fn plan_jobs_diversifies_when_proof_cooldown_active_and_bounds_it() {
         // Drive a lane into a non-AI proof_required diagnosis (status=error, auto_safe!=true).
         let name = format!("cooldown_lane_{}", std::process::id());
         let repo = json!({"name": name.clone(), "path": format!("C:/p/{name}")});
@@ -2220,20 +2269,53 @@ mod tests {
         );
         let job = jobs.iter().find(|j| j.name == name).expect("job planned");
         assert_eq!(
-            job.kind, "needs_human_spec",
-            "an ACTIVE cooldown emits a needs_human_spec need, not another inert proof_required"
+            job.kind, "implement",
+            "an ACTIVE cooldown DIVERSIFIES (a gated AI attempt), never a human park"
         );
-        assert!(!job.requires_ai, "needs_human_spec is a non-AI inert need");
+        assert!(job.requires_ai, "the diversification is a gated AI implement iteration");
         assert!(
-            job.reason.contains("PROOF_COOLDOWN_THRESHOLD"),
-            "the need reason names the retry-theater kill: {reason}",
+            job.reason.contains("diversification") && job.reason.contains("FRESH, DIFFERENT"),
+            "the reason frames a fresh-approach attempt: {reason}",
             reason = job.reason
         );
         assert!(
-            job.next_action.contains("spec a real fix"),
-            "the next action tells the operator to spec a real fix: {next}",
+            job.next_action.contains("DIFFERENT approach"),
+            "the next action tells the brain to take a different approach: {next}",
             next = job.next_action
         );
+        assert_eq!(
+            diversify_count(&st, &name, &today_local()),
+            1,
+            "the diversification consumed one of the per-day budget"
+        );
+        assert!(
+            !jobs.iter().any(|j| j.kind == "needs_human_spec"),
+            "no lane is ever parked for a human: {jobs:?}"
+        );
+
+        // BUDGET SPENT: with the daily diversification cap already used, an ACTIVE cooldown BACKS OFF
+        // to low-frequency autonomous retry (inert proof_required) — still NEVER a human park.
+        let mut st_capped = json!({
+            "manual_queue": [],
+            "proof_cooldowns": {name.clone(): {
+                "until": future.format("%Y-%m-%dT%H:%M:%SZ").to_string(), "consecutive": 3
+            }},
+            "diversify": {name.clone(): {"date": today_local(), "count": DIVERSIFY_DAILY_CAP}}
+        });
+        let jobs = plan_jobs(
+            std::slice::from_ref(&repo),
+            &cfg,
+            &json!({"projects": {}}),
+            &mut st_capped,
+            None,
+            false,
+        );
+        let job = jobs.iter().find(|j| j.name == name).expect("job planned");
+        assert_eq!(
+            job.kind, "proof_required",
+            "past the daily diversification cap the lane backs off to inert proof_required, not a park"
+        );
+        assert!(job.reason.contains("backing off"), "the backoff is explicit: {}", job.reason);
 
         // EXPIRED cooldown (until in the past): proof_required re-fires (the lane is no longer parked).
         let past = Utc::now() - ChronoDuration::seconds(3600);
@@ -2258,13 +2340,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(rt);
     }
 
-    // A STRUCTURALLY stuck lane (a stranded/unmerged branch — human reconcile required) must reach
-    // the TERMINAL `needs_human_spec` state on the VERY FIRST sweep, with NO cooldown armed, instead
-    // of the inert `proof_required` job — proving retry theater is killed at the source and never
-    // re-fires. A retry-later lane (needs_goal) under the identical empty state stays proof_required,
-    // so the two remediation ladders are provably distinct.
+    // A STRUCTURALLY stuck lane (a stranded/unmerged branch) is DIVERSIFIED (a bounded gated AI
+    // attempt at a fresh approach) on the very first sweep — NEVER parked for a human. A retry-later
+    // lane (needs_goal) under the identical empty state stays proof_required, so the two ladders are
+    // still distinct; neither is ever routed to needs_human_spec.
     #[test]
-    fn plan_jobs_routes_structurally_stuck_lane_to_terminal_needs_human_spec() {
+    fn plan_jobs_diversifies_a_structurally_stuck_lane_instead_of_parking() {
         // ---- structural lane: a persistent stranded rsi/* branch (has_stop + !running + reason). ----
         let stuck = format!("stranded_lane_{}", std::process::id());
         let stuck_repo = json!({"name": stuck.clone(), "path": format!("C:/p/{stuck}")});
@@ -2318,25 +2399,31 @@ mod tests {
 
         let stuck_job = jobs.iter().find(|j| j.name == stuck).expect("structural job planned");
         assert_eq!(
-            stuck_job.kind, "needs_human_spec",
-            "a structurally-stuck lane must terminally park, NOT re-fire proof_required"
+            stuck_job.kind, "implement",
+            "a structurally-stuck lane DIVERSIFIES (a gated AI attempt), NOT a human park"
         );
-        assert_eq!(stuck_job.state, "needs_human_spec");
-        assert!(!stuck_job.requires_ai, "the terminal park is a non-AI inert need");
+        assert_eq!(stuck_job.state, "queued");
+        assert!(stuck_job.requires_ai, "the diversification is a gated AI implement iteration");
         assert!(
-            stuck_job.next_action.contains("reconcile the structural blocker"),
-            "the next action tells the operator to reconcile the git/process state: {next}",
+            stuck_job.next_action.contains("DIFFERENT approach"),
+            "the next action tells the brain to take a different approach: {next}",
             next = stuck_job.next_action
         );
-        // The specific diagnose() evidence is preserved (which branch), not a generic park message.
+        // The specific diagnose() evidence is preserved (which branch) inside the diversify framing.
         assert!(
-            stuck_job.reason.to_lowercase().contains("stranded"),
-            "the reason keeps the specific structural cause: {reason}",
+            stuck_job.reason.to_lowercase().contains("stranded")
+                && stuck_job.reason.contains("diversification"),
+            "the reason keeps the specific structural cause under the diversify framing: {reason}",
             reason = stuck_job.reason
         );
+        assert_eq!(
+            diversify_count(&st, &stuck, &today_local()),
+            1,
+            "the structural diversification consumed one of the per-day budget"
+        );
         assert!(
-            proof_cooldown_entry(&st, &stuck).is_none(),
-            "the terminal park must not depend on (or arm) the proof_required cooldown"
+            !jobs.iter().any(|j| j.kind == "needs_human_spec"),
+            "no lane is ever routed to needs_human_spec: {jobs:?}"
         );
 
         // The retry-later lane, under the identical empty state, keeps the proof_required ladder.
@@ -2388,13 +2475,13 @@ mod tests {
         );
     }
 
-    // The starvation kill itself: on the DISPATCH path a surfaced needs_human_spec is skipped
-    // (its stuck streak still bumps inline) so the queue's real jobs get the dispatch slot; the
-    // DISPLAY path still shows it; a changed fingerprint re-surfaces it.
+    // THE BOUND HOLDS: a structurally-stuck lane DIVERSIFIES at most DIVERSIFY_DAILY_CAP times per
+    // day (each a gated AI attempt at a fresh approach), then BACKS OFF to inert proof_required —
+    // which the dispatch path emit-bypasses, freeing the slot for real jobs. `needs_human_spec` is
+    // never produced, spend is bounded, and the dashboard still surfaces the blocker.
     #[test]
-    fn plan_jobs_parks_surfaced_needs_human_spec_on_dispatch_path() {
-        // Structural nhs lane (the asmodeus shape): stop sentinel + stranded reason, !running.
-        let parked = format!("nhs_parked_lane_{}", std::process::id());
+    fn plan_jobs_diversification_bound_holds_and_frees_the_slot() {
+        let parked = format!("bound_lane_{}", std::process::id());
         let parked_repo = json!({"name": parked.clone(), "path": format!("C:/p/{parked}")});
         let parked_rt = paths::runtime_dir(&parked_repo).unwrap();
         let _ = std::fs::remove_dir_all(&parked_rt);
@@ -2411,72 +2498,52 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        // A healthy lane behind it whose implement job was starving.
-        let real = format!("nhs_real_lane_{}", std::process::id());
-        let real_repo = json!({"name": real.clone(), "path": format!("C:/p/{real}")});
-        let real_rt = paths::runtime_dir(&real_repo).unwrap();
-        let _ = std::fs::remove_dir_all(&real_rt);
-        std::fs::create_dir_all(&real_rt).unwrap();
 
-        let cfg = json!({"provider": "openrouter", "targets": [parked.clone(), real.clone()]});
-        let repos = [parked_repo, real_repo];
+        let cfg = json!({"provider": "openrouter", "targets": [parked.clone()]});
+        let repos = [parked_repo];
         let ops = json!({"projects": {}});
-
-        // Sweep 1 (dispatch path, nothing surfaced yet): the need IS planned — the one surfacing.
         let mut st = json!({"manual_queue": []});
-        let jobs = plan_jobs(&repos, &cfg, &ops, &mut st, None, true);
-        let need = jobs
-            .iter()
-            .find(|j| j.name == parked && j.kind == "needs_human_spec")
-            .expect("first sweep surfaces the need once");
-        // once() marks the surfacing after the dispatch — simulate exactly that.
-        mark_nhs_surfaced(&mut st, &parked, &need.reason);
 
-        // Sweep 2 (dispatch path): the identical need is PARKED; the real job gets the slot.
-        let before = st["stuck"][&parked]["sweeps"].as_u64().unwrap_or(0);
+        // The first DIVERSIFY_DAILY_CAP dispatch sweeps each DIVERSIFY (a gated AI implement attempt).
+        for i in 1..=DIVERSIFY_DAILY_CAP {
+            let jobs = plan_jobs(&repos, &cfg, &ops, &mut st, None, true);
+            let job = jobs.iter().find(|j| j.name == parked).expect("diversify job planned");
+            assert_eq!(job.kind, "implement", "sweep {i} diversifies (gated AI attempt): {job:?}");
+            assert!(job.requires_ai);
+            assert_eq!(
+                diversify_count(&st, &parked, &today_local()),
+                i,
+                "the per-day budget is consumed monotonically"
+            );
+            assert!(
+                !jobs.iter().any(|j| j.kind == "needs_human_spec"),
+                "never a human park: {jobs:?}"
+            );
+        }
+
+        // Past the cap the lane BACKS OFF: proof_required is emit-bypassed on the dispatch path, so
+        // the lane drops OUT of the queue (slot freed) — never a needs_human_spec, no more AI spend.
         let jobs = plan_jobs(&repos, &cfg, &ops, &mut st, None, true);
         assert!(
             !jobs.iter().any(|j| j.name == parked),
-            "a surfaced need must not re-enqueue on the dispatch path: {jobs:?}"
-        );
-        assert!(
-            jobs.iter().any(|j| j.name == real && j.kind == "implement"),
-            "the starved real job now heads the queue: {jobs:?}"
+            "past the cap the lane backs off (emit-bypassed proof_required), freeing the slot: {jobs:?}"
         );
         assert_eq!(
-            st["stuck"][&parked]["sweeps"].as_u64().unwrap_or(0),
-            before + 1,
-            "the parked lane's stuck streak still bumps (watchdog window intact)"
+            diversify_count(&st, &parked, &today_local()),
+            DIVERSIFY_DAILY_CAP,
+            "the daily diversification budget is capped — no runaway spend"
         );
 
-        // Display path (emit_proofs=false): the dashboard still shows the parked need.
+        // The DISPLAY path still surfaces the blocker (inert proof_required, NOT a human park).
         let jobs = plan_jobs(&repos, &cfg, &ops, &mut st, None, false);
-        assert!(
-            jobs.iter().any(|j| j.name == parked && j.kind == "needs_human_spec"),
-            "the display path keeps showing WHY the lane is parked: {jobs:?}"
+        let job = jobs.iter().find(|j| j.name == parked).expect("display job planned");
+        assert_eq!(
+            job.kind, "proof_required",
+            "the dashboard shows the inert blocker, not a human park: {job:?}"
         );
-
-        // The lane's state changes (different stranding => different diagnose evidence/reason):
-        // the need re-surfaces exactly once.
-        std::fs::write(
-            parked_rt.join("heartbeat.json"),
-            serde_json::to_string(&json!({
-                "status": "error",
-                "phase": "preflight",
-                "reason": "stranded_unmerged_branch_persistent",
-                "last_summary": "Stranded finished work: rsi/iter-OTHER (+3 commit(s) not on main) — not an ancestor of the fork base.",
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let jobs = plan_jobs(&repos, &cfg, &ops, &mut st, None, true);
-        assert!(
-            jobs.iter().any(|j| j.name == parked && j.kind == "needs_human_spec"),
-            "a changed fingerprint (lane state changed) re-surfaces the need once: {jobs:?}"
-        );
+        assert!(job.reason.contains("backing off"), "the backoff is explicit: {}", job.reason);
 
         let _ = std::fs::remove_dir_all(parked_rt);
-        let _ = std::fs::remove_dir_all(real_rt);
     }
 
     // ===================================================================== #
