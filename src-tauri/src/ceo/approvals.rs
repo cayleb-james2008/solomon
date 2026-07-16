@@ -7,8 +7,9 @@
 //! self-tooling manifest, so "what is waiting on me?" required a per-lane spelunk. `regenerate`
 //! (ridden on the FAST deterministic core of `ceo::tick`, every ~2 min sweep) rewrites
 //! `runtime/_pending_approvals.md` (human) + `.json` (dashboard) with every unapproved growth
-//! draft, unapproved outreach draft, and tool awaiting live-approval — each carrying the EXACT
-//! one-line edit that approves it.
+//! draft, unapproved outreach draft, and tool awaiting an approval (dry-run VALIDATION first —
+//! registration executes nothing — then live invocation) — each carrying the EXACT one-line edit
+//! that approves its next rung.
 //!
 //! HARD INVARIANTS (unchanged by this module):
 //!   * READ-ONLY over the gated artifacts — this surface never sets `approved`, never edits a
@@ -95,9 +96,12 @@ pub(crate) fn collect_outreach_pending(rows: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// Tools awaiting live-approval: every manifest entry whose `approved` is not exactly boolean
-/// `true` (absent / false / string "true" all read as unapproved — fail-closed, mirroring
-/// `draft_line_approved`'s strictness). Pure over the manifest Value; sorted for determinism.
+/// Tools awaiting an operator approval: every manifest entry whose `approved` is not exactly
+/// boolean `true` (absent / false / string "true" all read as unapproved — fail-closed, mirroring
+/// `draft_line_approved`'s strictness). Each row carries the EXACT edit for its NEXT rung:
+/// a `dry_run.pending` entry needs `approved_validation: true` first (registration executed
+/// nothing — the sandboxed dry-run is itself operator-gated); a validated entry needs
+/// `approved: true` for live invocation. Pure over the manifest Value; sorted for determinism.
 pub(crate) fn collect_tools_pending(manifest: &Value) -> Vec<Value> {
     let Some(tools) = manifest.get("tools").and_then(Value::as_object) else {
         return Vec::new();
@@ -106,15 +110,34 @@ pub(crate) fn collect_tools_pending(manifest: &Value) -> Vec<Value> {
         .iter()
         .filter(|(_, e)| e.get("approved").and_then(Value::as_bool) != Some(true))
         .map(|(name, e)| {
+            let pending_validation =
+                e.pointer("/dry_run/pending").and_then(Value::as_bool) == Some(true);
+            let validation_cleared =
+                e.get("approved_validation").and_then(Value::as_bool) == Some(true);
+            let approve = if pending_validation && !validation_cleared {
+                format!(
+                    "set \"approved_validation\": true on tools.{name} in \
+                     runtime\\_tools\\tools_manifest.json to allow the sandboxed dry-run \
+                     (registration executed nothing)"
+                )
+            } else if pending_validation {
+                format!(
+                    "validation approved — the next CEO sweep runs tools.{name}'s sandboxed \
+                     dry-run and records pass/fail"
+                )
+            } else {
+                format!(
+                    "set \"approved\": true on tools.{name} in runtime\\_tools\\tools_manifest.json \
+                     to allow live invocation"
+                )
+            };
             json!({
                 "name": name,
                 "purpose": e.get("purpose").and_then(Value::as_str).unwrap_or(""),
                 "lint_passed": e.pointer("/lint/passed").and_then(Value::as_bool).unwrap_or(false),
                 "dry_run_passed": e.pointer("/dry_run/passed").and_then(Value::as_bool).unwrap_or(false),
-                "approve": format!(
-                    "set \"approved\": true on tools.{name} in runtime\\_tools\\tools_manifest.json \
-                     to allow live invocation"
-                ),
+                "pending_validation": pending_validation,
+                "approve": approve,
             })
         })
         .collect();
@@ -203,14 +226,18 @@ pub(crate) fn render_md(growth: &[Value], outreach: &[Value], tools: &[Value]) -
         md.push('\n');
     }
     if !tools.is_empty() {
-        md.push_str("## Tools awaiting live-approval (dry-run only until approved)\n\n");
+        md.push_str("## Tools awaiting approval (inert until operator-approved)\n\n");
         for t in tools {
+            let dry = if t["pending_validation"].as_bool().unwrap_or(false) {
+                "pending".to_string()
+            } else {
+                t["dry_run_passed"].as_bool().unwrap_or(false).to_string()
+            };
             md.push_str(&format!(
-                "- **{}** — {} (lint={} dry_run={})\n  - approve: {}\n",
+                "- **{}** — {} (lint={} dry_run={dry})\n  - approve: {}\n",
                 t["name"].as_str().unwrap_or(""),
                 t["purpose"].as_str().unwrap_or(""),
                 t["lint_passed"].as_bool().unwrap_or(false),
-                t["dry_run_passed"].as_bool().unwrap_or(false),
                 t["approve"].as_str().unwrap_or("")
             ));
         }
@@ -372,6 +399,39 @@ mod tests {
         assert!(collect_tools_pending(&json!({"tools": []})).is_empty());
     }
 
+    #[test]
+    fn collect_tools_pending_routes_pending_validation_to_the_validation_edit() {
+        let manifest = json!({"version": 1, "tools": {
+            // freshly registered — dry-run never ran (registration executes nothing)
+            "gamma": {"purpose": "new helper", "approved": false, "approved_validation": false,
+                      "validation": "pending_operator",
+                      "lint": {"passed": true}, "dry_run": {"passed": false, "pending": true}},
+            // operator already cleared validation — the sweep will run it
+            "delta": {"purpose": "queued helper", "approved": false, "approved_validation": true,
+                      "validation": "pending_operator",
+                      "lint": {"passed": true}, "dry_run": {"passed": false, "pending": true}},
+            // validated — the remaining rung is live approval
+            "epsilon": {"purpose": "validated helper", "approved": false,
+                        "approved_validation": true, "validation": "validated",
+                        "lint": {"passed": true}, "dry_run": {"passed": true}},
+        }});
+        let out = collect_tools_pending(&manifest);
+        assert_eq!(out.len(), 3, "{out:?}");
+        let by_name = |n: &str| out.iter().find(|t| t["name"] == n).unwrap().clone();
+        let gamma = by_name("gamma");
+        assert_eq!(gamma["pending_validation"], true);
+        let approve = gamma["approve"].as_str().unwrap();
+        assert!(approve.contains("set \"approved_validation\": true on tools.gamma"), "{approve}");
+        assert!(approve.contains("sandboxed dry-run"), "{approve}");
+        let delta = by_name("delta");
+        assert!(delta["approve"].as_str().unwrap().contains("next CEO sweep"), "{delta}");
+        let epsilon = by_name("epsilon");
+        assert!(
+            epsilon["approve"].as_str().unwrap().contains("set \"approved\": true on tools.epsilon"),
+            "{epsilon}"
+        );
+    }
+
     // -------- fact field extraction (pure) --------
     #[test]
     fn fact_field_and_subject_extraction() {
@@ -398,17 +458,22 @@ mod tests {
         )]);
         let tools = collect_tools_pending(&json!({"tools": {
             "counter": {"purpose": "count things", "approved": false,
-                        "lint": {"passed": true}, "dry_run": {"passed": true}}}}));
+                        "lint": {"passed": true}, "dry_run": {"passed": true}},
+            "fresh": {"purpose": "unvalidated", "approved": false, "approved_validation": false,
+                      "lint": {"passed": true}, "dry_run": {"passed": false, "pending": true}}}}));
         let md = render_md(&growth, &outreach, &tools);
         assert!(md.starts_with("# Pending approvals"), "{md}");
-        assert!(md.contains("growth: 1 | outreach: 1 | tools: 1"), "{md}");
+        assert!(md.contains("growth: 1 | outreach: 1 | tools: 2"), "{md}");
         assert!(md.contains("Solomon never self-approves"), "{md}");
         assert!(md.contains("## Growth drafts (gated, unpublished)"), "{md}");
         assert!(md.contains("append {\"approved\": true}"), "{md}");
         assert!(md.contains("## Outreach drafts (gated, unsent)"), "{md}");
         assert!(md.contains("to p@o.com / subj hello there"), "{md}");
-        assert!(md.contains("## Tools awaiting live-approval"), "{md}");
+        assert!(md.contains("## Tools awaiting approval"), "{md}");
         assert!(md.contains("set \"approved\": true on tools.counter"), "{md}");
+        // the unvalidated tool carries the VALIDATION edit + an honest dry_run=pending flag
+        assert!(md.contains("set \"approved_validation\": true on tools.fresh"), "{md}");
+        assert!(md.contains("(lint=true dry_run=pending)"), "{md}");
         assert!(!md.contains("Nothing pending"), "{md}");
     }
 

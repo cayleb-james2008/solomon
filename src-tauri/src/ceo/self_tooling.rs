@@ -1,17 +1,22 @@
-//! CEO autonomy, piece 2 — TOOLSET SELF-EXTENSION: propose -> lint -> dry-run -> register ->
-//! invoke, every rung fail-closed, live effects human-gated.
+//! CEO autonomy, piece 2 — TOOLSET SELF-EXTENSION: propose -> lint -> register (inert) ->
+//! operator-approved dry-run validation -> invoke, every rung fail-closed, ALL execution
+//! human-gated.
 //!
 //! ============================ WHAT THIS ADDS =============================
 //! The operator's end goal names "control and add to its own toolset on the fly" as a CEO
 //! capability. This module gives it real teeth WITHOUT weakening a single gate: the CEO plane can
-//! autonomously author a small PowerShell helper, statically LINT it against a deny-list (the
-//! core safety gate — dangerous verbs are rejected BEFORE any subprocess touches the script),
-//! validate it with a sandboxed mandatory `-DryRun` self-test, and REGISTER it (script + manifest
-//! entry) under gitignored `runtime\_tools\`. A registered tool is auto-invocable by the tick
-//! ONLY in `-DryRun` (exactly what validation proved safe); a LIVE invocation requires an
-//! operator-set `approved: true` in the manifest — absent that, `invoke_tool(live=true)` DEGRADES
-//! to a dry-run and says so (never a silent live effect). `unregister_tool` is the built-in
-//! per-tool rollback.
+//! autonomously author a small PowerShell helper, statically LINT it against a deny-list (a cheap
+//! PRE-FILTER — dangerous verbs are rejected BEFORE the script ever touches disk), and REGISTER
+//! it (script + manifest entry) under gitignored `runtime\_tools\` WITHOUT EXECUTING A BYTE OF IT
+//! — not even `-DryRun`, not even a parse check. Model-authored code never auto-executes: the
+//! entry lands with `validation: "pending_operator"` + `dry_run: {passed:false, pending:true}`,
+//! and the sandboxed mandatory `-DryRun` self-test runs only after an operator hand-sets
+//! `approved_validation: true` on the entry (a later sweep's [`maybe_validate_approved_tools`]
+//! performs it, records pass/fail, and clears `pending`). A validated tool is auto-invocable by
+//! the tick ONLY in `-DryRun` (exactly what validation proved safe); a LIVE invocation requires
+//! the additional operator-set `approved: true` in the manifest — absent that,
+//! `invoke_tool(live=true)` DEGRADES to a dry-run and says so (never a silent live effect).
+//! `unregister_tool` is the built-in per-tool rollback.
 //! ========================================================================
 //!
 //! ## Location decision (why the provenance tripwire cannot break)
@@ -23,15 +28,22 @@
 //! ever enters that set. Promoting a tool to permanent tracked `tools\` is an explicit MANUAL
 //! operator step (copy + `operator:` commit), out of scope by design.
 //!
-//! ## The deny-list linter (static, fail-closed — the core safety gate)
+//! ## The deny-list linter (static, fail-closed — a cheap PRE-FILTER, not the gate)
 //! ANY match rejects, with the offending markers listed: file mutation outside `runtime\`/temp,
 //! network sends/fetches (+ the `research::EXTERNAL_MUTATION_MARKERS` set, reused so the two deny
 //! sources cannot diverge), process/service kills, background-process creation (schtasks /
-//! scheduled tasks / Start-Job / services — the no-daemons doctrine), and eval/policy/privilege
-//! escalation. A denied tool is never written to disk, never dry-run, never registered; the
-//! rejection is audited. The linter is deliberately over-broad (substring + word-boundary
-//! heuristics): a false positive costs one refused proposal, a false negative could cost a real
-//! side effect — fail-closed is the correct direction.
+//! scheduled tasks / Start-Job / services — the no-daemons doctrine), eval/policy/privilege
+//! escalation, and the OBFUSCATION family a substring scan cannot see: `-EncodedCommand` /
+//! `Invoke-Command`, the call operator `&` / dot-source `.` applied to anything other than a bare
+//! literal command name or a quoted literal string (expression building — `& ('Stop-Proc'+'ess')`
+//! assembles a denied verb out of innocent fragments), and backtick escapes outside strings
+//! (`` Sto`p-Process `` spells a denied verb without ever containing it). A denied tool is never
+//! written to disk, never registered; the rejection is audited. The linter is deliberately
+//! over-broad (substring + word-boundary + shape heuristics): a false positive costs one refused
+//! proposal, a false negative could cost a real side effect — fail-closed is the correct
+//! direction. But a token linter over a full scripting language is BYPASSABLE BY CONSTRUCTION,
+//! which is why it is only the pre-filter: the actual execution gate is the operator-approved
+//! sandboxed dry-run — nothing model-authored runs until a human clears it.
 //!
 //! ## Tamper evidence
 //! The manifest stores `sha256` of the exact registered bytes (the vendored `provenance` hash —
@@ -66,7 +78,9 @@ const TOOL_AUTHOR_PROMPT: &str = "You author ONE small PowerShell helper tool fo
     side effect and exit 0. It may only write under the relative 'runtime/' directory. FORBIDDEN \
     (statically rejected): deleting or writing files outside runtime/, any network access or \
     send, killing processes or services, creating scheduled tasks / services / background jobs, \
-    Invoke-Expression, execution-policy or registry or privilege changes. Keep it under 60 lines. \
+    Invoke-Expression, Invoke-Command, -EncodedCommand, execution-policy or registry or privilege \
+    changes, backtick escapes, and the call operator '&' or dot-sourcing applied to anything but a \
+    literal command name. Keep it under 60 lines. \
     Reply STRICT JSON only: {\"name\":\"<kebab-or-snake short name>\",\"purpose\":\"<one \
     line>\",\"script\":\"<the full PowerShell script>\"}";
 
@@ -179,13 +193,138 @@ const MUTATING_FS_MARKERS: &[&str] = &[
 /// Short dangerous aliases, WORD-BOUNDARY matched (a substring scan on "rm"/"del"/"irm" would trip
 /// on "form"/"deleted"/"confirm"). Denied OUTRIGHT — an alias is an obfuscation-shaped spelling of
 /// an already-denied verb, so no path allowance applies (stricter than the spec table, deliberate).
-const DENY_TOKENS: &[&str] = &["rm", "del", "rmdir", "iwr", "irm", "curl", "wget", "kill", "iex"];
+const DENY_TOKENS: &[&str] =
+    &["rm", "del", "rmdir", "iwr", "irm", "curl", "wget", "kill", "iex", "icm"];
+
+/// Execution-obfuscation surfaces (case-insensitive substring): `-EncodedCommand` smuggles a
+/// base64 payload past every text marker; `Invoke-Command` runs script blocks (locally or
+/// remotely) out of band. Denied OUTRIGHT.
+const OBFUSCATION_MARKERS: &[&str] = &["-encodedcommand", "invoke-command"];
 
 /// True iff `lower` contains `tok` as a standalone alphanumeric word (pure).
 fn has_token(lower: &str, tok: &str) -> bool {
     lower
         .split(|c: char| !c.is_ascii_alphanumeric())
         .any(|w| w == tok)
+}
+
+/// Push `h` once (the scanner can trip the same shape many times; one audit marker per family
+/// keeps the hit list readable). Pure.
+fn push_unique(hits: &mut Vec<String>, h: &str) {
+    if !hits.iter().any(|x| x == h) {
+        hits.push(h.to_string());
+    }
+}
+
+/// True iff `prev` (the previous significant char) legitimately opens a COMMAND POSITION — start
+/// of script/line, statement separator, block/group opener, or pipe. Pure.
+fn starts_command_position(prev: Option<char>) -> bool {
+    matches!(prev, None | Some('\n') | Some(';') | Some('{') | Some('(') | Some('|'))
+}
+
+/// True iff what follows index `j` (after `&` or dot-source `.`) is an admissible LITERAL
+/// invocation target: a bare literal command name (letter-first, then letters/digits/`-`/`_`,
+/// ending at a clean boundary) or a quoted LITERAL string (single-quoted, or double-quoted with
+/// no `$`/backtick — an interpolated "$x" builds a name at runtime). Anything else — `(`, `$`,
+/// `{`, `[`, concatenation — is expression building and is rejected. The admitted literal's TEXT
+/// is still subject to every substring marker family. Pure.
+fn literal_invocation_follows(cs: &[char], mut j: usize) -> bool {
+    while j < cs.len() && (cs[j] == ' ' || cs[j] == '\t') {
+        j += 1;
+    }
+    match cs.get(j).copied() {
+        Some(q) if q == '\'' || q == '"' => {
+            j += 1;
+            let mut dynamic = false;
+            while j < cs.len() && cs[j] != q {
+                if q == '"' && (cs[j] == '$' || cs[j] == '`') {
+                    dynamic = true; // interpolation / subexpression / escape builds the name
+                }
+                j += 1;
+            }
+            j < cs.len() && !dynamic // an unterminated quote is not a literal
+        }
+        Some(c) if c.is_ascii_alphabetic() => {
+            j += 1;
+            while j < cs.len() && (cs[j].is_ascii_alphanumeric() || cs[j] == '-' || cs[j] == '_') {
+                j += 1;
+            }
+            // the name must END at a clean boundary — a trailing `(`/`.`/`+`/quote keeps building.
+            match cs.get(j).copied() {
+                None => true,
+                Some(c2) => c2.is_whitespace() || matches!(c2, ';' | ')' | '}' | '|'),
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Scan `script` for the obfuscated-invocation shapes the substring families cannot see: the call
+/// operator `&` (or the dot-source `.` in command position) applied to anything other than a bare
+/// literal command name / quoted literal string, and backtick escapes outside strings that are
+/// not line continuations. Comments are skipped; quoted strings are opaque here (their contents
+/// are already substring-linted). `2>&1` stream merges and `&&` chains are not call operators.
+/// Pure; over-broad by design (a pre-filter, not the execution gate).
+fn call_operator_hits(script: &str) -> Vec<String> {
+    let cs: Vec<char> = script.chars().collect();
+    let mut hits: Vec<String> = Vec::new();
+    let mut prev: Option<char> = None; // previous significant char (' '/'\t' skipped, '\r' -> '\n')
+    let mut i = 0usize;
+    while i < cs.len() {
+        let c = cs[i];
+        match c {
+            '\'' | '"' => {
+                i += 1;
+                while i < cs.len() && cs[i] != c {
+                    i += 1;
+                }
+                i += 1; // past the closing quote (or end)
+                prev = Some(c);
+                continue;
+            }
+            '#' => {
+                while i < cs.len() && cs[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            '`' => {
+                let continuation =
+                    matches!(cs.get(i + 1).copied(), Some('\n') | Some('\r')) || i + 1 == cs.len();
+                if !continuation {
+                    push_unique(&mut hits, "obfuscation:backtick-escape");
+                }
+            }
+            '&' => {
+                if cs.get(i + 1) == Some(&'&') {
+                    i += 2; // `&&` pipeline chain — the next command is plain text, marker-scanned
+                    prev = Some('&');
+                    continue;
+                }
+                // `>&`/`<&` stream merges are redirections, not invocations.
+                let merge = matches!(prev, Some('>') | Some('<'));
+                if !merge && !literal_invocation_follows(&cs, i + 1) {
+                    push_unique(&mut hits, "obfuscation:call-operator-nonliteral");
+                }
+            }
+            '.' => {
+                // dot-source: `.` in command position followed by whitespace (`.5` / `.Trim()` /
+                // `a.b` are not — no whitespace, or not command position).
+                let dot_source = matches!(cs.get(i + 1).copied(), Some(' ') | Some('\t'));
+                if starts_command_position(prev) && dot_source && !literal_invocation_follows(&cs, i + 1) {
+                    push_unique(&mut hits, "obfuscation:dot-source-nonliteral");
+                }
+            }
+            _ => {}
+        }
+        if c == '\n' || c == '\r' {
+            prev = Some('\n');
+        } else if c != ' ' && c != '\t' {
+            prev = Some(c);
+        }
+        i += 1;
+    }
+    hits
 }
 
 /// Every '...'/"..." quoted literal in the script (naive scan — good enough for a deny linter:
@@ -225,8 +364,9 @@ fn path_allowed(lit: &str) -> bool {
         || l.contains("/_tools/sandbox")
 }
 
-/// The static deny-list linter (pure — the core safety gate, run FIRST). `Ok(())` admits the
-/// script to the dry-run rung; `Err` carries EVERY offending marker for the audit trail.
+/// The static deny-list linter (pure — a cheap fail-closed PRE-FILTER, run FIRST; the execution
+/// gate is the operator-approved dry-run). `Ok(())` admits the script to registration; `Err`
+/// carries EVERY offending marker for the audit trail.
 pub(crate) fn lint_tool(script: &str) -> Result<(), Vec<String>> {
     let lower = script.to_ascii_lowercase();
     let mut hits: Vec<String> = Vec::new();
@@ -261,6 +401,14 @@ pub(crate) fn lint_tool(script: &str) -> Result<(), Vec<String>> {
             hits.push(format!("token:{t}"));
         }
     }
+    for m in OBFUSCATION_MARKERS {
+        if lower.contains(m) {
+            hits.push(format!("obfuscation:{m}"));
+        }
+    }
+    // Invocation-shape scan: `&`/`.` on non-literal targets + backtick escapes (obfuscation that
+    // assembles denied verbs at runtime, invisible to every substring family above).
+    hits.extend(call_operator_hits(script));
     // Filesystem mutation: the verbs (and any `>` redirection) are admissible ONLY when the
     // script's path-like literals exist and are ALL under the allowed runtime/temp roots.
     let mut fs_triggers: Vec<String> = MUTATING_FS_MARKERS
@@ -436,21 +584,27 @@ pub struct ToolProposal {
     pub script: String,
 }
 
-/// Register a proposal through the FULL gate: name check -> LINT (first, before any subprocess) ->
-/// mandatory sandboxed dry-run -> `rsi:` provenance stamp + sha256 -> script + manifest write
-/// (`approved: false` — nothing in Solomon ever sets it true). ANY failing rung registers NOTHING
-/// and audits the named rejection. Returns `{ok, tool, reason?}`.
+/// Register a proposal through the PRE-FILTER gate: name check -> LINT (static, before the script
+/// ever touches disk) -> `rsi:` provenance stamp + sha256 -> script + manifest write. REGISTRATION
+/// NEVER EXECUTES THE SCRIPT — no `-DryRun`, no parse check, no subprocess of any kind:
+/// model-authored code runs only after an operator hand-sets `approved_validation: true` on the
+/// entry (see [`maybe_validate_approved_tools`]), and then only inside the sandboxed dry-run. The
+/// entry lands with `validation: "pending_operator"`, `dry_run: {passed:false, pending:true}`,
+/// `approved_validation: false`, and `approved: false` — nothing in Solomon ever sets either
+/// approval flag true. ANY failing rung registers NOTHING and audits the named rejection.
+/// Returns `{ok, tool, reason?}`.
 pub fn register_tool(p: &ToolProposal, model: &str, prompt_sha8: &str) -> Value {
     register_tool_with(p, model, prompt_sha8, &real_runner)
 }
 
-/// Core of [`register_tool`] with the subprocess RUNNER injected (hermetic tests need no real
-/// PowerShell; a `#[ignore]`d integration test can exercise the real one).
+/// Core of [`register_tool`] with the subprocess RUNNER injected. The runner is deliberately
+/// UNUSED: keeping the seam lets the `#[test]`s inject a panicking runner and PROVE registration
+/// executes nothing (the no-auto-execution contract, pinned forever).
 pub(crate) fn register_tool_with<R>(
     p: &ToolProposal,
     model: &str,
     prompt_sha8: &str,
-    runner: &R,
+    _runner: &R,
 ) -> Value
 where
     R: Fn(&[String], Option<&Path>, Duration) -> std::io::Result<proc::RunOut>,
@@ -464,22 +618,15 @@ where
         audit("lint_reject", &p.name, &markers.join(", "));
         return json!({"ok": false, "tool": p.name, "reason": "lint", "denied_markers": markers});
     }
-    // (2) mandatory dry-run (edge E13).
-    let dry_run = match dry_run_with(&p.name, &p.script, runner) {
-        Ok(rec) => rec,
-        Err(e) => {
-            audit("dryrun_fail", &p.name, &e);
-            return json!({"ok": false, "tool": p.name, "reason": e});
-        }
-    };
-    // (3) provenance stamp + tamper hash, then script + manifest (approved stays FALSE).
+    // (2) provenance stamp + tamper hash, then script + manifest — INERT: validation is
+    //     pending_operator, dry_run is pending, both approval flags start FALSE.
     let sha256 = crate::provenance::sha256_hex(p.script.as_bytes());
     let spath = script_path(&p.name);
     if let Some(parent) = spath.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     if proc::atomic_write_bytes(&spath, p.script.as_bytes()).is_err() {
-        audit("dryrun_fail", &p.name, "script write failed");
+        audit("register_fail", &p.name, "script write failed");
         return json!({"ok": false, "tool": p.name, "reason": "script write failed"});
     }
     let mut manifest = read_manifest();
@@ -499,18 +646,110 @@ where
         "authored_model": model,
         "prompt_sha8": prompt_sha8,
         "registered_ts": iso_now(),
-        "dry_run": dry_run,
+        "validation": "pending_operator",
+        "dry_run": {"passed": false, "pending": true},
         "lint": {"passed": true, "denied_markers": []},
+        "approved_validation": false,
         "approved": false,
         "invocations": [],
     });
     if !write_manifest(&manifest) {
         let _ = std::fs::remove_file(&spath); // no half-registration
-        audit("dryrun_fail", &p.name, "manifest write failed");
+        audit("register_fail", &p.name, "manifest write failed");
         return json!({"ok": false, "tool": p.name, "reason": "manifest write failed"});
     }
-    audit("register", &p.name, &format!("v{version} sha256={sha256} approved=false"));
+    audit(
+        "register",
+        &p.name,
+        &format!("v{version} sha256={sha256} validation=pending_operator approved=false (NOT executed)"),
+    );
     json!({"ok": true, "tool": p.name, "version": version})
+}
+
+// --------------------------------------------------------------------------- //
+// operator-approved validation — the ONLY seam that ever executes model-authored code
+// --------------------------------------------------------------------------- //
+
+/// The every-sweep VALIDATION seam, ridden on `ceo_autonomy_seams` right after the tool-propose
+/// seam (its own catch_unwind + `_seam_tool_validate` marker): find manifest entries the OPERATOR
+/// has cleared for validation (`approved_validation: true` — hand-set; nothing in Solomon writes
+/// it) that still carry `dry_run.pending`, run the existing sandboxed dry-run on each, record
+/// pass/fail + audit, and clear `pending`. No LLM, no day gate — cheap when nothing is approved
+/// (one manifest read).
+pub fn maybe_validate_approved_tools(_snapshot: &Value, _status: &Value) {
+    super::seam_marker("tool_validate");
+    let _ = validate_approved_tools_with(&real_runner);
+}
+
+/// Core of [`maybe_validate_approved_tools`] with the runner injected. Returns one
+/// `{tool, passed}` record per entry validated THIS sweep (empty when nothing was approved —
+/// unapproved entries are never touched, let alone executed).
+pub(crate) fn validate_approved_tools_with<R>(runner: &R) -> Vec<Value>
+where
+    R: Fn(&[String], Option<&Path>, Duration) -> std::io::Result<proc::RunOut>,
+{
+    let mut manifest = read_manifest();
+    let names: Vec<String> = manifest
+        .get("tools")
+        .and_then(Value::as_object)
+        .map(|t| {
+            t.iter()
+                .filter(|(_, e)| {
+                    e.get("approved_validation").and_then(Value::as_bool) == Some(true)
+                        && e.pointer("/dry_run/pending").and_then(Value::as_bool) == Some(true)
+                })
+                .map(|(n, _)| n.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out: Vec<Value> = Vec::new();
+    for name in names {
+        let entry = manifest.pointer(&format!("/tools/{name}")).cloned().unwrap_or(Value::Null);
+        let (passed, dry_run, note) = match validate_one(&name, &entry, runner) {
+            Ok(rec) => (true, rec, "sandboxed dry-run passed".to_string()),
+            Err(e) => (
+                false,
+                json!({
+                    "passed": false,
+                    "pending": false,
+                    "error": super::cap_line(&e, 200),
+                    "ts": iso_now(),
+                }),
+                e,
+            ),
+        };
+        // `pending` clears either way — a failed validation is a RECORDED verdict, not a retry
+        // loop; the operator re-registers (or re-approves a fresh registration) to try again.
+        manifest["tools"][&name]["dry_run"] = dry_run;
+        manifest["tools"][&name]["validation"] = json!(if passed { "validated" } else { "failed" });
+        audit(if passed { "validate_pass" } else { "validate_fail" }, &name, &note);
+        out.push(json!({"tool": name, "passed": passed}));
+    }
+    if !out.is_empty() {
+        let _ = write_manifest(&manifest);
+    }
+    out
+}
+
+/// One approved entry's validation: the on-disk bytes must still hash to the registered `sha256`
+/// (the operator approved THOSE bytes — a body edited since registration is refused, re-register
+/// it), then re-LINT (the linter may have grown teeth since registration), then the existing
+/// sandboxed parse + `-DryRun` self-test. Returns the manifest `dry_run` record on success.
+fn validate_one<R>(name: &str, entry: &Value, runner: &R) -> Result<Value, String>
+where
+    R: Fn(&[String], Option<&Path>, Duration) -> std::io::Result<proc::RunOut>,
+{
+    let bytes = std::fs::read(script_path(name))
+        .map_err(|_| "script missing on disk — re-register".to_string())?;
+    let disk_sha = crate::provenance::sha256_hex(&bytes);
+    if entry.get("sha256").and_then(Value::as_str) != Some(disk_sha.as_str()) {
+        return Err("sha256 mismatch (body changed since registration — re-register)".to_string());
+    }
+    let script = String::from_utf8_lossy(&bytes).into_owned();
+    if let Err(markers) = lint_tool(&script) {
+        return Err(format!("lint: {}", markers.join(", ")));
+    }
+    dry_run_with(name, &script, runner)
 }
 
 /// Invoke a registered tool. FAIL-CLOSED ladder: the manifest entry must exist with
@@ -695,10 +934,11 @@ fn propose_via_brain(need: &str) -> Result<(ToolProposal, String, String), Strin
 }
 
 /// The day-gated TOOL-PROPOSAL seam, ridden on `ceo_slow_tail`: at most ONE propose -> lint ->
-/// dry-run -> register attempt per day, and only when today's planner output carries a tooling
-/// directive (honest trigger) AND the fleet call budget has headroom. STAMP-FIRST (`create_new`)
-/// before the LLM call — a hung/failed authoring consumes the day's attempt; two OS processes
-/// cannot double-fire. Registration lands `approved:false` — live invocation stays human-gated.
+/// register attempt per day, and only when today's planner output carries a tooling directive
+/// (honest trigger) AND the fleet call budget has headroom. STAMP-FIRST (`create_new`) before the
+/// LLM call — a hung/failed authoring consumes the day's attempt; two OS processes cannot
+/// double-fire. Registration EXECUTES NOTHING and lands `validation: "pending_operator"` +
+/// `approved: false` — both the sandboxed dry-run and live invocation stay human-gated.
 pub fn maybe_propose_tool(_snapshot: &Value, _status: &Value) {
     super::seam_marker("tool_propose");
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -725,8 +965,10 @@ pub fn maybe_propose_tool(_snapshot: &Value, _status: &Value) {
             let _ = notify::send(&Notice::report(
                 format!("Solomon: tool proposal -> {}", proposal.name),
                 format!(
-                    "registered={ok} (lint+dry-run gated, approved=false — set approved:true in \
-                     runtime\\_tools\\tools_manifest.json to allow LIVE invocation)"
+                    "registered={ok} (linted, NOT executed — set \"approved_validation\": true on \
+                     tools.{} in runtime\\_tools\\tools_manifest.json to allow the sandboxed \
+                     dry-run; LIVE invocation additionally needs approved:true)",
+                    proposal.name
                 ),
             ));
         }
@@ -737,15 +979,18 @@ pub fn maybe_propose_tool(_snapshot: &Value, _status: &Value) {
 // tests — the self-tooling acceptance contracts
 // --------------------------------------------------------------------------- //
 
+/// Serialize every test that touches the SHARED tools manifest / audit / sandbox under the
+/// per-process temp home (read-modify-write races + the shared atomic-write tmp path would
+/// flake otherwise). Module-level so the `ceo.rs` seam-wiring test (which drives the validation
+/// seam over the same manifest) can serialize against these too. Mirrors APPROVALS_TEST_LOCK;
+/// poison-tolerant.
+#[cfg(test)]
+pub(crate) static TOOLING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
-
-    /// Serialize every test that touches the SHARED tools manifest / audit / sandbox under the
-    /// per-process temp home (read-modify-write races + the shared atomic-write tmp path would
-    /// flake otherwise). Mirrors NOTIFY_ENV_LOCK; poison-tolerant.
-    static TOOLING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn lock() -> std::sync::MutexGuard<'static, ()> {
         TOOLING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -789,6 +1034,24 @@ mod tests {
         read_manifest().pointer(&format!("/tools/{name}")).cloned().unwrap_or(Value::Null)
     }
 
+    /// The full pipeline a usable tool walks: register (executes NOTHING) -> operator hand-sets
+    /// `approved_validation: true` -> the validation seam runs the sandboxed dry-run. The fixture
+    /// every invoke test needs.
+    fn register_validated(p: &ToolProposal) {
+        let calls = Cell::new(0u32);
+        assert_eq!(register_tool_with(p, "m", "ph", &fake_runner(0, &calls))["ok"], true);
+        assert_eq!(calls.get(), 0, "registration never executes");
+        let mut m = read_manifest();
+        m["tools"][&p.name]["approved_validation"] = json!(true);
+        assert!(write_manifest(&m));
+        let out = validate_approved_tools_with(&fake_runner(0, &calls));
+        assert!(
+            out.iter().any(|r| r["tool"] == json!(p.name.clone()) && r["passed"] == json!(true)),
+            "validation passed for {}: {out:?}",
+            p.name
+        );
+    }
+
     // -------- 17: the linter rejects EVERY denied category --------
     #[test]
     fn lint_rejects_each_denied_marker_family() {
@@ -828,6 +1091,40 @@ mod tests {
         }
     }
 
+    // -------- 17b: the OBFUSCATION family — expression-built invocations, encoded payloads --------
+    #[test]
+    fn lint_rejects_the_call_operator_obfuscation_family() {
+        let cases: &[(&str, &str)] = &[
+            // expression building inside the call operator (the classic linter bypass)
+            ("& ('Stop-Proc'+'ess') -Name solomon", "concat inside call operator"),
+            ("& (\"Sto\"+\"p-Process\") -Name x", "double-quote concat call"),
+            ("& $cmd runtime/x", "call operator on a variable"),
+            ("& \"Stop-Pro$suffix\" -Name x", "interpolated double-quoted command name"),
+            ("& { Stop-Something }", "scriptblock invocation"),
+            ("& ([char]83 + 'top-Process')", "char-cast assembly"),
+            // dotted invocation of expressions
+            ("$sb = [scriptblock]::Create($x); . $sb", "dot-sourcing a variable"),
+            (". ($path)", "dot-sourcing a parenthesized expression"),
+            // encoded / out-of-band execution
+            ("powershell -EncodedCommand SQBFAFgAIABiAGEAZA==", "-EncodedCommand"),
+            ("Invoke-Command -ScriptBlock { Get-Date }", "Invoke-Command"),
+            ("icm { Get-Date }", "icm alias"),
+            // backtick escapes inside command position spell denied verbs without containing them
+            ("Sto`p-Process -Name solomon", "backtick-escape obfuscation"),
+        ];
+        for (script, why) in cases {
+            assert!(lint_tool(script).is_err(), "must reject ({why}): {script}");
+        }
+        // and the LITERAL forms stay admissible (pre-filter, not a busywork gate): a bare literal
+        // command name / quoted literal after `&` is fine (its text is still marker-scanned), and
+        // a backtick line continuation is not an escape.
+        assert!(lint_tool("& Write-Output hello").is_ok());
+        assert!(lint_tool("& 'Write-Output' hello").is_ok());
+        assert!(lint_tool("Write-Output one `\n  two").is_ok(), "line continuation is benign");
+        // literal-but-denied names are caught by the SUBSTRING families, not missed via `&`
+        assert!(lint_tool("& 'Stop-Process' -Name x").is_err());
+    }
+
     // -------- 18: the linter ACCEPTS a benign runtime-scoped -DryRun tool --------
     #[test]
     fn lint_accepts_a_benign_runtime_scoped_dryrun_script() {
@@ -865,21 +1162,31 @@ mod tests {
         );
     }
 
-    // -------- 20: a failing -DryRun blocks registration --------
+    // -------- 20: registration NEVER executes the proposed script --------
     #[test]
-    fn dryrun_failure_blocks_registration_and_audits() {
+    fn registration_never_executes_and_lands_pending_operator_validation() {
         let _l = lock();
-        let name = uniq_name("dryfail");
+        let name = uniq_name("noexec");
         let p = ToolProposal { name: name.clone(), purpose: "x".into(), script: benign_script() };
+        // A runner that PANICS on any invocation — registration must survive it untouched.
+        let panicking = |_a: &[String], _c: Option<&Path>, _t: Duration| -> std::io::Result<proc::RunOut> {
+            panic!("registration must NEVER execute the proposed script")
+        };
+        let out = register_tool_with(&p, "m", "ph", &panicking);
+        assert_eq!(out["ok"], true, "{out}");
+        let e = registered(&name);
+        assert_eq!(e["validation"], "pending_operator");
+        assert_eq!(e["dry_run"]["passed"], false);
+        assert_eq!(e["dry_run"]["pending"], true);
+        assert_eq!(e["approved_validation"], false, "only an operator flips it");
+        assert_eq!(e["approved"], false);
+        // and the unvalidated entry cannot be invoked AT ALL — not even dry-run
         let calls = Cell::new(0u32);
-        let out = register_tool_with(&p, "m", "ph", &fake_runner(3, &calls));
+        let out = invoke_tool_with(&name, false, &[], &fake_runner(0, &calls));
         assert_eq!(out["ok"], false, "{out}");
-        assert!(out["reason"].as_str().unwrap().starts_with("dry_run: exit 3"), "{out}");
-        assert!(calls.get() >= 2, "parse + dry-run both ran");
-        assert!(registered(&name).is_null(), "no manifest entry on a dry-run failure");
-        assert!(!script_path(&name).exists(), "no registered script on a dry-run failure");
-        let audit_body = std::fs::read_to_string(audit_path()).unwrap_or_default();
-        assert!(audit_body.contains("dryrun_fail"), "{audit_body}");
+        assert_eq!(out["reason"], "unvalidated manifest entry");
+        assert_eq!(calls.get(), 0, "no subprocess for an unvalidated tool");
+        let _ = unregister_tool(&name);
     }
 
     // -------- 21: a clean register writes script + stamped manifest entry --------
@@ -892,11 +1199,14 @@ mod tests {
         let calls = Cell::new(0u32);
         let out = register_tool_with(&p, "model-z", "ab12cd34", &fake_runner(0, &calls));
         assert_eq!(out["ok"], true, "{out}");
+        assert_eq!(calls.get(), 0, "registration executes nothing");
         let e = registered(&name);
         assert_eq!(e["provenance"], "rsi:", "the provenance stamp is mandatory");
         assert_eq!(e["approved"], false, "approved starts FALSE — only an operator flips it");
         assert_eq!(e["sha256"], crate::provenance::sha256_hex(script.as_bytes()));
-        assert_eq!(e["dry_run"]["passed"], true);
+        assert_eq!(e["validation"], "pending_operator");
+        assert_eq!(e["dry_run"]["passed"], false, "no dry-run ran — pending the operator");
+        assert_eq!(e["dry_run"]["pending"], true);
         assert_eq!(e["lint"]["passed"], true);
         assert_eq!(e["authored_model"], "model-z");
         assert_eq!(e["prompt_sha8"], "ab12cd34");
@@ -908,6 +1218,86 @@ mod tests {
         let _ = unregister_tool(&name);
     }
 
+    // -------- the validation seam: operator-approved entries ONLY --------
+    #[test]
+    fn validation_seam_runs_only_operator_approved_entries() {
+        let _l = lock();
+        let approved = uniq_name("valyes");
+        let untouched = uniq_name("valno");
+        for n in [&approved, &untouched] {
+            let p = ToolProposal { name: n.clone(), purpose: "x".into(), script: benign_script() };
+            let calls = Cell::new(0u32);
+            assert_eq!(register_tool_with(&p, "m", "ph", &fake_runner(0, &calls))["ok"], true);
+        }
+        // operator hand-sets approved_validation on ONE entry
+        let mut m = read_manifest();
+        m["tools"][&approved]["approved_validation"] = json!(true);
+        assert!(write_manifest(&m));
+
+        let calls = Cell::new(0u32);
+        let out = validate_approved_tools_with(&fake_runner(0, &calls));
+        assert!(
+            out.iter().any(|r| r["tool"] == json!(approved.clone()) && r["passed"] == json!(true)),
+            "{out:?}"
+        );
+        assert!(
+            !out.iter().any(|r| r["tool"] == json!(untouched.clone())),
+            "the unapproved entry is never validated: {out:?}"
+        );
+        let e = registered(&approved);
+        assert_eq!(e["validation"], "validated");
+        assert_eq!(e["dry_run"]["passed"], true);
+        assert!(e["dry_run"].get("pending").is_none(), "pending cleared: {e}");
+        let u = registered(&untouched);
+        assert_eq!(u["validation"], "pending_operator", "untouched entry stays pending");
+        assert_eq!(u["dry_run"]["pending"], true);
+        // a validated tool is now dry-run invocable; the untouched one still refuses
+        let out = invoke_tool_with(&approved, false, &[], &fake_runner(0, &calls));
+        assert_eq!(out["ok"], true, "{out}");
+        assert_eq!(out["mode"], "dry_run");
+        let out = invoke_tool_with(&untouched, false, &[], &fake_runner(0, &calls));
+        assert_eq!(out["reason"], "unvalidated manifest entry");
+        // a second sweep finds nothing pending — validation is one-shot, not a retry loop
+        let before = calls.get();
+        assert!(validate_approved_tools_with(&fake_runner(0, &calls)).is_empty());
+        assert_eq!(calls.get(), before, "no re-execution of an already-validated tool");
+        let audit_body = std::fs::read_to_string(audit_path()).unwrap_or_default();
+        assert!(audit_body.contains("validate_pass"), "{audit_body}");
+        for n in [&approved, &untouched] {
+            let _ = unregister_tool(n);
+        }
+    }
+
+    // -------- a failing approved dry-run records the verdict + clears pending --------
+    #[test]
+    fn validation_failure_records_fail_and_still_blocks_invoke() {
+        let _l = lock();
+        let name = uniq_name("valfail");
+        let p = ToolProposal { name: name.clone(), purpose: "x".into(), script: benign_script() };
+        let calls = Cell::new(0u32);
+        assert_eq!(register_tool_with(&p, "m", "ph", &fake_runner(0, &calls))["ok"], true);
+        let mut m = read_manifest();
+        m["tools"][&name]["approved_validation"] = json!(true);
+        assert!(write_manifest(&m));
+
+        let out = validate_approved_tools_with(&fake_runner(7, &calls)); // -DryRun exits 7
+        assert!(
+            out.iter().any(|r| r["tool"] == json!(name.clone()) && r["passed"] == json!(false)),
+            "{out:?}"
+        );
+        let e = registered(&name);
+        assert_eq!(e["validation"], "failed");
+        assert_eq!(e["dry_run"]["passed"], false);
+        assert_eq!(e["dry_run"]["pending"], false, "the verdict is recorded, not retried");
+        assert!(e["dry_run"]["error"].as_str().unwrap().starts_with("dry_run: exit 7"), "{e}");
+        // still not invocable
+        let out = invoke_tool_with(&name, false, &[], &fake_runner(0, &calls));
+        assert_eq!(out["reason"], "unvalidated manifest entry");
+        let audit_body = std::fs::read_to_string(audit_path()).unwrap_or_default();
+        assert!(audit_body.contains("validate_fail"), "{audit_body}");
+        let _ = unregister_tool(&name);
+    }
+
     // -------- 22: sha256 tamper check refuses a hand-edited body --------
     #[test]
     fn tampered_script_body_is_refused_at_invoke() {
@@ -915,7 +1305,7 @@ mod tests {
         let name = uniq_name("tamper");
         let p = ToolProposal { name: name.clone(), purpose: "x".into(), script: benign_script() };
         let calls = Cell::new(0u32);
-        assert_eq!(register_tool_with(&p, "m", "ph", &fake_runner(0, &calls))["ok"], true);
+        register_validated(&p);
         // hand-edit the on-disk body (bypassing registration)
         std::fs::write(script_path(&name), "param([switch]$DryRun)\nexit 0\n# edited").unwrap();
         let out = invoke_tool_with(&name, false, &[], &fake_runner(0, &calls));
@@ -930,8 +1320,7 @@ mod tests {
         let _l = lock();
         let name = uniq_name("livegate");
         let p = ToolProposal { name: name.clone(), purpose: "x".into(), script: benign_script() };
-        let calls = Cell::new(0u32);
-        assert_eq!(register_tool_with(&p, "m", "ph", &fake_runner(0, &calls))["ok"], true);
+        register_validated(&p);
 
         // (23) live requested, approved==false -> DEGRADES to -DryRun, loudly flagged.
         let seen_dryrun = Cell::new(false);
