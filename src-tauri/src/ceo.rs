@@ -60,6 +60,13 @@ pub mod research;
 // growth.rs.
 pub mod growth;
 
+// CEO autonomy, piece 3: the unified `_pending_approvals` operator surface — regenerated on every
+// tick's FAST deterministic core (file-IO only, no LLM), aggregating every unapproved growth
+// draft, unapproved outreach draft, and tool awaiting live-approval, each with the EXACT one-line
+// edit that approves it. READ-ONLY over the gated artifacts; Solomon never self-approves. See
+// approvals.rs.
+pub mod approvals;
+
 // D8 Layer 3: the CROSS-PROJECT wins ledger reader — the minimal cross-project learning surfaced
 // into the morning plan. It TAILS the existing append-only runtime/outcomes.jsonl and extracts
 // ANONYMIZED prior wins (shipped iteration / published post / positive equity day / live trade)
