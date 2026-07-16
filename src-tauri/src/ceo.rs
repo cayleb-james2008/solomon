@@ -397,7 +397,7 @@ fn ceo_slow_tail(snapshot: Value, status: Value) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::ceo::growth::maybe_auto_publish_growth(&snapshot, &status)
     }));
-    // CEO AUTONOMY SEAMS (cold-outreach compose + fail-closed send, toolset self-extension) —
+    // CEO AUTONOMY SEAMS (cold-outreach compose + AUTONOMOUS auto-send, toolset self-extension) —
     // bundled in their own fn so the wiring #[test] can drive them synchronously; each keeps its
     // OWN catch_unwind isolation exactly like the growth seams above.
     ceo_autonomy_seams(&snapshot, &status);
@@ -410,21 +410,21 @@ fn ceo_slow_tail(snapshot: Value, status: Value) {
 }
 
 /// The four CEO-autonomy sub-grafts, ridden on `ceo_slow_tail` (each in its OWN catch_unwind —
-/// one seam's panic can never skip the next, the watchdog per-graft discipline). Every seam is
-/// FAIL-CLOSED by construction: composing is day-gated + honest-triggered + budget-aware and
-/// yields gated local DRAFTS only; sending, tool dry-run validation, and live tool invocation
-/// are inert until an operator hand-sets `approved: true` / `approved_validation: true` (nothing
-/// in Solomon ever writes those flags). Factored out of `ceo_slow_tail` so the wiring `#[test]`
-/// proves the seams are invoked (via their sweep markers) without running the LLM-bearing day
-/// gates.
+/// one seam's panic can never skip the next, the watchdog per-graft discipline). Every seam runs
+/// AUTONOMOUSLY behind AUTOMATED safety (no human approval wait): composing is day-gated +
+/// honest-triggered + budget-aware; cold-outreach SENDS behind the operator-target guard + rate
+/// caps + persona + honest footer (SMTP-absent stays inert — a data dependency). Factored out of
+/// `ceo_slow_tail` so the wiring `#[test]` proves the seams are invoked (via their sweep markers)
+/// without running the LLM-bearing day gates.
 fn ceo_autonomy_seams(snapshot: &Value, status: &Value) {
     // COLD-OUTREACH COMPOSER (day-gated, honest-trigger, budget-aware) — gated local DRAFTS only.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::ceo::outreach::maybe_draft_outreach(snapshot, status)
     }));
-    // COLD-OUTREACH SEND (every sweep, FAIL-CLOSED — inert until operator approval + SMTP env).
+    // COLD-OUTREACH SEND (every sweep, AUTONOMOUS behind automated guards — operator-target guard,
+    // rate caps, persona, idempotency, honest footer; SMTP-absent stays inert as a data dependency).
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::ceo::outreach::maybe_send_approved_outreach(snapshot, status)
+        crate::ceo::outreach::maybe_auto_send_outreach(snapshot, status)
     }));
     // TOOLSET SELF-EXTENSION (day-gated propose -> lint -> register; registration executes
     // NOTHING — validation and live invocation both stay human-gated).

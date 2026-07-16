@@ -1,36 +1,38 @@
-//! CEO autonomy, piece 1 — the COLD-OUTREACH pipeline: gated cold-email DRAFTS by default, a real
-//! send ONLY behind an operator-set `approved: true` + SMTP env creds.
+//! CEO autonomy, piece 1 — the COLD-OUTREACH pipeline: gated cold-email drafts that AUTO-SEND
+//! behind AUTOMATED guardrails (no human approval), when SMTP env creds are present.
 //!
 //! ============================ WHAT THIS ADDS =============================
 //! The operator's end goal names "cold outreach" as a CEO capability, but the growth plane only
 //! drafts lane-branded CONTENT. This module adds the missing outreach lane, reusing the growth
 //! machinery wholesale: the honest planner-directive trigger, the public-lane eligibility
-//! predicate, the persona deny filter, the dated-fact drafts log, and — critically — the SAME
-//! fail-closed `growth::draft_line_approved` human gate (re-exported, never forked). Targets are
-//! OPERATOR-SUPPLIED ONLY (`runtime/<lane>/outreach_targets.json`): Solomon never scrapes,
-//! guesses, or enriches contact data — an absent/empty target list yields an empty template + one
-//! deduped needs card, never a fabricated contact.
+//! predicate, the persona deny filter, the dated-fact drafts log. Targets are OPERATOR-SUPPLIED
+//! ONLY (`runtime/<lane>/outreach_targets.json`): Solomon never scrapes, guesses, or enriches
+//! contact data — an absent/empty target list yields an empty template + one deduped needs card,
+//! never a fabricated contact.
 //! ========================================================================
 //!
-//! ## Why this is safe by CONSTRUCTION
-//!   * COMPOSE writes a GATED, unsent, provenance-tagged draft line (model id + prompt hash +
-//!     target key + operator rationale embedded) to `outreach_drafts.jsonl` — a local append under
-//!     Solomon's runtime dir, day-capped (`outreach.max_drafts_per_day`, default 3), deduped per
-//!     target forever, budget-aware (`fleet::daily_calls_remaining`), persona-filtered.
-//!   * SEND is FAIL-CLOSED and inert by default: it fires ONLY when the NEWEST drafts line is an
-//!     operator-authored JSON object with boolean `approved: true` (the growth gate, reused), AND
-//!     SMTP env creds exist, AND the sover-grade rate caps (5/day, 1/hour defaults) allow, AND the
-//!     persona filter re-passes. Idempotent by line signature — an approved draft sends at most
-//!     once, ever, across any number of sweeps and OS processes.
+//! ## Why this is safe by CONSTRUCTION (AUTOMATED safety, not a human gate)
+//!   * COMPOSE writes a GATED, provenance-tagged draft line to `outreach_drafts.jsonl` AND the FULL
+//!     sendable payload to `outreach_outbox.jsonl` — local appends under Solomon's runtime dir,
+//!     day-capped (`outreach.max_drafts_per_day`, default 3), deduped per target forever,
+//!     budget-aware (`fleet::daily_calls_remaining`), persona-filtered.
+//!   * SEND is AUTONOMOUS behind AUTOMATED guardrails ONLY: it ships the oldest UNSENT outbox entry
+//!     when (the recipient is on the OPERATOR-SUPPLIED target list — the hard anti-scrape line),
+//!     AND SMTP env creds exist, AND the sover-grade rate caps (5/day, 1/hour defaults) allow, AND
+//!     the persona filter re-passes, AND an honest sender-identity/opt-out footer is attached.
+//!     Idempotent by message signature — a message sends at most once, ever, across any number of
+//!     sweeps and OS processes. There is NO `approved:true` wait.
 //!   * TRANSPORT is `curl.exe` SMTP (the exact zero-dependency posture `notify.rs` established) —
 //!     no lettre/reqwest/tokio; the argv is a pure, pinned-by-test function.
 //!   * Every artifact lives under gitignored `runtime/` — no new tracked file, so the provenance
 //!     tripwire (`provenance::TRACKED`) is untouched.
 //!
-//! ## HARD INVARIANT (never violated)
-//! Nothing in this module — or anywhere in Solomon — ever writes `approved: true`. No approval =>
-//! no send, no creds => no send (+ one deduped needs card), and a send failure never fakes success
-//! (the signature is recorded ONLY on curl exit 0, so a transient failure stays retriable).
+//! ## HARD INVARIANTS (never violated)
+//! Recipients are OPERATOR-SUPPLIED ONLY (never fabricated/scraped — re-checked at send). No SMTP
+//! creds => no send (+ one deduped needs card) — a DATA dependency, the only thing that keeps the
+//! seam inert. A send failure never fakes success (the signature is recorded ONLY on curl exit 0,
+//! so a transient failure stays retriable). Rate caps + persona + the honest footer are AUTOMATED
+//! safety and stay.
 #![allow(dead_code)]
 
 use crate::control::{paths, proc};
@@ -40,9 +42,9 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-// Reuse — never fork — the growth plane's fail-closed primitives (§ the two-copies-drift trap):
-// the operator approval gate and the deterministic persona deny filter.
-pub(crate) use crate::ceo::growth::{draft_line_approved, violates_persona};
+// Reuse — never fork — the growth plane's deterministic persona deny filter (§ the two-copies-drift
+// trap): the same operator-marker gate the growth composer enforces.
+pub(crate) use crate::ceo::growth::violates_persona;
 
 // --------------------------------------------------------------------------- //
 // config + constants
@@ -115,6 +117,15 @@ fn sent_state_path(repo: &Value) -> Option<PathBuf> {
 /// `runtime/<lane>/outreach_sent.jsonl` — append-only audit trail of ACTUAL send attempts.
 fn sent_log_path(repo: &Value) -> Option<PathBuf> {
     paths::runtime_dir(repo).map(|d| d.join("outreach_sent.jsonl"))
+}
+
+/// `runtime/<lane>/outreach_outbox.jsonl` — the AUTONOMOUS send queue. The composer appends the FULL
+/// sendable payload (`{ts,target_key,to,subject,body,signature}`) here on a clean draft; the
+/// auto-send seam reads the oldest UNSENT entry. Distinct from `outreach_drafts.jsonl` (the
+/// human-readable provenance log, which stores only a truncated body head) so autonomous sending has
+/// the complete message without a human re-typing it. None for a nameless row.
+fn outbox_path(repo: &Value) -> Option<PathBuf> {
+    paths::runtime_dir(repo).map(|d| d.join("outreach_outbox.jsonl"))
 }
 
 /// `runtime/<lane>/_outreach_needs_paged_<which>` — the needs-card dedupe marker (`which` is
@@ -292,6 +303,57 @@ fn rate_ok(st: &Value, daily_cap: i64, hourly_cap: i64) -> bool {
 
 fn bump_rate(st: &mut Value) {
     bump_rate_at(st, &local_today(), local_hour());
+}
+
+/// The stable per-message send-idempotency signature: SHA-256 over `to\nsubject\nbody` (pure). An
+/// already-sent signature is never re-sent, so re-composing the identical message is a no-op.
+pub(crate) fn send_signature(to: &str, subject: &str, body: &str) -> String {
+    crate::provenance::sha256_hex(format!("{}\n{}\n{}", to.trim(), subject.trim(), body).as_bytes())
+}
+
+/// Append a minimal, TRUTHFUL sender-identity + opt-out footer to a cold-email body when one is not
+/// already present — the honesty floor for AUTONOMOUS sending (CAN-SPAM-style: identify the sender +
+/// offer an opt-out). The message is identified as the PROJECT's automated outreach (the lane brand,
+/// never the operator's name — persona-safe) and is a one-time note (the composer dedupes each target
+/// forever, so this is literally true). Idempotent: a body that already carries an unsubscribe /
+/// one-time-note line is returned unchanged. Pure — unit-tested.
+pub(crate) fn ensure_footer(body: &str, lane: &str) -> String {
+    let lower = body.to_lowercase();
+    if lower.contains("unsubscribe") || lower.contains("one-time note") {
+        return body.to_string();
+    }
+    format!(
+        "{body}\n\n\u{2014}\nSent by the {lane} project's automated outreach (a one-time note). \
+         Reply if you'd prefer we don't follow up."
+    )
+}
+
+/// Read the outbox (`outreach_outbox.jsonl`) as parsed records, skipping any unparseable line (a
+/// corrupt line can never wedge the queue). Newest last, matching append order. Pure over the file.
+fn read_outbox(path: &Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|raw| {
+            raw.lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The idempotency key for an outbox entry: its recorded `signature` when present (the composer
+/// stamps one), else derived from `to/subject/body` — so the scan filter and the send dedup can
+/// never disagree. Pure.
+fn outbox_signature(e: &Value) -> String {
+    if let Some(s) = e.get("signature").and_then(Value::as_str) {
+        return s.to_string();
+    }
+    send_signature(
+        e.get("to").and_then(Value::as_str).unwrap_or("").trim(),
+        e.get("subject").and_then(Value::as_str).unwrap_or(""),
+        e.get("body").and_then(Value::as_str).unwrap_or(""),
+    )
 }
 
 // --------------------------------------------------------------------------- //
@@ -683,11 +745,28 @@ where
     match ObservationLog::at(dlog).append_fact(today, &fact) {
         Ok(()) => {
             record_last(&mut st, "ok");
+            // AUTONOMOUS SEND QUEUE: persist the FULL sendable payload to the outbox so the auto-send
+            // seam has the complete message (the drafts log stores only a truncated body head). The
+            // recipient is the OPERATOR-SUPPLIED target's own email — Solomon never invents a contact.
+            let to = target.get("email").and_then(Value::as_str).unwrap_or("").trim().to_string();
+            if let Some(obx) = outbox_path(repo) {
+                append_jsonl(
+                    &obx,
+                    &json!({
+                        "ts": today,
+                        "target_key": key,
+                        "to": to,
+                        "subject": subject,
+                        "body": body,
+                        "signature": send_signature(&to, &subject, &body),
+                    }),
+                );
+            }
             let _ = notify::send(&Notice::report(
                 format!("Solomon: outreach draft -> {lane}"),
                 format!(
-                    "{subject} (GATED, unsent — review runtime\\{lane}\\outreach_drafts.jsonl, \
-                     approve the newest line to send)"
+                    "{subject} (queued for autonomous send behind rate/persona/target guards — \
+                     runtime\\{lane}\\outreach_outbox.jsonl)"
                 ),
             ));
         }
@@ -697,13 +776,14 @@ where
 }
 
 // --------------------------------------------------------------------------- //
-// SEND seam — maybe_send_approved_outreach (every sweep, FAIL-CLOSED, inert)
+// SEND seam — maybe_auto_send_outreach (every sweep, AUTONOMOUS behind automated guards)
 // --------------------------------------------------------------------------- //
 
-/// The every-sweep SEND seam, ridden on `ceo_slow_tail` — fully INERT until an operator approves
-/// a draft AND SMTP env creds exist (the growth publish "last inch" shape). Nothing in Solomon
-/// ever sets `approved`.
-pub fn maybe_send_approved_outreach(_snapshot: &Value, _status: &Value) {
+/// The every-sweep AUTO-SEND seam, ridden on `ceo_slow_tail`. Sends the oldest UNSENT outbox entry
+/// AUTONOMOUSLY — NO operator `approved:true` wait — behind AUTOMATED guardrails only (operator-
+/// target guard, rate caps, persona, idempotency, honest footer). SMTP-absent stays fully inert (a
+/// DATA dependency, not a human gate): with no creds the seam pages the needs card ONCE, sends none.
+pub fn maybe_auto_send_outreach(_snapshot: &Value, _status: &Value) {
     super::seam_marker("outreach_send");
     let creds = smtp_creds();
     for repo in crate::control::registry::read_repos_json() {
@@ -714,74 +794,79 @@ pub fn maybe_send_approved_outreach(_snapshot: &Value, _status: &Value) {
     }
 }
 
-/// Decide-and-send for ONE lane with the SENDER SEAM INJECTED (testable without curl/SMTP).
-/// FAIL-CLOSED ladder (spec §3.6): newest line must be operator-approved -> well-formed
-/// {to,subject,body} -> not already sent (signature idempotency) -> creds present (else needs
-/// card ONCE) -> under rate caps -> persona re-check -> send. The signature is recorded ONLY on
-/// exit 0, so a transient failure stays retriable (edge E9) and a success can never re-send (E10).
+/// Decide-and-send for ONE lane with the SENDER SEAM INJECTED (testable without curl/SMTP). The
+/// AUTOMATED-only ladder that REPLACES the human approval gate: pick the oldest UNSENT outbox entry
+/// -> well-formed {to,subject,body} -> the recipient is on the OPERATOR-SUPPLIED target list (never
+/// a fabricated/scraped contact) -> not already sent (signature idempotency) -> SMTP creds present
+/// (else needs card ONCE, stay inert) -> under the daily/hourly rate caps -> persona + truthful-
+/// content re-check -> honest sender-identity/opt-out footer -> send. The signature is recorded ONLY
+/// on exit 0, so a transient failure stays retriable (edge E9) and a success can never re-send (E10).
 pub(crate) fn send_lane<F>(repo: &Value, creds: Option<&SmtpCreds>, sender: F) -> Value
 where
     F: FnOnce(&SmtpCreds, &Path, &str, &str, &str) -> Result<proc::RunOut, String>,
 {
     let lane = paths::repo_name(repo);
     let skip = |reason: &str| json!({"lane": lane, "sent": false, "reason": reason});
-    let (Some(dlog), Some(sstate), Some(slog), Some(dir)) = (
-        drafts_log_path(repo),
+    let (Some(obx), Some(tpath), Some(sstate), Some(slog), Some(dir)) = (
+        outbox_path(repo),
+        targets_path(repo),
         sent_state_path(repo),
         sent_log_path(repo),
         paths::runtime_dir(repo),
     ) else {
         return json!({"lane": lane, "sent": false, "reason": "nameless lane"});
     };
-    let Some(newest) = ObservationLog::at(dlog).tail(1).into_iter().next() else {
-        return skip("no drafts");
+    // Already-sent signatures — needed to pick the oldest UNSENT outbox entry AND to dedup below.
+    let mut st = read_json_state(&sstate);
+    let sent_sigs: Vec<String> = st
+        .get("sent_signatures")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    // Oldest UNSENT outbox entry (FIFO — nothing starves; the rate cap paces the queue).
+    let Some(entry) = read_outbox(&obx)
+        .into_iter()
+        .find(|e| !sent_sigs.contains(&outbox_signature(e)))
+    else {
+        return skip("nothing to send");
     };
-    if !draft_line_approved(&newest) {
-        // The human gate is CLOSED — the sender is NOT called (inert by default).
-        return skip("not approved");
-    }
-    // Parse the operator's approved payload (fail-closed on a malformed approval, edge E10):
-    // the JSON object after an optional `<date>\t` prefix, requiring non-empty to/subject/body
-    // and a whitespace-free @-carrying recipient (headers are flattened, so no header injection).
-    let payload = newest.split_once('\t').map(|(_d, rest)| rest).unwrap_or(newest.as_str());
-    let obj: Value = match serde_json::from_str::<Value>(payload.trim())
-        .or_else(|_| serde_json::from_str::<Value>(newest.trim()))
-    {
-        Ok(v) => v,
-        Err(_) => return skip("malformed approval"),
-    };
-    let to = obj.get("to").and_then(Value::as_str).unwrap_or("").trim().to_string();
-    let subject = super::cap_line(obj.get("subject").and_then(Value::as_str).unwrap_or(""), 200);
-    let body = obj.get("body").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    // The idempotency key of the chosen entry (the scan guarantees it is not yet sent).
+    let signature = outbox_signature(&entry);
+    let to = entry.get("to").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let subject = super::cap_line(entry.get("subject").and_then(Value::as_str).unwrap_or(""), 200);
+    let body = entry.get("body").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    // WELL-FORMED (edge E10): non-empty to/subject/body + a whitespace-free @-carrying recipient
+    // (headers are single-line-flattened downstream, so no header injection).
     if to.is_empty()
         || subject.is_empty()
         || body.is_empty()
         || !to.contains('@')
         || to.chars().any(char::is_whitespace)
     {
-        return skip("malformed approval");
+        return skip("malformed outbox entry");
     }
-    // IDEMPOTENCY (edge E10): the signature of the EXACT approved line; at most one send ever.
-    let signature = crate::provenance::sha256_hex(newest.trim().as_bytes());
-    let mut st = read_json_state(&sstate);
-    let already = st
-        .get("sent_signatures")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().any(|s| s.as_str() == Some(signature.as_str())))
-        .unwrap_or(false);
-    if already {
-        return skip("already sent");
+    // OPERATOR-TARGET GUARD (the hard anti-scrape line): the recipient MUST be on the lane's
+    // operator-supplied target list. Solomon never fabricates, guesses, or scrapes a contact — a
+    // recipient not on the operator's list is refused even if it somehow reached the outbox.
+    let targets_raw = std::fs::read_to_string(&tpath).unwrap_or_default();
+    let target_keys: Vec<String> = load_targets(&targets_raw)
+        .iter()
+        .filter_map(|t| t.get("email").and_then(Value::as_str))
+        .map(target_key)
+        .collect();
+    if !target_keys.contains(&target_key(&to)) {
+        return skip("recipient not in operator targets");
     }
-    // SMTP PRESENCE (edge E8): approved but no creds => page the needs card ONCE, stay unsent.
+    // SMTP PRESENCE (edge E8): queued but no creds => page the needs card ONCE, stay inert. This is
+    // a DATA dependency, not a human approval — the ONLY thing gating an otherwise-autonomous send.
     let Some(c) = creds else {
         page_needs_once(
             repo,
             "smtp",
-            format!("Solomon: outreach approved but no SMTP -> {lane}"),
+            format!("Solomon: outreach queued but no SMTP -> {lane}"),
             format!(
-                "An approved outreach draft for {lane} is ready to send but no SMTP creds are \
-                 set. Add SOLOMON_SMTP_HOST/USER/PASS (+optional PORT/FROM) to <HERE>\\.env. The \
-                 draft stays unsent."
+                "An outreach message for {lane} is queued to send but no SMTP creds are set. Add \
+                 SOLOMON_SMTP_HOST/USER/PASS (+optional PORT/FROM) to <HERE>\\.env. It stays unsent."
             ),
         );
         return skip("no smtp creds");
@@ -791,18 +876,21 @@ where
     if !rate_ok(&st, daily_cap, hourly_cap) {
         return skip("rate capped");
     }
-    // PERSONA re-check (edge E7, belt-and-suspenders — an operator could hand-edit the line).
+    // PERSONA + truthful-content re-check (edge E7) — belt-and-suspenders over the compose-time gate.
     if violates_persona(&format!("{subject} {body}")) {
         let _ = notify::send(&Notice::red(
             format!("Solomon: outreach send REFUSED -> {lane}"),
-            "the approved draft carries an operator-identifying marker (persona rule) — edit and \
-             re-approve"
+            "the queued message carries an operator-identifying marker (persona rule) — skipped"
                 .to_string(),
         ));
         return skip("persona violation");
     }
+    // HONEST FOOTER: identify the sender + offer an opt-out before the message leaves (truthful-
+    // content safety for autonomous sending). The signature above is over the PRE-footer body so it
+    // stays stable against the deterministic footer.
+    let send_body = ensure_footer(&body, &lane);
     let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    match sender(c, &dir, &to, &subject, &body) {
+    match sender(c, &dir, &to, &subject, &send_body) {
         Ok(out) if out.code == 0 => {
             bump_rate(&mut st);
             let mut sigs: Vec<String> = st
@@ -1030,7 +1118,16 @@ mod tests {
         assert!(line.contains("rsi: outreach DRAFT [GATED, unsent, cold-email]"), "{line}");
         assert!(line.contains("to=Person@Org.com"), "{line}");
         assert!(line.contains("model=model-x"), "{line}");
-        assert!(!draft_line_approved(line), "a composed draft is NEVER approved");
+
+        // the AUTONOMOUS send queue carries the FULL sendable payload (not a truncated body head)
+        let obx = read_outbox(&outbox_path(&repo).unwrap());
+        assert_eq!(obx.len(), 1, "compose queues exactly one outbox entry: {obx:?}");
+        assert_eq!(obx[0]["to"], "Person@Org.com");
+        assert!(obx[0]["body"].as_str().unwrap().contains("2 features shipped this week"),
+                "the outbox holds the FULL body: {}", obx[0]["body"]);
+        assert_eq!(obx[0]["signature"], send_signature("Person@Org.com",
+            "Quick intro from the project",
+            "We ship a small tool; your community writes about exactly this. 2 features shipped this week."));
 
         let st = read_json_state(&drafted_state_path(&repo).unwrap());
         assert_eq!(st["last"], "ok");
@@ -1120,40 +1217,38 @@ mod tests {
         std::env::remove_var("SOLOMON_NOTIFY_OFF");
     }
 
-    // -------- 10: SEND is fail-closed — an unapproved newest line never sends --------
+    // -------- 10: SEND refuses a recipient NOT on the operator target list (hard anti-scrape) -----
     #[test]
-    fn send_is_fail_closed_without_operator_approval() {
+    fn send_refuses_a_recipient_not_on_the_operator_target_list() {
         let repo = uniq_repo("sendgate");
-        // a composed (never-approved) draft line is the newest line
-        let log = ObservationLog::at(drafts_log_path(&repo).unwrap());
-        log.append_fact(&today(), "rsi: outreach DRAFT [GATED, unsent, cold-email] lane=x target=k to=a@b.c subj=s :: b (t=1 model=m prompt=p rationale=r)").unwrap();
+        // the operator seeded ONE target; the outbox somehow holds a DIFFERENT recipient
+        seed_targets(&repo, json!([{"email": "listed@org.com", "rationale": "fits"}]));
+        seed_outbox(&repo, "not-listed@elsewhere.com", "s", "an honest body");
 
         let creds = SmtpCreds { host: "h".into(), port: 465, user: "u".into(), pass: "p".into(), from: "u".into() };
-        let mut called = false;
         let out = send_lane(&repo, Some(&creds), |_, _, _, _, _| {
-            called = true;
-            Ok(proc::RunOut { code: 0, stdout: String::new(), stderr: String::new() })
+            panic!("a recipient off the operator target list must NEVER send")
         });
         assert_eq!(out["sent"], false);
-        assert_eq!(out["reason"], "not approved");
-        assert!(!called, "the sender seam must fire ZERO times without approval");
-        // and across many sweeps it stays inert
-        for _ in 0..5 {
-            let out = send_lane(&repo, Some(&creds), |_, _, _, _, _| {
-                panic!("still not approved")
-            });
-            assert_eq!(out["sent"], false);
-        }
+        assert_eq!(out["reason"], "recipient not in operator targets");
+
+        // an EMPTY outbox is simply inert (nothing to send), never a send
+        let repo2 = uniq_repo("sendempty");
+        seed_targets(&repo2, one_target());
+        let out2 = send_lane(&repo2, Some(&creds), |_, _, _, _, _| panic!("empty outbox never sends"));
+        assert_eq!(out2["reason"], "nothing to send");
         cleanup(&repo);
+        cleanup(&repo2);
     }
 
-    // -------- 11: approved + SMTP absent => needs card once, no send, no signature --------
+    // -------- 11: queued + SMTP absent => needs card once, no send, no signature (DATA dependency) --
     #[test]
-    fn approved_without_smtp_pages_needs_card_and_stays_unsent() {
+    fn queued_without_smtp_pages_needs_card_and_stays_unsent() {
         let _env = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
         let repo = uniq_repo("nosmtp");
-        approve_newest(&repo, "p@o.com", "Hello", "We built a thing worth your time.");
+        seed_targets(&repo, json!([{"email": "p@o.com", "rationale": "fits"}]));
+        seed_outbox(&repo, "p@o.com", "Hello", "We built a thing worth your time.");
 
         let out = send_lane(&repo, None, |_, _, _, _, _| {
             panic!("no creds — the sender must not fire")
@@ -1167,23 +1262,29 @@ mod tests {
         std::env::remove_var("SOLOMON_NOTIFY_OFF");
     }
 
-    // -------- 12: approved + SMTP present => exactly one send, idempotent forever --------
+    // -------- 12: AUTO-send (no approval) => exactly one send with the honest footer, idempotent ---
     #[test]
-    fn approved_with_smtp_sends_exactly_once() {
+    fn auto_send_with_smtp_sends_exactly_once_with_footer() {
         let _env = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
         let repo = uniq_repo("sendonce");
-        approve_newest(&repo, "p@o.com", "Hello", "Honest body.");
+        let lane = lane_of(&repo);
+        seed_targets(&repo, json!([{"email": "p@o.com", "rationale": "fits"}]));
+        seed_outbox(&repo, "p@o.com", "Hello", "Honest body.");
         let creds = SmtpCreds { host: "h".into(), port: 465, user: "u".into(), pass: "p".into(), from: "u".into() };
 
         let mut calls = 0;
-        let out = send_lane(&repo, Some(&creds), |_, _, to, subject, _| {
+        let out = send_lane(&repo, Some(&creds), |_, _, to, subject, body| {
             calls += 1;
             assert_eq!(to, "p@o.com");
             assert_eq!(subject, "Hello");
+            // the composed body rides AND the honest sender-identity/opt-out footer is attached
+            assert!(body.contains("Honest body."), "the composed body rides: {body}");
+            assert!(body.contains(&format!("the {lane} project's automated outreach")), "footer id: {body}");
+            assert!(body.to_lowercase().contains("reply"), "opt-out line present: {body}");
             Ok(proc::RunOut { code: 0, stdout: String::new(), stderr: String::new() })
         });
-        assert_eq!(out["sent"], true, "{out}");
+        assert_eq!(out["sent"], true, "an auto-send fires with NO operator approval: {out}");
         assert_eq!(calls, 1);
         // the audit trail + signature landed
         let audit = std::fs::read_to_string(sent_log_path(&repo).unwrap()).unwrap();
@@ -1192,12 +1293,12 @@ mod tests {
         assert_eq!(st["sent_signatures"].as_array().unwrap().len(), 1);
         assert_eq!(st["count"], 1);
 
-        // the SECOND sweep does NOT re-send the same approved line (signature idempotency)
+        // the SECOND sweep does NOT re-send the same message (signature idempotency)
         let out = send_lane(&repo, Some(&creds), |_, _, _, _, _| {
             panic!("an already-sent signature must never re-send")
         });
         assert_eq!(out["sent"], false);
-        assert_eq!(out["reason"], "already sent");
+        assert_eq!(out["reason"], "nothing to send");
         cleanup(&repo);
         std::env::remove_var("SOLOMON_NOTIFY_OFF");
     }
@@ -1208,7 +1309,8 @@ mod tests {
         let _env = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
         let repo = uniq_repo("sendfail");
-        approve_newest(&repo, "p@o.com", "Hello", "Body.");
+        seed_targets(&repo, json!([{"email": "p@o.com", "rationale": "fits"}]));
+        seed_outbox(&repo, "p@o.com", "Hello", "Body.");
         let creds = SmtpCreds { host: "h".into(), port: 465, user: "u".into(), pass: "p".into(), from: "u".into() };
 
         let out = send_lane(&repo, Some(&creds), |_, _, _, _, _| {
@@ -1312,16 +1414,18 @@ mod tests {
         cleanup(&repo);
     }
 
-    // -------- helper: make the newest drafts line an operator-approved JSON object --------
-    fn approve_newest(repo: &Value, to: &str, subject: &str, body: &str) {
-        let p = drafts_log_path(repo).unwrap();
+    // -------- helper: queue a FULL sendable payload in the outbox (the composer's product) --------
+    fn seed_outbox(repo: &Value, to: &str, subject: &str, body: &str) {
+        let p = outbox_path(repo).unwrap();
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&p).unwrap();
         writeln!(
             f,
             "{}",
-            json!({"approved": true, "to": to, "subject": subject, "body": body})
+            json!({"ts": today(), "target_key": target_key(to), "to": to,
+                   "subject": subject, "body": body,
+                   "signature": send_signature(to, subject, body)})
         )
         .unwrap();
     }
