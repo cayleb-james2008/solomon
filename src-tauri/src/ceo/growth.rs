@@ -1008,21 +1008,72 @@ fn write_published_marker(repo: &Value, signature: &str, published: bool, mode: 
     }
 }
 
-/// Decide-and-publish for ONE lane, with the publish SEAM INJECTED so the call/no-call boundary is
-/// testable without a real publish. Reads the NEWEST `growth_drafts.jsonl` line; dispatches through
-/// `dispatch` ONLY when the operator approved it AND it is not an already-handled no-op. Returns a
-/// small outcome Value (`dispatched` tells the caller/test whether the seam fired). Pure of a real
-/// publish — the injected `dispatch` is the ONLY external effect, and in production it is the gated,
-/// dry-run-first `dispatch_growth_publish` (money_guard + pecrt FIRST; a lane not promoted to
-/// `mode:"live"` only dry-runs). Idempotency (every-sweep safe): an approved line already
-/// LIVE-published (`published == true`) is never re-published; an approved line already handled as a
-/// dry-run is not re-dispatched UNLESS the lane has since been promoted to live — so the compose ->
-/// publish seam neither spams a live channel nor churns the gate every ~2 min.
-fn publish_approved_draft<F>(repo: &Value, is_live: bool, dispatch: F) -> Value
+/// `runtime/<lane>/_growth_published_<YYYY-MM-DD>` — the per-lane per-day AUTO-PUBLISH RATE cap
+/// marker (a sibling of the compose day-gate `_growth_drafted_<date>`; inert, janitor-tolerated).
+/// One CLAIM per lane per day caps auto-publish at one dispatch/lane/day — the same rate discipline
+/// the composer uses — so autonomous publishing can never storm a channel or the subprocess budget.
+/// `None` for a nameless lane.
+fn published_day_marker_path(repo: &Value, date: &str) -> Option<PathBuf> {
+    paths::runtime_dir(repo).map(|d| d.join(format!("_growth_published_{date}")))
+}
+
+/// Atomically CLAIM this lane's ONE auto-publish attempt for `date` (`create_new` — exactly one OS
+/// process wins across the GUI tick and the Sentinel watchdog one-shot, the identical cross-process
+/// discipline as `claim_growth_stamp`). Returns false when already claimed (rate cap reached this
+/// day), nameless, or on any IO error — fail-closed: skip the lane, never double-publish.
+fn claim_published_day(repo: &Value, date: &str) -> bool {
+    use std::io::Write;
+    (|| -> std::io::Result<()> {
+        let p = published_day_marker_path(repo, date).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "nameless lane — no runtime dir")
+        })?;
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&p)?;
+        f.write_all(format!("publish attempt {ts}").as_bytes())
+    })()
+    .is_ok()
+}
+
+/// The AUTOMATED content gate that REPLACES the operator `approved:true` wait (pure — unit-tested).
+/// A composed draft auto-publishes ONLY if it is genuine composed CONTENT that clears the
+/// deterministic persona filter: Solomon ships what its evidence-grounded composer produced, never a
+/// fabricated/empty line, never a raw operator-control JSON edit, never operator-identifying copy.
+/// Returns the draft TEXT to publish on success, or `Err(reason)` naming the automated block
+/// (surfaced for observability + the tests). This is content + persona safety, NOT a human gate.
+pub(crate) fn auto_publish_content_check(newest: &str) -> Result<String, &'static str> {
+    // The composer writes `<date>\t<fact>` TEXT lines; publish the fact after an optional date tab.
+    let text = newest.split_once('\t').map(|(_d, rest)| rest).unwrap_or(newest).trim();
+    if text.is_empty() {
+        return Err("empty draft"); // nothing composed — never fabricate a publish
+    }
+    // A raw JSON control line (e.g. an operator `{"approved":...}` edit) is NOT publishable content.
+    if serde_json::from_str::<Value>(text).is_ok() {
+        return Err("control line, not content");
+    }
+    if violates_persona(text) {
+        return Err("persona violation"); // deterministic operator-marker deny filter
+    }
+    Ok(text.to_string())
+}
+
+/// AUTO-publish decide-and-ship for ONE lane, with the publish SEAM INJECTED so the call/no-call
+/// boundary is testable without a real publish. Reads the NEWEST `growth_drafts.jsonl` line and
+/// AUTONOMOUSLY dispatches it — NO operator `approved:true` wait — behind the AUTOMATED safety that
+/// stays: (1) the `auto_publish_content_check` persona/content gate, (2) per-draft dedup (a draft
+/// already LIVE-published is never re-shipped), (3) the per-lane-per-day publish RATE cap
+/// (`claim_published_day`), and (4) inside `dispatch` the money_guard + pecrt brand-safety gate,
+/// dry-run-first (a lane not promoted to `mode:"live"` only dry-runs). `dispatched` tells the
+/// caller/test whether the seam fired. The live/dry-run decision lives entirely inside the gated
+/// `dispatch` (it reads the lane's `growth_publish.mode`), so this seam needs no live flag.
+fn auto_publish_draft<F>(repo: &Value, dispatch: F) -> Value
 where
     F: FnOnce(&Value, &str) -> Value,
 {
     let lane = paths::repo_name(repo);
+    let today = Utc::now().format("%Y-%m-%d").to_string();
     let path = match GrowthSpecialist::drafts_log_path(repo) {
         Some(p) => p,
         None => return json!({"lane": lane, "dispatched": false, "reason": "nameless lane"}),
@@ -1031,32 +1082,32 @@ where
         Some(l) => l,
         None => return json!({"lane": lane, "dispatched": false, "reason": "no drafts"}),
     };
-    if !draft_line_approved(&newest) {
-        // The human gate is CLOSED — no `approved: true`. dispatch is NOT called (inert).
-        return json!({"lane": lane, "dispatched": false, "reason": "not approved"});
-    }
+    // (1) AUTOMATED content + persona gate — replaces the human `approved:true` wait.
+    let text = match auto_publish_content_check(&newest) {
+        Ok(t) => t,
+        Err(reason) => return json!({"lane": lane, "dispatched": false, "reason": reason}),
+    };
     let signature = newest.trim();
+    // (2) Per-draft dedup: this exact draft already LIVE-published -> never re-ship it.
     if let Some(prev) = read_published_marker(repo) {
-        if prev.get("signature").and_then(Value::as_str) == Some(signature) {
-            let already_live = prev.get("published").and_then(Value::as_bool) == Some(true);
-            // Already live-published this exact draft -> never re-publish. Or: handled as a dry-run
-            // and the lane is STILL not live -> nothing changed, do not re-dispatch (no gate churn).
-            if already_live || !is_live {
-                return json!({
-                    "lane": lane, "dispatched": false,
-                    "reason": if already_live { "already published" } else { "dry-run unchanged" },
-                });
-            }
-            // else: handled as a dry-run but the lane was since promoted to live -> fall through and
-            // dispatch the live publish once.
+        if prev.get("signature").and_then(Value::as_str) == Some(signature)
+            && prev.get("published").and_then(Value::as_bool) == Some(true)
+        {
+            return json!({"lane": lane, "dispatched": false, "reason": "already published"});
         }
     }
-    // The gate is OPEN and this is a fresh approval (or a dry-run lane just promoted to live): fire
-    // the injected publish seam ONCE. detail is a short provenance note — the publish path routes via
-    // the project's OWN sanctioned argv and largely ignores it; the money/pecrt gate runs first.
+    // (3) Per-lane-per-day RATE cap: at most ONE auto-publish dispatch per lane per day. A failed /
+    // dry-run publish also consumes the day (bounded — never a per-sweep retry storm); the next
+    // FRESH draft ships tomorrow. Cross-process safe (GUI tick vs Sentinel one-shot).
+    if !claim_published_day(repo, &today) {
+        return json!({"lane": lane, "dispatched": false, "reason": "daily publish cap reached"});
+    }
+    // Gates passed: fire the injected publish seam ONCE. detail is a short provenance note — the
+    // publish path routes via the project's OWN sanctioned argv and largely ignores it; the
+    // money/pecrt brand-safety gate inside `dispatch` runs FIRST.
     let detail = format!(
-        "operator-approved growth draft (publish_recency confirms): {}",
-        super::cap_line(signature, 200)
+        "auto-published growth draft (content+persona checks passed): {}",
+        super::cap_line(&text, 200)
     );
     let out = dispatch(repo, &detail);
     let published = out.get("published").and_then(Value::as_bool).unwrap_or(false);
@@ -1065,26 +1116,26 @@ where
     // LOG the published:true/false result for observability; the publish_recency probe independently
     // confirms a live publish by reading the project's own post registry (no fleet_ledger row here).
     let _ = crate::notify::send(&crate::notify::Notice::report(
-        format!("Solomon: growth publish -> {lane}"),
-        format!("approved draft dispatched: published={published} mode={mode}"),
+        format!("Solomon: growth auto-publish -> {lane}"),
+        format!("draft dispatched: published={published} mode={mode}"),
     ));
     json!({"lane": lane, "dispatched": true, "published": published, "mode": mode})
 }
 
-/// The PUBLISH "last inch" ridden on `ceo_slow_tail` (the human-gated compose -> publish -> measure
-/// wire): for each PUBLIC lane, publish its newest growth draft ONLY when the operator hand-set
-/// `approved: true` on it, through the gated dry-run-first `dispatch_growth_publish`. Fully INERT
-/// until a human approves a draft (nothing here — or anywhere in Solomon — sets `approved`). Visits
-/// lanes in the registry order; `status`/`snapshot` are accepted for signature parity with the other
-/// tail seams (publish eligibility is the operator's approval, not a health rollup).
-pub fn maybe_publish_approved_growth(_snapshot: &Value, _status: &Value) {
+/// The PUBLISH "last inch" ridden on `ceo_slow_tail` (the AUTONOMOUS compose -> publish -> measure
+/// wire): for each PUBLIC lane, AUTO-publish its newest growth draft — NO operator `approved:true`
+/// wait — behind the AUTOMATED safety in `auto_publish_draft` (persona/content check, per-draft
+/// dedup, per-lane-per-day rate cap) and the gated dry-run-first `dispatch_growth_publish`
+/// (money_guard + pecrt brand-safety FIRST; a lane not promoted to `mode:"live"` only dry-runs).
+/// Visits lanes in registry order; `status`/`snapshot` are accepted for signature parity with the
+/// other tail seams (publish eligibility is the automated content/rate safety, not a health rollup).
+pub fn maybe_auto_publish_growth(_snapshot: &Value, _status: &Value) {
     for repo in crate::control::registry::read_repos_json() {
         // Only explicit public lanes are publish candidates (same cheap pre-check as the composer).
         if !repo.get("public").and_then(Value::as_bool).unwrap_or(false) {
             continue;
         }
-        let is_live = GrowthSpecialist::is_live_publish(&repo);
-        let _ = publish_approved_draft(&repo, is_live, dispatch_growth_publish);
+        let _ = auto_publish_draft(&repo, dispatch_growth_publish);
     }
 }
 
@@ -1814,65 +1865,114 @@ mod tests {
         assert!(!draft_line_approved("not json at all"));
     }
 
-    // The seam contract: an UNAPPROVED newest draft NEVER dispatches a publish; an operator-APPROVED
-    // one dispatches EXACTLY once (the real publish is gated/mocked by the injected seam), and an
-    // unchanged dry-run does not re-dispatch every sweep. Nothing here sets `approved` — the human does.
+    // The pure AUTOMATED content gate: a genuine composed TEXT draft passes; an empty line, a raw
+    // operator-control JSON line, and a persona-violating draft are all BLOCKED — no human approval.
     #[test]
-    fn publish_last_inch_dispatches_only_on_operator_approval() {
+    fn auto_publish_content_check_passes_content_and_blocks_persona_and_control_lines() {
+        // a real composed draft (persona-clean) passes, returning the fact text to publish
+        let ok = auto_publish_content_check(
+            "2026-07-15\trsi: growth DRAFT [GATED, unpublished, organic] lane=x: [post] honest copy (t=1)",
+        );
+        assert!(ok.is_ok(), "a persona-clean composed draft must pass: {ok:?}");
+        assert!(ok.unwrap().contains("honest copy"));
+        // empty / control-JSON / persona-violating drafts are refused (fail-closed, named reason)
+        assert_eq!(auto_publish_content_check("2026-07-15\t   ").unwrap_err(), "empty draft");
+        assert_eq!(
+            auto_publish_content_check("2026-07-15\t{\"approved\": true}").unwrap_err(),
+            "control line, not content"
+        );
+        assert_eq!(
+            auto_publish_content_check(
+                "2026-07-15\trsi: growth DRAFT lane=x: maintained by cayleb (t=2)"
+            )
+            .unwrap_err(),
+            "persona violation"
+        );
+    }
+
+    // The AUTONOMOUS publish seam contract: a composed draft AUTO-publishes with NO operator
+    // `approved:true`; the per-lane-per-day RATE cap blocks a second same-day publish; a persona
+    // violation blocks BEFORE consuming the day's budget; and a draft already LIVE-published is never
+    // re-shipped (per-draft dedup). Nothing here waits on a human.
+    #[test]
+    fn auto_publish_fires_without_approval_and_content_rate_gates_block() {
         use std::cell::Cell;
-        // publish_approved_draft logs via notify::send on dispatch — silence it (kill-switch).
+        // auto_publish_draft logs via notify::send on dispatch — silence it (kill-switch).
         let _env = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        let today = Utc::now().format("%Y-%m-%d").to_string();
 
-        // --- draft WITHOUT approved:true -> dispatch is NOT called ---
-        let repo_no = uniq_repo("pub_noapprove");
-        let rt_no = paths::runtime_dir(&repo_no).unwrap();
-        let _ = std::fs::remove_dir_all(&rt_no);
-        std::fs::create_dir_all(&rt_no).unwrap();
+        // --- a plain composed draft (NO approved:true) AUTO-publishes exactly once ---
+        let repo = uniq_repo("pub_auto");
+        let rt = paths::runtime_dir(&repo).unwrap();
+        let _ = std::fs::remove_dir_all(&rt);
+        std::fs::create_dir_all(&rt).unwrap();
         std::fs::write(
-            rt_no.join("growth_drafts.jsonl"),
-            "2026-07-15\trsi: growth DRAFT [GATED, unpublished, organic] lane=x: hi (t=1)\n",
+            rt.join("growth_drafts.jsonl"),
+            "2026-07-15\trsi: growth DRAFT [GATED, unpublished, organic] lane=x: [post] Ship it — honest copy (t=1)\n",
         )
         .unwrap();
-        let called_no = Cell::new(0u32);
-        let out_no = publish_approved_draft(&repo_no, false, |_r, _d| {
-            called_no.set(called_no.get() + 1);
+        let called = Cell::new(0u32);
+        let out = auto_publish_draft(&repo, |_r, _d| {
+            called.set(called.get() + 1);
             json!({"published": false, "mode": "dry_run"})
         });
-        assert_eq!(called_no.get(), 0, "an unapproved draft must NOT dispatch a publish");
-        assert_eq!(out_no["dispatched"], json!(false));
+        assert_eq!(called.get(), 1, "a composed draft MUST auto-publish without approved:true");
+        assert_eq!(out["dispatched"], json!(true));
 
-        // --- draft WITH approved:true -> dispatch IS called (publish gated/mocked) ---
-        let repo_yes = uniq_repo("pub_approve");
-        let rt_yes = paths::runtime_dir(&repo_yes).unwrap();
-        let _ = std::fs::remove_dir_all(&rt_yes);
-        std::fs::create_dir_all(&rt_yes).unwrap();
-        // The operator approves by making the NEWEST line a JSON object with approved:true.
-        std::fs::write(
-            rt_yes.join("growth_drafts.jsonl"),
-            "2026-07-15\t{\"approved\": true, \"note\": \"ship the README post\"}\n",
-        )
-        .unwrap();
-        let called_yes = Cell::new(0u32);
-        let out_yes = publish_approved_draft(&repo_yes, false, |_r, _d| {
-            called_yes.set(called_yes.get() + 1);
-            json!({"published": false, "mode": "dry_run"}) // gate the actual publish in the test
-        });
-        assert_eq!(called_yes.get(), 1, "an operator-approved draft MUST dispatch exactly one publish");
-        assert_eq!(out_yes["dispatched"], json!(true));
-
-        // Idempotency: the same dry-run draft on a still-not-live lane must NOT re-dispatch next sweep.
-        let out_again = publish_approved_draft(&repo_yes, false, |_r, _d| {
-            called_yes.set(called_yes.get() + 1);
+        // --- RATE cap: a SECOND publish on the SAME lane the SAME day is blocked ---
+        let out_again = auto_publish_draft(&repo, |_r, _d| {
+            called.set(called.get() + 1);
             json!({"published": false, "mode": "dry_run"})
         });
-        assert_eq!(called_yes.get(), 1, "an unchanged dry-run must not re-dispatch every ~2 min sweep");
+        assert_eq!(called.get(), 1, "the per-lane-per-day rate cap blocks a second same-day publish");
         assert_eq!(out_again["dispatched"], json!(false));
+        assert_eq!(out_again["reason"], json!("daily publish cap reached"));
+
+        // --- PERSONA violation blocks, and does NOT consume the day's rate budget ---
+        let repo_p = uniq_repo("pub_persona");
+        let rt_p = paths::runtime_dir(&repo_p).unwrap();
+        let _ = std::fs::remove_dir_all(&rt_p);
+        std::fs::create_dir_all(&rt_p).unwrap();
+        std::fs::write(
+            rt_p.join("growth_drafts.jsonl"),
+            "2026-07-15\trsi: growth DRAFT [GATED, unpublished, organic] lane=x: maintained by cayleb (t=2)\n",
+        )
+        .unwrap();
+        let called_p = Cell::new(0u32);
+        let out_p = auto_publish_draft(&repo_p, |_r, _d| {
+            called_p.set(called_p.get() + 1);
+            json!({"published": true, "mode": "live"})
+        });
+        assert_eq!(called_p.get(), 0, "a persona-violating draft must NOT dispatch");
+        assert_eq!(out_p["reason"], json!("persona violation"));
+        assert!(
+            !published_day_marker_path(&repo_p, &today).unwrap().exists(),
+            "a persona block must fail BEFORE the day-claim (no rate budget consumed)"
+        );
+
+        // --- DEDUP: a draft already LIVE-published is never re-shipped ---
+        let repo_d = uniq_repo("pub_dedup");
+        let rt_d = paths::runtime_dir(&repo_d).unwrap();
+        let _ = std::fs::remove_dir_all(&rt_d);
+        std::fs::create_dir_all(&rt_d).unwrap();
+        let line =
+            "2026-07-15\trsi: growth DRAFT [GATED, unpublished, organic] lane=x: [post] already live (t=3)";
+        std::fs::write(rt_d.join("growth_drafts.jsonl"), format!("{line}\n")).unwrap();
+        write_published_marker(&repo_d, line.trim(), true, "live"); // simulate a prior live publish
+        let called_d = Cell::new(0u32);
+        let out_d = auto_publish_draft(&repo_d, |_r, _d| {
+            called_d.set(called_d.get() + 1);
+            json!({"published": true, "mode": "live"})
+        });
+        assert_eq!(called_d.get(), 0, "a draft already live-published must NOT be re-shipped");
+        assert_eq!(out_d["reason"], json!("already published"));
 
         std::env::remove_var("SOLOMON_NOTIFY_OFF");
-        let _ = std::fs::remove_dir_all(rt_no);
-        let _ = std::fs::remove_dir_all(rt_yes);
+        let _ = std::fs::remove_dir_all(rt);
+        let _ = std::fs::remove_dir_all(rt_p);
+        let _ = std::fs::remove_dir_all(rt_d);
     }
 }
