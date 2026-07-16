@@ -418,7 +418,10 @@ pub(crate) fn controller_clean_at(root: &Path, expected_branch: &str) -> Result<
 // the standard test vectors below.
 // --------------------------------------------------------------------------- //
 
-fn sha256_hex(data: &[u8]) -> String {
+// pub(crate): the CEO outreach/self-tooling planes reuse this SAME vendored hash for target dedup
+// keys, send-idempotency signatures, and the tool tamper stamp — one hash source, never a second
+// copy to drift. Visibility widening only; the tripwire behavior is byte-identical.
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,

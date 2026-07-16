@@ -1520,7 +1520,6 @@ fn increment_daily(st: &mut Value) {
 /// shared quota and never needs a second ledger. Purely additive — no state write, no behavior
 /// change to the fleet loop; a caller seeing 0 simply skips composing this sweep and retries once
 /// the date rolls the counter.
-#[allow(dead_code)] // wired by the CEO outreach/self-tooling composers (next slice)
 pub fn daily_calls_remaining() -> i64 {
     let cfg = registry::autopilot_config();
     calls_remaining(&cfg, &read_state(&cfg))
@@ -1529,7 +1528,6 @@ pub fn daily_calls_remaining() -> i64 {
 /// Pure core of [`daily_calls_remaining`] (unit-tested without disk): budget minus today's used
 /// calls, never negative. A stale `daily.date` reads as zero used (the date reset `daily_used`
 /// already enforces), so the remaining budget resets with the day.
-#[allow(dead_code)] // used by daily_calls_remaining (allowed-dead until the next slice) + tests
 pub(crate) fn calls_remaining(cfg: &Value, st: &Value) -> i64 {
     (daily_budget(cfg) - daily_used(st)).max(0)
 }

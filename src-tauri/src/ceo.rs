@@ -60,6 +60,14 @@ pub mod research;
 // growth.rs.
 pub mod growth;
 
+// CEO autonomy, piece 1: the COLD-OUTREACH pipeline — every public lane composes a small, bounded
+// number of provenance-tagged cold-email DRAFTS per day (operator-supplied targets only, honest
+// planner-directive trigger, budget-aware), gated exactly like growth drafts; a send happens ONLY
+// for a draft the operator hand-marked `approved: true` AND only when SMTP env creds exist —
+// otherwise draft-only + a deduped needs card. Nothing in Solomon ever sets `approved`. See
+// outreach.rs.
+pub mod outreach;
+
 // CEO autonomy, piece 3: the unified `_pending_approvals` operator surface — regenerated on every
 // tick's FAST deterministic core (file-IO only, no LLM), aggregating every unapproved growth
 // draft, unapproved outreach draft, and tool awaiting live-approval, each with the EXACT one-line
@@ -782,6 +790,22 @@ fn build_plan_user_json(
 /// The per-day idempotence marker appended to every CEO backlog item.
 fn ceo_marker(date: &str) -> String {
     format!("(ceo {date})")
+}
+
+/// Drop a tiny per-seam sweep marker under `runtime/_ceo/_seam_<name>` (best-effort, one small
+/// write per ~2-min tail invocation). Two jobs: (1) the observable heartbeat the wiring `#[test]`s
+/// assert — proving a tail seam is actually INVOKED, not dead code; (2) a cheap "when did this
+/// seam last run?" answer for the operator. Never fails a sweep — a disk hiccup loses the marker,
+/// nothing else.
+pub(crate) fn seam_marker(name: &str) {
+    let p = paths::here()
+        .join("runtime")
+        .join(CEO_WARM_LANE)
+        .join(format!("_seam_{name}"));
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&p, Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
 }
 
 /// HERE/improver/<name>/backlog.md — the exact file improver::backlog::top_backlog_item reads.
