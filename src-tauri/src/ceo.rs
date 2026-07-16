@@ -388,13 +388,14 @@ fn ceo_slow_tail(snapshot: Value, status: Value) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::ceo::growth::maybe_draft_growth_content(&snapshot, &status)
     }));
-    // GROWTH PUBLISH "last inch" (D12 / Phase B): the human-gated compose -> publish -> measure wire.
-    // Publishes a lane's newest growth draft ONLY when the operator hand-set `approved: true` on it,
-    // through the gated dry-run-first `dispatch_growth_publish` (money_guard + pecrt FIRST). Nothing in
-    // Solomon sets `approved`, so this is fully INERT until the operator acts; it writes no fleet_ledger
-    // revenue row (a publish is an outcome, not revenue) and the `publish_recency` probe confirms it.
+    // GROWTH PUBLISH "last inch" (D12 / Phase B): the AUTONOMOUS compose -> publish -> measure wire.
+    // Auto-publishes a lane's newest growth draft — NO operator approval wait — behind the AUTOMATED
+    // safety (persona/content check, per-draft dedup, per-lane-per-day rate cap) and the gated
+    // dry-run-first `dispatch_growth_publish` (money_guard + pecrt brand-safety FIRST). It writes no
+    // fleet_ledger revenue row (a publish is an outcome, not revenue) and the `publish_recency`
+    // probe confirms it.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::ceo::growth::maybe_publish_approved_growth(&snapshot, &status)
+        crate::ceo::growth::maybe_auto_publish_growth(&snapshot, &status)
     }));
     // CEO AUTONOMY SEAMS (cold-outreach compose + fail-closed send, toolset self-extension) —
     // bundled in their own fn so the wiring #[test] can drive them synchronously; each keeps its
