@@ -616,6 +616,40 @@ pub fn diagnose_categories() -> &'static [&'static str] {
     ]
 }
 
+/// True iff `category` names a STRUCTURALLY stuck condition — a lane whose diagnosis is a
+/// human-spec-required git/process CORPSE that no autopilot loop iteration can ever clear:
+/// a stranded/unmerged branch (needs a human merge/push/delete), a deliberately self-stopped
+/// or hung loop process (needs a human Start / a killed PID), or a base the loop physically
+/// refuses to touch (un-pushed out-of-band commits, or untracked files a preflight clean would
+/// delete). These are distinct from a "retry-later" blocker that clears on its own or on a
+/// config edit — a provider quota cooldown, a stale gate/CI streak, an exhausted backlog, or a
+/// missing key/goal — which the loop CAN make progress on once the condition lifts.
+///
+/// The autopilot scheduler (`fleet::plan_jobs`) uses this to route a structural lane DIRECTLY to
+/// the TERMINAL `needs_human_spec` state instead of the inert `proof_required` job: the
+/// proof_required cooldown only rate-limits and RE-FIRES the identical corpse every 4h, and for a
+/// condition nothing the scheduler does can heal (it cannot merge a branch, kill a PID, or push a
+/// base) that re-surfacing is pure retry theater. A retry-later blocker keeps the
+/// proof_required → cooldown → needs_human_spec ladder so a self-clearing condition re-enters the
+/// queue rather than being parked forever.
+///
+/// Every literal here is a member of [`diagnose_categories`] and is one that diagnose() marks
+/// `auto_safe == false` (so it actually reaches the proof_required branch); `stale_lock` and
+/// `stop_lingering` reach it only in their auto_safe==false variants (hung PID / unclean stop) —
+/// their auto-safe variants are handled by the maintenance branch upstream. A drift test
+/// cross-checks membership against [`diagnose_categories`].
+pub fn is_structurally_stuck(category: &str) -> bool {
+    matches!(
+        category,
+        "stranded_unmerged_branch"
+            | "persistent_self_stop"
+            | "stop_lingering"
+            | "stale_lock"
+            | "base_out_of_band"
+            | "untracked_refusal"
+    )
+}
+
 /// Anti-thrash helper: count recent supervisor.jsonl records that are a RUNG-0, non-escalate
 /// auto-fix of `cat`. Mirrors the comprehension in diagnose().
 ///
@@ -3139,6 +3173,48 @@ mod tests {
             "diagnose()'s assigned category literals and diagnose_categories() drifted — \
              update diagnose_categories() (and actions.json, which the closure test enforces)"
         );
+    }
+
+    // is_structurally_stuck must name ONLY real diagnose categories (a rename would silently make
+    // the fleet terminal-park a no-op), and must draw the retry-later / structural line correctly:
+    // the git/process corpses are structural; quota / gate-streak / backlog / config blockers are not.
+    #[test]
+    fn is_structurally_stuck_partitions_categories_correctly() {
+        let cats = diagnose_categories();
+        for structural in [
+            "stranded_unmerged_branch",
+            "persistent_self_stop",
+            "stop_lingering",
+            "stale_lock",
+            "base_out_of_band",
+            "untracked_refusal",
+        ] {
+            assert!(
+                cats.contains(&structural),
+                "structural literal '{structural}' is not a real diagnose category"
+            );
+            assert!(
+                is_structurally_stuck(structural),
+                "'{structural}' must be classified structural"
+            );
+        }
+        // Retry-later blockers keep the proof_required → cooldown ladder — they must NOT be structural.
+        for retry_later in [
+            "quota_error",
+            "gate_red_streak",
+            "ci_red_streak",
+            "noop_streak",
+            "needs_goal",
+            "no_key",
+            "key_shape_mismatch",
+            "unknown_error",
+            "ok",
+        ] {
+            assert!(
+                !is_structurally_stuck(retry_later),
+                "'{retry_later}' is retry-later/config, not a structural human-spec corpse"
+            );
+        }
     }
 
     // ---------------- TTL escalations (closed action registry, catalog #3) ----------------
