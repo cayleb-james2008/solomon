@@ -68,6 +68,15 @@ pub mod growth;
 // outreach.rs.
 pub mod outreach;
 
+// CEO autonomy, piece 2: TOOLSET SELF-EXTENSION — the CEO plane can propose -> lint -> dry-run ->
+// register -> invoke a new PowerShell tool under gitignored `runtime\_tools\` (never tracked
+// source; the provenance tripwire is untouched). Registration requires the static deny-list lint
+// AND a sandboxed `-DryRun` exit-0 AND the `rsi:` provenance stamp; a LIVE invocation additionally
+// requires an operator-set `approved: true` — else it DEGRADES to a dry-run (never a silent live
+// effect). The linter actively rejects daemon/schtasks creation (no-background-processes doctrine).
+// See self_tooling.rs.
+pub mod self_tooling;
+
 // CEO autonomy, piece 3: the unified `_pending_approvals` operator surface — regenerated on every
 // tick's FAST deterministic core (file-IO only, no LLM), aggregating every unapproved growth
 // draft, unapproved outreach draft, and tool awaiting live-approval, each with the EXACT one-line

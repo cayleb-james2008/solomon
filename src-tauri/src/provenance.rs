@@ -21,7 +21,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Git-tracked watched files, relative to the controller repo root.
-const TRACKED: &[&str] = &["repos.json", "ops.json", "actions.json"];
+// pub(crate): ceo::self_tooling's tripwire-guard #[test] pins that NO `_tools` artifact ever
+// enters this set (the tool manifest is a gitignored runtime file, never tracked/watched).
+// Visibility widening only; the set and the tripwire behavior are byte-identical.
+pub(crate) const TRACKED: &[&str] = &["repos.json", "ops.json", "actions.json"];
 /// The gitignored secrets file — watched by content hash, never by git.
 const ENV_FILE: &str = ".env";
 /// Drift may persist this long uncommitted before the tripwire pages + holds (the acceptance
