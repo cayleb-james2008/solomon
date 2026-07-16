@@ -1514,6 +1514,26 @@ fn increment_daily(st: &mut Value) {
     st["daily"] = json!({"date": today(), "calls": calls});
 }
 
+/// Daily-budget headroom for the CEO plane's composers (outreach / self-tooling): how many agent
+/// calls remain under `daily_call_budget` today, clamped at zero. Reads the SAME autopilot state
+/// ledger `plan_jobs`/`increment_daily` maintain, so a CEO compose can never spend past the fleet's
+/// shared quota and never needs a second ledger. Purely additive — no state write, no behavior
+/// change to the fleet loop; a caller seeing 0 simply skips composing this sweep and retries once
+/// the date rolls the counter.
+#[allow(dead_code)] // wired by the CEO outreach/self-tooling composers (next slice)
+pub fn daily_calls_remaining() -> i64 {
+    let cfg = registry::autopilot_config();
+    calls_remaining(&cfg, &read_state(&cfg))
+}
+
+/// Pure core of [`daily_calls_remaining`] (unit-tested without disk): budget minus today's used
+/// calls, never negative. A stale `daily.date` reads as zero used (the date reset `daily_used`
+/// already enforces), so the remaining budget resets with the day.
+#[allow(dead_code)] // used by daily_calls_remaining (allowed-dead until the next slice) + tests
+pub(crate) fn calls_remaining(cfg: &Value, st: &Value) -> i64 {
+    (daily_budget(cfg) - daily_used(st)).max(0)
+}
+
 fn max_concurrent(cfg: &Value) -> i64 {
     cfg.get("max_concurrent_agent_calls")
         .and_then(Value::as_i64)
@@ -1881,6 +1901,29 @@ mod tests {
         let mut st2 = json!({});
         increment_daily(&mut st2);
         assert_eq!(daily_used(&st2), 1);
+    }
+
+    // The CEO-plane budget preflight primitive: remaining = budget - used, clamped >= 0, and a
+    // stale daily date resets by day — so an outreach/tooling compose can never spend past the
+    // fleet's shared `daily_call_budget` and never double-books a second ledger.
+    #[test]
+    fn daily_calls_remaining_is_budget_minus_used_clamped_and_date_reset() {
+        let cfg = json!({"daily_call_budget": 10});
+        // no state yet -> the full budget remains
+        assert_eq!(calls_remaining(&cfg, &json!({})), 10);
+        // today's burn counts down
+        let st = json!({"daily": {"date": today(), "calls": 4}});
+        assert_eq!(calls_remaining(&cfg, &st), 6);
+        // at cap -> exactly 0; past cap -> still 0 (never negative)
+        let st = json!({"daily": {"date": today(), "calls": 10}});
+        assert_eq!(calls_remaining(&cfg, &st), 0);
+        let st = json!({"daily": {"date": today(), "calls": 99}});
+        assert_eq!(calls_remaining(&cfg, &st), 0);
+        // yesterday's burn does NOT consume today's budget (resets by date, like daily_used)
+        let st = json!({"daily": {"date": "1999-01-01", "calls": 99}});
+        assert_eq!(calls_remaining(&cfg, &st), 10);
+        // absent budget -> the conservative daily_budget default (40)
+        assert_eq!(calls_remaining(&json!({}), &json!({})), 40);
     }
 
     #[test]
