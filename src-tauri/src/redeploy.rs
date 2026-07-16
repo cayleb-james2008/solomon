@@ -4,8 +4,11 @@
 //! On a periodic check (wired into the watchdog sweep — see `watchdog::main`), if the running
 //! orchestrator's build sha is behind its remote default branch (`origin/HEAD`, resolved from git —
 //! never a hardcoded `main`) AND a rebuild is warranted:
-//!   (a) `cargo build --release` into a STAGING path (`target/release/<exe>.new.exe`, NOT the
-//!       locked live exe),
+//!   (a) `cargo build --release` with an ISOLATED `--target-dir` (`target/redeploy-staging`) —
+//!       the link NEVER touches `target/release/<exe>`, which is the RUNNING exe (the Sentinel
+//!       watchdog executes it; an in-place relink fails with "Access is denied (os error 5)");
+//!       on success the canonical `target/release/<exe>` is refreshed via rename-then-copy
+//!       (renaming a running exe's file is legal on Windows) and `<exe>.new.exe` is staged,
 //!   (b) wait for a genuine DRAIN WINDOW where NO lane is mid-ship AND no live-money lane has an
 //!       open trade,
 //!   (c) atomically swap the staged exe in and relaunch, resuming lanes.
@@ -44,6 +47,15 @@ const DRAIN_WAIT_MINS: u64 = 10;
 
 /// Poll interval while waiting for a drain window (seconds).
 const DRAIN_POLL_S: u64 = 15;
+
+/// The isolated Cargo target dir (under `target/`) for the staging build. The build must NEVER
+/// link into `target/release` directly: that dir holds the RUNNING exe and a relink of a locked
+/// file fails with os error 5 — which made self-redeploy able to merge code but never ship it.
+const STAGING_TARGET_DIR: &str = "redeploy-staging";
+
+/// Prune `<exe>.old-<ts>` rollback artifacts older than this (3 days) — enough time to roll back
+/// a bad swap by hand, not enough to accrete gigabytes of stale binaries.
+const OLD_ARTIFACT_MAX_AGE_S: u64 = 3 * 24 * 60 * 60;
 
 // --------------------------------------------------------------------------- //
 // DRAIN-GATE PREDICATE — pure, the load-bearing safety contract
@@ -193,10 +205,83 @@ pub fn build_behind_origin() -> Option<bool> {
 // STAGING BUILD
 // --------------------------------------------------------------------------- //
 
-/// `cargo build --release` in Solomon's own checkout, then copy the freshly-built exe to a STAGING
-/// path (`target/release/<exe>.new.exe`) beside it — NOT the locked live exe. Returns the staged
-/// path. The build is the expensive part (minutes); it does not interrupt any lane (a cargo build
-/// touches neither the live exe nor any lane's runtime).
+/// `<workspace>/target/redeploy-staging` — the isolated Cargo target dir for the staging build.
+/// Pure path construction (tested).
+fn staging_target_dir(workspace: &Path) -> PathBuf {
+    workspace.join("target").join(STAGING_TARGET_DIR)
+}
+
+/// Where the staging build's release artifact lands: `<staging target dir>/release/<exe>`. Pure.
+fn staging_built_exe(workspace: &Path, exe: &str) -> PathBuf {
+    staging_target_dir(workspace).join("release").join(exe)
+}
+
+/// `<exe>.old-<ts>` — the timestamped rename target for the (possibly running) release artifact.
+/// Distinct from `old_exe_name`'s `<stem>.old.<ext>` (the drain-window swap's single rollback
+/// slot): refresh can happen while the old exe is still running, so each one needs its own name.
+/// Pure.
+fn timestamped_old_name(exe: &str, ts: &str) -> String {
+    format!("{exe}.old-{ts}")
+}
+
+/// True iff `file_name` is a `<exe>.old-<ts>` rollback artifact old enough to prune. Pure
+/// decision over (name, age) — the live exe, `<exe>.new.exe`, the swap's `<stem>.old.<ext>`, and
+/// fresh rollbacks never match.
+fn should_prune_old_artifact(file_name: &str, exe: &str, age: Duration) -> bool {
+    file_name.starts_with(&format!("{exe}.old-"))
+        && age >= Duration::from_secs(OLD_ARTIFACT_MAX_AGE_S)
+}
+
+/// Best-effort sweep of stale `<exe>.old-<ts>` artifacts in `release_dir`. A removal that fails
+/// (e.g. the old exe is STILL running) is simply retried on a later redeploy pass.
+fn prune_old_artifacts(release_dir: &Path, exe: &str) {
+    let Ok(rd) = std::fs::read_dir(release_dir) else {
+        return;
+    };
+    for ent in rd.flatten() {
+        let name = ent.file_name().to_string_lossy().into_owned();
+        let age = ent
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .unwrap_or_default();
+        if should_prune_old_artifact(&name, exe, age) {
+            let _ = std::fs::remove_file(ent.path());
+        }
+    }
+}
+
+/// Refresh the canonical release artifact from the staged build: rename the (possibly RUNNING)
+/// `<release_dir>/<exe>` to `<exe>.old-<ts>` — Windows/NTFS permits renaming a running exe's
+/// file, only deleting/overwriting it is denied — then copy the freshly-built exe into the
+/// canonical path, then prune stale `.old-<ts>` leftovers. This rename-then-copy is what replaces
+/// the old in-place relink (which failed with os error 5 whenever the exe was live).
+fn refresh_release_artifact(built: &Path, release_dir: &Path, exe: &str) -> Result<(), String> {
+    std::fs::create_dir_all(release_dir).map_err(|e| format!("release dir: {e}"))?;
+    let live = release_dir.join(exe);
+    if live.exists() {
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let old = release_dir.join(timestamped_old_name(exe, &ts));
+        std::fs::rename(&live, &old)
+            .map_err(|e| format!("rename {} -> {} failed: {e}", live.display(), old.display()))?;
+    }
+    std::fs::copy(built, &live)
+        .map_err(|e| format!("copy {} -> {} failed: {e}", built.display(), live.display()))?;
+    prune_old_artifacts(release_dir, exe);
+    Ok(())
+}
+
+/// `cargo build --release` in Solomon's own checkout with an ISOLATED `--target-dir`
+/// (`target/redeploy-staging`): the link NEVER touches `target/release/<exe>` — that file is the
+/// RUNNING orchestrator (the Sentinel task executes the build artifact directly), and an in-place
+/// relink of a locked exe fails with "Access is denied (os error 5)", which left Solomon able to
+/// merge code but never ship its own binary. On build success the canonical
+/// `target/release/<exe>` is refreshed via rename-then-copy (`refresh_release_artifact`), stale
+/// `.old-<ts>` rollbacks are pruned, and the staged copy (`target/release/<exe>.new.exe`) is
+/// returned — the exact contract `maybe_self_redeploy` consumes (it hands the staged path to
+/// `swap_and_relaunch` during the drain window). The build interrupts no lane (isolated target
+/// dir; no lane runtime touched).
 pub fn stage_build() -> Result<PathBuf, String> {
     let repo = apptest_health::solomon_repo()
         .ok_or_else(|| "solomon repo not located — cannot self-redeploy".to_string())?;
@@ -207,10 +292,13 @@ pub fn stage_build() -> Result<PathBuf, String> {
     // (Bug-bounty cycle 1, conf 97: self-redeploy was permanently inoperative because both the cwd
     // and the artifact path pointed at the repo root.) cwd + paths are the workspace dir.
     let workspace = repo.join("src-tauri");
-    // `cargo build --release` in the workspace. Long timeout — a clean release build can take many
-    // minutes; an incremental one is fast. A timeout aborts the child and returns Err (no swap).
+    let staging = staging_target_dir(&workspace);
+    let staging_s = staging.to_string_lossy().into_owned();
+    // `cargo build --release --target-dir target/redeploy-staging` in the workspace. Long timeout —
+    // a clean release build can take many minutes; an incremental one is fast. A timeout aborts the
+    // child and returns Err (no swap).
     let r = proc::run(
-        &[cargo_s.as_str(), "build", "--release"],
+        &[cargo_s.as_str(), "build", "--release", "--target-dir", staging_s.as_str()],
         Some(&workspace),
         Some(Duration::from_secs(60 * 30)),
     )
@@ -220,18 +308,21 @@ pub fn stage_build() -> Result<PathBuf, String> {
         let tail: String = tail.chars().take(300).collect();
         return Err(format!("cargo build --release failed (code {}): {tail}", r.code));
     }
-    // The built exe: src-tauri/target/release/<default-run>.exe (Cargo.toml default-run = "solomon").
+    // The built exe: <staging>/release/<default-run>.exe (Cargo.toml default-run = "solomon").
     let exe_name = exe_file_name();
-    let built = workspace.join("target").join("release").join(&exe_name);
+    let built = staging_built_exe(&workspace, &exe_name);
     if !built.is_file() {
         return Err(format!(
             "build reported success but {} not found",
             built.display()
         ));
     }
-    // Staging path: same dir, <exe>.new.exe — never the locked live exe.
-    let staged_name = new_exe_name(&exe_name);
-    let staged = workspace.join("target").join("release").join(&staged_name);
+    // Refresh the canonical release artifact (rename-while-running + copy) so everything that
+    // launches `target/release/<exe>` — the Sentinel task, lane children — picks up the new build.
+    let release_dir = workspace.join("target").join("release");
+    refresh_release_artifact(&built, &release_dir, &exe_name)?;
+    // Staging copy for the drain-window swap: same contract as always (<exe>.new.exe in release/).
+    let staged = release_dir.join(new_exe_name(&exe_name));
     std::fs::copy(&built, &staged)
         .map_err(|e| format!("copy {} -> {} failed: {e}", built.display(), staged.display()))?;
     Ok(staged)
@@ -703,5 +794,82 @@ mod tests {
         // no extension -> suffix appended
         assert_eq!(new_exe_name("solomon"), "solomon.new");
         assert_eq!(old_exe_name("solomon"), "solomon.old");
+    }
+
+    // -------- staging-build path construction: NEVER under target/release --------
+    #[test]
+    fn staging_paths_are_isolated_from_the_release_dir() {
+        let ws = Path::new("C:\\w\\src-tauri");
+        assert_eq!(
+            staging_target_dir(ws),
+            ws.join("target").join("redeploy-staging"),
+            "the staging build gets its own target dir"
+        );
+        let built = staging_built_exe(ws, "solomon.exe");
+        assert_eq!(
+            built,
+            ws.join("target").join("redeploy-staging").join("release").join("solomon.exe")
+        );
+        // the load-bearing invariant: the LINK output is never inside target/release (the running
+        // exe's dir — an in-place relink of a locked exe fails with os error 5)
+        assert!(!built.starts_with(ws.join("target").join("release")));
+    }
+
+    // -------- timestamped .old-<ts> naming + the pure prune decision --------
+    #[test]
+    fn timestamped_old_name_and_prune_decision() {
+        assert_eq!(
+            timestamped_old_name("solomon.exe", "20260716T000000Z"),
+            "solomon.exe.old-20260716T000000Z"
+        );
+        let stale = Duration::from_secs(OLD_ARTIFACT_MAX_AGE_S);
+        // stale rollbacks prune (boundary inclusive); fresh ones stay
+        assert!(should_prune_old_artifact("solomon.exe.old-20260701T000000Z", "solomon.exe", stale));
+        assert!(!should_prune_old_artifact(
+            "solomon.exe.old-20260716T000000Z",
+            "solomon.exe",
+            Duration::from_secs(60)
+        ));
+        // NEVER the live exe, the staged .new.exe, the swap's single .old.exe slot, or another
+        // exe's rollbacks — regardless of age
+        for name in ["solomon.exe", "solomon.new.exe", "solomon.old.exe", "other.exe.old-2026"] {
+            assert!(
+                !should_prune_old_artifact(name, "solomon.exe", stale * 10),
+                "{name} must never be pruned"
+            );
+        }
+    }
+
+    // -------- refresh_release_artifact: rename-then-copy over a temp dir (no cargo) --------
+    #[test]
+    fn refresh_release_artifact_renames_the_live_exe_and_copies_the_staged_build() {
+        let root = std::env::temp_dir().join(format!("rdp_refresh_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let release = root.join("release");
+        let built = root.join("built.exe");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&built, b"NEW BYTES").unwrap();
+        let olds = |dir: &std::path::Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("solomon.exe.old-"))
+                .count()
+        };
+
+        // first refresh: no live exe yet -> plain copy, no rollback artifact
+        refresh_release_artifact(&built, &release, "solomon.exe").unwrap();
+        assert_eq!(std::fs::read(release.join("solomon.exe")).unwrap(), b"NEW BYTES");
+        assert_eq!(olds(&release), 0);
+
+        // second refresh: the live exe is renamed to .old-<ts>; the new bytes take the live path
+        std::fs::write(&built, b"NEWER BYTES").unwrap();
+        refresh_release_artifact(&built, &release, "solomon.exe").unwrap();
+        assert_eq!(std::fs::read(release.join("solomon.exe")).unwrap(), b"NEWER BYTES");
+        assert_eq!(olds(&release), 1, "the previous live exe is preserved for rollback");
+        // fresh rollbacks survive the prune sweep (age gate), so both artifacts coexist
+        assert!(release.join("solomon.exe").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
