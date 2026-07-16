@@ -79,9 +79,9 @@ pub mod self_tooling;
 
 // CEO autonomy, piece 3: the unified `_pending_approvals` operator surface — regenerated on every
 // tick's FAST deterministic core (file-IO only, no LLM), aggregating every unapproved growth
-// draft, unapproved outreach draft, and tool awaiting live-approval, each with the EXACT one-line
-// edit that approves it. READ-ONLY over the gated artifacts; Solomon never self-approves. See
-// approvals.rs.
+// draft, unapproved outreach draft, and tool awaiting validation/live approval, each with the
+// EXACT one-line edit that approves its next rung. READ-ONLY over the gated artifacts; Solomon
+// never self-approves. See approvals.rs.
 pub mod approvals;
 
 // D8 Layer 3: the CROSS-PROJECT wins ledger reader — the minimal cross-project learning surfaced
@@ -340,8 +340,8 @@ fn tick_core() -> (Value, Value) {
 
     // PENDING-APPROVALS SURFACE (every sweep, cheap file-IO only, no LLM): regenerate
     // runtime/_pending_approvals.{md,json} so the operator always has ONE fresh place listing every
-    // unapproved growth draft, outreach draft, and tool awaiting live-approval with the exact
-    // approve edit. Lives in the FAST core (not the single-flighted tail) so it refreshes even
+    // unapproved growth draft, outreach draft, and tool awaiting validation/live approval with the
+    // exact approve edit. Lives in the FAST core (not the single-flighted tail) so it refreshes even
     // when a slow tail is in flight. Isolated like every other graft.
     let _ = std::panic::catch_unwind(|| {
         let _ = crate::ceo::approvals::regenerate();
@@ -408,13 +408,14 @@ fn ceo_slow_tail(snapshot: Value, status: Value) {
     let _ = std::panic::catch_unwind(ceo_day_gates);
 }
 
-/// The three CEO-autonomy sub-grafts, ridden on `ceo_slow_tail` (each in its OWN catch_unwind —
+/// The four CEO-autonomy sub-grafts, ridden on `ceo_slow_tail` (each in its OWN catch_unwind —
 /// one seam's panic can never skip the next, the watchdog per-graft discipline). Every seam is
 /// FAIL-CLOSED by construction: composing is day-gated + honest-triggered + budget-aware and
-/// yields gated local DRAFTS only; sending and live tool invocation are inert until an operator
-/// hand-sets `approved: true` (nothing in Solomon ever writes that flag). Factored out of
-/// `ceo_slow_tail` so the wiring `#[test]` proves the seams are invoked (via their sweep markers)
-/// without running the LLM-bearing day gates.
+/// yields gated local DRAFTS only; sending, tool dry-run validation, and live tool invocation
+/// are inert until an operator hand-sets `approved: true` / `approved_validation: true` (nothing
+/// in Solomon ever writes those flags). Factored out of `ceo_slow_tail` so the wiring `#[test]`
+/// proves the seams are invoked (via their sweep markers) without running the LLM-bearing day
+/// gates.
 fn ceo_autonomy_seams(snapshot: &Value, status: &Value) {
     // COLD-OUTREACH COMPOSER (day-gated, honest-trigger, budget-aware) — gated local DRAFTS only.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -424,10 +425,16 @@ fn ceo_autonomy_seams(snapshot: &Value, status: &Value) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::ceo::outreach::maybe_send_approved_outreach(snapshot, status)
     }));
-    // TOOLSET SELF-EXTENSION (day-gated propose -> lint -> dry-run -> register; live invoke
-    // human-gated, degrading to -DryRun without approval).
+    // TOOLSET SELF-EXTENSION (day-gated propose -> lint -> register; registration executes
+    // NOTHING — validation and live invocation both stay human-gated).
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::ceo::self_tooling::maybe_propose_tool(snapshot, status)
+    }));
+    // TOOL VALIDATION (every sweep, FAIL-CLOSED — executes nothing until an operator hand-sets
+    // approved_validation:true on a manifest entry; then runs the sandboxed dry-run and records
+    // the pass/fail verdict).
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::ceo::self_tooling::maybe_validate_approved_tools(snapshot, status)
     }));
 }
 
@@ -3039,25 +3046,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(obs_path.parent().unwrap());
     }
 
-    // -------- CEO autonomy wiring: the three seams are INVOKED, not dead code --------
+    // -------- CEO autonomy wiring: the four seams are INVOKED, not dead code --------
     // Each maybe_* seam drops a `runtime/_ceo/_seam_<name>` sweep marker at entry; driving the
     // bundled `ceo_autonomy_seams` (the exact fn `ceo_slow_tail` calls after the growth publish
-    // seam) must land all three — proving the grafts are wired. Hermetic: the temp HERE has no
-    // repos.json, so every seam no-ops after its marker (no LLM, no send, no registration).
+    // seam) must land all four — proving the grafts are wired. Hermetic: the temp HERE has no
+    // repos.json (and no approved manifest entries), so every seam no-ops after its marker
+    // (no LLM, no send, no registration, no execution).
     #[test]
     fn ceo_autonomy_seams_are_invoked_and_drop_their_sweep_markers() {
         let _env = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // The validation seam reads the SHARED tools manifest — serialize against the
+        // self_tooling tests so a mid-flight registration is never validated out from under them.
+        let _tools = crate::ceo::self_tooling::TOOLING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
         let seam_dir = paths::here().join("runtime").join(CEO_WARM_LANE);
-        for m in ["_seam_outreach_compose", "_seam_outreach_send", "_seam_tool_propose"] {
+        let markers = [
+            "_seam_outreach_compose",
+            "_seam_outreach_send",
+            "_seam_tool_propose",
+            "_seam_tool_validate",
+        ];
+        for m in markers {
             let _ = std::fs::remove_file(seam_dir.join(m));
         }
 
         ceo_autonomy_seams(&json!({}), &json!({}));
 
-        for m in ["_seam_outreach_compose", "_seam_outreach_send", "_seam_tool_propose"] {
+        for m in markers {
             assert!(
                 seam_dir.join(m).exists(),
                 "the {m} seam must be invoked by ceo_autonomy_seams (wired, not dead code)"
