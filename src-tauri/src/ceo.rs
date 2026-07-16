@@ -346,6 +346,14 @@ fn ceo_slow_tail(snapshot: Value, status: Value) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::ceo::growth::maybe_draft_growth_content(&snapshot, &status)
     }));
+    // GROWTH PUBLISH "last inch" (D12 / Phase B): the human-gated compose -> publish -> measure wire.
+    // Publishes a lane's newest growth draft ONLY when the operator hand-set `approved: true` on it,
+    // through the gated dry-run-first `dispatch_growth_publish` (money_guard + pecrt FIRST). Nothing in
+    // Solomon sets `approved`, so this is fully INERT until the operator acts; it writes no fleet_ledger
+    // revenue row (a publish is an outcome, not revenue) and the `publish_recency` probe confirms it.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::ceo::growth::maybe_publish_approved_growth(&snapshot, &status)
+    }));
     // DEEP-WORK FOCUS (Polsia): concentrate one top-leverage lane's next milestone into ordered
     // [campaign] steps; the other lanes keep their health-only baseline. Same fresh snapshot.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

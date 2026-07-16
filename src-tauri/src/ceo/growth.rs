@@ -943,6 +943,152 @@ fn compose_and_dispatch(
 }
 
 // --------------------------------------------------------------------------- #
+// The PUBLISH "last inch" — the human-gated compose -> publish -> measure seam
+// --------------------------------------------------------------------------- #
+//
+// The three growth islands already exist independently: COMPOSE writes a gated draft to
+// `runtime/<lane>/growth_drafts.jsonl` (`maybe_draft_growth_content`); PUBLISH routes a draft
+// through the project's OWN dry-run-first sanctioned lane (`dispatch_growth_publish`); MEASURE is
+// the `publish_recency` ops probe reading the project's own post registry. This seam is the ONLY
+// wire between COMPOSE and PUBLISH, and it is HUMAN-GATED: a draft ships ONLY when the operator has
+// hand-set a boolean `approved: true` flag on the NEWEST drafts line. Nothing in Solomon ever sets
+// `approved` — so with today's drafts (plain `<date>\t<fact>` text lines, never approved) this is
+// fully INERT. It never auto-approves, never weakens the money_guard/pecrt gate (which still runs
+// FIRST inside `dispatch_growth_publish`), and writes NO `fleet_ledger` revenue row (a publish is an
+// OUTCOME, not revenue — `fleet_ledger` is the money file).
+
+/// True iff a growth-drafts line carries an operator-set `"approved": true` flag. The composer only
+/// ever writes plain `<date>\t<fact>` TEXT lines (never approved); an operator APPROVES a draft by
+/// making the newest line a JSON object with a boolean `"approved": true` (optionally keeping the
+/// `<date>\t` prefix, which is stripped here). Pure + FAIL-CLOSED: anything that is not a JSON object
+/// with `approved == true` (every composed text line, malformed edits, `approved:"true"` strings,
+/// `approved:1`) is NOT approved. Nothing in Solomon ever writes this flag — it is the human gate.
+pub(crate) fn draft_line_approved(line: &str) -> bool {
+    // Try the payload after an optional leading `<date>\t`, then the whole line (the operator may
+    // author a bare JSON object without the date prefix). Either parsing to `{"approved": true}` wins.
+    let after_tab = line.split_once('\t').map(|(_d, rest)| rest).unwrap_or(line);
+    [after_tab, line].iter().any(|cand| {
+        serde_json::from_str::<Value>(cand.trim())
+            .ok()
+            .and_then(|v| v.get("approved").and_then(Value::as_bool))
+            == Some(true)
+    })
+}
+
+/// `runtime/<lane>/_growth_published` — the per-lane publish idempotency marker (a sibling of the
+/// `_growth_drafted_<date>` compose stamp; inert, janitor-tolerated). Records the LAST handled
+/// approved-line signature + its publish outcome so this every-sweep seam neither re-publishes a
+/// LIVE draft nor re-dispatches an unchanged dry-run. `None` for a nameless lane.
+fn published_marker_path(repo: &Value) -> Option<PathBuf> {
+    paths::runtime_dir(repo).map(|d| d.join("_growth_published"))
+}
+
+/// Read the last-handled `{signature, published}` marker (`None` when absent/unparseable — a fresh
+/// lane, treated as never handled — fail-open toward dispatching, which is itself gated + dry-run).
+fn read_published_marker(repo: &Value) -> Option<Value> {
+    let p = published_marker_path(repo)?;
+    let raw = std::fs::read_to_string(p).ok()?;
+    serde_json::from_str::<Value>(&raw).ok()
+}
+
+/// Persist the publish marker for `signature` with its outcome (best-effort; a disk hiccup only
+/// loses the idempotency hint, so at worst the next sweep re-dispatches a gated dry-run — never a
+/// duplicate LIVE publish path, which is separately guarded by the `published == true` skip below).
+fn write_published_marker(repo: &Value, signature: &str, published: bool, mode: &str) {
+    if let Some(p) = published_marker_path(repo) {
+        let _ = proc::atomic_write_json(
+            &p,
+            &json!({
+                "signature": signature,
+                "published": published,
+                "mode": mode,
+                "ts": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            }),
+        );
+    }
+}
+
+/// Decide-and-publish for ONE lane, with the publish SEAM INJECTED so the call/no-call boundary is
+/// testable without a real publish. Reads the NEWEST `growth_drafts.jsonl` line; dispatches through
+/// `dispatch` ONLY when the operator approved it AND it is not an already-handled no-op. Returns a
+/// small outcome Value (`dispatched` tells the caller/test whether the seam fired). Pure of a real
+/// publish — the injected `dispatch` is the ONLY external effect, and in production it is the gated,
+/// dry-run-first `dispatch_growth_publish` (money_guard + pecrt FIRST; a lane not promoted to
+/// `mode:"live"` only dry-runs). Idempotency (every-sweep safe): an approved line already
+/// LIVE-published (`published == true`) is never re-published; an approved line already handled as a
+/// dry-run is not re-dispatched UNLESS the lane has since been promoted to live — so the compose ->
+/// publish seam neither spams a live channel nor churns the gate every ~2 min.
+fn publish_approved_draft<F>(repo: &Value, is_live: bool, dispatch: F) -> Value
+where
+    F: FnOnce(&Value, &str) -> Value,
+{
+    let lane = paths::repo_name(repo);
+    let path = match GrowthSpecialist::drafts_log_path(repo) {
+        Some(p) => p,
+        None => return json!({"lane": lane, "dispatched": false, "reason": "nameless lane"}),
+    };
+    let newest = match ObservationLog::at(path).tail(1).into_iter().next() {
+        Some(l) => l,
+        None => return json!({"lane": lane, "dispatched": false, "reason": "no drafts"}),
+    };
+    if !draft_line_approved(&newest) {
+        // The human gate is CLOSED — no `approved: true`. dispatch is NOT called (inert).
+        return json!({"lane": lane, "dispatched": false, "reason": "not approved"});
+    }
+    let signature = newest.trim();
+    if let Some(prev) = read_published_marker(repo) {
+        if prev.get("signature").and_then(Value::as_str) == Some(signature) {
+            let already_live = prev.get("published").and_then(Value::as_bool) == Some(true);
+            // Already live-published this exact draft -> never re-publish. Or: handled as a dry-run
+            // and the lane is STILL not live -> nothing changed, do not re-dispatch (no gate churn).
+            if already_live || !is_live {
+                return json!({
+                    "lane": lane, "dispatched": false,
+                    "reason": if already_live { "already published" } else { "dry-run unchanged" },
+                });
+            }
+            // else: handled as a dry-run but the lane was since promoted to live -> fall through and
+            // dispatch the live publish once.
+        }
+    }
+    // The gate is OPEN and this is a fresh approval (or a dry-run lane just promoted to live): fire
+    // the injected publish seam ONCE. detail is a short provenance note — the publish path routes via
+    // the project's OWN sanctioned argv and largely ignores it; the money/pecrt gate runs first.
+    let detail = format!(
+        "operator-approved growth draft (publish_recency confirms): {}",
+        super::cap_line(signature, 200)
+    );
+    let out = dispatch(repo, &detail);
+    let published = out.get("published").and_then(Value::as_bool).unwrap_or(false);
+    let mode = out.get("mode").and_then(Value::as_str).unwrap_or("").to_string();
+    write_published_marker(repo, signature, published, &mode);
+    // LOG the published:true/false result for observability; the publish_recency probe independently
+    // confirms a live publish by reading the project's own post registry (no fleet_ledger row here).
+    let _ = crate::notify::send(&crate::notify::Notice::report(
+        format!("Solomon: growth publish -> {lane}"),
+        format!("approved draft dispatched: published={published} mode={mode}"),
+    ));
+    json!({"lane": lane, "dispatched": true, "published": published, "mode": mode})
+}
+
+/// The PUBLISH "last inch" ridden on `ceo_slow_tail` (the human-gated compose -> publish -> measure
+/// wire): for each PUBLIC lane, publish its newest growth draft ONLY when the operator hand-set
+/// `approved: true` on it, through the gated dry-run-first `dispatch_growth_publish`. Fully INERT
+/// until a human approves a draft (nothing here — or anywhere in Solomon — sets `approved`). Visits
+/// lanes in the registry order; `status`/`snapshot` are accepted for signature parity with the other
+/// tail seams (publish eligibility is the operator's approval, not a health rollup).
+pub fn maybe_publish_approved_growth(_snapshot: &Value, _status: &Value) {
+    for repo in crate::control::registry::read_repos_json() {
+        // Only explicit public lanes are publish candidates (same cheap pre-check as the composer).
+        if !repo.get("public").and_then(Value::as_bool).unwrap_or(false) {
+            continue;
+        }
+        let is_live = GrowthSpecialist::is_live_publish(&repo);
+        let _ = publish_approved_draft(&repo, is_live, dispatch_growth_publish);
+    }
+}
+
+// --------------------------------------------------------------------------- #
 // tests — the D12 acceptance contracts
 // --------------------------------------------------------------------------- #
 
@@ -1648,5 +1794,85 @@ mod tests {
             let _ = std::fs::remove_dir_all(dir);
         }
         std::env::remove_var("SOLOMON_NOTIFY_OFF");
+    }
+
+    // ---- PUBLISH "last inch" — the human approval gate (draft_line_approved is pure + fail-closed) ----
+    #[test]
+    fn draft_line_approved_only_on_a_json_object_with_boolean_true() {
+        // The composer's real output shape — a plain dated TEXT fact — is NEVER approved.
+        assert!(!draft_line_approved(
+            "2026-07-15\trsi: growth DRAFT [GATED, unpublished, organic] lane=x: hi (t=1)"
+        ));
+        // Operator approval: a JSON object with a boolean-true `approved`, with or without the date tab.
+        assert!(draft_line_approved("2026-07-15\t{\"approved\": true, \"note\": \"ship it\"}"));
+        assert!(draft_line_approved("{\"approved\":true}"));
+        // Fail-closed: string/int truthies and a false flag are NOT approval.
+        assert!(!draft_line_approved("{\"approved\":\"true\"}"));
+        assert!(!draft_line_approved("{\"approved\":1}"));
+        assert!(!draft_line_approved("{\"approved\":false}"));
+        assert!(!draft_line_approved("{}"));
+        assert!(!draft_line_approved("not json at all"));
+    }
+
+    // The seam contract: an UNAPPROVED newest draft NEVER dispatches a publish; an operator-APPROVED
+    // one dispatches EXACTLY once (the real publish is gated/mocked by the injected seam), and an
+    // unchanged dry-run does not re-dispatch every sweep. Nothing here sets `approved` — the human does.
+    #[test]
+    fn publish_last_inch_dispatches_only_on_operator_approval() {
+        use std::cell::Cell;
+        // publish_approved_draft logs via notify::send on dispatch — silence it (kill-switch).
+        let _env = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+
+        // --- draft WITHOUT approved:true -> dispatch is NOT called ---
+        let repo_no = uniq_repo("pub_noapprove");
+        let rt_no = paths::runtime_dir(&repo_no).unwrap();
+        let _ = std::fs::remove_dir_all(&rt_no);
+        std::fs::create_dir_all(&rt_no).unwrap();
+        std::fs::write(
+            rt_no.join("growth_drafts.jsonl"),
+            "2026-07-15\trsi: growth DRAFT [GATED, unpublished, organic] lane=x: hi (t=1)\n",
+        )
+        .unwrap();
+        let called_no = Cell::new(0u32);
+        let out_no = publish_approved_draft(&repo_no, false, |_r, _d| {
+            called_no.set(called_no.get() + 1);
+            json!({"published": false, "mode": "dry_run"})
+        });
+        assert_eq!(called_no.get(), 0, "an unapproved draft must NOT dispatch a publish");
+        assert_eq!(out_no["dispatched"], json!(false));
+
+        // --- draft WITH approved:true -> dispatch IS called (publish gated/mocked) ---
+        let repo_yes = uniq_repo("pub_approve");
+        let rt_yes = paths::runtime_dir(&repo_yes).unwrap();
+        let _ = std::fs::remove_dir_all(&rt_yes);
+        std::fs::create_dir_all(&rt_yes).unwrap();
+        // The operator approves by making the NEWEST line a JSON object with approved:true.
+        std::fs::write(
+            rt_yes.join("growth_drafts.jsonl"),
+            "2026-07-15\t{\"approved\": true, \"note\": \"ship the README post\"}\n",
+        )
+        .unwrap();
+        let called_yes = Cell::new(0u32);
+        let out_yes = publish_approved_draft(&repo_yes, false, |_r, _d| {
+            called_yes.set(called_yes.get() + 1);
+            json!({"published": false, "mode": "dry_run"}) // gate the actual publish in the test
+        });
+        assert_eq!(called_yes.get(), 1, "an operator-approved draft MUST dispatch exactly one publish");
+        assert_eq!(out_yes["dispatched"], json!(true));
+
+        // Idempotency: the same dry-run draft on a still-not-live lane must NOT re-dispatch next sweep.
+        let out_again = publish_approved_draft(&repo_yes, false, |_r, _d| {
+            called_yes.set(called_yes.get() + 1);
+            json!({"published": false, "mode": "dry_run"})
+        });
+        assert_eq!(called_yes.get(), 1, "an unchanged dry-run must not re-dispatch every ~2 min sweep");
+        assert_eq!(out_again["dispatched"], json!(false));
+
+        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        let _ = std::fs::remove_dir_all(rt_no);
+        let _ = std::fs::remove_dir_all(rt_yes);
     }
 }

@@ -655,6 +655,31 @@ fn plan_jobs(
                 "hold",
             )
         };
+        // TERMINAL PARK (kill retry theater at the SOURCE): a lane whose diagnosis is a
+        // STRUCTURALLY stuck condition — a stranded/unmerged branch, a self-stopped or hung loop
+        // process, an un-pushed / untracked-blocked base — is HUMAN-SPEC-REQUIRED, not retry-later.
+        // Route it DIRECTLY to the terminal `needs_human_spec` state so `proof_required` is NEVER
+        // chosen for it. This PRECEDES the proof_required cooldown below, which only rate-limits and
+        // RE-FIRES the identical inert proof_required job every PROOF_COOLDOWN_S: for a condition no
+        // loop iteration can clear — nothing the scheduler does merges the branch, kills the PID, or
+        // pushes the base — re-surfacing the same corpse on cooldown expiry is pure theater. A
+        // CONFIG/TRANSIENT blocker (missing key/goal, provider quota, a stale gate, an exhausted
+        // backlog) is NOT structural and keeps the proof_required → cooldown → needs_human_spec
+        // ladder, so a self-clearing condition re-enters the queue rather than being parked forever.
+        // No inline stuck bump here: unlike the proof_required emit-bypass below (which is `continue`d
+        // before finish_non_ai_job), a needs_human_spec job flows to the shared post-dispatch bump in
+        // `once()`, exactly as the cooldown-parked needs_human_spec does — streak accounting is
+        // identical, and the routing above is purely category-driven (it never reads the streak).
+        if kind == "proof_required" && supervisor::is_structurally_stuck(diag_cat) {
+            kind = "needs_human_spec";
+            state = "needs_human_spec";
+            requires_ai = false;
+            // `reason` already holds diagnose()'s evidence (set in the proof_required arm) — keep it
+            // so the operator sees the SPECIFIC structural cause (which branch / which PID / which
+            // base), not a generic park message.
+            next_action = "reconcile the structural blocker (merge/push the stranded branch, kill \
+                           the hung improver PID, or push/clean the base), then wake the lane";
+        }
         // proof_required COOLDOWN (kill retry theater): a lane parked for PROOF_COOLDOWN_S after
         // PROOF_COOLDOWN_THRESHOLD consecutive inert proof_required sweeps emits a
         // `needs_human_spec` need (kind "decision") INSTEAD of another inert proof_required job.
@@ -2100,6 +2125,98 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(rt);
+    }
+
+    // A STRUCTURALLY stuck lane (a stranded/unmerged branch — human reconcile required) must reach
+    // the TERMINAL `needs_human_spec` state on the VERY FIRST sweep, with NO cooldown armed, instead
+    // of the inert `proof_required` job — proving retry theater is killed at the source and never
+    // re-fires. A retry-later lane (needs_goal) under the identical empty state stays proof_required,
+    // so the two remediation ladders are provably distinct.
+    #[test]
+    fn plan_jobs_routes_structurally_stuck_lane_to_terminal_needs_human_spec() {
+        // ---- structural lane: a persistent stranded rsi/* branch (has_stop + !running + reason). ----
+        let stuck = format!("stranded_lane_{}", std::process::id());
+        let stuck_repo = json!({"name": stuck.clone(), "path": format!("C:/p/{stuck}")});
+        let stuck_rt = paths::runtime_dir(&stuck_repo).unwrap();
+        let _ = std::fs::remove_dir_all(&stuck_rt);
+        std::fs::create_dir_all(&stuck_rt).unwrap();
+        // No `lock` file => !running. A `stop` sentinel + reason => diagnose "stranded_unmerged_branch".
+        std::fs::write(stuck_rt.join("stop"), "stranded_unmerged_branch_persistent\n").unwrap();
+        std::fs::write(
+            stuck_rt.join("heartbeat.json"),
+            serde_json::to_string(&json!({
+                "status": "error",
+                "phase": "preflight",
+                "reason": "stranded_unmerged_branch_persistent",
+                "last_summary": "Stranded finished work: rsi/iter-x (ahead 14) — not an ancestor of the fork base.",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // ---- retry-later lane: needs_goal (config fix, self-clears — keeps the proof_required ladder). ----
+        let retry = format!("needsgoal_lane_{}", std::process::id());
+        let retry_repo = json!({"name": retry.clone(), "path": format!("C:/p/{retry}")});
+        let retry_rt = paths::runtime_dir(&retry_repo).unwrap();
+        let _ = std::fs::remove_dir_all(&retry_rt);
+        std::fs::create_dir_all(&retry_rt).unwrap();
+        std::fs::write(
+            retry_rt.join("heartbeat.json"),
+            serde_json::to_string(&json!({
+                "status": "error",
+                "reason": "needs_goal",
+                "last_summary": "no north-star GOAL and no actionable backlog",
+                "updated_at": now(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // EMPTY state: NO proof_cooldowns armed — so a needs_human_spec verdict can ONLY come from the
+        // terminal structural park, never the cooldown path (which the cooldown test covers separately).
+        let cfg = json!({"provider": "openrouter", "targets": [stuck.clone(), retry.clone()]});
+        let mut st = json!({"manual_queue": []});
+        let jobs = plan_jobs(
+            &[stuck_repo, retry_repo],
+            &cfg,
+            &json!({"projects": {}}),
+            &mut st,
+            None,
+            false,
+        );
+
+        let stuck_job = jobs.iter().find(|j| j.name == stuck).expect("structural job planned");
+        assert_eq!(
+            stuck_job.kind, "needs_human_spec",
+            "a structurally-stuck lane must terminally park, NOT re-fire proof_required"
+        );
+        assert_eq!(stuck_job.state, "needs_human_spec");
+        assert!(!stuck_job.requires_ai, "the terminal park is a non-AI inert need");
+        assert!(
+            stuck_job.next_action.contains("reconcile the structural blocker"),
+            "the next action tells the operator to reconcile the git/process state: {next}",
+            next = stuck_job.next_action
+        );
+        // The specific diagnose() evidence is preserved (which branch), not a generic park message.
+        assert!(
+            stuck_job.reason.to_lowercase().contains("stranded"),
+            "the reason keeps the specific structural cause: {reason}",
+            reason = stuck_job.reason
+        );
+        assert!(
+            proof_cooldown_entry(&st, &stuck).is_none(),
+            "the terminal park must not depend on (or arm) the proof_required cooldown"
+        );
+
+        // The retry-later lane, under the identical empty state, keeps the proof_required ladder.
+        let retry_job = jobs.iter().find(|j| j.name == retry).expect("retry job planned");
+        assert_eq!(
+            retry_job.kind, "proof_required",
+            "a retry-later (config-fixable) blocker keeps proof_required — the two ladders are distinct"
+        );
+
+        let _ = std::fs::remove_dir_all(stuck_rt);
+        let _ = std::fs::remove_dir_all(retry_rt);
     }
 
     // ===================================================================== #
