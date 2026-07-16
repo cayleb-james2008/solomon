@@ -277,7 +277,22 @@ fn ceo_tick_fact(epoch_s: u64, plan_state: &str, summary_state: &str) -> String 
 /// `solomon watchdog` one-shot lands it before exit. Every gate + catch_unwind isolation is preserved
 /// — the tail re-runs the SAME gates against the SAME fresh snapshot; nothing here bypasses one.
 pub fn tick() {
-    // ---------- FAST DETERMINISTIC CORE (always completes; resets CEO_GRAFT_RUNNING within ms) ----------
+    let (snapshot, status) = tick_core();
+    // ---------- SLOW BEST-EFFORT TAIL (offloaded; single-flighted; never blocks the core) ----------
+    // The slow authority-bearing sub-grafts run on their OWN thread so a 250 s ollama call or a 600 s
+    // produce/post subprocess can NEVER wedge the 2-min sweep or pin the CEO graft flag. Single-flighted
+    // (`CEO_SLOW_TAIL_RUNNING`): a still-running tail makes the next spawn a no-op, so slow tails can
+    // never accumulate (the 809-thread GUI leak). The tail reads the SAME fresh snapshot+status the core
+    // built. ALL GATES PRESERVED — see `ceo_slow_tail`.
+    spawn_ceo_slow_tail(move || ceo_slow_tail(snapshot, status));
+}
+
+/// The FAST DETERMINISTIC CORE of [`tick`] (always completes; resets CEO_GRAFT_RUNNING within ms),
+/// factored out so the wiring `#[test]` can drive it synchronously without spawning the slow tail
+/// (which would race the single-flight flag across parallel tests). Returns the fresh
+/// (snapshot, status) pair the tail consumes. Production behavior is byte-identical to the
+/// pre-split `tick` — this is a seam, not a change.
+fn tick_core() -> (Value, Value) {
     let _ = std::panic::catch_unwind(blind_window_notice_once);
 
     // WARM CARRY-FORWARD (D11): reconstruct the CEO thread's warm working context from its OWN prior
@@ -323,13 +338,16 @@ pub fn tick() {
         scale::maybe_scale_lanes(&snapshot, &status)
     }));
 
-    // ---------- SLOW BEST-EFFORT TAIL (offloaded; single-flighted; never blocks the core) ----------
-    // The slow authority-bearing sub-grafts run on their OWN thread so a 250 s ollama call or a 600 s
-    // produce/post subprocess can NEVER wedge the 2-min sweep or pin the CEO graft flag. Single-flighted
-    // (`CEO_SLOW_TAIL_RUNNING`): a still-running tail makes the next spawn a no-op, so slow tails can
-    // never accumulate (the 809-thread GUI leak). The tail reads the SAME fresh snapshot+status the core
-    // built. ALL GATES PRESERVED — see `ceo_slow_tail`.
-    spawn_ceo_slow_tail(move || ceo_slow_tail(snapshot, status));
+    // PENDING-APPROVALS SURFACE (every sweep, cheap file-IO only, no LLM): regenerate
+    // runtime/_pending_approvals.{md,json} so the operator always has ONE fresh place listing every
+    // unapproved growth draft, outreach draft, and tool awaiting live-approval with the exact
+    // approve edit. Lives in the FAST core (not the single-flighted tail) so it refreshes even
+    // when a slow tail is in flight. Isolated like every other graft.
+    let _ = std::panic::catch_unwind(|| {
+        let _ = crate::ceo::approvals::regenerate();
+    });
+
+    (snapshot, status)
 }
 
 /// The D11 warm append (the fast-core deterministic tail): read the CEO day-gate state from disk and
@@ -378,12 +396,39 @@ fn ceo_slow_tail(snapshot: Value, status: Value) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::ceo::growth::maybe_publish_approved_growth(&snapshot, &status)
     }));
+    // CEO AUTONOMY SEAMS (cold-outreach compose + fail-closed send, toolset self-extension) —
+    // bundled in their own fn so the wiring #[test] can drive them synchronously; each keeps its
+    // OWN catch_unwind isolation exactly like the growth seams above.
+    ceo_autonomy_seams(&snapshot, &status);
     // DEEP-WORK FOCUS (Polsia): concentrate one top-leverage lane's next milestone into ordered
     // [campaign] steps; the other lanes keep their health-only baseline. Same fresh snapshot.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         focus::maybe_focus(&snapshot, &status)
     }));
     let _ = std::panic::catch_unwind(ceo_day_gates);
+}
+
+/// The three CEO-autonomy sub-grafts, ridden on `ceo_slow_tail` (each in its OWN catch_unwind —
+/// one seam's panic can never skip the next, the watchdog per-graft discipline). Every seam is
+/// FAIL-CLOSED by construction: composing is day-gated + honest-triggered + budget-aware and
+/// yields gated local DRAFTS only; sending and live tool invocation are inert until an operator
+/// hand-sets `approved: true` (nothing in Solomon ever writes that flag). Factored out of
+/// `ceo_slow_tail` so the wiring `#[test]` proves the seams are invoked (via their sweep markers)
+/// without running the LLM-bearing day gates.
+fn ceo_autonomy_seams(snapshot: &Value, status: &Value) {
+    // COLD-OUTREACH COMPOSER (day-gated, honest-trigger, budget-aware) — gated local DRAFTS only.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::ceo::outreach::maybe_draft_outreach(snapshot, status)
+    }));
+    // COLD-OUTREACH SEND (every sweep, FAIL-CLOSED — inert until operator approval + SMTP env).
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::ceo::outreach::maybe_send_approved_outreach(snapshot, status)
+    }));
+    // TOOLSET SELF-EXTENSION (day-gated propose -> lint -> dry-run -> register; live invoke
+    // human-gated, degrading to -DryRun without approval).
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::ceo::self_tooling::maybe_propose_tool(snapshot, status)
+    }));
 }
 
 /// The two day-gated CEO jobs — the morning plan (LLM, >= 07:00) and the evening summary
@@ -2992,5 +3037,61 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(obs_path.parent().unwrap());
+    }
+
+    // -------- CEO autonomy wiring: the three seams are INVOKED, not dead code --------
+    // Each maybe_* seam drops a `runtime/_ceo/_seam_<name>` sweep marker at entry; driving the
+    // bundled `ceo_autonomy_seams` (the exact fn `ceo_slow_tail` calls after the growth publish
+    // seam) must land all three — proving the grafts are wired. Hermetic: the temp HERE has no
+    // repos.json, so every seam no-ops after its marker (no LLM, no send, no registration).
+    #[test]
+    fn ceo_autonomy_seams_are_invoked_and_drop_their_sweep_markers() {
+        let _env = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        let seam_dir = paths::here().join("runtime").join(CEO_WARM_LANE);
+        for m in ["_seam_outreach_compose", "_seam_outreach_send", "_seam_tool_propose"] {
+            let _ = std::fs::remove_file(seam_dir.join(m));
+        }
+
+        ceo_autonomy_seams(&json!({}), &json!({}));
+
+        for m in ["_seam_outreach_compose", "_seam_outreach_send", "_seam_tool_propose"] {
+            assert!(
+                seam_dir.join(m).exists(),
+                "the {m} seam must be invoked by ceo_autonomy_seams (wired, not dead code)"
+            );
+        }
+        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+    }
+
+    // -------- CEO autonomy wiring: the tick's FAST core regenerates the approvals surface --------
+    // `tick_core` is exactly `tick` minus the slow-tail spawn (which the single-flight test above
+    // already covers, and which would race the process-global flag if driven here). After one core
+    // pass the `_pending_approvals` surface must exist — the operator's one place to approve
+    // everything is refreshed every sweep, even while a slow tail is in flight.
+    #[test]
+    fn tick_core_regenerates_the_pending_approvals_surface() {
+        let _env = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        let _a = crate::ceo::approvals::APPROVALS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let md = paths::here().join("runtime").join("_pending_approvals.md");
+        let js = paths::here().join("runtime").join("_pending_approvals.json");
+        let _ = std::fs::remove_file(&md);
+        let _ = std::fs::remove_file(&js);
+
+        let (_snapshot, _status) = tick_core();
+
+        assert!(md.exists(), "tick's fast core must regenerate _pending_approvals.md every sweep");
+        assert!(js.exists(), "tick's fast core must regenerate _pending_approvals.json every sweep");
+        let body = std::fs::read_to_string(&md).unwrap();
+        assert!(body.starts_with("# Pending approvals"), "{body}");
+        assert!(body.contains("Solomon never self-approves"), "{body}");
+        std::env::remove_var("SOLOMON_NOTIFY_OFF");
     }
 }
