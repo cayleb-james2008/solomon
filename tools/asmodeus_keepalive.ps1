@@ -11,7 +11,9 @@
 
     - KILL marker present -> refuse (operator halt always wins; NEVER cleared here)
     - Asmodeus.exe already running -> no-op
-    - otherwise -> launch target\release\Asmodeus.exe --headless detached, hidden
+    - otherwise -> launch target\release\Asmodeus.exe windowed (visible GUI, taskbar-clickable;
+      operator 2026-07-16: apps run as their windowed exe versions — the old headless/hidden
+      launch is deleted)
 
   NOT a background loop: cadence comes only from whoever invokes it (Solomon's
   visible watchdog, or the operator). KILL/DRAIN markers always win.
@@ -63,16 +65,16 @@ if (-not (Test-Path $Exe)) {
 }
 
 if ($DryRun) {
-    Write-KeepaliveLog "dry-run: would launch `"$Exe`" --headless (cwd=$RepoRoot) (solomon seam)"
+    Write-KeepaliveLog "dry-run: would launch `"$Exe`" windowed (cwd=$RepoRoot) (solomon seam)"
     exit 0
 }
 
-Start-Process -FilePath $Exe -ArgumentList '--headless' -WorkingDirectory $RepoRoot -WindowStyle Hidden
+Start-Process -FilePath $Exe -WorkingDirectory $RepoRoot
 Start-Sleep -Seconds 3
 $post = Get-CimInstance Win32_Process -Filter "Name='Asmodeus.exe'" -ErrorAction SilentlyContinue |
     Select-Object -First 1
 if ($post) {
-    Write-KeepaliveLog "launched: `"$Exe`" --headless (pid=$($post.ProcessId), cwd=$RepoRoot) (solomon seam)"
+    Write-KeepaliveLog "launched: `"$Exe`" windowed (pid=$($post.ProcessId), cwd=$RepoRoot) (solomon seam)"
 } else {
     Write-KeepaliveLog "error: launch attempted but no Asmodeus.exe process visible (solomon seam)"
     exit 1
