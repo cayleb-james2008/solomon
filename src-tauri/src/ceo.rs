@@ -426,16 +426,15 @@ fn ceo_autonomy_seams(snapshot: &Value, status: &Value) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::ceo::outreach::maybe_auto_send_outreach(snapshot, status)
     }));
-    // TOOLSET SELF-EXTENSION (day-gated propose -> lint -> register; registration executes
-    // NOTHING — validation and live invocation both stay human-gated).
+    // TOOLSET SELF-EXTENSION (day-gated propose -> lint -> sandboxed dry-run validation -> register
+    // VALIDATED + usable; no human approval — the lint + dry-run are the automated safety).
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::ceo::self_tooling::maybe_propose_tool(snapshot, status)
     }));
-    // TOOL VALIDATION (every sweep, FAIL-CLOSED — executes nothing until an operator hand-sets
-    // approved_validation:true on a manifest entry; then runs the sandboxed dry-run and records
-    // the pass/fail verdict).
+    // AUTONOMOUS TOOL INVOKE (every sweep, BOUNDED — runs the validated self-authored tools live, at
+    // most one/sweep + one/tool/day, behind the lint + dry_run + sha256 automated gates).
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::ceo::self_tooling::maybe_validate_approved_tools(snapshot, status)
+        crate::ceo::self_tooling::maybe_invoke_validated_tools(snapshot, status)
     }));
 }
 
@@ -3058,18 +3057,20 @@ mod tests {
         let _env = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // The validation seam reads the SHARED tools manifest — serialize against the
-        // self_tooling tests so a mid-flight registration is never validated out from under them.
+        // The invoke seam reads the SHARED tools manifest — serialize against the self_tooling tests
+        // so a mid-flight registration is never invoked out from under them, and clear the manifest
+        // so no leftover validated tool is executed live during this wiring-only assertion.
         let _tools = crate::ceo::self_tooling::TOOLING_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _ = std::fs::remove_file(crate::ceo::self_tooling::manifest_path());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
         let seam_dir = paths::here().join("runtime").join(CEO_WARM_LANE);
         let markers = [
             "_seam_outreach_compose",
             "_seam_outreach_send",
             "_seam_tool_propose",
-            "_seam_tool_validate",
+            "_seam_tool_invoke",
         ];
         for m in markers {
             let _ = std::fs::remove_file(seam_dir.join(m));
