@@ -645,6 +645,15 @@ mod tests {
             // 2026-07-12 wave-1 advisor commit (audit plan 009) merged into main with a
             // "config(gate):" subject — real history, cannot be rewritten; recorded, not laundered.
             "c3f22031e2b09fe206441f7c8a329465fb711bc6",
+            // 2026-07-13/15 RSI/advisor + fleet-work commits that touched watched config with
+            // non-conforming subjects ("fleet:"/"perf:"/"publish:"/"advisor(w4):") and are now
+            // pushed to origin/main — immutable, so recorded here per the no-rewrite rule (NOT
+            // laundered). Root cause is a process gap: the RSI/advisor commit-message path must
+            // emit an `operator:`/`rsi:` subject for watched-file commits so this stops recurring.
+            "d4d73b3e69825c5621deb3b6142b9371ec0ce576",
+            "b85970f1f8f53abcef8d9eb186d77da90ee94b66",
+            "754e9b05d6ded9f751e005160e727aa3c05b5761",
+            "89aa5f6563d5bb166c7e45a91d12fb00c6966f3f",
         ];
         let text = String::from_utf8_lossy(&out.stdout);
         let violations: Vec<&str> = text

@@ -27,6 +27,8 @@
 
 use crate::control::paths;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -181,6 +183,145 @@ fn ensure_exists_at(target: &Path) -> Result<(), String> {
     let header = serde_json::to_string(&schema_row()).map_err(|e| fail(&e.to_string()))?;
     std::fs::write(target, format!("{header}\n")).map_err(|e| fail(&e.to_string()))?;
     Ok(())
+}
+
+// --------------------------------------------------------------------------- //
+// app revenue rollup — the WRITE side of the money truth
+// --------------------------------------------------------------------------- //
+//
+// The June post-mortem's root cause was that this ledger's `append` had NO
+// production caller: the money-truth file only ever carried baseline $0 rows, so
+// the CEO plane graded HEALTH (ops::ledger::append_daily) instead of MONEY. This
+// rollup is the missing wire. It is a READER-side rollup — Solomon reads each
+// app's own revenue ledger the same way ops::probe already reads sover's live
+// post_registry.json — so a separate app process never needs the fleet path.
+//
+// Today only sover has a real money-IN ledger: data/<profile>/revenue_ledger.json,
+// written SOLELY through sover's operator-confirmed `POST /sover/revenue/add`
+// route (amount>0, content-hashed `rev_` ids). No sales have happened, so this
+// no-ops honestly ($0 stays $0 — nothing is fabricated); the moment a human
+// confirms sover's first sale it flows into the fleet money truth automatically
+// and the CEO can finally grade against a real dollar.
+
+/// Extract the set of sover revenue-entry ids already recorded in the fleet
+/// ledger, so a re-run never double-appends. Each rolled-up row embeds its sover
+/// `rev_...` id as the first whitespace token of its note. Lenient: unparseable
+/// lines and non-sover rows are skipped.
+fn seen_sover_ids(fleet_content: &str) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for line in fleet_content.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("project").and_then(Value::as_str) != Some("sover") {
+            continue;
+        }
+        if let Some(note) = v.get("note").and_then(Value::as_str) {
+            if let Some(tok) = note.split_whitespace().find(|t| t.starts_with("rev_")) {
+                set.insert(tok.to_string());
+            }
+        }
+    }
+    set
+}
+
+/// Map one sover money-IN ledger entry to a fleet revenue row. Returns None when
+/// the entry lacks the identity fields we need (a `rev_` id + a finite positive
+/// amount) — an unmappable row is SKIPPED (an honest under-count), never
+/// fabricated. `cost_usd` is 0.0: sover does not track per-sale cost.
+fn map_sover_entry(profile: &str, e: &Value) -> Option<LedgerEntry> {
+    let id = e.get("id").and_then(Value::as_str)?;
+    if !id.starts_with("rev_") {
+        return None;
+    }
+    let amount = e.get("amount").and_then(Value::as_f64)?;
+    if !amount.is_finite() || amount <= 0.0 {
+        return None;
+    }
+    let source = e.get("source").and_then(Value::as_str).unwrap_or("unknown");
+    // ts: sover's `recorded_at` (real event time) if present, else the entry date
+    // at midnight. Sover writes local naive timestamps; fleet `validate` only
+    // requires a non-empty ts, so the real event time is carried through as-is.
+    let ts = e
+        .get("recorded_at")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            e.get("date")
+                .and_then(Value::as_str)
+                .map(|d| format!("{d}T00:00:00"))
+        })
+        .unwrap_or_default();
+    if ts.trim().is_empty() {
+        return None;
+    }
+    let orig = e.get("note").and_then(Value::as_str).unwrap_or("");
+    let note = if orig.is_empty() {
+        format!("{id} (sover/{profile})")
+    } else {
+        format!("{id} (sover/{profile}) — {orig}")
+    };
+    Some(LedgerEntry {
+        project: "sover".to_string(),
+        ts,
+        revenue_usd: amount,
+        cost_usd: 0.0,
+        source: source.to_string(),
+        note: Some(note),
+    })
+}
+
+/// Roll up each fleet app's OWN revenue ledger into the fleet money-truth file.
+/// Production entrypoint: resolves sover's live data root
+/// (`%LOCALAPPDATA%/Sover/data/`) and appends any not-yet-recorded revenue. Best-
+/// effort and non-fatal — never panics, never blocks the CEO evening rhythm.
+/// Returns the number of new rows appended (0 on most days, honestly).
+pub fn rollup_apps() -> usize {
+    let Ok(local) = std::env::var("LOCALAPPDATA") else {
+        return 0;
+    };
+    let sover_data = Path::new(&local).join("Sover").join("data");
+    rollup_from(&sover_data, &path())
+}
+
+/// Path-parameterized core of [`rollup_apps`] (tests pass isolated temp dirs):
+/// read every `<profile>/revenue_ledger.json` under `sover_data`, dedup against
+/// the fleet ledger at `fleet_path` by sover id, and append the new rows.
+fn rollup_from(sover_data: &Path, fleet_path: &Path) -> usize {
+    let fleet_content = std::fs::read_to_string(fleet_path).unwrap_or_default();
+    let mut seen = seen_sover_ids(&fleet_content);
+    let mut appended = 0usize;
+    let Ok(rd) = std::fs::read_dir(sover_data) else {
+        return 0; // no sover live state yet -> honest no-op
+    };
+    for prof in rd.flatten() {
+        if !prof.path().is_dir() {
+            continue;
+        }
+        let profile = prof.file_name().to_string_lossy().to_string();
+        let ledger = prof.path().join("revenue_ledger.json");
+        let Ok(content) = std::fs::read_to_string(&ledger) else {
+            continue;
+        };
+        let entries = serde_json::from_str::<Value>(&content)
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        for e in &entries {
+            let id = e.get("id").and_then(Value::as_str).unwrap_or("");
+            if id.is_empty() || seen.contains(id) {
+                continue;
+            }
+            let Some(row) = map_sover_entry(&profile, e) else {
+                continue;
+            };
+            if append_at(&row, fleet_path).is_ok() {
+                seen.insert(id.to_string());
+                appended += 1;
+            }
+        }
+    }
+    appended
 }
 
 // --------------------------------------------------------------------------- //
@@ -372,5 +513,152 @@ mod tests {
         assert_eq!(back.source, SCHEMA_PROJECT);
         assert_eq!(back.revenue_usd, 0.0);
         assert!(back.note.is_some());
+    }
+
+    // -------- app revenue rollup (the WRITE side of the money truth) --------
+
+    fn rollup_root(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "solomon_rollup_{}_{}_{}",
+            std::process::id(),
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn write_sover_ledger(sover_data: &Path, profile: &str, entries: Value) {
+        let dir = sover_data.join(profile);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("revenue_ledger.json"),
+            serde_json::to_string_pretty(&entries).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn sover_entry(id: &str, source: &str, amount: f64, date: &str) -> Value {
+        json!({"id": id, "source": source, "amount": amount, "currency": "USD",
+               "date": date, "recorded_at": format!("{date}T10:00:00"), "by": "operator"})
+    }
+
+    #[test]
+    fn rollup_appends_new_sover_revenue_and_is_idempotent() {
+        let root = rollup_root("rollup");
+        let sover_data = root.join("sover_data");
+        let fleet = root.join("fleet_ledger.jsonl");
+        std::fs::write(&fleet, "").unwrap();
+        write_sover_ledger(
+            &sover_data,
+            "ggg",
+            json!([
+                sover_entry("rev_aaaaaaaaaaaa", "digital_product", 12.5, "2026-07-15"),
+                sover_entry("rev_bbbbbbbbbbbb", "affiliate", 3.0, "2026-07-15"),
+            ]),
+        );
+        let n = rollup_from(&sover_data, &fleet);
+        assert_eq!(n, 2, "two new sover revenue rows appended");
+        let content = std::fs::read_to_string(&fleet).unwrap();
+        let rows: Vec<Value> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["project"], json!("sover"));
+        assert_eq!(rows[0]["revenue_usd"], json!(12.5));
+        assert_eq!(rows[0]["source"], json!("digital_product"));
+        assert_eq!(rows[0]["cost_usd"], json!(0.0));
+        assert!(rows[0]["note"]
+            .as_str()
+            .unwrap()
+            .starts_with("rev_aaaaaaaaaaaa"));
+        // idempotent: a second rollup appends nothing (dedup by sover id)
+        let n2 = rollup_from(&sover_data, &fleet);
+        assert_eq!(n2, 0, "re-run must not double-append");
+        assert_eq!(
+            std::fs::read_to_string(&fleet)
+                .unwrap()
+                .lines()
+                .filter(|l| !l.is_empty())
+                .count(),
+            2
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollup_noops_when_no_sover_state() {
+        let root = rollup_root("rollup_empty");
+        let fleet = root.join("fleet_ledger.jsonl");
+        std::fs::write(&fleet, "").unwrap();
+        // sover_data dir does not exist -> honest no-op, fleet untouched
+        assert_eq!(rollup_from(&root.join("missing"), &fleet), 0);
+        assert_eq!(std::fs::read_to_string(&fleet).unwrap(), "");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollup_skips_seen_unmappable_and_nonpositive() {
+        let root = rollup_root("rollup_skip");
+        let sover_data = root.join("sover_data");
+        let fleet = root.join("fleet_ledger.jsonl");
+        // pre-seed the fleet ledger with one already-recorded sover id
+        let pre = LedgerEntry {
+            project: "sover".into(),
+            ts: "2026-07-14T10:00:00".into(),
+            revenue_usd: 5.0,
+            cost_usd: 0.0,
+            source: "tips".into(),
+            note: Some("rev_cccccccccccc (sover/ggg)".into()),
+        };
+        std::fs::write(&fleet, format!("{}\n", serde_json::to_string(&pre).unwrap())).unwrap();
+        write_sover_ledger(
+            &sover_data,
+            "ggg",
+            json!([
+                sover_entry("rev_cccccccccccc", "tips", 5.0, "2026-07-14"), // already seen -> skip
+                sover_entry("rev_dddddddddddd", "digital_product", 9.0, "2026-07-15"), // new -> append
+                json!({"id": "rev_eeeeeeeeeeee", "source": "x", "amount": -1.0, "date": "2026-07-15"}), // <=0 -> skip
+                json!({"id": "not_a_rev", "source": "x", "amount": 2.0, "date": "2026-07-15"}), // bad id -> skip
+            ]),
+        );
+        let n = rollup_from(&sover_data, &fleet);
+        assert_eq!(n, 1, "only the one new, valid, unseen entry is appended");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn map_sover_entry_rejects_bad_rows() {
+        assert!(
+            map_sover_entry("ggg", &json!({"id": "rev_x", "amount": 1.0, "date": "2026-07-15"}))
+                .is_some()
+        );
+        assert!(
+            map_sover_entry("ggg", &json!({"id": "rev_x", "amount": 0.0, "date": "2026-07-15"}))
+                .is_none(),
+            "zero amount rejected (money-IN only)"
+        );
+        assert!(
+            map_sover_entry(
+                "ggg",
+                &json!({"id": "rev_x", "amount": f64::NAN, "date": "2026-07-15"})
+            )
+            .is_none(),
+            "NaN rejected"
+        );
+        assert!(
+            map_sover_entry("ggg", &json!({"id": "bad", "amount": 1.0, "date": "2026-07-15"}))
+                .is_none(),
+            "non-rev id rejected"
+        );
+        assert!(
+            map_sover_entry("ggg", &json!({"amount": 1.0, "date": "2026-07-15"})).is_none(),
+            "missing id rejected"
+        );
     }
 }

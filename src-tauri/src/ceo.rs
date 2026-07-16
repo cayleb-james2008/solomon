@@ -1685,12 +1685,21 @@ pub fn evening_summary() -> Value {
         return json!({"ok": false, "error": format!("cannot write {}", report_path.display())});
     }
     ledger::append_daily(&snapshot);
+    // Roll each app's OWN confirmed revenue into the fleet money-truth file so the CEO
+    // grades against real dollars, not a green health signal (the June post-mortem root
+    // cause: fleet_ledger::append had no caller). No-ops honestly while revenue is $0.
+    let rolled = ops::fleet_ledger::rollup_apps();
 
     let fleet = ops::outcomes::payload_summary(&status);
     let mut body = format!("fleet: {fleet}");
     for f in flags.iter().take(10) {
         body.push('\n');
         body.push_str(f);
+    }
+    if rolled > 0 {
+        body.push_str(&format!(
+            "\n$ {rolled} new revenue row(s) recorded in fleet_ledger.jsonl"
+        ));
     }
     let notice = if urgent {
         Notice::red(format!("Solomon evening report {today} — ATTENTION"), body)
