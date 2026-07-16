@@ -425,7 +425,9 @@ pub fn diagnose(repo: &Value) -> Value {
         // persistent_self_stop because the fix is a HUMAN reconcile (merge/ship/push/delete): the
         // CEO plane maps persistent_self_stop to clear_escalation_and_retry, which deletes the
         // STOP sentinel — for this deterministic condition that would thrash park→clear→re-park
-        // every preflight. This category routes to the deduped operator page instead.
+        // every preflight. This category routes to the deduped operator page instead; the ONLY
+        // automated clear is revalidate_persisted_error's VERIFIED recheck (no stranded branch
+        // remains — never a blind retry).
         cat = "stranded_unmerged_branch".into();
         ev = trunc_or(summary, 200, "stranded finished rsi/* work found at preflight");
         rec = vec![
@@ -650,6 +652,204 @@ pub fn is_structurally_stuck(category: &str) -> bool {
     )
 }
 
+/// True iff `category` names a RE-CHECKABLE persisted heartbeat error: a git-state condition
+/// (dirty tree, out-of-band/un-pushed base, untracked files blocking the clean, a stranded rsi/*
+/// branch) whose CURRENT truth can be cheaply re-derived from the repo itself. These are the
+/// stale-error wedge class: the error heartbeat is written once by the loop's preflight and then
+/// persists forever because only a RUNNING loop rewrites heartbeat.json — after the operator (or
+/// another agent) fixes the underlying git state, diagnose() keeps re-asserting the corpse and the
+/// autopilot parks the lane on it (the 2026-07-15 solomon self-lane 'controller tree dirty — 3
+/// commit(s) not on origin/main' persisted a full day past main==origin/main). NOT in this set:
+/// process conditions (stale_lock/stuck — the lock/PID files ARE current truth), config conditions
+/// (needs_goal/no_key — cleared by the config write path), provider conditions (quota_error — owns
+/// its own cooldown), and persistent_self_stop (the watchdog's `persistent_stop_cleared` already
+/// re-observes those reason markers each sweep).
+pub fn is_recheckable_stale_error(category: &str) -> bool {
+    matches!(
+        category,
+        "dirty_tree" | "base_out_of_band" | "untracked_refusal" | "stranded_unmerged_branch"
+    )
+}
+
+/// STALE-ERROR REVALIDATION (the 'proof_required wedge' self-heal, audit 2026-07-16): when a
+/// NON-RUNNING lane's diagnosis is a re-checkable persisted heartbeat error
+/// ([`is_recheckable_stale_error`]), re-run the ACTUAL underlying check before re-asserting it.
+/// If the condition no longer reproduces, clear the error — refresh heartbeat.json to idle (and
+/// remove the runner's own stranded stop sentinel), stamp supervisor.jsonl, retire any stale
+/// escalation via note_healthy — and return the recover()-shaped result so queued jobs can
+/// dispatch again. Returns None when the category is not re-checkable, the lane is running (a
+/// live loop owns its heartbeat — never rewrite under it), or the condition STILL reproduces
+/// (fail-closed: any indeterminate git result keeps the error; existing behavior is untouched).
+///
+/// The probes mirror the writers exactly:
+///   * dirty_tree / base_out_of_band / untracked_refusal → [`provenance::controller_clean_at`]
+///     (clean tree with runtime/ excluded + HEAD on the resolved base + not ahead of upstream) —
+///     the same check the solomon self-lane preflight runs, and strictly stronger than the managed
+///     repos' own dirty/unpushed preflight bails.
+///   * stranded_unmerged_branch → [`stranded_guard_still_blocks`], the stale-fork guard re-run
+///     with FAIL-CLOSED semantics (an unreadable branch keeps the park; detection's fail-open
+///     skip is only safe when the outcome is 'do not block', never when it is 'clear the stop').
+///
+/// Called from `recover()` (watchdog sweeps) and from the autopilot dispatch path
+/// (`fleet::plan_jobs`, emit_proofs only) so a healed lane unwedges within one sweep of either.
+pub fn revalidate_persisted_error(repo: &Value, diag: &Value) -> Option<Value> {
+    let cat = diag
+        .get("category")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if !is_recheckable_stale_error(&cat) {
+        return None;
+    }
+    if diag.get("running").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let path = paths::repo_path(repo);
+    if path.is_empty() {
+        return None;
+    }
+    let dir = rt(repo)?;
+    let healed = match cat.as_str() {
+        "dirty_tree" | "base_out_of_band" | "untracked_refusal" => {
+            let base = registry::project_resolved_base_branch(repo, &path);
+            crate::provenance::controller_clean_at(std::path::Path::new(&path), &base).is_ok()
+        }
+        "stranded_unmerged_branch" => !stranded_guard_still_blocks(repo, &path),
+        _ => false,
+    };
+    if !healed {
+        return None; // still reproduces (or indeterminate) — keep the error; existing ladder runs
+    }
+    let mut actions: Vec<String> = vec!["stale_error_recheck_cleared".into()];
+    // The stranded park carries the runner's own STOP sentinel (reason marker
+    // `stranded_unmerged_branch_persistent`); with the stranding verified-reconciled, remove it so
+    // the lane doesn't land in stop_lingering next diagnose. Never touches an operator Stop —
+    // diagnose() only assigns this category on that exact reason marker.
+    if cat == "stranded_unmerged_branch"
+        && heartbeat::read_heartbeat(repo)
+            .as_ref()
+            .and_then(|h| h.get("reason"))
+            .and_then(Value::as_str)
+            == Some("stranded_unmerged_branch_persistent")
+        && std::fs::remove_file(dir.join("stop")).is_ok()
+    {
+        actions.push("clear_stop".into());
+    }
+    // Return the lane to idle: the recorded manual unwedge procedure ("refresh heartbeat.json to
+    // idle after re-verifying the blocker is false"), now automated. Only the error fields change;
+    // the rest of the heartbeat (repo/model/iteration/…) is preserved.
+    let mut hb = heartbeat::read_heartbeat(repo).unwrap_or_else(|| json!({}));
+    if let Value::Object(ref mut o) = hb {
+        o.insert("status".into(), json!("idle"));
+        o.insert("phase".into(), Value::Null);
+        o.remove("reason");
+        o.insert(
+            "last_summary".into(),
+            json!(format!(
+                "self-healed: persisted '{cat}' error re-checked and no longer reproduces — \
+                 lane returned to idle"
+            )),
+        );
+        o.insert("updated_at".into(), json!(now()));
+    }
+    let _ = std::fs::write(
+        dir.join("heartbeat.json"),
+        serde_json::to_vec(&hb).unwrap_or_default(),
+    );
+    let msg = format!(
+        "stale '{cat}' heartbeat error re-checked — the condition no longer reproduces; \
+         cleared to idle so queued jobs can dispatch"
+    );
+    append_jsonl(
+        repo,
+        "supervisor.jsonl",
+        &json!({
+            "ts": now(),
+            "category": cat,
+            "rung": 0,
+            "actions": actions,
+            "escalate": false,
+            "message": msg,
+        }),
+    );
+    // Retire the stale escalation + stamp the healthy transition record (breaks the log-once
+    // dedupe so a genuine recurrence re-escalates).
+    note_healthy(repo);
+    Some(json!({
+        "ok": true,
+        "category": cat,
+        "actions_taken": actions,
+        "escalate": false,
+        "message": msg,
+    }))
+}
+
+/// FAIL-CLOSED re-run of the stale-fork guard for [`revalidate_persisted_error`]: true when ANY
+/// local `rsi/*` / `solomon-recovered/*` branch still blocks forking (commits the base lacks,
+/// invisible upstream — [`gitops::stranded_blocks_fork`] policy under the repo's CONFIGURED ship
+/// mode), or when git cannot answer (which_git/path/branch-list/rev-list failure ⇒ merged-ness
+/// UNKNOWN ⇒ still blocks). Detection proper (`gitops::stranded_unmerged_branches`) fails OPEN
+/// (skip the branch) because its callers only use it to decline forking; here the outcome is
+/// clearing a park that protects finished work, so the polarity must invert.
+fn stranded_guard_still_blocks(repo: &Value, path: &str) -> bool {
+    let git = match proc::which_git() {
+        Some(g) => g,
+        None => return true,
+    };
+    let git_s = git.to_string_lossy().into_owned();
+    let g = |args: &[&str]| -> Option<proc::RunOut> {
+        let mut full: Vec<&str> = Vec::with_capacity(args.len() + 3);
+        full.push(git_s.as_str());
+        full.push("-C");
+        full.push(path);
+        full.extend_from_slice(args);
+        proc::run(&full, None, Some(Duration::from_secs(30))).ok()
+    };
+    let ls = match g(&["branch", "--list", "rsi/*", "solomon-recovered/*"]) {
+        Some(o) if o.code == 0 => o.stdout,
+        _ => return true,
+    };
+    let cur = match g(&["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Some(o) if o.code == 0 => o.stdout.trim().to_string(),
+        _ => return true,
+    };
+    let base = registry::project_resolved_base_branch(repo, path);
+    let has_remote = g(&["remote", "get-url", "origin"])
+        .map(|o| o.code == 0)
+        .unwrap_or(false);
+    let ship = registry::project_ship(repo);
+    for line in ls.lines() {
+        // strip the current-branch '*' and the checked-out-in-another-worktree '+' markers
+        let b = line.trim_start_matches(['*', '+', ' ']).trim();
+        if b.is_empty() || b == cur {
+            continue;
+        }
+        let ahead = match g(&["rev-list", "--count", &format!("{base}..{b}")]) {
+            Some(o) if o.code == 0 => match o.stdout.trim().parse::<i64>() {
+                Ok(n) => n,
+                Err(_) => return true, // unparseable count — unknown, fail closed
+            },
+            _ => return true, // rev-list failed — merged-ness unknown, fail closed
+        };
+        if ahead <= 0 {
+            continue;
+        }
+        let on_origin = has_remote
+            && g(&[
+                "merge-base",
+                "--is-ancestor",
+                b,
+                &format!("refs/remotes/origin/{b}"),
+            ])
+            .map(|o| o.code == 0)
+            .unwrap_or(false);
+        if crate::improver::gitops::stranded_blocks_fork(b, ahead, on_origin, &ship) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Anti-thrash helper: count recent supervisor.jsonl records that are a RUNG-0, non-escalate
 /// auto-fix of `cat`. Mirrors the comprehension in diagnose().
 ///
@@ -754,7 +954,8 @@ fn suggested_steps(repo: &Value, cat: &str) -> Vec<String> {
             "how daedulus silently lost 14 finished commits). Reconcile by hand:".into(),
             "  • merge or ship the stranded branch (or push it so origin holds the work)".into(),
             "  • or delete it deliberately if the work is truly obsolete".into(),
-            "then press Start (this stop is pinned — it is never auto-cleared)".into(),
+            "then press Start (this stop never clears on a BLIND retry; the supervisor's".into(),
+            "stale-error recheck clears it only once NO stranded branch remains — verified)".into(),
         ],
         _ => vec![cd, "git status".into()],
     }
@@ -1180,6 +1381,15 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
         // escalate=false, breaking the dedupe guard.
         note_healthy(repo);
         return json!({"ok": true, "category": "ok", "actions_taken": [], "escalate": false, "message": "healthy"});
+    }
+
+    // STALE-ERROR REVALIDATION (the proof_required-wedge self-heal): a persisted heartbeat error
+    // of a re-checkable git-state class (dirty tree / out-of-band base / untracked refusal /
+    // stranded branch) is re-run against the repo RIGHT NOW before the ladder re-asserts it. A
+    // verified-healed condition clears the error and returns the lane to idle; a still-true (or
+    // indeterminate) condition returns None and the existing ladder runs unchanged.
+    if let Some(out) = revalidate_persisted_error(repo, &d) {
+        return out;
     }
 
     // TTL escalation pre-step (catalog #3): an escalation that has outlived its TTL executes its
@@ -3437,5 +3647,239 @@ mod tests {
         assert_eq!(esc["fallback_runs"], json!(0));
         assert!(esc_expires_in(&repo) > 0, "legacy record now carries a live TTL");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ==================================================================== //
+    // stale-error revalidation — the proof_required-wedge self-heal
+    // ==================================================================== //
+    //
+    // A lane that persists an error heartbeat (e.g. 'controller tree dirty — 3 commit(s) not on
+    // origin/main') keeps it FOREVER once the loop exits: only a running loop rewrites
+    // heartbeat.json, so after the git state heals, diagnose() re-asserts the corpse every sweep
+    // and the autopilot parks the lane on proof_required (the 2026-07-15 solomon self-lane wedge).
+    // revalidate_persisted_error re-runs the ACTUAL check and clears a verified-healed error.
+
+    // A real (tiny) git repo on `main` for the revalidation probes — same shape as the
+    // provenance.rs fixture; controller_clean_at and the stranded recheck both shell real git.
+    fn tmp_git_repo_sup(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "solomon_sup_reval_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() % 1_000_000)
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+            vec!["commit", "--allow-empty", "-m", "init"],
+            vec!["branch", "-M", "main"],
+        ] {
+            let st = Command::new("git").args(&args).current_dir(&dir).status().unwrap();
+            assert!(st.success(), "git {args:?} failed in {dir:?}");
+        }
+        dir
+    }
+
+    fn gitc(dir: &Path, args: &[&str]) {
+        let st = Command::new("git").args(args).current_dir(dir).status().unwrap();
+        assert!(st.success(), "git {args:?} failed in {dir:?}");
+    }
+
+    // Runtime-dir + repo-row fixture pointing at a real git working tree.
+    fn reval_repo(tag: &str, gdir: &Path) -> (std::path::PathBuf, Value) {
+        let name = format!("sup_reval_{tag}_{}", std::process::id());
+        let repo = json!({"name": name, "path": gdir.to_string_lossy()});
+        let rdir = paths::runtime_dir(&repo).unwrap();
+        let _ = std::fs::remove_dir_all(&rdir);
+        std::fs::create_dir_all(&rdir).unwrap();
+        (rdir, repo)
+    }
+
+    #[test]
+    fn recheckable_stale_error_set_is_a_subset_of_diagnose_categories() {
+        for cat in [
+            "dirty_tree",
+            "base_out_of_band",
+            "untracked_refusal",
+            "stranded_unmerged_branch",
+        ] {
+            assert!(is_recheckable_stale_error(cat), "{cat} is re-checkable");
+            assert!(
+                diagnose_categories().contains(&cat),
+                "{cat} must be a real diagnose() category"
+            );
+        }
+        // Process/config/provider conditions are NOT in the set — their state files are current
+        // truth (locks), their writers clear them (config), or they own a cooldown (quota).
+        for cat in ["ok", "stale_lock", "stuck", "needs_goal", "no_key", "quota_error",
+                    "persistent_self_stop", "noop_streak", "unknown_error"] {
+            assert!(!is_recheckable_stale_error(cat), "{cat} must not be re-checkable");
+        }
+    }
+
+    #[test]
+    fn revalidate_clears_stale_dirty_tree_error_to_idle() {
+        let gdir = tmp_git_repo_sup("clean");
+        let (rdir, repo) = reval_repo("clean", &gdir);
+        // The EXACT 2026-07-15 solomon wedge shape: a preflight error persisted long after the
+        // tree healed (this fixture's tree is clean, on main, no upstream => healed NOW).
+        write_hb(
+            &rdir,
+            &json!({
+                "status": "error",
+                "phase": "preflight",
+                "last_summary": "controller tree dirty/off-base — base 'main' has 3 commit(s) not on its upstream 'origin/main'",
+                "updated_at": "2026-07-15T20:49:05Z",
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], json!("dirty_tree"), "fixture reproduces the wedge diagnosis");
+        let out = revalidate_persisted_error(&repo, &d).expect("verified-healed error clears");
+        assert_eq!(out["ok"], json!(true));
+        assert_eq!(out["escalate"], json!(false));
+        assert_eq!(out["actions_taken"][0], json!("stale_error_recheck_cleared"));
+        let hb = heartbeat::read_heartbeat(&repo).unwrap();
+        assert_eq!(hb["status"], json!("idle"), "lane returned to idle");
+        assert!(hb.get("reason").is_none());
+        assert_eq!(
+            diagnose(&repo)["category"],
+            json!("ok"),
+            "the next diagnose sees a healthy lane so queued jobs can dispatch"
+        );
+        let _ = std::fs::remove_dir_all(&rdir);
+        let _ = std::fs::remove_dir_all(&gdir);
+    }
+
+    #[test]
+    fn revalidate_keeps_error_while_condition_still_reproduces() {
+        let gdir = tmp_git_repo_sup("dirty");
+        let (rdir, repo) = reval_repo("dirty", &gdir);
+        std::fs::write(gdir.join("stray.rs"), b"x").unwrap(); // genuinely dirty NOW
+        write_hb(
+            &rdir,
+            &json!({
+                "status": "error",
+                "phase": "preflight",
+                "last_summary": "base tree is dirty — preflight bailed",
+                "updated_at": "2026-07-15T20:49:05Z",
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], json!("dirty_tree"));
+        assert!(
+            revalidate_persisted_error(&repo, &d).is_none(),
+            "a still-true condition is NEVER cleared (fail-closed)"
+        );
+        let hb = heartbeat::read_heartbeat(&repo).unwrap();
+        assert_eq!(hb["status"], json!("error"), "heartbeat untouched while the error is real");
+        let _ = std::fs::remove_dir_all(&rdir);
+        let _ = std::fs::remove_dir_all(&gdir);
+    }
+
+    #[test]
+    fn revalidate_ignores_non_recheckable_categories() {
+        let (dir, repo) = tmp_repo("revalskip");
+        write_hb(
+            &dir,
+            &json!({
+                "status": "error",
+                "reason": "needs_goal",
+                "last_summary": "no north-star GOAL and no actionable backlog",
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], json!("needs_goal"));
+        assert!(
+            revalidate_persisted_error(&repo, &d).is_none(),
+            "config-class errors are cleared by their writers, not by a git recheck"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revalidate_clears_stranded_error_and_stop_once_branch_reconciled() {
+        let gdir = tmp_git_repo_sup("stranded");
+        // A finished rsi/* branch carrying a commit main lacks (no remote => invisible upstream).
+        gitc(&gdir, &["checkout", "-b", "rsi/iter-x"]);
+        std::fs::write(gdir.join("work.rs"), b"w").unwrap();
+        gitc(&gdir, &["add", "work.rs"]);
+        gitc(&gdir, &["commit", "-m", "rsi: finished work"]);
+        gitc(&gdir, &["checkout", "main"]);
+        let (rdir, repo) = reval_repo("stranded", &gdir);
+        std::fs::write(rdir.join("stop"), "stranded_unmerged_branch_persistent\n").unwrap();
+        write_hb(
+            &rdir,
+            &json!({
+                "status": "error",
+                "phase": "preflight",
+                "reason": "stranded_unmerged_branch_persistent",
+                "last_summary": "Stranded finished work: rsi/iter-x (+1 commit(s) not on main) — not an ancestor of the fork base.",
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], json!("stranded_unmerged_branch"));
+        // Still stranded — the park holds (fail-closed guard re-ran and CONFIRMED the blocker).
+        assert!(
+            revalidate_persisted_error(&repo, &d).is_none(),
+            "a live stranding must keep the park"
+        );
+        assert!(rdir.join("stop").exists(), "stop sentinel untouched while stranded");
+
+        // Reconcile: merge the stranded branch into the base (the human fix this park asks for).
+        gitc(&gdir, &["merge", "rsi/iter-x"]);
+        let out = revalidate_persisted_error(&repo, &d).expect("verified-reconciled stranding clears");
+        let acts = out["actions_taken"].as_array().unwrap();
+        assert!(acts.iter().any(|a| a == "clear_stop"), "the runner's own stop sentinel clears: {acts:?}");
+        assert!(!rdir.join("stop").exists());
+        let hb = heartbeat::read_heartbeat(&repo).unwrap();
+        assert_eq!(hb["status"], json!("idle"));
+        assert!(hb.get("reason").is_none());
+        assert_eq!(diagnose(&repo)["category"], json!("ok"));
+        let _ = std::fs::remove_dir_all(&rdir);
+        let _ = std::fs::remove_dir_all(&gdir);
+    }
+
+    // The recover() ladder takes the revalidation path BEFORE re-asserting/auto-fixing a stale
+    // error — the exact wedge sequence (reset_to_base thrash -> anti-thrash escalate) never starts.
+    #[test]
+    fn recover_clears_stale_dirty_tree_error_instead_of_reasserting() {
+        let gdir = tmp_git_repo_sup("recover");
+        let (rdir, repo) = reval_repo("recover", &gdir);
+        write_hb(
+            &rdir,
+            &json!({
+                "status": "error",
+                "phase": "preflight",
+                "last_summary": "controller tree dirty/off-base — base 'main' has 3 commit(s) not on its upstream 'origin/main'",
+                "updated_at": "2026-07-15T20:49:05Z",
+            }),
+        );
+        let out = recover(&repo, false, false, false);
+        assert_eq!(out["ok"], json!(true));
+        assert_eq!(out["escalate"], json!(false));
+        assert_eq!(out["actions_taken"][0], json!("stale_error_recheck_cleared"));
+        // The supervisor log carries the recheck record AND the healthy transition record.
+        let log = heartbeat::read_supervisor_log(&repo, 5);
+        assert!(
+            log.iter().any(|l| {
+                l.get("actions")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().any(|x| x.as_str() == Some("stale_error_recheck_cleared")))
+                    .unwrap_or(false)
+            }),
+            "supervisor.jsonl records the recheck-clear: {log:?}"
+        );
+        assert_eq!(
+            log.last().and_then(|l| l.get("category")).and_then(Value::as_str),
+            Some("ok"),
+            "note_healthy stamped the healthy transition (dedupe broken for recurrences)"
+        );
+        let _ = std::fs::remove_dir_all(&rdir);
+        let _ = std::fs::remove_dir_all(&gdir);
     }
 }
