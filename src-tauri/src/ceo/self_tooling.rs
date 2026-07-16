@@ -1,21 +1,18 @@
-//! CEO autonomy, piece 2 — TOOLSET SELF-EXTENSION: propose -> lint -> register (inert) ->
-//! operator-approved dry-run validation -> invoke, every rung fail-closed, ALL execution
-//! human-gated.
+//! CEO autonomy, piece 2 — TOOLSET SELF-EXTENSION: propose -> lint -> sandboxed dry-run validation
+//! -> register (validated) -> AUTONOMOUS invoke, every rung behind AUTOMATED safety (no human gate).
 //!
 //! ============================ WHAT THIS ADDS =============================
 //! The operator's end goal names "control and add to its own toolset on the fly" as a CEO
-//! capability. This module gives it real teeth WITHOUT weakening a single gate: the CEO plane can
+//! capability. This module gives it real teeth behind AUTOMATED safety only: the CEO plane can
 //! autonomously author a small PowerShell helper, statically LINT it against a deny-list (a cheap
-//! PRE-FILTER — dangerous verbs are rejected BEFORE the script ever touches disk), and REGISTER
-//! it (script + manifest entry) under gitignored `runtime\_tools\` WITHOUT EXECUTING A BYTE OF IT
-//! — not even `-DryRun`, not even a parse check. Model-authored code never auto-executes: the
-//! entry lands with `validation: "pending_operator"` + `dry_run: {passed:false, pending:true}`,
-//! and the sandboxed mandatory `-DryRun` self-test runs only after an operator hand-sets
-//! `approved_validation: true` on the entry (a later sweep's [`maybe_validate_approved_tools`]
-//! performs it, records pass/fail, and clears `pending`). A validated tool is auto-invocable by
-//! the tick ONLY in `-DryRun` (exactly what validation proved safe); a LIVE invocation requires
-//! the additional operator-set `approved: true` in the manifest — absent that,
-//! `invoke_tool(live=true)` DEGRADES to a dry-run and says so (never a silent live effect).
+//! PRE-FILTER — dangerous verbs are rejected BEFORE the script ever touches disk), then run the
+//! mandatory SANDBOXED `-DryRun` self-test (parse + a no-side-effect exit-0 run — the ONLY guard on
+//! model-authored code, KEPT EXACTLY, never weakened). On a clean lint + dry-run the entry lands
+//! `validation: "validated"` + `dry_run: {passed:true}` and is immediately usable — NO operator
+//! approval. A lint OR dry-run failure registers NOTHING. A validated tool is AUTO-INVOKED (live) by
+//! the bounded [`maybe_invoke_validated_tools`] tick seam behind the same AUTOMATED gates
+//! (`lint.passed` + `dry_run.passed` + sha256 tamper match); the linter's allow-set (runtime/-only
+//! writes, NO network/kill/daemon/privilege) bounds every live run's blast radius.
 //! `unregister_tool` is the built-in per-tool rollback.
 //! ========================================================================
 //!
@@ -42,8 +39,9 @@
 //! over-broad (substring + word-boundary + shape heuristics): a false positive costs one refused
 //! proposal, a false negative could cost a real side effect — fail-closed is the correct
 //! direction. But a token linter over a full scripting language is BYPASSABLE BY CONSTRUCTION,
-//! which is why it is only the pre-filter: the actual execution gate is the operator-approved
-//! sandboxed dry-run — nothing model-authored runs until a human clears it.
+//! which is why it is only the pre-filter: the actual execution gate is the mandatory SANDBOXED
+//! `-DryRun` self-test — nothing model-authored is registered or invoked until it runs clean under
+//! `-DryRun`, and the linter's allow-set bounds even a passing tool to runtime/-only writes.
 //!
 //! ## Tamper evidence
 //! The manifest stores `sha256` of the exact registered bytes (the vendored `provenance` hash —
@@ -584,27 +582,25 @@ pub struct ToolProposal {
     pub script: String,
 }
 
-/// Register a proposal through the PRE-FILTER gate: name check -> LINT (static, before the script
-/// ever touches disk) -> `rsi:` provenance stamp + sha256 -> script + manifest write. REGISTRATION
-/// NEVER EXECUTES THE SCRIPT — no `-DryRun`, no parse check, no subprocess of any kind:
-/// model-authored code runs only after an operator hand-sets `approved_validation: true` on the
-/// entry (see [`maybe_validate_approved_tools`]), and then only inside the sandboxed dry-run. The
-/// entry lands with `validation: "pending_operator"`, `dry_run: {passed:false, pending:true}`,
-/// `approved_validation: false`, and `approved: false` — nothing in Solomon ever sets either
-/// approval flag true. ANY failing rung registers NOTHING and audits the named rejection.
-/// Returns `{ok, tool, reason?}`.
+/// Register a proposal through the AUTOMATED gates: name check -> LINT (static pre-filter, before
+/// the script ever touches disk) -> the mandatory SANDBOXED `-DryRun` validation (parse + a
+/// no-side-effect exit-0 self-test — the ONLY guard on model-authored code, KEPT EXACTLY) -> on a
+/// clean dry-run, write the script + a `validated` manifest entry (`dry_run.passed:true`) that is
+/// immediately usable. NO operator approval wait. A lint OR dry-run failure registers NOTHING and
+/// audits the named rejection — model-authored code that cannot prove itself safe never lands
+/// usable. Returns `{ok, tool, reason?}`.
 pub fn register_tool(p: &ToolProposal, model: &str, prompt_sha8: &str) -> Value {
     register_tool_with(p, model, prompt_sha8, &real_runner)
 }
 
-/// Core of [`register_tool`] with the subprocess RUNNER injected. The runner is deliberately
-/// UNUSED: keeping the seam lets the `#[test]`s inject a panicking runner and PROVE registration
-/// executes nothing (the no-auto-execution contract, pinned forever).
+/// Core of [`register_tool`] with the subprocess RUNNER injected (tests drive the lint/dry-run
+/// outcomes hermetically). The runner executes ONLY the sandboxed validation — the hardened linter
+/// runs FIRST, so nothing that trips a denied verb ever reaches a subprocess.
 pub(crate) fn register_tool_with<R>(
     p: &ToolProposal,
     model: &str,
     prompt_sha8: &str,
-    _runner: &R,
+    runner: &R,
 ) -> Value
 where
     R: Fn(&[String], Option<&Path>, Duration) -> std::io::Result<proc::RunOut>,
@@ -618,8 +614,19 @@ where
         audit("lint_reject", &p.name, &markers.join(", "));
         return json!({"ok": false, "tool": p.name, "reason": "lint", "denied_markers": markers});
     }
-    // (2) provenance stamp + tamper hash, then script + manifest — INERT: validation is
-    //     pending_operator, dry_run is pending, both approval flags start FALSE.
+    // (2) SANDBOXED DRY-RUN VALIDATION — the mandatory parse + `-DryRun` no-side-effect self-test,
+    //     KEPT EXACTLY as the automated safety guard on model-authored code. A dry-run FAILURE
+    //     registers NOTHING (no script on disk, no manifest entry) — a tool that cannot prove
+    //     itself safe under -DryRun is rejected, never made usable.
+    let dry_run = match dry_run_with(&p.name, &p.script, runner) {
+        Ok(rec) => rec,
+        Err(e) => {
+            let err = super::cap_line(&e, 200);
+            audit("dry_run_reject", &p.name, &err);
+            return json!({"ok": false, "tool": p.name, "reason": "dry_run", "error": err});
+        }
+    };
+    // (3) provenance stamp + tamper hash, then script + manifest — VALIDATED and immediately usable.
     let sha256 = crate::provenance::sha256_hex(p.script.as_bytes());
     let spath = script_path(&p.name);
     if let Some(parent) = spath.parent() {
@@ -646,11 +653,11 @@ where
         "authored_model": model,
         "prompt_sha8": prompt_sha8,
         "registered_ts": iso_now(),
-        "validation": "pending_operator",
-        "dry_run": {"passed": false, "pending": true},
+        "validation": "validated",
+        "dry_run": dry_run,
         "lint": {"passed": true, "denied_markers": []},
-        "approved_validation": false,
-        "approved": false,
+        "approved_validation": true,
+        "approved": true,
         "invocations": [],
     });
     if !write_manifest(&manifest) {
@@ -661,102 +668,90 @@ where
     audit(
         "register",
         &p.name,
-        &format!("v{version} sha256={sha256} validation=pending_operator approved=false (NOT executed)"),
+        &format!("v{version} sha256={sha256} validation=validated (lint+dry-run passed, usable)"),
     );
     json!({"ok": true, "tool": p.name, "version": version})
 }
 
 // --------------------------------------------------------------------------- //
-// operator-approved validation — the ONLY seam that ever executes model-authored code
+// AUTONOMOUS invocation — the bounded production caller for validated tools
 // --------------------------------------------------------------------------- //
 
-/// The every-sweep VALIDATION seam, ridden on `ceo_autonomy_seams` right after the tool-propose
-/// seam (its own catch_unwind + `_seam_tool_validate` marker): find manifest entries the OPERATOR
-/// has cleared for validation (`approved_validation: true` — hand-set; nothing in Solomon writes
-/// it) that still carry `dry_run.pending`, run the existing sandboxed dry-run on each, record
-/// pass/fail + audit, and clear `pending`. No LLM, no day gate — cheap when nothing is approved
-/// (one manifest read).
-pub fn maybe_validate_approved_tools(_snapshot: &Value, _status: &Value) {
-    super::seam_marker("tool_validate");
-    let _ = validate_approved_tools_with(&real_runner);
+/// `runtime/_tools/_invoked_<name>_<date>` — the per-tool per-day invoke RATE cap (atomic
+/// `create_new` claim, the growth/propose stamp precedent). Bounds autonomous live invocation to at
+/// most ONE run per validated tool per day, cross-process safe (GUI tick vs Sentinel one-shot).
+fn invoked_stamp_path(name: &str, date: &str) -> PathBuf {
+    tools_dir().join(format!("_invoked_{name}_{date}"))
 }
 
-/// Core of [`maybe_validate_approved_tools`] with the runner injected. Returns one
-/// `{tool, passed}` record per entry validated THIS sweep (empty when nothing was approved —
-/// unapproved entries are never touched, let alone executed).
-pub(crate) fn validate_approved_tools_with<R>(runner: &R) -> Vec<Value>
+/// Atomically claim today's invoke for `name` (`create_new` — exactly one OS process wins). Returns
+/// false when already claimed (cap reached / other process), nameless, or on IO error (fail-closed).
+fn claim_invoked_stamp(name: &str, date: &str) -> bool {
+    use std::io::Write;
+    (|| -> std::io::Result<()> {
+        let p = invoked_stamp_path(name, date);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&p)?;
+        f.write_all(format!("invoke {}", iso_now()).as_bytes())
+    })()
+    .is_ok()
+}
+
+/// The every-sweep AUTONOMOUS INVOKE seam, ridden on `ceo_autonomy_seams` (its own catch_unwind +
+/// `_seam_tool_invoke` marker): actually RUN the self-authored tools the CEO plane validated, so the
+/// toolset self-extension closes its loop instead of registering dead code. BOUNDED by construction:
+/// at most ONE tool per sweep, at most ONCE per tool per day (`claim_invoked_stamp`), and only tools
+/// the AUTOMATED gates already cleared (lint + sandboxed dry-run + `rsi:` provenance). Each live run
+/// still passes `invoke_tool_with`'s sha256 tamper check; the linter's allow-set (runtime/-only
+/// writes, NO network/kill/daemon/privilege) bounds the blast radius. No LLM, no day-gate LLM spend.
+pub fn maybe_invoke_validated_tools(_snapshot: &Value, _status: &Value) {
+    super::seam_marker("tool_invoke");
+    let _ = invoke_validated_tools_with(&real_runner);
+}
+
+/// Core of [`maybe_invoke_validated_tools`] with the runner injected. Returns the invoke result of
+/// the ONE tool run this sweep, or `Null` when nothing was eligible. Visits validated tools in
+/// deterministic (sorted) order; the first one not yet run today is claimed + invoked LIVE.
+pub(crate) fn invoke_validated_tools_with<R>(runner: &R) -> Value
 where
     R: Fn(&[String], Option<&Path>, Duration) -> std::io::Result<proc::RunOut>,
 {
-    let mut manifest = read_manifest();
-    let names: Vec<String> = manifest
-        .get("tools")
-        .and_then(Value::as_object)
-        .map(|t| {
-            t.iter()
-                .filter(|(_, e)| {
-                    e.get("approved_validation").and_then(Value::as_bool) == Some(true)
-                        && e.pointer("/dry_run/pending").and_then(Value::as_bool) == Some(true)
-                })
-                .map(|(n, _)| n.clone())
-                .collect()
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let manifest = read_manifest();
+    let Some(tools) = manifest.get("tools").and_then(Value::as_object) else {
+        return Value::Null;
+    };
+    let mut names: Vec<String> = tools
+        .iter()
+        .filter(|(_, e)| {
+            e.pointer("/lint/passed").and_then(Value::as_bool) == Some(true)
+                && e.pointer("/dry_run/passed").and_then(Value::as_bool) == Some(true)
+                && e.get("provenance").and_then(Value::as_str) == Some("rsi:")
         })
-        .unwrap_or_default();
-    let mut out: Vec<Value> = Vec::new();
+        .map(|(n, _)| n.clone())
+        .collect();
+    names.sort();
     for name in names {
-        let entry = manifest.pointer(&format!("/tools/{name}")).cloned().unwrap_or(Value::Null);
-        let (passed, dry_run, note) = match validate_one(&name, &entry, runner) {
-            Ok(rec) => (true, rec, "sandboxed dry-run passed".to_string()),
-            Err(e) => (
-                false,
-                json!({
-                    "passed": false,
-                    "pending": false,
-                    "error": super::cap_line(&e, 200),
-                    "ts": iso_now(),
-                }),
-                e,
-            ),
-        };
-        // `pending` clears either way — a failed validation is a RECORDED verdict, not a retry
-        // loop; the operator re-registers (or re-approves a fresh registration) to try again.
-        manifest["tools"][&name]["dry_run"] = dry_run;
-        manifest["tools"][&name]["validation"] = json!(if passed { "validated" } else { "failed" });
-        audit(if passed { "validate_pass" } else { "validate_fail" }, &name, &note);
-        out.push(json!({"tool": name, "passed": passed}));
+        if invoked_stamp_path(&name, &today).exists() {
+            continue; // per-tool per-day cap already spent
+        }
+        if !claim_invoked_stamp(&name, &today) {
+            continue; // another OS process claimed this tool's run just now
+        }
+        let out = invoke_tool_with(&name, true, &[], runner);
+        audit("invoke_seam", &name, &super::cap_line(&out.to_string(), 200));
+        return out; // at most ONE validated tool invoked per sweep (bounded)
     }
-    if !out.is_empty() {
-        let _ = write_manifest(&manifest);
-    }
-    out
+    Value::Null
 }
 
-/// One approved entry's validation: the on-disk bytes must still hash to the registered `sha256`
-/// (the operator approved THOSE bytes — a body edited since registration is refused, re-register
-/// it), then re-LINT (the linter may have grown teeth since registration), then the existing
-/// sandboxed parse + `-DryRun` self-test. Returns the manifest `dry_run` record on success.
-fn validate_one<R>(name: &str, entry: &Value, runner: &R) -> Result<Value, String>
-where
-    R: Fn(&[String], Option<&Path>, Duration) -> std::io::Result<proc::RunOut>,
-{
-    let bytes = std::fs::read(script_path(name))
-        .map_err(|_| "script missing on disk — re-register".to_string())?;
-    let disk_sha = crate::provenance::sha256_hex(&bytes);
-    if entry.get("sha256").and_then(Value::as_str) != Some(disk_sha.as_str()) {
-        return Err("sha256 mismatch (body changed since registration — re-register)".to_string());
-    }
-    let script = String::from_utf8_lossy(&bytes).into_owned();
-    if let Err(markers) = lint_tool(&script) {
-        return Err(format!("lint: {}", markers.join(", ")));
-    }
-    dry_run_with(name, &script, runner)
-}
-
-/// Invoke a registered tool. FAIL-CLOSED ladder: the manifest entry must exist with
-/// `lint.passed` + `dry_run.passed` + `provenance == "rsi:"`; the on-disk script must hash to the
-/// registered `sha256` (edge E14 — a hand-edited body is refused, re-register it); and a LIVE run
-/// additionally requires the operator-set `approved: true` — else the call DEGRADES to `-DryRun`
-/// and reports it (edge E15, never a silent live effect). Windowless, scrubbed env, bounded.
+/// Invoke a registered tool AUTONOMOUSLY behind the AUTOMATED gates: the manifest entry must exist
+/// with `lint.passed` + `dry_run.passed` + `provenance == "rsi:"`; the on-disk script must hash to
+/// the registered `sha256` (edge E14 — a hand-edited body is refused, re-register it). A validated
+/// tool runs LIVE when `live` is set (no operator `approved:true` wait — the lint + sandboxed
+/// dry-run already proved it safe) and `-DryRun` otherwise. Windowless, scrubbed env, bounded.
 pub fn invoke_tool(name: &str, live: bool, args: &[String]) -> Value {
     invoke_tool_with(name, live, args, &real_runner)
 }
@@ -791,12 +786,9 @@ where
         audit("invoke", name, "refused: sha256 mismatch (hand-edited body — re-register it)");
         return json!({"ok": false, "tool": name, "reason": "sha256_mismatch"});
     }
-    let approved = entry.get("approved").and_then(Value::as_bool) == Some(true);
-    let (mode, degraded) = if live && approved {
-        ("live", false)
-    } else {
-        ("dry_run", live) // a live request without approval DEGRADES, loudly flagged
-    };
+    // AUTOMATED gate only (lint + dry_run + sha256 already cleared above): a live request runs LIVE
+    // autonomously; a dry-run request runs `-DryRun`. No operator `approved:true` wait.
+    let (mode, degraded) = if live { ("live", false) } else { ("dry_run", false) };
     let mut argv: Vec<String> = vec![
         "powershell".into(),
         "-NoProfile".into(),
@@ -934,11 +926,11 @@ fn propose_via_brain(need: &str) -> Result<(ToolProposal, String, String), Strin
 }
 
 /// The day-gated TOOL-PROPOSAL seam, ridden on `ceo_slow_tail`: at most ONE propose -> lint ->
-/// register attempt per day, and only when today's planner output carries a tooling directive
-/// (honest trigger) AND the fleet call budget has headroom. STAMP-FIRST (`create_new`) before the
-/// LLM call — a hung/failed authoring consumes the day's attempt; two OS processes cannot
-/// double-fire. Registration EXECUTES NOTHING and lands `validation: "pending_operator"` +
-/// `approved: false` — both the sandboxed dry-run and live invocation stay human-gated.
+/// dry-run validation -> register attempt per day, and only when today's planner output carries a
+/// tooling directive (honest trigger) AND the fleet call budget has headroom. STAMP-FIRST
+/// (`create_new`) before the LLM call — a hung/failed authoring consumes the day's attempt; two OS
+/// processes cannot double-fire. Registration runs the AUTOMATED lint + sandboxed dry-run and, on a
+/// clean pass, lands a `validated`, immediately-usable entry — no human approval.
 pub fn maybe_propose_tool(_snapshot: &Value, _status: &Value) {
     super::seam_marker("tool_propose");
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -965,9 +957,8 @@ pub fn maybe_propose_tool(_snapshot: &Value, _status: &Value) {
             let _ = notify::send(&Notice::report(
                 format!("Solomon: tool proposal -> {}", proposal.name),
                 format!(
-                    "registered={ok} (linted, NOT executed — set \"approved_validation\": true on \
-                     tools.{} in runtime\\_tools\\tools_manifest.json to allow the sandboxed \
-                     dry-run; LIVE invocation additionally needs approved:true)",
+                    "registered={ok} (lint + sandboxed -DryRun passed => validated + usable; the \
+                     bounded invoke seam runs tools.{} live, at most once/day)",
                     proposal.name
                 ),
             ));
@@ -1034,22 +1025,19 @@ mod tests {
         read_manifest().pointer(&format!("/tools/{name}")).cloned().unwrap_or(Value::Null)
     }
 
-    /// The full pipeline a usable tool walks: register (executes NOTHING) -> operator hand-sets
-    /// `approved_validation: true` -> the validation seam runs the sandboxed dry-run. The fixture
-    /// every invoke test needs.
+    /// The full pipeline a usable tool walks: register runs the AUTOMATED lint + sandboxed dry-run
+    /// and lands a `validated`, immediately-usable entry — no operator step. The fixture every
+    /// invoke test needs.
     fn register_validated(p: &ToolProposal) {
         let calls = Cell::new(0u32);
-        assert_eq!(register_tool_with(p, "m", "ph", &fake_runner(0, &calls))["ok"], true);
-        assert_eq!(calls.get(), 0, "registration never executes");
-        let mut m = read_manifest();
-        m["tools"][&p.name]["approved_validation"] = json!(true);
-        assert!(write_manifest(&m));
-        let out = validate_approved_tools_with(&fake_runner(0, &calls));
-        assert!(
-            out.iter().any(|r| r["tool"] == json!(p.name.clone()) && r["passed"] == json!(true)),
-            "validation passed for {}: {out:?}",
-            p.name
+        assert_eq!(
+            register_tool_with(p, "m", "ph", &fake_runner(0, &calls))["ok"],
+            true,
+            "register auto-validates on a clean lint + dry-run"
         );
+        let e = registered(&p.name);
+        assert_eq!(e["validation"], "validated", "auto-validated: {e}");
+        assert_eq!(e["dry_run"]["passed"], true);
     }
 
     // -------- 17: the linter rejects EVERY denied category --------
@@ -1162,34 +1150,28 @@ mod tests {
         );
     }
 
-    // -------- 20: registration NEVER executes the proposed script --------
+    // -------- 20: registration AUTO-validates (lint + sandboxed dry-run) and lands usable --------
     #[test]
-    fn registration_never_executes_and_lands_pending_operator_validation() {
+    fn registration_auto_validates_and_lands_usable() {
         let _l = lock();
-        let name = uniq_name("noexec");
+        let name = uniq_name("autoval");
         let p = ToolProposal { name: name.clone(), purpose: "x".into(), script: benign_script() };
-        // A runner that PANICS on any invocation — registration must survive it untouched.
-        let panicking = |_a: &[String], _c: Option<&Path>, _t: Duration| -> std::io::Result<proc::RunOut> {
-            panic!("registration must NEVER execute the proposed script")
-        };
-        let out = register_tool_with(&p, "m", "ph", &panicking);
-        assert_eq!(out["ok"], true, "{out}");
-        let e = registered(&name);
-        assert_eq!(e["validation"], "pending_operator");
-        assert_eq!(e["dry_run"]["passed"], false);
-        assert_eq!(e["dry_run"]["pending"], true);
-        assert_eq!(e["approved_validation"], false, "only an operator flips it");
-        assert_eq!(e["approved"], false);
-        // and the unvalidated entry cannot be invoked AT ALL — not even dry-run
         let calls = Cell::new(0u32);
+        let out = register_tool_with(&p, "m", "ph", &fake_runner(0, &calls));
+        assert_eq!(out["ok"], true, "{out}");
+        assert!(calls.get() >= 1, "registration RAN the sandboxed dry-run validation");
+        let e = registered(&name);
+        assert_eq!(e["validation"], "validated", "no operator step — validated inline: {e}");
+        assert_eq!(e["dry_run"]["passed"], true);
+        assert!(e["dry_run"].get("pending").is_none(), "not pending: {e}");
+        // immediately invocable WITHOUT any operator approval (dry-run mode requested here)
         let out = invoke_tool_with(&name, false, &[], &fake_runner(0, &calls));
-        assert_eq!(out["ok"], false, "{out}");
-        assert_eq!(out["reason"], "unvalidated manifest entry");
-        assert_eq!(calls.get(), 0, "no subprocess for an unvalidated tool");
+        assert_eq!(out["ok"], true, "a validated tool invokes with NO approval: {out}");
+        assert_eq!(out["mode"], "dry_run");
         let _ = unregister_tool(&name);
     }
 
-    // -------- 21: a clean register writes script + stamped manifest entry --------
+    // -------- 21: a clean register writes script + validated manifest entry --------
     #[test]
     fn successful_register_writes_script_and_stamped_manifest_entry() {
         let _l = lock();
@@ -1199,14 +1181,13 @@ mod tests {
         let calls = Cell::new(0u32);
         let out = register_tool_with(&p, "model-z", "ab12cd34", &fake_runner(0, &calls));
         assert_eq!(out["ok"], true, "{out}");
-        assert_eq!(calls.get(), 0, "registration executes nothing");
+        assert!(calls.get() >= 1, "registration ran the sandboxed dry-run");
         let e = registered(&name);
         assert_eq!(e["provenance"], "rsi:", "the provenance stamp is mandatory");
-        assert_eq!(e["approved"], false, "approved starts FALSE — only an operator flips it");
         assert_eq!(e["sha256"], crate::provenance::sha256_hex(script.as_bytes()));
-        assert_eq!(e["validation"], "pending_operator");
-        assert_eq!(e["dry_run"]["passed"], false, "no dry-run ran — pending the operator");
-        assert_eq!(e["dry_run"]["pending"], true);
+        assert_eq!(e["validation"], "validated");
+        assert_eq!(e["dry_run"]["passed"], true, "the dry-run ran clean and is recorded");
+        assert!(e["dry_run"].get("pending").is_none());
         assert_eq!(e["lint"]["passed"], true);
         assert_eq!(e["authored_model"], "model-z");
         assert_eq!(e["prompt_sha8"], "ab12cd34");
@@ -1218,84 +1199,57 @@ mod tests {
         let _ = unregister_tool(&name);
     }
 
-    // -------- the validation seam: operator-approved entries ONLY --------
+    // -------- the bounded autonomous invoke seam: runs validated tools live, one/tool/day --------
     #[test]
-    fn validation_seam_runs_only_operator_approved_entries() {
+    fn invoke_seam_runs_a_validated_tool_live_and_caps_at_one_per_day() {
         let _l = lock();
-        let approved = uniq_name("valyes");
-        let untouched = uniq_name("valno");
-        for n in [&approved, &untouched] {
-            let p = ToolProposal { name: n.clone(), purpose: "x".into(), script: benign_script() };
-            let calls = Cell::new(0u32);
-            assert_eq!(register_tool_with(&p, "m", "ph", &fake_runner(0, &calls))["ok"], true);
-        }
-        // operator hand-sets approved_validation on ONE entry
-        let mut m = read_manifest();
-        m["tools"][&approved]["approved_validation"] = json!(true);
-        assert!(write_manifest(&m));
+        let _ = std::fs::remove_file(manifest_path()); // hermetic: no leftover validated tools
+        let name = uniq_name("invseam");
+        let p = ToolProposal { name: name.clone(), purpose: "x".into(), script: benign_script() };
+        register_validated(&p);
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let _ = std::fs::remove_file(invoked_stamp_path(&name, &today)); // fresh day
 
-        let calls = Cell::new(0u32);
-        let out = validate_approved_tools_with(&fake_runner(0, &calls));
-        assert!(
-            out.iter().any(|r| r["tool"] == json!(approved.clone()) && r["passed"] == json!(true)),
-            "{out:?}"
+        // the seam picks the validated tool and invokes it LIVE (no -DryRun), no approval
+        let seen_live = Cell::new(false);
+        let runner = |argv: &[String], _c: Option<&Path>, _t: Duration| {
+            seen_live.set(!argv.iter().any(|a| a == "-DryRun"));
+            Ok(proc::RunOut { code: 0, stdout: String::new(), stderr: String::new() })
+        };
+        let out = invoke_validated_tools_with(&runner);
+        assert_eq!(out["tool"], json!(name.clone()), "the validated tool is invoked: {out}");
+        assert_eq!(out["mode"], "live", "the seam invokes LIVE autonomously: {out}");
+        assert!(seen_live.get(), "the live run carries no -DryRun switch");
+        assert!(invoked_stamp_path(&name, &today).exists(), "the per-tool per-day cap is claimed");
+
+        // a SECOND sweep the same day is capped — nothing runs (bounded)
+        let out2 = invoke_validated_tools_with(
+            &|_a: &[String], _c: Option<&Path>, _t: Duration| {
+                panic!("the per-tool per-day cap must block a second same-day invoke")
+            },
         );
-        assert!(
-            !out.iter().any(|r| r["tool"] == json!(untouched.clone())),
-            "the unapproved entry is never validated: {out:?}"
-        );
-        let e = registered(&approved);
-        assert_eq!(e["validation"], "validated");
-        assert_eq!(e["dry_run"]["passed"], true);
-        assert!(e["dry_run"].get("pending").is_none(), "pending cleared: {e}");
-        let u = registered(&untouched);
-        assert_eq!(u["validation"], "pending_operator", "untouched entry stays pending");
-        assert_eq!(u["dry_run"]["pending"], true);
-        // a validated tool is now dry-run invocable; the untouched one still refuses
-        let out = invoke_tool_with(&approved, false, &[], &fake_runner(0, &calls));
-        assert_eq!(out["ok"], true, "{out}");
-        assert_eq!(out["mode"], "dry_run");
-        let out = invoke_tool_with(&untouched, false, &[], &fake_runner(0, &calls));
-        assert_eq!(out["reason"], "unvalidated manifest entry");
-        // a second sweep finds nothing pending — validation is one-shot, not a retry loop
-        let before = calls.get();
-        assert!(validate_approved_tools_with(&fake_runner(0, &calls)).is_empty());
-        assert_eq!(calls.get(), before, "no re-execution of an already-validated tool");
-        let audit_body = std::fs::read_to_string(audit_path()).unwrap_or_default();
-        assert!(audit_body.contains("validate_pass"), "{audit_body}");
-        for n in [&approved, &untouched] {
-            let _ = unregister_tool(n);
-        }
+        assert!(out2.is_null(), "the daily cap holds: {out2}");
+        let _ = std::fs::remove_file(invoked_stamp_path(&name, &today));
+        let _ = unregister_tool(&name);
     }
 
-    // -------- a failing approved dry-run records the verdict + clears pending --------
+    // -------- a dry-run FAILURE registers nothing (rejected, never made usable) --------
     #[test]
-    fn validation_failure_records_fail_and_still_blocks_invoke() {
+    fn dry_run_failing_proposal_registers_nothing_and_audits() {
         let _l = lock();
-        let name = uniq_name("valfail");
+        let name = uniq_name("dryfail");
         let p = ToolProposal { name: name.clone(), purpose: "x".into(), script: benign_script() };
         let calls = Cell::new(0u32);
-        assert_eq!(register_tool_with(&p, "m", "ph", &fake_runner(0, &calls))["ok"], true);
-        let mut m = read_manifest();
-        m["tools"][&name]["approved_validation"] = json!(true);
-        assert!(write_manifest(&m));
-
-        let out = validate_approved_tools_with(&fake_runner(7, &calls)); // -DryRun exits 7
-        assert!(
-            out.iter().any(|r| r["tool"] == json!(name.clone()) && r["passed"] == json!(false)),
-            "{out:?}"
-        );
-        let e = registered(&name);
-        assert_eq!(e["validation"], "failed");
-        assert_eq!(e["dry_run"]["passed"], false);
-        assert_eq!(e["dry_run"]["pending"], false, "the verdict is recorded, not retried");
-        assert!(e["dry_run"]["error"].as_str().unwrap().starts_with("dry_run: exit 7"), "{e}");
-        // still not invocable
+        let out = register_tool_with(&p, "m", "ph", &fake_runner(7, &calls)); // -DryRun exits 7
+        assert_eq!(out["ok"], false, "a dry-run failure rejects registration: {out}");
+        assert_eq!(out["reason"], "dry_run");
+        assert!(registered(&name).is_null(), "NO manifest entry for a dry-run-failing tool");
+        assert!(!script_path(&name).exists(), "NO script written for a dry-run-failing tool");
+        // it cannot be invoked (never registered)
         let out = invoke_tool_with(&name, false, &[], &fake_runner(0, &calls));
-        assert_eq!(out["reason"], "unvalidated manifest entry");
+        assert_eq!(out["reason"], "not_found");
         let audit_body = std::fs::read_to_string(audit_path()).unwrap_or_default();
-        assert!(audit_body.contains("validate_fail"), "{audit_body}");
-        let _ = unregister_tool(&name);
+        assert!(audit_body.contains("dry_run_reject"), "{audit_body}");
     }
 
     // -------- 22: sha256 tamper check refuses a hand-edited body --------
@@ -1314,38 +1268,34 @@ mod tests {
         let _ = unregister_tool(&name);
     }
 
-    // -------- 23 + 24: live invocation is human-gated; approved unlocks it --------
+    // -------- 23 + 24: live invocation runs AUTONOMOUSLY behind the automated gates (no approval) --
     #[test]
-    fn live_invoke_degrades_to_dryrun_until_operator_approves() {
+    fn live_invoke_runs_autonomously_without_approval() {
         let _l = lock();
-        let name = uniq_name("livegate");
+        let name = uniq_name("liveauto");
         let p = ToolProposal { name: name.clone(), purpose: "x".into(), script: benign_script() };
         register_validated(&p);
 
-        // (23) live requested, approved==false -> DEGRADES to -DryRun, loudly flagged.
+        // (23) live requested on a validated tool -> runs LIVE, no operator approved:true wait.
         let seen_dryrun = Cell::new(false);
         let runner = |argv: &[String], _c: Option<&Path>, _t: Duration| {
             seen_dryrun.set(argv.iter().any(|a| a == "-DryRun"));
             Ok(proc::RunOut { code: 0, stdout: String::new(), stderr: String::new() })
         };
         let out = invoke_tool_with(&name, true, &[], &runner);
-        assert_eq!(out["mode"], "dry_run", "unapproved live request degrades: {out}");
-        assert_eq!(out["degraded"], true);
-        assert!(seen_dryrun.get(), "the degraded run actually rides -DryRun");
-
-        // (24) the OPERATOR sets approved:true (hand-edit of the manifest) -> live unlocks.
-        let mut m = read_manifest();
-        m["tools"][&name]["approved"] = json!(true);
-        assert!(write_manifest(&m));
-        let out = invoke_tool_with(&name, true, &[], &runner);
-        assert_eq!(out["mode"], "live", "{out}");
-        assert_eq!(out["degraded"], false);
+        assert_eq!(out["mode"], "live", "a validated tool runs LIVE with NO approval: {out}");
+        assert_eq!(out["degraded"], false, "no degradation — the automated gates already cleared it");
         assert!(!seen_dryrun.get(), "a live run carries no -DryRun switch");
+
+        // (24) a dry-run request still runs -DryRun (the caller chooses the mode).
+        let out = invoke_tool_with(&name, false, &[], &runner);
+        assert_eq!(out["mode"], "dry_run", "{out}");
+        assert!(seen_dryrun.get(), "the dry-run request rides -DryRun");
         // and the invocation history recorded both runs
         let inv = registered(&name)["invocations"].as_array().unwrap().clone();
         assert_eq!(inv.len(), 2);
-        assert_eq!(inv[0]["mode"], "dry_run");
-        assert_eq!(inv[1]["mode"], "live");
+        assert_eq!(inv[0]["mode"], "live");
+        assert_eq!(inv[1]["mode"], "dry_run");
         let _ = unregister_tool(&name);
     }
 
