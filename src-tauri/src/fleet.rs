@@ -712,13 +712,12 @@ fn plan_jobs(
         // force-heal ladder still sees the full streak); only the job KIND changes.
         if kind == "proof_required" && proof_cooldown_active_at(st, &name, Utc::now()) {
             let cd = proof_cooldown_entry(st, &name).cloned().unwrap_or(Value::Null);
-            kind = "needs_human_spec".into();
-            state = "needs_human_spec".into();
+            kind = "needs_human_spec";
+            state = "needs_human_spec";
             requires_ai = false;
             reason = "lane hit PROOF_COOLDOWN_THRESHOLD consecutive proof_required sweeps without a \
-                      mutation; parked for a human spec — retry theater killed"
-                .into();
-            next_action = "review the blocker, spec a real fix, then wake the lane".into();
+                      mutation; parked for a human spec — retry theater killed";
+            next_action = "review the blocker, spec a real fix, then wake the lane";
             // Surface the cooldown in the job reason so the dashboard shows WHY it is parked.
             let _ = cd; // (the verdict's extra carries the diagnosis; the cooldown is in state)
         }
@@ -762,7 +761,7 @@ fn plan_jobs(
             let _ = proof(
                 &job,
                 "proof_required",
-                &reason,
+                reason,
                 Some(json!({"ops": ops_project})),
                 Some(repo),
             );
@@ -1519,8 +1518,7 @@ fn max_concurrent(cfg: &Value) -> i64 {
     cfg.get("max_concurrent_agent_calls")
         .and_then(Value::as_i64)
         .unwrap_or(1)
-        .max(1)
-        .min(2)
+        .clamp(1, 2)
 }
 
 fn cfg_targets(cfg: &Value) -> Vec<String> {
@@ -2482,7 +2480,7 @@ mod tests {
     /// (ratio, proof_count, implement_count). implement == 0 -> ratio is None (no denominator — the
     /// probe reports unobservable, not a fabricated green). Pure — the caller passes the event lines
     /// + the now boundary. This is the computation the `cmd`-kind ops.json probe runs via a thin
-    /// PowerShell wrapper (see ops.json solomon proof_ratio probe) AND the unit-tested pure core.
+    ///   PowerShell wrapper (see ops.json solomon proof_ratio probe) AND the unit-tested pure core.
     pub fn proof_implement_ratio(lines: &[&str], now: DateTime<Utc>) -> Option<f64> {
         let since = now - ChronoDuration::hours(24);
         let proof = count_job_finished(lines, since, now, "proof_required", "proof_required") as f64;
@@ -2572,7 +2570,7 @@ mod tests {
     fn proof_implement_ratio_green_at_1_to_1() {
         let now = Utc::now();
         // 1 proof_required, 1 implement shipped -> 1.0 -> GREEN (<=1.5).
-        let lines = vec![
+        let lines = [
             serde_json::to_string(&json!({
                 "event": "job_finished", "repo": "dotz", "job": "proof_required",
                 "outcome": "proof_required",
@@ -2616,7 +2614,7 @@ mod tests {
     fn proof_implement_ratio_excludes_events_outside_24h_window() {
         let now = Utc::now();
         // An old proof_required (30h ago) is OUTSIDE the 24h window; only the fresh ones count.
-        let lines = vec![
+        let lines = [
             serde_json::to_string(&json!({
                 "event": "job_finished", "repo": "dotz", "job": "proof_required",
                 "outcome": "proof_required",
