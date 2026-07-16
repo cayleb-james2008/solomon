@@ -58,6 +58,13 @@ pre-enforcement violation is instead acknowledged here and excluded from the gat
   non-AI proof_required at equal priority`. Touched `repos.json` without a provenance tag; landed
   before the gate was executed. New watched-file commits still require a tag — this list is
   append-only for genuinely historical commits, never a bypass for new ones.
+- `d4d73b3e69825c5621deb3b6142b9371ec0ce576` (`fleet: …`), `b85970f1f8f53abcef8d9eb186d77da90ee94b66`
+  (`perf: …`), `754e9b05d6ded9f751e005160e727aa3c05b5761` (`publish: …`),
+  `89aa5f6563d5bb166c7e45a91d12fb00c6966f3f` (`advisor(w4): …`) — 2026-07-13/15 RSI/advisor and
+  fleet-work commits that mutated `repos.json`/`actions.json` with non-conforming subject prefixes.
+  Already pushed to `origin/main`, so immutable; recorded here (not laundered) per the no-rewrite
+  rule. These are a symptom of a real process gap — the RSI/advisor commit path does not tag
+  watched-file commits — which must be fixed at the source so this list stops growing.
 
 ## Enforcement (WS5 tripwire)
 
