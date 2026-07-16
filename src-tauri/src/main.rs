@@ -64,7 +64,13 @@ async fn bridge(app: tauri::AppHandle, method: String, args: Vec<Value>) -> Resu
 /// reads: {ok, available, currentSha, version}. `currentSha` stays the same value `current_sha` shows
 /// (the checkout's short git sha) so the version label is unchanged. On any error: {ok:false, available:false}.
 async fn update_status(app: &tauri::AppHandle) -> Value {
-    let current_sha = api::dispatch("current_sha", &[]).unwrap_or(Value::Null);
+    // current_sha spawns git and waits on it — keep that wait on the blocking pool, never this
+    // async worker (the same rule the dispatch arm below follows; a hung git here would stall a
+    // runtime worker that also drives the watchdog/CEO ticks).
+    let current_sha =
+        tauri::async_runtime::spawn_blocking(|| api::dispatch("current_sha", &[]).unwrap_or(Value::Null))
+            .await
+            .unwrap_or(Value::Null);
     let updater = match app.updater() {
         Ok(u) => u,
         Err(_) => return json!({"ok": false, "available": false}),

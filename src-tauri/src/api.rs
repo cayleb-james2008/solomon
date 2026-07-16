@@ -305,13 +305,115 @@ fn ops_state() -> Value {
 /// git/gh call degrades ONLY that field (to its documented default) and never blanks the card or lies
 /// `running:false`. The control::* ports return Values rather than panicking, but the guard preserves
 /// app.py's `_safe(fn, default)` contract exactly (and shields a future panic in any delegate).
+///
+/// SUBPROCESS BUDGET: this is the 4s dashboard poll. Uncached it spawned `gh auth status` ×2 +
+/// `gh api user` + N×(~5 git + 1 `gh pr list`) per poll — a continuous ~5-10 proc/s churn that,
+/// with the GUI open all day, piled up dozens of concurrent gh.exe/git.exe children and starved
+/// the runtime (observed 2026-07-16: watchdog/CEO ticks frozen ~1h). gh auth is now behind a 60s
+/// TTL (gh_status_cached) and the per-repo fan-out behind a ~10s snapshot (repo_states_cached),
+/// so steady-state polling costs ZERO subprocess spawns.
 fn get_state(st: &AppState) -> Value {
     let repos = safe(registry::load_repos, Vec::new());
-    let gh_ready = safe(gh::gh_ready, false);
+    let (gh_ready, github) = gh_status_cached();
+    let out = repo_states_cached(&repos, gh_ready);
 
-    // Each repo's payload is independent — its own git/gh/fs probes, including a network `gh pr list`
-    // and ~5 git spawns. The old serial loop made one 4s dashboard refresh cost N×(those spawns).
-    // Fan out one thread per repo and collect IN ORDER: O(N×per_repo) -> O(per_repo).
+    let autopilot = safe(crate::fleet::state, Value::Null);
+    json!({
+        "repos": out,
+        "gh_ready": gh_ready,
+        "theme": st.get_theme(),
+        "auto_push": st.get_auto_push(),
+        "auto_ai_fix": st.get_auto_ai_fix(),
+        "providers": ["ollama-cloud", "openrouter"],
+        "keys": safe(keys::keys_status, json!({})),
+        "github": github,
+        "autopilot": autopilot.clone(),
+        "fleet": autopilot,
+    })
+}
+
+/// gh_ready + github_status behind one shared 60s-TTL cache. Uncached, EVERY poll spawned
+/// `gh auth status` twice (github_status recomputes gh_ready internally) plus `gh api user`.
+/// One github_status() per TTL now serves both fields — `gh_ready` is read out of the same
+/// payload the dashboard shows, so the two can never disagree within a window. Auth state
+/// changes (login/logout) surface within 60s, same order as gh's own credential prompts.
+fn gh_status_cached() -> (bool, Value) {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(Instant, Value)>> = Mutex::new(None);
+    let unpack =
+        |v: &Value| (v.get("ready").and_then(Value::as_bool).unwrap_or(false), v.clone());
+    if let Ok(g) = CACHE.lock() {
+        if let Some((t, v)) = g.as_ref() {
+            if t.elapsed() < Duration::from_secs(60) {
+                return unpack(v);
+            }
+        }
+    }
+    let status = safe(gh::github_status, json!({}));
+    if let Ok(mut g) = CACHE.lock() {
+        *g = Some((Instant::now(), status.clone()));
+    }
+    unpack(&status)
+}
+
+/// (stamped_at, registry input, computed payload) for get_state's per-repo fan-out. Module-level
+/// so mutating dispatch arms can drop it via [`invalidate_repo_snapshot`].
+#[allow(clippy::type_complexity)]
+static REPO_SNAPSHOT: std::sync::Mutex<Option<(std::time::Instant, Vec<Value>, Vec<Value>)>> =
+    std::sync::Mutex::new(None);
+
+/// Dispatch methods that only READ state — the get_state snapshot survives them. Every method not
+/// listed here drops it (see dispatch), so a future mutator invalidates by default.
+const SNAPSHOT_READ_ONLY_METHODS: &[&str] = &[
+    "get_state",
+    "ops_state",
+    "autopilot_state",
+    "fleet_state",
+    "cached_update_status",
+    "current_sha",
+    "get_theme",
+    "get_auto_push",
+    "get_auto_ai_fix",
+    "get_layout",
+    "read_log",
+    "read_history",
+    "read_contract",
+    "metrics",
+    "read_supervisor_log",
+    "read_escalation",
+    "app_test_state",
+    "app_test_frame",
+    "read_app_test_report",
+    "pr_diff",
+];
+
+/// Drop the get_state repo snapshot so the NEXT poll recomputes. Called by dispatch for every
+/// non-read-only method — a Start/Stop/merge/config edit must never be answered with a ≤10s-stale
+/// `running`/`prs` view on the poll that immediately follows the click.
+fn invalidate_repo_snapshot() {
+    if let Ok(mut g) = REPO_SNAPSHOT.lock() {
+        *g = None;
+    }
+}
+
+/// The per-repo fan-out behind a ~10s snapshot cache. Each repo_state costs ~5 git spawns plus a
+/// network `gh pr list`; at a 4s poll cadence that is a permanent multi-process/second churn, so
+/// one fan-out per TTL serves the polls in between. The snapshot is bypassed when the registry
+/// content changes (add/edit/remove of a repo shows up on the very next poll) and dropped by
+/// [`invalidate_repo_snapshot`] on mutating dispatch methods. The diagnose/note_healthy
+/// re-observation side effect inside repo_state now runs at ≤10s cadence instead of 4s — still
+/// far more frequent than the watchdog sweep it backs up.
+fn repo_states_cached(repos: &[Value], gh_ready: bool) -> Vec<Value> {
+    use std::time::Instant;
+    if let Ok(g) = REPO_SNAPSHOT.lock() {
+        if let Some(out) = snapshot_hit(&g, repos) {
+            return out;
+        }
+    }
+    // Each repo's payload is independent — its own git/gh/fs probes. The old serial loop made one
+    // refresh cost N×(those spawns) in wall-clock; fan out one thread per repo and collect IN
+    // ORDER: O(N×per_repo) -> O(per_repo).
     // ponytail: one OS thread per repo (unbounded); cap with a small pool if the repo count grows large.
     let objs: Vec<&Value> = repos.iter().filter(|r| r.is_object()).collect();
     let out: Vec<Value> = std::thread::scope(|scope| {
@@ -323,20 +425,28 @@ fn get_state(st: &AppState) -> Value {
             .filter(|v| !v.is_null())
             .collect()
     });
+    if let Ok(mut g) = REPO_SNAPSHOT.lock() {
+        *g = Some((Instant::now(), repos.to_vec(), out.clone()));
+    }
+    out
+}
 
-    let autopilot = safe(crate::fleet::state, Value::Null);
-    json!({
-        "repos": out,
-        "gh_ready": gh_ready,
-        "theme": st.get_theme(),
-        "auto_push": st.get_auto_push(),
-        "auto_ai_fix": st.get_auto_ai_fix(),
-        "providers": ["ollama-cloud", "openrouter"],
-        "keys": safe(keys::keys_status, json!({})),
-        "github": safe(gh::github_status, json!({})),
-        "autopilot": autopilot.clone(),
-        "fleet": autopilot,
-    })
+/// The pure serve-from-snapshot decision behind [`repo_states_cached`]: the cached payload is
+/// served ONLY while young (<10s) AND computed from byte-identical registry input. Extracted from
+/// the static so the tests can exercise it without racing other tests' dispatch-driven
+/// invalidations.
+fn snapshot_hit(
+    g: &Option<(std::time::Instant, Vec<Value>, Vec<Value>)>,
+    repos: &[Value],
+) -> Option<Vec<Value>> {
+    match g {
+        Some((t, input, out))
+            if t.elapsed() < std::time::Duration::from_secs(10) && input == repos =>
+        {
+            Some(out.clone())
+        }
+        _ => None,
+    }
 }
 
 /// The diagnose() fallback used by `repo_state` when `supervisor::diagnose` panics (caught by
@@ -544,6 +654,17 @@ pub fn bridge_surface() -> Vec<&'static str> {
 pub fn dispatch(method: &str, args: &[Value]) -> Result<Value, String> {
     // A fresh load per dispatch: disk (.solomon.json) is the source of truth (see module note).
     let mut st = AppState::load();
+
+    // Every method OUTSIDE the read-only set may mutate what the repo cards show (running, prs,
+    // escalation, config, worktrees, …) — drop the ≤10s get_state snapshot BEFORE handling it so
+    // the poll that follows the click recomputes instead of echoing the pre-action view. Allowlist
+    // (not a mutator blocklist) so a future method fails SAFE: forgetting to list a new read-only
+    // poller costs one extra fan-out, never a stale dashboard after an action.
+    // (This sits above the `match method` head on purpose — the arm-parsing closure test scans
+    // only the match body.)
+    if !SNAPSHOT_READ_ONLY_METHODS.contains(&method) {
+        invalidate_repo_snapshot();
+    }
 
     let v: Value = match method {
         // ---- in-app updater --------------------------------------------
@@ -1584,5 +1705,59 @@ mod tests {
             json!({"ok": true})
         );
         assert_eq!(dispatch("get_layout", &[]).unwrap(), layout);
+    }
+
+    // -------- get_state subprocess-churn caches --------
+    // The 4s dashboard poll must serve gh auth + per-repo git state from short-TTL caches, not
+    // fresh gh.exe/git.exe spawns (2026-07-16: uncached polling starved the runtime for ~1h).
+    // snapshot_hit is the pure serve-or-recompute decision; these pin its three exits without
+    // touching the REPO_SNAPSHOT static (other tests' dispatch calls invalidate it concurrently).
+
+    #[test]
+    fn snapshot_hit_serves_fresh_matching_input() {
+        let input = vec![json!({"name": "x"})];
+        let payload = vec![json!({"name": "x", "sentinel": true})];
+        let g = Some((std::time::Instant::now(), input.clone(), payload.clone()));
+        assert_eq!(snapshot_hit(&g, &input), Some(payload));
+    }
+
+    #[test]
+    fn snapshot_hit_bypassed_when_registry_input_changes() {
+        // A repo add/edit/remove must show on the very NEXT poll, not after the TTL.
+        let cached_input = vec![json!({"name": "x"})];
+        let g = Some((
+            std::time::Instant::now(),
+            cached_input,
+            vec![json!({"name": "x"})],
+        ));
+        let new_input = vec![json!({"name": "x"}), json!({"name": "y"})];
+        assert_eq!(snapshot_hit(&g, &new_input), None);
+        assert_eq!(snapshot_hit(&None, &new_input), None); // invalidated/empty cache recomputes
+    }
+
+    #[test]
+    fn snapshot_hit_expires_after_ttl() {
+        let input = vec![json!({"name": "x"})];
+        // A stamp older than the 10s TTL — checked_sub instead of arithmetic so a platform with a
+        // small Instant epoch can't panic; skip (vacuously pass) if the clock can't go back 11s.
+        let Some(old) = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(11))
+        else {
+            return;
+        };
+        let g = Some((old, input.clone(), vec![json!({"name": "x"})]));
+        assert_eq!(snapshot_hit(&g, &input), None);
+    }
+
+    #[test]
+    fn read_only_snapshot_allowlist_names_real_dispatch_methods() {
+        // The allowlist is fail-safe by construction (an unlisted method just over-invalidates),
+        // but a typo'd/renamed entry would silently stop exempting a poller — pin every listed
+        // name to the API_METHODS registry.
+        for m in SNAPSHOT_READ_ONLY_METHODS {
+            assert!(
+                API_METHODS.contains(m),
+                "SNAPSHOT_READ_ONLY_METHODS entry {m:?} is not a dispatch method"
+            );
+        }
     }
 }
