@@ -13,6 +13,12 @@
 //!     (a dict keyed `id:platform`, entries carrying `published_at` + `url`)
 //!   - a project with a `sqlite_query` probe: that probe's `db` is the finance database
 //!     (asmodeus schema: equity / trades / venue_fills), opened READ-ONLY like every ops probe
+//!   - a project with a `growth_publish*` probe: that probe's `file` is the growth auto-publish
+//!     marker (`runtime/<lane>/_growth_published`, written by growth.rs on every dispatch); a
+//!     `growth_artifact*` probe's `file` is the sanctioned lane's produced-artifact glob (release
+//!     installer) — together the MEASURE leg of the compose -> publish -> measure loop, so a
+//!     maki/dotz growth experiment lands in the outcomes ledger the critique planes read, not
+//!     only in sover's post registry
 //!
 //! `evening summary` appends one line per day to `runtime/outcomes.jsonl` (append-only) — the
 //! honest daily record the CEO rhythm plans against and the Asmodeus profit-milestone reads from.
@@ -164,6 +170,78 @@ pub fn finance_activity(db: &Path, now: DateTime<Utc>) -> Value {
     })
 }
 
+/// Growth-publish MEASURE leg from the auto-publish marker (`runtime/<lane>/_growth_published`,
+/// written by `growth::write_published_marker` on every dispatch: `{signature, published, mode,
+/// ts}`): whether a LIVE publish landed inside the window, the mode of the last dispatch, and its
+/// timestamp. Missing/corrupt marker -> nulls + a scoped `growth_publish_unobservable` note
+/// (never a fake zero — a lane that never dispatched must read as unmeasured, the same honesty
+/// rule as `posts_activity`).
+pub fn growth_publish_activity(marker: &Path, now: DateTime<Utc>) -> Value {
+    let data: Option<Value> = std::fs::read(marker)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok());
+    let rec = match data {
+        Some(v) => v,
+        None => {
+            return json!({
+                "growth_published_24h": Value::Null,
+                "growth_publish_mode": Value::Null,
+                "last_growth_publish_at": Value::Null,
+                "growth_publish_unobservable":
+                    format!("missing/unparsable marker {}", marker.display()),
+            })
+        }
+    };
+    let ts = probe::parse_ts(rec.get("ts").unwrap_or(&Value::Null));
+    let published = rec.get("published").and_then(Value::as_bool).unwrap_or(false);
+    let cutoff = now - Duration::seconds(WINDOW_S);
+    let in_window = ts.map(|t| t >= cutoff).unwrap_or(false);
+    json!({
+        // the marker holds only the LAST dispatch; the per-lane-per-day cap means 0/1 is exact
+        "growth_published_24h": if published && in_window { 1 } else { 0 },
+        "growth_publish_mode": rec.get("mode").cloned().unwrap_or(Value::Null),
+        "last_growth_publish_at": ts.map(fmt),
+    })
+}
+
+/// Produced-artifact EVIDENCE for a sanctioned publish lane: the newest file matching `glob`
+/// (single `*` in the filename component, mirroring the `file_age` probe's minimal glob — e.g.
+/// maki's `bundle/nsis/Maki_*_x64-setup.exe`, whose NAME carries the version) + its mtime. A
+/// publish claim without a matching artifact is a claim without evidence (the June 30 empty-url
+/// lesson, applied to installers). No matches -> present:false with null name/mtime.
+pub fn growth_artifact_activity(glob: &Path) -> Value {
+    let newest = newest_glob_match(glob);
+    json!({
+        "growth_artifact_present": newest.is_some(),
+        "growth_artifact_newest": newest.as_ref().map(|(n, _)| n.clone()),
+        "growth_artifact_mtime": newest.map(|(_, m)| fmt(DateTime::<Utc>::from(m))),
+    })
+}
+
+/// Newest `(file_name, mtime)` among `glob`'s matches — the same deliberately-minimal one-`*`
+/// filename glob as `probe::newest_mtime`, returning the NAME too (the version evidence). Literal
+/// paths (no `*`) resolve to themselves. None on missing dir / no matches / unreadable metadata.
+fn newest_glob_match(glob: &Path) -> Option<(String, std::time::SystemTime)> {
+    let name = glob.file_name()?.to_string_lossy().into_owned();
+    let Some(star) = name.find('*') else {
+        let m = std::fs::metadata(glob).and_then(|m| m.modified()).ok()?;
+        return Some((name, m));
+    };
+    let (prefix, suffix) = (&name[..star], &name[star + 1..]);
+    let mut newest: Option<(String, std::time::SystemTime)> = None;
+    for e in std::fs::read_dir(glob.parent()?).ok()?.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if n.starts_with(prefix) && n.ends_with(suffix) && n.len() >= prefix.len() + suffix.len() {
+            if let Ok(m) = e.metadata().and_then(|md| md.modified()) {
+                if newest.as_ref().map(|(_, cur)| m > *cur).unwrap_or(true) {
+                    newest = Some((n, m));
+                }
+            }
+        }
+    }
+    newest
+}
+
 // --------------------------------------------------------------------------- //
 // snapshot
 // --------------------------------------------------------------------------- //
@@ -194,6 +272,25 @@ pub fn project_outcomes(entry: &Value, now: DateTime<Utc>) -> Value {
         if id.starts_with("publish_recency") && !out.contains_key("posts_24h") {
             if let Some(f) = cfg.get("file").and_then(Value::as_str) {
                 if let Value::Object(m) = posts_activity(&registry::resolve_path(f, &repo_path), now) {
+                    out.extend(m);
+                }
+            }
+        } else if id.starts_with("growth_publish") && !out.contains_key("growth_published_24h") {
+            // The growth MEASURE leg (2026-07-17): the probe's file is the lane's auto-publish
+            // marker — mirrored into the outcomes ledger so the compose -> publish -> measure loop
+            // closes for lanes (maki/dotz) whose publishes never touch a post registry.
+            if let Some(f) = cfg.get("file").and_then(Value::as_str) {
+                if let Value::Object(m) =
+                    growth_publish_activity(&registry::resolve_path(f, &repo_path), now)
+                {
+                    out.extend(m);
+                }
+            }
+        } else if id.starts_with("growth_artifact") && !out.contains_key("growth_artifact_present") {
+            if let Some(f) = cfg.get("file").and_then(Value::as_str) {
+                if let Value::Object(m) =
+                    growth_artifact_activity(&registry::resolve_path(f, &repo_path))
+                {
                     out.extend(m);
                 }
             }
@@ -378,6 +475,92 @@ mod tests {
         assert!(got["unobservable"].as_str().unwrap().contains("missing db"));
     }
 
+    // -------- growth_publish_activity (the maki/dotz MEASURE leg) --------
+    #[test]
+    fn growth_publish_activity_measures_live_window_and_mode() {
+        let now = Utc::now();
+        let p = temp_file("gp_marker");
+        // a fresh LIVE publish inside the window -> measured 1
+        std::fs::write(
+            &p,
+            serde_json::to_string(&json!({
+                "signature": "2026-07-16\trsi: growth DRAFT ...",
+                "published": true, "mode": "live",
+                "ts": fmt(now - Duration::seconds(3600)),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let got = growth_publish_activity(&p, now);
+        assert_eq!(got["growth_published_24h"], json!(1));
+        assert_eq!(got["growth_publish_mode"], json!("live"));
+        assert!(got["last_growth_publish_at"].is_string());
+        assert!(got.get("growth_publish_unobservable").is_none());
+        // a dry-run / not-opted-in dispatch is NOT a publish (dotz's mode "not_opted_in")
+        std::fs::write(
+            &p,
+            serde_json::to_string(&json!({
+                "published": false, "mode": "not_opted_in",
+                "ts": fmt(now - Duration::seconds(3600)),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let got = growth_publish_activity(&p, now);
+        assert_eq!(got["growth_published_24h"], json!(0));
+        assert_eq!(got["growth_publish_mode"], json!("not_opted_in"));
+        // a live publish OUTSIDE the window counts 0 but keeps the honest last-at timestamp
+        std::fs::write(
+            &p,
+            serde_json::to_string(&json!({
+                "published": true, "mode": "live",
+                "ts": fmt(now - Duration::seconds(2 * WINDOW_S)),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let got = growth_publish_activity(&p, now);
+        assert_eq!(got["growth_published_24h"], json!(0));
+        assert!(got["last_growth_publish_at"].is_string());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn growth_publish_activity_missing_marker_is_unobservable_not_zero() {
+        let got = growth_publish_activity(Path::new("Z:/absent/_growth_published"), Utc::now());
+        assert_eq!(got["growth_published_24h"], Value::Null); // null, never a fake zero
+        assert!(got["growth_publish_unobservable"]
+            .as_str()
+            .unwrap()
+            .contains("missing/unparsable"));
+    }
+
+    // -------- growth_artifact_activity (produced-artifact evidence) --------
+    #[test]
+    fn growth_artifact_activity_finds_newest_versioned_installer() {
+        let dir = temp_file("gp_artifacts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Maki_2.0.0_x64-setup.exe"), b"old").unwrap();
+        std::fs::write(dir.join("unrelated.txt"), b"x").unwrap();
+        let newer = dir.join("Maki_2.1.0_x64-setup.exe");
+        std::fs::write(&newer, b"new").unwrap();
+        // ensure a strictly newer mtime regardless of fs timestamp granularity
+        let t = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        let _ = filetime::set_file_mtime(&newer, filetime::FileTime::from_system_time(t));
+        let got = growth_artifact_activity(&dir.join("Maki_*_x64-setup.exe"));
+        assert_eq!(got["growth_artifact_present"], json!(true));
+        // the newest match's NAME is the version evidence
+        assert_eq!(got["growth_artifact_newest"], json!("Maki_2.1.0_x64-setup.exe"));
+        assert!(got["growth_artifact_mtime"].is_string());
+        // no matches / missing dir -> honest absence, never a panic
+        let none = growth_artifact_activity(&dir.join("Other_*_setup.exe"));
+        assert_eq!(none["growth_artifact_present"], json!(false));
+        assert_eq!(none["growth_artifact_newest"], Value::Null);
+        let gone = growth_artifact_activity(Path::new("Z:/absent/dir/A_*_setup.exe"));
+        assert_eq!(gone["growth_artifact_present"], json!(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // -------- project_outcomes source discovery --------
     #[test]
     fn project_outcomes_discovers_posts_source_from_publish_recency_probe() {
@@ -404,8 +587,45 @@ mod tests {
         assert_eq!(got["posts_24h"], json!(1));
         // no sqlite probe -> no finance keys at all (absent, not null-noise)
         assert!(got.get("equity_usd").is_none());
+        // no growth probes -> no growth keys either
+        assert!(got.get("growth_published_24h").is_none());
+        assert!(got.get("growth_artifact_present").is_none());
         // lane history for an unknown lane -> zeros
         assert_eq!(got["iterations_24h"], json!(0));
         let _ = std::fs::remove_file(&reg);
+    }
+
+    #[test]
+    fn project_outcomes_discovers_growth_measure_sources_from_growth_probes() {
+        let now = Utc::now();
+        let marker = temp_file("disc_gp_marker");
+        std::fs::write(
+            &marker,
+            serde_json::to_string(&json!({
+                "published": true, "mode": "live", "ts": fmt(now - Duration::seconds(60)),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let dir = temp_file("disc_gp_art");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("App_1.0_setup.exe"), b"a").unwrap();
+        let entry = json!({
+            "name": "ledger_gp_disc_test",
+            "priority": 5,
+            "probes": [
+                {"id": "growth_publish_recency", "kind": "json_field",
+                 "file": marker.to_string_lossy(), "path": "ts", "mode": "age"},
+                {"id": "growth_artifact_fresh", "kind": "file_age",
+                 "file": dir.join("App_*_setup.exe").to_string_lossy()}
+            ]
+        });
+        let got = project_outcomes(&entry, now);
+        assert_eq!(got["growth_published_24h"], json!(1));
+        assert_eq!(got["growth_publish_mode"], json!("live"));
+        assert_eq!(got["growth_artifact_present"], json!(true));
+        assert_eq!(got["growth_artifact_newest"], json!("App_1.0_setup.exe"));
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
