@@ -68,6 +68,10 @@ struct Job {
     requires_ai: bool,
     reason: String,
     next_action: String,
+    /// True iff this implement job is an autonomous diversification (re-spec) attempt. `once()`
+    /// charges the lane's per-day diversify budget when THIS job actually dispatches (job_started)
+    /// — plan_jobs only routes on the count and never spends (see charge_diversify_dispatch).
+    diversify: bool,
 }
 
 struct AutopilotLease {
@@ -237,6 +241,12 @@ pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
 
     st["active"] = job_value(&job);
     st["last_dispatched"] = json!(job.name.clone());
+    // Diversify budget is charged HERE, at actual dispatch — a planned re-spec that lost the
+    // single_agent slot costs nothing (plan-time bumping read 3/3 spent on a day with ZERO
+    // job_started events for the starved lanes; see the Job.diversify doc).
+    if job.diversify {
+        charge_diversify_dispatch(&mut st, &job.name);
+    }
     let _ = write_state(&st);
     append_event(
         &json!({"event": "job_started", "repo": job.name, "kind": job.kind, "requires_ai": job.requires_ai}),
@@ -575,6 +585,7 @@ fn plan_jobs(
                 requires_ai: false,
                 reason: "repo is listed in autopilot targets but missing from registry".into(),
                 next_action: "fix repos.json target/path".into(),
+                diversify: false,
             });
             continue;
         };
@@ -587,7 +598,7 @@ fn plan_jobs(
         }
         let mut diag = supervisor::diagnose(repo);
         // STALE-ERROR REVALIDATION (dispatch path only): a persisted heartbeat error of a
-        // re-checkable git-state class (dirty tree / out-of-band base / stranded branch) is
+        // re-checkable class (dirty tree / out-of-band base / stranded branch / gh-auth) is
         // re-run against the repo before the scheduler routes on it — a condition that no longer
         // reproduces is cleared to idle (the 2026-07-15 solomon self-lane wedge: 'controller tree
         // dirty — 3 commit(s) not on origin/main' persisted a day past main==origin/main, parking
@@ -700,14 +711,22 @@ fn plan_jobs(
         // Holds the diversify/backoff reason string; assigned (and `reason` re-pointed at it) only on
         // the would_park path, so it must outlive the borrow until `jobs.push` below.
         let diversify_reason: String;
+        // Marks the pushed job as a diversify attempt so `once()` charges the budget at ACTUAL
+        // dispatch (job_started). Planning must NOT spend: plan_jobs runs 2x per sweep (dispatch +
+        // display re-plan) and every state() poll, while only ONE planned job wins the single_agent
+        // slot — plan-time bumping burned 3/3 with ZERO job_started events for the lane (the
+        // 2026-07-17 asmodeus+solomon ~20h proof_required starvation).
+        let mut diversify_job = false;
         let would_park = kind == "proof_required"
             && (supervisor::is_structurally_stuck(diag_cat)
                 || proof_cooldown_active_at(st, &name, Utc::now()));
         if would_park {
             let today = today_local();
             if diversify_count(st, &name, &today) < DIVERSIFY_DAILY_CAP {
-                bump_diversify_count(st, &name, &today);
-                let n = diversify_count(st, &name, &today);
+                // n = the attempt number IF this job dispatches; the count itself is only bumped
+                // by charge_diversify_dispatch when once() actually starts the job.
+                let n = diversify_count(st, &name, &today) + 1;
+                diversify_job = true;
                 kind = "implement";
                 state = "queued";
                 requires_ai = true;
@@ -768,6 +787,7 @@ fn plan_jobs(
                 requires_ai: false,
                 reason: reason.to_string(),
                 next_action: next_action.to_string(),
+                diversify: false,
             };
             let _ = proof(
                 &job,
@@ -792,6 +812,7 @@ fn plan_jobs(
             requires_ai,
             reason: reason.into(),
             next_action: next_action.into(),
+            diversify: diversify_job,
         });
     }
     jobs.sort_by(|a, b| {
@@ -1315,6 +1336,15 @@ fn diversify_count(st: &Value, name: &str, today: &str) -> u64 {
         .filter(|e| e.get("date").and_then(Value::as_str) == Some(today))
         .and_then(|e| e.get("count").and_then(Value::as_u64))
         .unwrap_or(0)
+}
+
+/// Charge ONE unit of the lane's per-day diversification budget — called by `once()` when a
+/// diversify job ACTUALLY dispatches (the job_started event), never at plan time. plan_jobs only
+/// READS the count to route; a planned re-spec that loses the single_agent dispatch slot must not
+/// consume budget (2026-07-17 starvation: asmodeus+solomon read 3/3 spent on a day with zero
+/// job_started events because plan_jobs bumped on every dispatch/display/state() plan).
+fn charge_diversify_dispatch(st: &mut Value, name: &str) {
+    bump_diversify_count(st, name, &today_local());
 }
 
 /// Increment (or start, resetting on a new day) the lane's diversification count for `today`. Bounds
@@ -2285,8 +2315,8 @@ mod tests {
         );
         assert_eq!(
             diversify_count(&st, &name, &today_local()),
-            1,
-            "the diversification consumed one of the per-day budget"
+            0,
+            "PLANNING consumes nothing — the budget is charged at actual dispatch (job_started)"
         );
         assert!(
             !jobs.iter().any(|j| j.kind == "needs_human_spec"),
@@ -2418,8 +2448,8 @@ mod tests {
         );
         assert_eq!(
             diversify_count(&st, &stuck, &today_local()),
-            1,
-            "the structural diversification consumed one of the per-day budget"
+            0,
+            "PLANNING the structural diversification consumes nothing — charged at dispatch"
         );
         assert!(
             !jobs.iter().any(|j| j.kind == "needs_human_spec"),
@@ -2504,16 +2534,20 @@ mod tests {
         let ops = json!({"projects": {}});
         let mut st = json!({"manual_queue": []});
 
-        // The first DIVERSIFY_DAILY_CAP dispatch sweeps each DIVERSIFY (a gated AI implement attempt).
+        // The first DIVERSIFY_DAILY_CAP dispatch sweeps each DIVERSIFY (a gated AI implement
+        // attempt). Each sweep plans the job, then the dispatch charge (`once()`'s job_started
+        // path — same charge_diversify_dispatch seam) consumes one budget unit.
         for i in 1..=DIVERSIFY_DAILY_CAP {
             let jobs = plan_jobs(&repos, &cfg, &ops, &mut st, None, true);
             let job = jobs.iter().find(|j| j.name == parked).expect("diversify job planned");
             assert_eq!(job.kind, "implement", "sweep {i} diversifies (gated AI attempt): {job:?}");
             assert!(job.requires_ai);
+            assert!(job.diversify, "the planned job is marked for the dispatch-time charge");
+            charge_diversify_dispatch(&mut st, &parked); // the job WON the slot and dispatched
             assert_eq!(
                 diversify_count(&st, &parked, &today_local()),
                 i,
-                "the per-day budget is consumed monotonically"
+                "each ACTUAL dispatch consumes exactly one budget unit"
             );
             assert!(
                 !jobs.iter().any(|j| j.kind == "needs_human_spec"),
@@ -2544,6 +2578,63 @@ mod tests {
         assert!(job.reason.contains("backing off"), "the backoff is explicit: {}", job.reason);
 
         let _ = std::fs::remove_dir_all(parked_rt);
+    }
+
+    // PLANNED-BUT-UNDISPATCHED re-spec does NOT consume budget (2026-07-17 starvation root cause):
+    // plan_jobs runs on the dispatch sweep, the display re-plan, AND every state() poll, but only
+    // ONE planned job wins the single_agent slot. Plan-time bumping burned the whole 3/day budget
+    // (asmodeus+solomon read 3/3 on a day with ZERO job_started events for those lanes), wedging
+    // both lanes in the proof_required backoff for ~20h. The budget must move only when the job
+    // actually dispatches.
+    #[test]
+    fn planned_but_undispatched_re_spec_does_not_consume_budget() {
+        let lane = format!("undispatched_lane_{}", std::process::id());
+        let repo = json!({"name": lane.clone(), "path": format!("C:/p/{lane}")});
+        let rt = paths::runtime_dir(&repo).unwrap();
+        let _ = std::fs::remove_dir_all(&rt);
+        std::fs::create_dir_all(&rt).unwrap();
+        std::fs::write(rt.join("stop"), "stranded_unmerged_branch_persistent\n").unwrap();
+        std::fs::write(
+            rt.join("heartbeat.json"),
+            serde_json::to_string(&json!({
+                "status": "error",
+                "phase": "preflight",
+                "reason": "stranded_unmerged_branch_persistent",
+                "last_summary": "Stranded finished work: rsi/iter-x (+1 commit(s) not on main) — not an ancestor of the fork base.",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let cfg = json!({"provider": "openrouter", "targets": [lane.clone()]});
+        let repos = [repo];
+        let ops = json!({"projects": {}});
+        let mut st = json!({"manual_queue": []});
+
+        // Many dispatch-path plans where the lane LOSES the single_agent slot every time (no
+        // charge): the budget must stay untouched and the re-spec must keep re-planning as the
+        // SAME first attempt — not silently exhaust to 3/3 with zero dispatches.
+        for sweep in 1..=2 * DIVERSIFY_DAILY_CAP {
+            let jobs = plan_jobs(&repos, &cfg, &ops, &mut st, None, true);
+            let job = jobs.iter().find(|j| j.name == lane).expect("re-spec job planned");
+            assert_eq!(job.kind, "implement", "sweep {sweep} still plans the re-spec: {job:?}");
+            assert!(job.diversify);
+            assert!(
+                job.reason.contains(&format!("1/{DIVERSIFY_DAILY_CAP}")),
+                "the attempt number does not advance while undispatched: {}",
+                job.reason
+            );
+            assert_eq!(
+                diversify_count(&st, &lane, &today_local()),
+                0,
+                "sweep {sweep}: a planned-but-undispatched re-spec consumes NO budget"
+            );
+        }
+        // The lane finally wins the slot once — exactly one unit is charged.
+        charge_diversify_dispatch(&mut st, &lane);
+        assert_eq!(diversify_count(&st, &lane, &today_local()), 1);
+
+        let _ = std::fs::remove_dir_all(rt);
     }
 
     // ===================================================================== #

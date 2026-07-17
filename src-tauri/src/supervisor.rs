@@ -652,22 +652,30 @@ pub fn is_structurally_stuck(category: &str) -> bool {
     )
 }
 
-/// True iff `category` names a RE-CHECKABLE persisted heartbeat error: a git-state condition
-/// (dirty tree, out-of-band/un-pushed base, untracked files blocking the clean, a stranded rsi/*
-/// branch) whose CURRENT truth can be cheaply re-derived from the repo itself. These are the
+/// True iff `category` names a RE-CHECKABLE persisted heartbeat error: a condition (dirty tree,
+/// out-of-band/un-pushed base, untracked files blocking the clean, a stranded rsi/* branch, a
+/// gh-auth/origin failure) whose CURRENT truth can be cheaply re-derived live. These are the
 /// stale-error wedge class: the error heartbeat is written once by the loop's preflight and then
 /// persists forever because only a RUNNING loop rewrites heartbeat.json — after the operator (or
-/// another agent) fixes the underlying git state, diagnose() keeps re-asserting the corpse and the
+/// another agent) fixes the underlying state, diagnose() keeps re-asserting the corpse and the
 /// autopilot parks the lane on it (the 2026-07-15 solomon self-lane 'controller tree dirty — 3
-/// commit(s) not on origin/main' persisted a full day past main==origin/main). NOT in this set:
-/// process conditions (stale_lock/stuck — the lock/PID files ARE current truth), config conditions
-/// (needs_goal/no_key — cleared by the config write path), provider conditions (quota_error — owns
-/// its own cooldown), and persistent_self_stop (the watchdog's `persistent_stop_cleared` already
-/// re-observes those reason markers each sweep).
+/// commit(s) not on origin/main' persisted a full day past main==origin/main; the 2026-07-16
+/// asmodeus 'gh not authenticated' from a run that died in 10s persisted ~20h past `gh auth
+/// status` verifying green). `gh_not_ready` is in the set because its writer's probe
+/// (`ctx.github_ready`: gh auth + origin reachable) is re-runnable in seconds and the condition
+/// routinely heals out-of-band (a keyring re-login) without the dead loop ever rewriting the
+/// heartbeat. NOT in this set: process conditions (stale_lock/stuck — the lock/PID files ARE
+/// current truth), config conditions (needs_goal/no_key — cleared by the config write path),
+/// provider conditions (quota_error — owns its own cooldown), and persistent_self_stop (the
+/// watchdog's `persistent_stop_cleared` already re-observes those reason markers each sweep).
 pub fn is_recheckable_stale_error(category: &str) -> bool {
     matches!(
         category,
-        "dirty_tree" | "base_out_of_band" | "untracked_refusal" | "stranded_unmerged_branch"
+        "dirty_tree"
+            | "base_out_of_band"
+            | "untracked_refusal"
+            | "stranded_unmerged_branch"
+            | "gh_not_ready"
     )
 }
 
@@ -689,10 +697,28 @@ pub fn is_recheckable_stale_error(category: &str) -> bool {
 ///   * stranded_unmerged_branch → [`stranded_guard_still_blocks`], the stale-fork guard re-run
 ///     with FAIL-CLOSED semantics (an unreadable branch keeps the park; detection's fail-open
 ///     skip is only safe when the outcome is 'do not block', never when it is 'clear the stop').
+///   * gh_not_ready → [`gh_origin_recheck_ok`], the writer's own probe (`ctx.github_ready`: live
+///     `gh auth status` + `git ls-remote --heads origin`) re-run FAIL-CLOSED — the 2026-07-16
+///     asmodeus wedge: a 10s-dead run persisted 'gh not authenticated' ~20h past a green
+///     `gh auth status` because this class was not re-checkable.
 ///
 /// Called from `recover()` (watchdog sweeps) and from the autopilot dispatch path
-/// (`fleet::plan_jobs`, emit_proofs only) so a healed lane unwedges within one sweep of either.
+/// (`fleet::plan_jobs`, emit_proofs only — which iterates PARKED proof_required lanes too, so a
+/// stale error on a parked lane clears at diagnosis time) so a healed lane unwedges within one
+/// sweep of either.
 pub fn revalidate_persisted_error(repo: &Value, diag: &Value) -> Option<Value> {
+    revalidate_persisted_error_inner(repo, diag, &gh_origin_recheck_ok)
+}
+
+/// Decision core of the revalidation with the gh-auth probe injected (`gh_recheck(path) -> healed`)
+/// so tests can drive the gh_not_ready arm deterministically without a live keyring/network — same
+/// seam style as `watchdog::autopilot_recover_pass_inner`. Production passes
+/// [`gh_origin_recheck_ok`]; every other arm shells its own probe directly.
+fn revalidate_persisted_error_inner(
+    repo: &Value,
+    diag: &Value,
+    gh_recheck: &dyn Fn(&str) -> bool,
+) -> Option<Value> {
     let cat = diag
         .get("category")
         .and_then(Value::as_str)
@@ -715,6 +741,7 @@ pub fn revalidate_persisted_error(repo: &Value, diag: &Value) -> Option<Value> {
             crate::provenance::controller_clean_at(std::path::Path::new(&path), &base).is_ok()
         }
         "stranded_unmerged_branch" => !stranded_guard_still_blocks(repo, &path),
+        "gh_not_ready" => gh_recheck(&path),
         _ => false,
     };
     if !healed {
@@ -848,6 +875,36 @@ fn stranded_guard_still_blocks(repo: &Value, path: &str) -> bool {
         }
     }
     false
+}
+
+/// FAIL-CLOSED live re-run of the gh-auth/origin probe for [`revalidate_persisted_error`]'s
+/// `gh_not_ready` arm, mirroring the WRITER (`ctx.github_ready`, the run.rs preflight that
+/// persisted the error): healed iff `gh auth status` exits 0 (via [`crate::control::gh::gh_ready`]
+/// — 8s timeout, spawn failure/timeout → false) AND `git -C <path> ls-remote --heads origin`
+/// exits 0 (origin reachable). Any indeterminate result (missing gh/git, timeout, spawn error)
+/// keeps the error — clearing a park may only follow a VERIFIED green probe.
+fn gh_origin_recheck_ok(path: &str) -> bool {
+    if !crate::control::gh::gh_ready() {
+        return false;
+    }
+    let git = match proc::which_git() {
+        Some(g) => g,
+        None => return false,
+    };
+    proc::run(
+        &[
+            git.as_os_str(),
+            "-C".as_ref(),
+            path.as_ref(),
+            "ls-remote".as_ref(),
+            "--heads".as_ref(),
+            "origin".as_ref(),
+        ],
+        None,
+        Some(Duration::from_secs(30)),
+    )
+    .map(|o| o.code == 0)
+    .unwrap_or(false)
 }
 
 /// Anti-thrash helper: count recent supervisor.jsonl records that are a RUNG-0, non-escalate
@@ -1384,8 +1441,8 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
     }
 
     // STALE-ERROR REVALIDATION (the proof_required-wedge self-heal): a persisted heartbeat error
-    // of a re-checkable git-state class (dirty tree / out-of-band base / untracked refusal /
-    // stranded branch) is re-run against the repo RIGHT NOW before the ladder re-asserts it. A
+    // of a re-checkable class (dirty tree / out-of-band base / untracked refusal / stranded
+    // branch / gh-auth) is re-run against the repo RIGHT NOW before the ladder re-asserts it. A
     // verified-healed condition clears the error and returns the lane to idle; a still-true (or
     // indeterminate) condition returns None and the existing ladder runs unchanged.
     if let Some(out) = revalidate_persisted_error(repo, &d) {
@@ -3707,6 +3764,7 @@ mod tests {
             "base_out_of_band",
             "untracked_refusal",
             "stranded_unmerged_branch",
+            "gh_not_ready",
         ] {
             assert!(is_recheckable_stale_error(cat), "{cat} is re-checkable");
             assert!(
@@ -3842,6 +3900,59 @@ mod tests {
         assert_eq!(diagnose(&repo)["category"], json!("ok"));
         let _ = std::fs::remove_dir_all(&rdir);
         let _ = std::fs::remove_dir_all(&gdir);
+    }
+
+    // The 2026-07-16 asmodeus wedge: a run that died ~10s in persisted 'GitHub not ready — gh not
+    // authenticated' and gh_not_ready was NOT a re-checkable class, so neither the dispatch-path
+    // revalidation (fleet::plan_jobs — which iterates PARKED proof_required lanes too) nor
+    // recover() ever re-ran the probe — the lane starved ~20h behind a FALSE error while a live
+    // `gh auth status` verified green. The gh arm re-runs the WRITER's probe (injected here so the
+    // test needs no keyring/network) and clears the stale error at diagnosis time.
+    #[test]
+    fn revalidate_clears_stale_gh_not_ready_error_when_auth_reverifies() {
+        let name = format!("sup_reval_gh_{}", std::process::id());
+        let repo = json!({"name": name.clone(), "path": format!("C:/p/{name}")});
+        let rdir = paths::runtime_dir(&repo).unwrap();
+        let _ = std::fs::remove_dir_all(&rdir);
+        std::fs::create_dir_all(&rdir).unwrap();
+        // The EXACT persisted shape run.rs's preflight writes before exiting (asmodeus 22:48Z run).
+        write_hb(
+            &rdir,
+            &json!({
+                "status": "error",
+                "last_summary": "GitHub not ready — gh not authenticated (run `gh auth login`). Connect GitHub before Solomon iterates this remote repo.",
+                "updated_at": "2026-07-16T22:48:31Z",
+            }),
+        );
+        let d = diagnose(&repo);
+        assert_eq!(d["category"], json!("gh_not_ready"), "fixture reproduces the wedge diagnosis");
+
+        // Probe still red — FAIL-CLOSED: the error stays and the heartbeat is untouched.
+        assert!(
+            revalidate_persisted_error_inner(&repo, &d, &|_| false).is_none(),
+            "a still-failing gh probe must keep the error"
+        );
+        assert_eq!(heartbeat::read_heartbeat(&repo).unwrap()["status"], json!("error"));
+
+        // Probe green (gh auth + origin re-verified) — the stale error clears to idle.
+        let expected_path = format!("C:/p/{name}");
+        let out = revalidate_persisted_error_inner(&repo, &d, &|p| {
+            assert_eq!(p, expected_path, "the probe re-checks THIS repo's origin");
+            true
+        })
+        .expect("verified-green gh probe clears the stale error");
+        assert_eq!(out["ok"], json!(true));
+        assert_eq!(out["escalate"], json!(false));
+        assert_eq!(out["actions_taken"][0], json!("stale_error_recheck_cleared"));
+        let hb = heartbeat::read_heartbeat(&repo).unwrap();
+        assert_eq!(hb["status"], json!("idle"), "lane returned to idle");
+        assert!(hb.get("reason").is_none());
+        assert_eq!(
+            diagnose(&repo)["category"],
+            json!("ok"),
+            "the next diagnose sees a healthy lane so queued jobs can dispatch"
+        );
+        let _ = std::fs::remove_dir_all(&rdir);
     }
 
     // The recover() ladder takes the revalidation path BEFORE re-asserting/auto-fixing a stale
