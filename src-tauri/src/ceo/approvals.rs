@@ -1,22 +1,23 @@
 //! The unified `_pending_approvals` operator surface — ONE deterministic, cheap (file-IO-only,
-//! no LLM) place the operator reads to approve everything at once.
+//! no LLM) place the operator reads to see what Solomon is ABOUT TO DO autonomously and what
+//! still waits on a human hand.
 //!
-//! Solomon's external effects are all FAIL-CLOSED behind an operator-set `approved: true` (growth
-//! publish, cold-outreach send, live tool invocation) — but before this module the pending items
-//! were scattered across per-lane `growth_drafts.jsonl` / `outreach_drafts.jsonl` tails and the
-//! self-tooling manifest, so "what is waiting on me?" required a per-lane spelunk. `regenerate`
-//! (ridden on the FAST deterministic core of `ceo::tick`, every ~2 min sweep) rewrites
-//! `runtime/_pending_approvals.md` (human) + `.json` (dashboard) with every unapproved growth
-//! draft, unapproved outreach draft, and tool awaiting an approval (dry-run VALIDATION first —
-//! registration executes nothing — then live invocation) — each carrying the EXACT one-line edit
-//! that approves its next rung.
+//! TRUTH NOTE (2026-07-16, commits b6f148a / 4febc11 / 7ea9c23): growth publish, cold-outreach
+//! send, and self-tooling validate+invoke are AUTONOMOUS — they run behind AUTOMATED gates only
+//! (persona/content checks, per-lane-per-day rate caps, the operator-supplied target list, lint +
+//! sandboxed dry-run + sha256) with NO operator `approved: true` wait. This surface therefore
+//! lists each lane's IMMINENT autonomous action with the EXACT edit that STOPS it, and names what
+//! REMAINS human-gated: money-out (money_guard, fail-closed), live-capital changes,
+//! `growth_publish` live-mode promotion, SMTP credential provisioning, and external platform
+//! logins. `regenerate` (ridden on the FAST deterministic core of `ceo::tick`, every ~2 min
+//! sweep) rewrites `runtime/_pending_approvals.md` (human) + `.json` (dashboard).
 //!
 //! HARD INVARIANTS (unchanged by this module):
-//!   * READ-ONLY over the gated artifacts — this surface never sets `approved`, never edits a
-//!     draft, never touches the manifest. Solomon never self-approves; the approve edits listed
-//!     here are instructions for a HUMAN hand.
-//!   * Approval detection is the SAME fail-closed `growth::draft_line_approved` the publish/send
-//!     seams use (re-used, never forked) — the surface and the gates can never drift apart.
+//!   * READ-ONLY over the listed artifacts — this surface never publishes, never sends, never
+//!     edits a draft, never touches the manifest. The stop edits listed here are instructions for
+//!     a HUMAN hand.
+//!   * The growth rows use the SAME `growth::auto_publish_content_check` the auto-publish seam
+//!     ships through (re-used, never forked) — the surface and the seam can never drift apart.
 //!   * A corrupt log/manifest omits ITS row (catch_unwind per lane; unparseable manifest reads as
 //!     empty) — the surface is still written, never wedged, never a truncation (edge E19/E16).
 #![allow(dead_code)]
@@ -49,59 +50,68 @@ pub(crate) fn tools_manifest_path() -> PathBuf {
 // collectors — pure over injected rows / the manifest Value (unit-tested)
 // --------------------------------------------------------------------------- //
 
-/// Growth drafts awaiting approval. `rows` is `[{lane, path, newest}]` (the newest drafts line per
-/// public lane, assembled by `regenerate`); a row surfaces iff its newest line exists and is NOT
-/// operator-approved per the fail-closed `growth::draft_line_approved`. Pure.
+/// Growth drafts queued for AUTONOMOUS publish. `rows` is `[{lane, path, newest}]` (the newest
+/// drafts line per public lane, assembled by `regenerate`); a row surfaces iff its newest line is
+/// genuine auto-publishable CONTENT per the SAME `growth::auto_publish_content_check` the
+/// auto-publish seam ships through (blank/control/persona-violating lines will not publish, so
+/// they are not listed as imminent). Pure.
 pub(crate) fn collect_growth_pending(rows: &[Value]) -> Vec<Value> {
     rows.iter()
         .filter_map(|r| {
             let (lane, path, newest) = row_parts(r)?;
-            if crate::ceo::growth::draft_line_approved(newest) {
-                return None; // already approved — the publish seam owns it now
+            if crate::ceo::growth::auto_publish_content_check(newest).is_err() {
+                return None; // not publishable content — the seam would refuse it, nothing imminent
             }
             Some(json!({
                 "lane": lane,
                 "path": path,
                 "preview": super::cap_line(newest, 200),
-                "approve": format!(
-                    "append {{\"approved\": true}} (with your edits) as the newest line of {path}"
+                "action": format!(
+                    "will auto-publish at next slow-tail sweep (once/lane/day cap; dry-run unless \
+                     the lane's growth_publish.mode is \"live\") unless removed — delete the newest \
+                     line of {path} to stop it"
                 ),
             }))
         })
         .collect()
 }
 
-/// Outreach drafts awaiting approval — same fail-closed filter as growth, plus the resolved
-/// `to`/`subject` pulled out of the draft fact so the operator sees WHO would be emailed before
-/// approving. Pure.
+/// Outreach drafts queued for AUTONOMOUS send — the composer wrote each draft's full sendable
+/// payload to the lane's `outreach_outbox.jsonl` twin, and the auto-send seam ships the oldest
+/// unsent entry behind the operator-target guard + rate caps (SMTP creds are a data dependency the
+/// operator provisions). The resolved `to`/`subject` are pulled out of the draft fact so the
+/// operator sees WHO will be emailed before it fires. Pure.
 pub(crate) fn collect_outreach_pending(rows: &[Value]) -> Vec<Value> {
     rows.iter()
         .filter_map(|r| {
             let (lane, path, newest) = row_parts(r)?;
             if crate::ceo::growth::draft_line_approved(newest) {
-                return None;
+                return None; // a hand-edited JSON control line is not a queued composer draft
             }
+            let outbox = path.replace("outreach_drafts.jsonl", "outreach_outbox.jsonl");
             Some(json!({
                 "lane": lane,
                 "path": path,
                 "to": fact_field(newest, "to="),
                 "subject": fact_subject(newest),
                 "preview": super::cap_line(newest, 200),
-                "approve": format!(
-                    "make the newest line of {path} a JSON object {{\"approved\": true, \"to\": ..., \
-                     \"subject\": ..., \"body\": ...}} to authorize the send (requires SMTP env)"
+                "action": format!(
+                    "auto-sends (no approval wait) once SMTP creds are present and the recipient \
+                     is on the operator target list — remove the matching entry from {outbox} to \
+                     stop it"
                 ),
             }))
         })
         .collect()
 }
 
-/// Tools awaiting an operator approval: every manifest entry whose `approved` is not exactly
-/// boolean `true` (absent / false / string "true" all read as unapproved — fail-closed, mirroring
-/// `draft_line_approved`'s strictness). Each row carries the EXACT edit for its NEXT rung:
-/// a `dry_run.pending` entry needs `approved_validation: true` first (registration executed
-/// nothing — the sandboxed dry-run is itself operator-gated); a validated entry needs
-/// `approved: true` for live invocation. Pure over the manifest Value; sorted for determinism.
+/// Self-authored tools NOT auto-registered as approved — legacy pre-autonomy manifest entries
+/// (`approved` != exactly boolean `true`; the 7ea9c23 pipeline registers straight to
+/// `approved: true`). TRUTH: since 7ea9c23 the invoke gates are lint + sandboxed dry-run + sha256
+/// — the `approved` flag is NO LONGER consulted, so a dry-run-passed entry here invokes
+/// AUTONOMOUSLY, while a dry-run-pending/failed entry is an inert stub the autonomous pipeline
+/// will not resurrect. Each row carries the truthful state + the retire edit. Pure over the
+/// manifest Value; sorted for determinism.
 pub(crate) fn collect_tools_pending(manifest: &Value) -> Vec<Value> {
     let Some(tools) = manifest.get("tools").and_then(Value::as_object) else {
         return Vec::new();
@@ -112,32 +122,28 @@ pub(crate) fn collect_tools_pending(manifest: &Value) -> Vec<Value> {
         .map(|(name, e)| {
             let pending_validation =
                 e.pointer("/dry_run/pending").and_then(Value::as_bool) == Some(true);
-            let validation_cleared =
-                e.get("approved_validation").and_then(Value::as_bool) == Some(true);
-            let approve = if pending_validation && !validation_cleared {
+            let dry_run_passed =
+                e.pointer("/dry_run/passed").and_then(Value::as_bool).unwrap_or(false);
+            let retire =
+                format!("delete tools.{name} from runtime\\_tools\\tools_manifest.json to retire it");
+            let action = if dry_run_passed && !pending_validation {
                 format!(
-                    "set \"approved_validation\": true on tools.{name} in \
-                     runtime\\_tools\\tools_manifest.json to allow the sandboxed dry-run \
-                     (registration executed nothing)"
-                )
-            } else if pending_validation {
-                format!(
-                    "validation approved — the next CEO sweep runs tools.{name}'s sandboxed \
-                     dry-run and records pass/fail"
+                    "invokes AUTONOMOUSLY behind the lint + sandboxed dry-run + sha256 gates (the \
+                     legacy \"approved\" flag is no longer consulted) — {retire}"
                 )
             } else {
                 format!(
-                    "set \"approved\": true on tools.{name} in runtime\\_tools\\tools_manifest.json \
-                     to allow live invocation"
+                    "inert stub: its sandboxed dry-run never passed under the pre-autonomy flow \
+                     and the autonomous pipeline only registers tools it authors — {retire}"
                 )
             };
             json!({
                 "name": name,
                 "purpose": e.get("purpose").and_then(Value::as_str).unwrap_or(""),
                 "lint_passed": e.pointer("/lint/passed").and_then(Value::as_bool).unwrap_or(false),
-                "dry_run_passed": e.pointer("/dry_run/passed").and_then(Value::as_bool).unwrap_or(false),
+                "dry_run_passed": dry_run_passed,
                 "pending_validation": pending_validation,
-                "approve": approve,
+                "action": action,
             })
         })
         .collect();
@@ -184,14 +190,19 @@ pub(crate) fn fact_subject(line: &str) -> String {
 // --------------------------------------------------------------------------- //
 
 /// Render the human-readable surface. Pure so the `#[test]` pins the markdown: a header with the
-/// counts + the never-self-approves note, one section per non-empty category, each item carrying
-/// its EXACT approve edit; all-empty renders an honest "Nothing pending." body.
+/// counts + the AUTONOMY truth note (what runs without approval vs what stays human-gated), one
+/// section per non-empty category, each item carrying its truthful state + the EXACT stop/retire
+/// edit; all-empty renders an honest "Nothing pending." body.
 pub(crate) fn render_md(growth: &[Value], outreach: &[Value], tools: &[Value]) -> String {
     let mut md = String::new();
-    md.push_str("# Pending approvals\n\n");
+    md.push_str("# Pending approvals & autonomous actions\n\n");
     md.push_str(&format!(
-        "growth: {} | outreach: {} | tools: {} — Solomon never self-approves; every item below \
-         waits for an operator-set `approved: true`.\n\n",
+        "growth: {} | outreach: {} | tools: {} — AUTONOMY (2026-07-16, commits \
+         b6f148a/4febc11/7ea9c23): growth publish, outreach send, and self-tooling \
+         validate+invoke run AUTONOMOUSLY behind automated gates — items below do NOT wait for an \
+         operator `approved: true`; each carries the exact edit that STOPS it. Still human-gated: \
+         money-out (money_guard, fail-closed), live-capital changes, growth_publish live-mode \
+         promotion, SMTP credential provisioning, and external platform logins.\n\n",
         growth.len(),
         outreach.len(),
         tools.len()
@@ -201,32 +212,32 @@ pub(crate) fn render_md(growth: &[Value], outreach: &[Value], tools: &[Value]) -
         return md;
     }
     if !growth.is_empty() {
-        md.push_str("## Growth drafts (gated, unpublished)\n\n");
+        md.push_str("## Growth drafts (will auto-publish at next slow-tail unless removed)\n\n");
         for g in growth {
             md.push_str(&format!(
-                "- **{}** — {}\n  - approve: {}\n",
+                "- **{}** — {}\n  - action: {}\n",
                 g["lane"].as_str().unwrap_or(""),
                 g["preview"].as_str().unwrap_or(""),
-                g["approve"].as_str().unwrap_or("")
+                g["action"].as_str().unwrap_or("")
             ));
         }
         md.push('\n');
     }
     if !outreach.is_empty() {
-        md.push_str("## Outreach drafts (gated, unsent)\n\n");
+        md.push_str("## Outreach drafts (queued for autonomous send)\n\n");
         for o in outreach {
             md.push_str(&format!(
-                "- **{}** — to {} / subj {}\n  - approve: {}\n",
+                "- **{}** — to {} / subj {}\n  - action: {}\n",
                 o["lane"].as_str().unwrap_or(""),
                 o["to"].as_str().unwrap_or("?"),
                 o["subject"].as_str().unwrap_or("?"),
-                o["approve"].as_str().unwrap_or("")
+                o["action"].as_str().unwrap_or("")
             ));
         }
         md.push('\n');
     }
     if !tools.is_empty() {
-        md.push_str("## Tools awaiting approval (inert until operator-approved)\n\n");
+        md.push_str("## Self-authored tools (autonomous — no operator approval gate)\n\n");
         for t in tools {
             let dry = if t["pending_validation"].as_bool().unwrap_or(false) {
                 "pending".to_string()
@@ -234,11 +245,11 @@ pub(crate) fn render_md(growth: &[Value], outreach: &[Value], tools: &[Value]) -
                 t["dry_run_passed"].as_bool().unwrap_or(false).to_string()
             };
             md.push_str(&format!(
-                "- **{}** — {} (lint={} dry_run={dry})\n  - approve: {}\n",
+                "- **{}** — {} (lint={} dry_run={dry})\n  - action: {}\n",
                 t["name"].as_str().unwrap_or(""),
                 t["purpose"].as_str().unwrap_or(""),
                 t["lint_passed"].as_bool().unwrap_or(false),
-                t["approve"].as_str().unwrap_or("")
+                t["action"].as_str().unwrap_or("")
             ));
         }
         md.push('\n');
@@ -247,7 +258,9 @@ pub(crate) fn render_md(growth: &[Value], outreach: &[Value], tools: &[Value]) -
 }
 
 // --------------------------------------------------------------------------- //
-// regenerate — the every-tick surface writer (file-IO only, bounded, no LLM)
+// regenerate — the every-tick surface writer (file-IO only, bounded, no LLM):
+// every auto-publish-pending growth draft, queued outreach draft, and legacy
+// (non-auto-registered) tool row, each with its truthful state + stop edit.
 // --------------------------------------------------------------------------- //
 
 /// Regenerate both surfaces from disk and return `{ok, counts:{growth,outreach,tools}}`. Reads the
@@ -336,9 +349,9 @@ mod tests {
         json!({"lane": lane, "path": format!("runtime/{lane}/outreach_drafts.jsonl"), "newest": newest})
     }
 
-    // -------- collectors are fail-closed over the newest line --------
+    // -------- collectors surface exactly what the autonomous seams would act on --------
     #[test]
-    fn collect_growth_pending_surfaces_only_unapproved_newest_lines() {
+    fn collect_growth_pending_surfaces_only_auto_publishable_content_lines() {
         let rows = vec![
             growth_row("sover", "2026-07-16\trsi: growth DRAFT [GATED, unpublished, organic] lane=sover: x (t=1)"),
             growth_row("dotz", "2026-07-16\t{\"approved\": true, \"title\": \"ship it\"}"),
@@ -346,18 +359,22 @@ mod tests {
             growth_row("blank", "   "),
         ];
         let out = collect_growth_pending(&rows);
-        assert_eq!(out.len(), 1, "only the unapproved sover draft surfaces: {out:?}");
+        assert_eq!(out.len(), 1, "only the publishable sover content line surfaces: {out:?}");
         assert_eq!(out[0]["lane"], "sover");
-        // the approve instruction is the EXACT one-line edit
-        let approve = out[0]["approve"].as_str().unwrap();
-        assert!(approve.contains("{\"approved\": true}"), "{approve}");
-        assert!(approve.contains("runtime/sover/growth_drafts.jsonl"), "{approve}");
-        // approved:"true" (string) and approved:1 stay pending — fail-closed strictness
-        let tricky = vec![
+        // the action states the AUTONOMOUS truth + the EXACT stop edit
+        let action = out[0]["action"].as_str().unwrap();
+        assert!(action.contains("will auto-publish at next slow-tail sweep"), "{action}");
+        assert!(action.contains("unless removed"), "{action}");
+        assert!(action.contains("delete the newest line of runtime/sover/growth_drafts.jsonl"), "{action}");
+        // JSON control lines of ANY shape are not content — the seam refuses them, nothing imminent
+        let control = vec![
             growth_row("a", "{\"approved\": \"true\"}"),
             growth_row("b", "{\"approved\": 1}"),
         ];
-        assert_eq!(collect_growth_pending(&tricky).len(), 2);
+        assert!(collect_growth_pending(&control).is_empty());
+        // a persona-violating draft will never auto-publish — never listed as imminent
+        let persona = vec![growth_row("c", "2026-07-16\tdraft credited to cayleb (t=1)")];
+        assert!(collect_growth_pending(&persona).is_empty());
     }
 
     #[test]
@@ -369,8 +386,12 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["to"], "person@org.com");
         assert_eq!(out[0]["subject"], "A short honest intro");
-        assert!(out[0]["approve"].as_str().unwrap().contains("requires SMTP env"));
-        // an approved outreach line no longer surfaces (the send seam owns it)
+        // the action states the AUTONOMOUS send truth + the outbox stop edit
+        let action = out[0]["action"].as_str().unwrap();
+        assert!(action.contains("auto-sends (no approval wait)"), "{action}");
+        assert!(action.contains("operator target list"), "{action}");
+        assert!(action.contains("runtime/sover/outreach_outbox.jsonl"), "{action}");
+        // a hand-edited JSON control line is not a queued composer draft — never surfaces
         let approved = "{\"approved\": true, \"to\": \"p@o.com\", \"subject\": \"s\", \"body\": \"b\"}";
         assert!(collect_outreach_pending(&[outreach_row("sover", approved)]).is_empty());
     }
@@ -390,27 +411,30 @@ mod tests {
         assert_eq!(out[0]["name"], "alpha"); // deterministic (sorted) order
         assert_eq!(out[1]["name"], "beta");
         assert_eq!(out[1]["dry_run_passed"], false);
-        assert!(out[0]["approve"]
-            .as_str()
-            .unwrap()
-            .contains("set \"approved\": true on tools.alpha"));
+        // dry-run-passed alpha invokes autonomously (approved is no longer a gate) — truth + retire
+        let alpha = out[0]["action"].as_str().unwrap();
+        assert!(alpha.contains("invokes AUTONOMOUSLY"), "{alpha}");
+        assert!(alpha.contains("delete tools.alpha"), "{alpha}");
+        // dry-run-failed beta is an inert stub, and says so
+        let beta = out[1]["action"].as_str().unwrap();
+        assert!(beta.contains("inert stub"), "{beta}");
+        assert!(beta.contains("delete tools.beta"), "{beta}");
         // empty / malformed manifests collect to nothing, never a panic (edge E16)
         assert!(collect_tools_pending(&json!({})).is_empty());
         assert!(collect_tools_pending(&json!({"tools": []})).is_empty());
     }
 
     #[test]
-    fn collect_tools_pending_routes_pending_validation_to_the_validation_edit() {
+    fn collect_tools_pending_states_the_post_autonomy_truth_per_dry_run_state() {
         let manifest = json!({"version": 1, "tools": {
-            // freshly registered — dry-run never ran (registration executes nothing)
+            // legacy pre-autonomy stubs — their dry-run never ran/passed; nothing resurrects them
             "gamma": {"purpose": "new helper", "approved": false, "approved_validation": false,
                       "validation": "pending_operator",
                       "lint": {"passed": true}, "dry_run": {"passed": false, "pending": true}},
-            // operator already cleared validation — the sweep will run it
             "delta": {"purpose": "queued helper", "approved": false, "approved_validation": true,
                       "validation": "pending_operator",
                       "lint": {"passed": true}, "dry_run": {"passed": false, "pending": true}},
-            // validated — the remaining rung is live approval
+            // dry-run passed — invokes autonomously; the legacy approved:false does NOT hold it
             "epsilon": {"purpose": "validated helper", "approved": false,
                         "approved_validation": true, "validation": "validated",
                         "lint": {"passed": true}, "dry_run": {"passed": true}},
@@ -418,18 +442,19 @@ mod tests {
         let out = collect_tools_pending(&manifest);
         assert_eq!(out.len(), 3, "{out:?}");
         let by_name = |n: &str| out.iter().find(|t| t["name"] == n).unwrap().clone();
-        let gamma = by_name("gamma");
-        assert_eq!(gamma["pending_validation"], true);
-        let approve = gamma["approve"].as_str().unwrap();
-        assert!(approve.contains("set \"approved_validation\": true on tools.gamma"), "{approve}");
-        assert!(approve.contains("sandboxed dry-run"), "{approve}");
-        let delta = by_name("delta");
-        assert!(delta["approve"].as_str().unwrap().contains("next CEO sweep"), "{delta}");
+        for stub in ["gamma", "delta"] {
+            let t = by_name(stub);
+            assert_eq!(t["pending_validation"], true);
+            let action = t["action"].as_str().unwrap();
+            assert!(action.contains("inert stub"), "{action}");
+            assert!(action.contains(&format!("delete tools.{stub}")), "{action}");
+            // the old operator-edit instructions are GONE — they no longer unlock anything
+            assert!(!action.contains("approved_validation\": true"), "{action}");
+        }
         let epsilon = by_name("epsilon");
-        assert!(
-            epsilon["approve"].as_str().unwrap().contains("set \"approved\": true on tools.epsilon"),
-            "{epsilon}"
-        );
+        let action = epsilon["action"].as_str().unwrap();
+        assert!(action.contains("invokes AUTONOMOUSLY"), "{action}");
+        assert!(action.contains("no longer consulted"), "{action}");
     }
 
     // -------- fact field extraction (pure) --------
@@ -446,7 +471,7 @@ mod tests {
 
     // -------- render_md (pure golden) --------
     #[test]
-    fn render_md_lists_each_item_with_its_exact_approve_edit() {
+    fn render_md_states_the_autonomy_truth_and_each_items_stop_edit() {
         let growth = collect_growth_pending(&[growth_row(
             "sover",
             "2026-07-16\trsi: growth DRAFT [GATED, unpublished, organic] lane=sover: reel copy (t=9)",
@@ -464,16 +489,23 @@ mod tests {
         let md = render_md(&growth, &outreach, &tools);
         assert!(md.starts_with("# Pending approvals"), "{md}");
         assert!(md.contains("growth: 1 | outreach: 1 | tools: 2"), "{md}");
-        assert!(md.contains("Solomon never self-approves"), "{md}");
-        assert!(md.contains("## Growth drafts (gated, unpublished)"), "{md}");
-        assert!(md.contains("append {\"approved\": true}"), "{md}");
-        assert!(md.contains("## Outreach drafts (gated, unsent)"), "{md}");
+        // the header tells the AUTONOMY truth — and the pre-7/16 claim is gone
+        assert!(md.contains("run AUTONOMOUSLY behind automated gates"), "{md}");
+        assert!(md.contains("Still human-gated: money-out"), "{md}");
+        assert!(!md.contains("Solomon never self-approves"), "{md}");
+        assert!(!md.contains("waits for an operator-set"), "{md}");
+        // growth: auto-publish relabel + the stop edit
+        assert!(md.contains("## Growth drafts (will auto-publish at next slow-tail unless removed)"), "{md}");
+        assert!(md.contains("delete the newest line of runtime/sover/growth_drafts.jsonl"), "{md}");
+        // outreach: autonomous send + the outbox stop edit
+        assert!(md.contains("## Outreach drafts (queued for autonomous send)"), "{md}");
         assert!(md.contains("to p@o.com / subj hello there"), "{md}");
-        assert!(md.contains("## Tools awaiting approval"), "{md}");
-        assert!(md.contains("set \"approved\": true on tools.counter"), "{md}");
-        // the unvalidated tool carries the VALIDATION edit + an honest dry_run=pending flag
-        assert!(md.contains("set \"approved_validation\": true on tools.fresh"), "{md}");
+        assert!(md.contains("runtime/sover/outreach_outbox.jsonl"), "{md}");
+        // tools: no approval gate; the legacy stub keeps its honest dry_run=pending flag
+        assert!(md.contains("## Self-authored tools (autonomous — no operator approval gate)"), "{md}");
+        assert!(md.contains("invokes AUTONOMOUSLY"), "{md}");
         assert!(md.contains("(lint=true dry_run=pending)"), "{md}");
+        assert!(md.contains("delete tools.fresh"), "{md}");
         assert!(!md.contains("Nothing pending"), "{md}");
     }
 

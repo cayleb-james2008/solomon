@@ -62,26 +62,27 @@ pub mod growth;
 
 // CEO autonomy, piece 1: the COLD-OUTREACH pipeline — every public lane composes a small, bounded
 // number of provenance-tagged cold-email DRAFTS per day (operator-supplied targets only, honest
-// planner-directive trigger, budget-aware), gated exactly like growth drafts; a send happens ONLY
-// for a draft the operator hand-marked `approved: true` AND only when SMTP env creds exist —
-// otherwise draft-only + a deduped needs card. Nothing in Solomon ever sets `approved`. See
-// outreach.rs.
+// planner-directive trigger, budget-aware); since 4febc11 (2026-07-16) the send is AUTONOMOUS —
+// no operator `approved: true` wait — behind AUTOMATED guards only (operator-target list, rate
+// caps, persona, idempotency, honest footer). SMTP creds are an operator-provisioned data
+// dependency: absent creds = inert + a deduped needs card. See outreach.rs.
 pub mod outreach;
 
 // CEO autonomy, piece 2: TOOLSET SELF-EXTENSION — the CEO plane can propose -> lint -> dry-run ->
 // register -> invoke a new PowerShell tool under gitignored `runtime\_tools\` (never tracked
-// source; the provenance tripwire is untouched). Registration requires the static deny-list lint
-// AND a sandboxed `-DryRun` exit-0 AND the `rsi:` provenance stamp; a LIVE invocation additionally
-// requires an operator-set `approved: true` — else it DEGRADES to a dry-run (never a silent live
-// effect). The linter actively rejects daemon/schtasks creation (no-background-processes doctrine).
-// See self_tooling.rs.
+// source; the provenance tripwire is untouched). Since 7ea9c23 (2026-07-16) the ladder is
+// AUTONOMOUS end-to-end: registration requires the static deny-list lint AND a sandboxed `-DryRun`
+// exit-0 AND the `rsi:` provenance stamp, and a LIVE invocation runs behind those AUTOMATED gates
+// plus the sha256 tamper check — no operator `approved: true` wait. The linter actively rejects
+// daemon/schtasks creation (no-background-processes doctrine). See self_tooling.rs.
 pub mod self_tooling;
 
 // CEO autonomy, piece 3: the unified `_pending_approvals` operator surface — regenerated on every
-// tick's FAST deterministic core (file-IO only, no LLM), aggregating every unapproved growth
-// draft, unapproved outreach draft, and tool awaiting validation/live approval, each with the
-// EXACT one-line edit that approves its next rung. READ-ONLY over the gated artifacts; Solomon
-// never self-approves. See approvals.rs.
+// tick's FAST deterministic core (file-IO only, no LLM), truthfully listing each lane's IMMINENT
+// autonomous action (auto-publish-pending growth drafts, queued outreach sends, legacy tool rows)
+// with the EXACT edit that STOPS it, plus what stays human-gated (money-out, live capital,
+// growth_publish live-mode promotion, SMTP provisioning, platform logins). READ-ONLY over the
+// listed artifacts. See approvals.rs.
 pub mod approvals;
 
 // D8 Layer 3: the CROSS-PROJECT wins ledger reader — the minimal cross-project learning surfaced
@@ -339,10 +340,11 @@ fn tick_core() -> (Value, Value) {
     }));
 
     // PENDING-APPROVALS SURFACE (every sweep, cheap file-IO only, no LLM): regenerate
-    // runtime/_pending_approvals.{md,json} so the operator always has ONE fresh place listing every
-    // unapproved growth draft, outreach draft, and tool awaiting validation/live approval with the
-    // exact approve edit. Lives in the FAST core (not the single-flighted tail) so it refreshes even
-    // when a slow tail is in flight. Isolated like every other graft.
+    // runtime/_pending_approvals.{md,json} so the operator always has ONE fresh place listing each
+    // lane's imminent AUTONOMOUS action (auto-publish-pending growth draft, queued outreach send,
+    // legacy tool row) with the exact stop edit, plus what stays human-gated. Lives in the FAST
+    // core (not the single-flighted tail) so it refreshes even when a slow tail is in flight.
+    // Isolated like every other graft.
     let _ = std::panic::catch_unwind(|| {
         let _ = crate::ceo::approvals::regenerate();
     });
@@ -3090,8 +3092,9 @@ mod tests {
     // -------- CEO autonomy wiring: the tick's FAST core regenerates the approvals surface --------
     // `tick_core` is exactly `tick` minus the slow-tail spawn (which the single-flight test above
     // already covers, and which would race the process-global flag if driven here). After one core
-    // pass the `_pending_approvals` surface must exist — the operator's one place to approve
-    // everything is refreshed every sweep, even while a slow tail is in flight.
+    // pass the `_pending_approvals` surface must exist — the operator's one place to see imminent
+    // autonomous actions + what stays human-gated, refreshed every sweep, even while a slow tail
+    // is in flight.
     #[test]
     fn tick_core_regenerates_the_pending_approvals_surface() {
         let _env = crate::notify::NOTIFY_ENV_LOCK
@@ -3112,7 +3115,10 @@ mod tests {
         assert!(js.exists(), "tick's fast core must regenerate _pending_approvals.json every sweep");
         let body = std::fs::read_to_string(&md).unwrap();
         assert!(body.starts_with("# Pending approvals"), "{body}");
-        assert!(body.contains("Solomon never self-approves"), "{body}");
+        // the header states the post-2026-07-16 AUTONOMY truth, not the retired approval wait
+        assert!(body.contains("run AUTONOMOUSLY behind automated gates"), "{body}");
+        assert!(body.contains("Still human-gated: money-out"), "{body}");
+        assert!(!body.contains("Solomon never self-approves"), "{body}");
         std::env::remove_var("SOLOMON_NOTIFY_OFF");
     }
 }
