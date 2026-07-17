@@ -111,7 +111,9 @@
                 "path": "*:youtube.published_at",
                 "mode": "age",
                 "yellow_after_s": 43200,
-                "red_after_s": 86400
+                "red_after_s": 86400,
+                "operator_gated": true,
+                "comment": "2026-07-17 (operator-directed fix-wave): operator_gated — YouTube publishing stops when the Google session logs out, a HUMAN re-login no agent can perform (the 'published 0 / held — logged out' state). The red stays honestly red, but the ops rollup marks red_operator_gated_only when no UNGATED probe is also red, so growth::eligible_repo keeps composing for the healthy platforms (IG/TikTok) instead of reading the whole engine as dead."
             },
             {
                 "id": "produce_recency",
@@ -158,7 +160,9 @@
                 "file": "%LOCALAPPDATA%\\Sover\\.runtime\\ggg\\lane_state.json",
                 "path": "control_youtube.last_run",
                 "mode": "age",
-                "red_after_s": 21600
+                "red_after_s": 21600,
+                "operator_gated": true,
+                "comment": "2026-07-17 (operator-directed fix-wave): operator_gated for the same reason as publish_recency_youtube — the control_youtube lane holds while the Google session is logged out (human-only re-login)."
             },
             {
                 "id": "autopost_gate",
@@ -190,6 +194,15 @@
                 "mode": "streak",
                 "want": "shipped",
                 "last_n": 5
+            },
+            {
+                "id": "growth_publish_recency",
+                "kind": "json_field",
+                "file": "runtime\\dotz\\_growth_published",
+                "path": "ts",
+                "mode": "age",
+                "yellow_after_s": 259200,
+                "comment": "2026-07-17 (operator-directed fix-wave): the growth MEASURE leg, mirroring maki's. dotz has no growth_publish block yet, so the marker records mode:not_opted_in dispatches (published:false) — this probe measures the auto-publish seam's dispatch recency and the ledger glue records the honest mode. When the operator wires a sanctioned dotz release lane, add the matching growth_artifact_fresh evidence probe. Yellow-only: no red_after_s, same rationale as maki's."
             }
         ]
     },
@@ -214,6 +227,22 @@
                 "mode": "age",
                 "yellow_after_s": 21600,
                 "red_after_s": 86400
+            },
+            {
+                "id": "growth_publish_recency",
+                "kind": "json_field",
+                "file": "runtime\\maki\\_growth_published",
+                "path": "ts",
+                "mode": "age",
+                "yellow_after_s": 259200,
+                "comment": "2026-07-17 (operator-directed fix-wave): the growth MEASURE leg. Reads the auto-publish marker growth.rs writes on every dispatch ({signature, published, mode, ts}) — maki's 2026-07-16 live publish was the fleet's first real growth experiment and had NO measurement probe. Yellow-only by design (no red_after_s): a quiet marketing week is not an engine outage, and the eligible_repo green-before-growth gate must never be wedged by a slow publish cadence. Missing file = never dispatched = honest yellow unobservable. ops/ledger.rs growth_publish_activity mirrors this file into the outcomes ledger so the published -> measured loop closes."
+            },
+            {
+                "id": "growth_artifact_fresh",
+                "kind": "file_age",
+                "file": "${REPO}\\src-tauri\\target\\release\\bundle\\nsis\\Maki_*_x64-setup.exe",
+                "yellow_after_s": 604800,
+                "comment": "2026-07-17 (operator-directed fix-wave): produced-artifact EVIDENCE for maki's sanctioned publish lane (scripts/build-release.ps1 -> signed NSIS installer; the filename carries the version). A growth_publish_recency green with published:true but NO matching installer is a publish claim without evidence — the June 30 empty-url lesson applied to installers. Yellow-only: absence/staleness degrades to unobservable/yellow, never red (release cadence is operator-paced). ops/ledger.rs growth_artifact_activity mirrors newest-name+mtime into the outcomes ledger."
             }
         ]
     },
