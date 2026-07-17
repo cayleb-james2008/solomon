@@ -281,6 +281,20 @@ pub fn sweep() -> Value {
     sweep_filtered(None)
 }
 
+/// True iff the probe config marks its RED as an OPERATOR-GATED external dependency (ops.json
+/// `operator_gated: true` — a human-owned platform login/session no agent can restore, e.g.
+/// sover's YouTube probes). Anything but exactly boolean true reads ungated — fail closed. Pure.
+pub(crate) fn probe_operator_gated(cfg: &Value) -> bool {
+    cfg.get("operator_gated").and_then(Value::as_bool) == Some(true)
+}
+
+/// The rollup classification consumers (growth's green-before-growth gate) read: a RED rollup is
+/// "operator-gated only" iff at least one red probe is operator-gated AND no ungated probe is red
+/// — i.e. the engine itself is alive and the red is a human dependency. Pure — unit-tested.
+pub(crate) fn red_only_operator_gated(worst: Status, gated_red: bool, ungated_red: bool) -> bool {
+    worst == Status::Red && gated_red && !ungated_red
+}
+
 /// One project: evaluate every probe, evolve state against the previous verdict file, persist the
 /// new verdict + incident transitions, and return the rollup entry for ops_status.json.
 fn sweep_project(entry: &Value, ts: &str) -> Value {
@@ -300,6 +314,8 @@ fn sweep_project(entry: &Value, ts: &str) -> Value {
     let mut restart_forbidden = false;
     let mut process_green = true;
     let mut outcomes_green = true;
+    let mut gated_red = false;
+    let mut ungated_red = false;
     let mut status_map = Map::new();
 
     for cfg in registry::project_probes(entry) {
@@ -360,6 +376,14 @@ fn sweep_project(entry: &Value, ts: &str) -> Value {
         if raw.restart_forbidden && status == Status::Red {
             restart_forbidden = true;
         }
+        // Classify each red as operator-gated vs engine (the growth compose gate's distinction).
+        if status == Status::Red {
+            if probe_operator_gated(&cfg) {
+                gated_red = true;
+            } else {
+                ungated_red = true;
+            }
+        }
         status_map.insert(id.clone(), json!(status.as_str()));
         probes.insert(id, verdict);
     }
@@ -385,6 +409,10 @@ fn sweep_project(entry: &Value, ts: &str) -> Value {
         "worst_probe": worst_probe,
         "reasons": reasons,
         "restart_forbidden": restart_forbidden,
+        // A red carried SOLELY by operator-gated probes (human platform login, e.g. sover's
+        // YouTube session) — growth::eligible_repo composes-and-holds through such a red instead
+        // of reading the engine as dead. Absent on sweep-panic entries -> consumers fail closed.
+        "red_operator_gated_only": red_only_operator_gated(worst, gated_red, ungated_red),
         "probes": Value::Object(status_map),
     })
 }
@@ -699,6 +727,26 @@ mod tests {
         // clock skew clamps at 0
         let future = json!({"checked_at": "2026-07-01T13:00:00Z"});
         assert_eq!(compute_blind_window(Some(&future), now_dt), json!(0.0));
+    }
+
+    // -------- operator-gated red classification (the growth compose-gate distinction) --------
+    #[test]
+    fn operator_gated_flag_and_red_classification() {
+        // config flag: exactly boolean true, everything else fail-closed ungated
+        assert!(probe_operator_gated(&json!({"operator_gated": true})));
+        assert!(!probe_operator_gated(&json!({"operator_gated": false})));
+        assert!(!probe_operator_gated(&json!({"operator_gated": "true"})));
+        assert!(!probe_operator_gated(&json!({})));
+        // rollup classification: red + only gated reds -> true
+        assert!(red_only_operator_gated(Status::Red, true, false));
+        // any ungated red (even alongside a gated one) -> engine-dead
+        assert!(!red_only_operator_gated(Status::Red, true, true));
+        assert!(!red_only_operator_gated(Status::Red, false, true));
+        // not red at all -> never claims the gated-red state (red-scoped by contract)
+        assert!(!red_only_operator_gated(Status::Yellow, true, false));
+        assert!(!red_only_operator_gated(Status::Green, false, false));
+        // red with no red probes recorded (defensive impossibility) stays fail-closed
+        assert!(!red_only_operator_gated(Status::Red, false, false));
     }
 
     // -------- rollup: worst wins + two-plane health rule --------

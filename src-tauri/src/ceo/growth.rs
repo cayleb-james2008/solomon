@@ -666,7 +666,10 @@ pub(crate) fn growth_directive(backlog: &str, today_marker: &str) -> Option<Stri
 /// private — asmodeus has no flag and daedulus is `false`, both excluded), a non-empty north star
 /// (morning_plan's "no north star = not a planned lane" rule), and its ops rollup is not RED
 /// (green-before-growth: don't market a dead engine; an ABSENT rollup is not red — drafting is
-/// local and harmless).
+/// local and harmless) — EXCEPT a red carried SOLELY by operator-gated external probes
+/// ([`red_on_operator_gated_probes_only`]) is NOT engine death: the engine keeps composing
+/// (compose-and-hold — drafts land in the gated log and the publish seam ships via the healthy
+/// platforms' sanctioned lane) while the human dependency, e.g. sover's YouTube login, waits.
 pub(crate) fn eligible_repo(repo: &Value, north_star: &str, rollup: &Value) -> bool {
     if paths::repo_name(repo).is_empty() {
         return false;
@@ -678,6 +681,17 @@ pub(crate) fn eligible_repo(repo: &Value, north_star: &str, rollup: &Value) -> b
         return false;
     }
     rollup.get("status").and_then(Value::as_str) != Some("red")
+        || red_on_operator_gated_probes_only(rollup)
+}
+
+/// True iff the rollup's RED is carried SOLELY by operator-gated external probes — ops.json probes
+/// marked `operator_gated: true` (a HUMAN-owned dependency like sover's YouTube Google session,
+/// which no agent can re-login), classified by the ops sweep into the rollup's
+/// `red_operator_gated_only` flag (`ops::outcomes::red_only_operator_gated`). Absent/false reads
+/// as engine-dead — fail closed, so pre-flag rollups and sweep-panic entries keep the strict
+/// green-before-growth behavior. Pure — unit-tested.
+pub(crate) fn red_on_operator_gated_probes_only(rollup: &Value) -> bool {
+    rollup.get("red_operator_gated_only").and_then(Value::as_bool) == Some(true)
 }
 
 /// `runtime/<lane>/_growth_drafted_<YYYY-MM-DD>` — the per-lane per-day compose marker (a sibling
@@ -1727,6 +1741,30 @@ mod tests {
         assert!(eligible_repo(&sover, "a goal", &json!({})));
         // a nameless row has no runtime dir and is never eligible
         assert!(!eligible_repo(&json!({"public": true}), "a goal", &green));
+    }
+
+    // ---- OPERATOR-GATED RED: a human-blocked platform probe is NOT engine death ----
+    #[test]
+    fn red_carried_only_by_operator_gated_probes_still_composes() {
+        let sover = json!({"name": "sover", "public": true});
+        // YouTube's human-gated login is the ONLY red -> the engine is alive: compose-and-hold
+        // proceeds for the healthy platforms (the 2026-07-17 sover zero-drafts wedge).
+        let yt_red = json!({"status": "red", "red_operator_gated_only": true, "probes": {
+            "publish_recency_youtube": "red", "publish_recency_instagram": "green"}});
+        assert!(red_on_operator_gated_probes_only(&yt_red));
+        assert!(eligible_repo(&sover, "a goal", &yt_red));
+        // ANY non-gated red = engine-dead -> green-before-growth holds, unchanged
+        let engine_red = json!({"status": "red", "red_operator_gated_only": false});
+        assert!(!red_on_operator_gated_probes_only(&engine_red));
+        assert!(!eligible_repo(&sover, "a goal", &engine_red));
+        // an ABSENT flag reads engine-dead (fail closed — pre-flag rollups, sweep-panic entries)
+        assert!(!eligible_repo(&sover, "a goal", &json!({"status": "red"})));
+        // non-bool junk is not a bypass
+        assert!(!eligible_repo(&sover, "a goal",
+            &json!({"status": "red", "red_operator_gated_only": "true"})));
+        // the flag is red-scoped: a non-red rollup is eligible with or without it
+        assert!(eligible_repo(&sover, "a goal",
+            &json!({"status": "yellow", "red_operator_gated_only": false})));
     }
 
     // ---- DAY-GATE: stamp-first — a stamped lane is a same-day no-op even when compose failed ----
