@@ -40,6 +40,10 @@ pub(crate) const TRACKED: &[&str] = &["repos.json", "ops.json", "actions.json"];
 /// Ratified 2026-07-18 by the operator per the proof-required-ledger-fix cycle's blocker B2 (the
 /// frozen-core/oracle boundary was never ratified before; this is the mechanical barrier, not prose).
 /// Adding a path here is itself a frozen-core edit (requires `operator:` provenance).
+// pub: the frozen-core build-gate test reads this constant; the runtime bin does not (the tripwire
+// is test-only, mirroring TRACKED's pub(crate) + the watched-file test). #[allow(dead_code)] keeps
+// clippy's -D dead_code happy in the runtime build where no non-test code references it.
+#[allow(dead_code)]
 pub const FROZEN_CORE: &[&str] = &[
     // The pecrt dual-implementation drift gate (Rust + Python + shared golden).
     "src-tauri/src/pecrt/drift.rs",
@@ -708,6 +712,15 @@ mod tests {
             "b85970f1f8f53abcef8d9eb186d77da90ee94b66",
             "754e9b05d6ded9f751e005160e727aa3c05b5761",
             "89aa5f6563d5bb166c7e45a91d12fb00c6966f3f",
+            // 2026-07-18 operator hand-edit to ops.json (sover process probe path_contains
+            // widened from 'sover-live' to 'sover') committed with an `ops:` subject — not a
+            // valid provenance prefix (operator:/rsi: family only). Real history, cannot be
+            // rewritten; recorded, not laundered. Root cause is a process gap: the operator's
+            // ad-hoc ops.json edits must use the `operator:` subject so they pass this gate. The
+            // 2026-07-18 frozen-core oracle barrier (this commit's sibling) closes the gap going
+            // forward for the frozen-core paths; the watched-file gate continues to require the
+            // `operator:`/`rsi:` subject for ops.json.
+            "e7c1a881bc013a1761cc4067f731959c8afefcd8",
         ];
         let text = String::from_utf8_lossy(&out.stdout);
         let violations: Vec<&str> = text

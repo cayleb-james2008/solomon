@@ -5,7 +5,8 @@
 //! through the existing gated `run-improver --once` executor.
 
 use crate::control::{heartbeat, locks, paths, proc, registry};
-use crate::improver::pi;
+use crate::improver::ctx::Ctx;
+use crate::improver::{pi, progress};
 use crate::notify;
 use crate::ops;
 use crate::supervisor;
@@ -858,6 +859,17 @@ fn plan_jobs(
         // actual implement/AI job behind it. The `needs_human_spec` escalation still queues (it
         // carries the operator-facing need). The `state()` display path (emit_proofs=false) still
         // queues proof_required so the dashboard shows the blocker.
+        //
+        // PROGRESS-LEDGER WIRING (the proof-required-ledger-fix cycle, 2026-07-18): a proof_required
+        // emit-bypass does NO mutation, so it IS a zero-delta completion of the (proof_required,
+        // goal, diagnosis) work — the exact retry-theater case the 3-strike quarantine (catalog #5)
+        // exists to kill. Before this wiring, the emit-bypass called `proof()` + `bump_stuck_counter`
+        // but NEVER `progress::record_outcome`, so the quarantine never fired and the lane re-fired
+        // the same dead work forever (solomon self-lane: 39 consecutive, 0 shipped). Now: build the
+        // lane Ctx, seed the ledger entry, snapshot the pre-state, emit the proof, then record the
+        // outcome — 3 zero-delta proof_required completions quarantine the key and the selector
+        // picks different work (the autonomous re-spec path above). The outcome word is "noop"
+        // (proof_required is inert — never "shipped"; same discipline as orchestrator.rs:655-660).
         if kind == "proof_required" && emit_proofs {
             let ops_project = ops_payload
                 .get("projects")
@@ -877,6 +889,53 @@ fn plan_jobs(
                 spec_category: None,
                 wake_override: false,
             };
+
+            // Progress-ledger wiring: seed the entry + snapshot the pre-state BEFORE proof() (so
+            // the post-state comparison in record_outcome measures the real delta, not our own
+            // bookkeeping). The key uses the standing repos.json goal as the goal component (the
+            // lane's north-star — the same goal a real implement iteration would select) and the
+            // diagnosis component is read from `runtime/<name>/escalation.json` via
+            // `progress::current_diagnosis(&ctx)` — the SAME reader the iteration path's
+            // `filter_quarantined_selection` uses (progress.rs:55-61), so a future extension of
+            // the iteration path to consult proof_required quarantines sees the same key. A lane
+            // whose diagnosis changes (e.g. gh_not_ready -> ok) gets a fresh key, so a healed lane
+            // is not blocked by the stale diagnosis's quarantine.
+            //
+            // NOTE (reviewer finding, 2026-07-18): today the iteration path's
+            // `filter_quarantined_selection` queries `progress_key(ctx.phase="implement", goal,
+            // current_diagnosis)` — a DIFFERENT key shape (ctx.phase="implement", not
+            // "proof_required") — so the quarantine this call arms is NOT currently consulted by
+            // the iteration path. The autonomous re-spec path above (the `would_park` branch)
+            // consults `proof_cooldown_entry` (armed by `bump_stuck_counter`), not
+            // `progress::quarantined`. So this `record_outcome` call is DEFENSE-IN-DEPTH
+            // OBSERVABILITY: it records the zero-delta completion in the progress ledger so the
+            // quarantine state is observable + so a future extension of the selector to consult
+            // proof_required keys (e.g. routing proof_required through
+            // `filter_quarantined_selection` with ctx.phase="proof_required") gets the strikes for
+            // free. The PRIMARY retry-theater killer remains `bump_stuck_counter` → `proof_cooldown`
+            // → the `would_park` autonomous re-spec path above. This call does no harm (it writes
+            // to the ledger, which is a read-only file to the selector) and adds real
+            // observability (the operator can read `runtime/<name>/progress.json` and see the
+            // strike count even when the cooldown hasn't armed yet).
+            let goal_text = registry::project_goal(repo);
+            let provider = registry::project_provider(repo);
+            let model = registry::project_model(repo);
+            let model_opt: Option<&str> = if model.is_empty() { None } else { Some(&model) };
+            let mut ctx = Ctx::configure(
+                &paths::repo_path(repo),
+                &name,
+                &provider,
+                model_opt,
+            );
+            let proof_diag = progress::current_diagnosis(&ctx);
+            let proof_key = progress::progress_key("proof_required", &goal_text, &proof_diag);
+            let proof_pre_hash = if proof_key.is_empty() {
+                String::new()
+            } else {
+                progress::note_selected(&ctx, &proof_key, &goal_text);
+                progress::state_hash(&ctx)
+            };
+
             let _ = proof(
                 &job,
                 "proof_required",
@@ -887,6 +946,19 @@ fn plan_jobs(
             // Bump the stuck counter inline so the proof cooldown + watchdog force-heal still arm
             // even though the job was never dispatched to finish_non_ai_job.
             bump_stuck_counter(st, &name, true);
+
+            // Record the zero-delta completion in the progress ledger (defense-in-depth
+            // observability — see the NOTE above). The record_outcome call computes post_hash
+            // internally and compares to proof_pre_hash; because proof_required is inert,
+            // post_hash == pre_hash → no_delta → strike++. At QUARANTINE_STRIKES (3) the key is
+            // quarantined for 24h in the ledger; the selector does not yet consult this key shape,
+            // but the quarantine state is observable in `runtime/<name>/progress.json` for the
+            // operator and for a future selector extension. calibration::resolve_pending is also
+            // folded in by record_outcome (no-op here — no pending calibration attempt was stamped
+            // for an inert proof_required).
+            if !proof_key.is_empty() {
+                progress::record_outcome(&mut ctx, &proof_key, &proof_pre_hash, "noop");
+            }
             continue;
         }
         if kind == "cooldown" {
