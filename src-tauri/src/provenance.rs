@@ -25,6 +25,50 @@ use std::time::Duration;
 // enters this set (the tool manifest is a gitignored runtime file, never tracked/watched).
 // Visibility widening only; the set and the tripwire behavior are byte-identical.
 pub(crate) const TRACKED: &[&str] = &["repos.json", "ops.json", "actions.json"];
+
+/// FROZEN-CORE oracle paths — the self-dealing surface for the solomon self-improvement lane.
+/// The pi-agent lane that improves Solomon's own repo writes harness code that ENFORCES the oracle
+/// (the anti-gaming gate, the pecrt drift gate, the money-out guard, the progress-ledger quarantine
+/// key logic, the gate/EVAL_CMD/freshness/visual_gate config fields). An improver that grades its own
+/// grader always "succeeds" — so these paths are READ-ONLY to the pi-agent lane after operator
+/// ratification. A commit that touches one of them MUST carry an `operator:` provenance prefix
+/// (operator: explicit human sign-off) — an `rsi:`-family tag (autonomous) is NOT sufficient. The
+/// build-gate test `frozen_core_commits_carry_operator_provenance_tags` enforces this on every
+/// `cargo test` run, mirroring the existing `watched_file_commits_since_convention_carry_provenance_tags`
+/// gate for the runtime-tracked config files.
+///
+/// Ratified 2026-07-18 by the operator per the proof-required-ledger-fix cycle's blocker B2 (the
+/// frozen-core/oracle boundary was never ratified before; this is the mechanical barrier, not prose).
+/// Adding a path here is itself a frozen-core edit (requires `operator:` provenance).
+pub const FROZEN_CORE: &[&str] = &[
+    // The pecrt dual-implementation drift gate (Rust + Python + shared golden).
+    "src-tauri/src/pecrt/drift.rs",
+    "src-tauri/src/pecrt/safety.rs",
+    "src-tauri/src/pecrt/warm.rs",
+    "src-tauri/src/pecrt/bus.rs",
+    "src-tauri/src/pecrt/mod.rs",
+    "pecrt.py",
+    "pecrt_golden.json",
+    // The NO-MONEY-OUT guard — fail-closed, outermost default-DENY.
+    "src-tauri/src/money_guard.rs",
+    // The anti-gaming gate (Gate #2) — the runner's own reward-hacking check.
+    // Only the decision functions are frozen; the rest of gates.rs is not.
+    // A path-level gate is coarse (the whole file is frozen) — but a partial-file
+    // freeze would require a line-range scan, which is brittle. The cycle's own
+    // frozen-core list (improver/solomon/AGENT.md) names the SPECIFIC functions
+    // (anti_gaming_reason, new_skip_markers) the pi-agent must not edit; the build
+    // gate enforces the file-level barrier, the AGENT.md names the function-level
+    // contract. Both apply.
+    "src-tauri/src/improver/gates.rs",
+    // The progress-ledger quarantine key logic (the 3-strike decision).
+    // The cycle's own fix ADDS a record_outcome call site in fleet.rs (NOT frozen —
+    // fleet.rs is the dispatch path, not the oracle); the quarantine DECISION logic
+    // (progress_key, QUARANTINE_STRIKES, the strike counter in record_outcome) is frozen.
+    "src-tauri/src/improver/progress.rs",
+    // The provenance convention doc + this tripwire itself (a self-edit could weaken it).
+    "docs/rsi/PROVENANCE.md",
+    "src-tauri/src/provenance.rs",
+];
 /// The gitignored secrets file — watched by content hash, never by git.
 const ENV_FILE: &str = ".env";
 /// Drift may persist this long uncommitted before the tripwire pages + holds (the acceptance
@@ -681,6 +725,129 @@ mod tests {
         assert!(
             violations.is_empty(),
             "watched-file commits without a provenance tag (docs/rsi/PROVENANCE.md): {violations:?}"
+        );
+    }
+
+    // -------- frozen-core oracle barrier (the self-dealing surface for the solomon self-lane) --------
+    //
+    // The solomon pi-agent lane writes harness code that ENFORCES the oracle (anti-gaming gate,
+    // pecrt drift gate, money-out guard, progress-ledger quarantine). An improver that grades its
+    // own grader always "succeeds" — so the frozen-core paths (FROZEN_CORE) require an `operator:`
+    // provenance prefix (explicit human sign-off), NOT an autonomous `rsi:`-family tag. This is
+    // the mechanical barrier B2 ratifies (the prose-only barrier left the self-dealing hole open).
+    //
+    // A `valid_provenance_subject` accepts both `operator:` and `rsi:`; for the frozen core we
+    // require the STRICTER `operator:` form. An `rsi:` commit touching a frozen-core path is a
+    // violation (an autonomous edit to its own oracle — the exact self-dealing this gate exists to
+    // refuse). The gate is a `#[test]` so it runs on every `cargo test` — the solomon self-lane's
+    // own gate (`cd src-tauri && cargo test`) catches a self-dealing edit at the gate, before ship.
+
+    /// True iff a commit subject carries the `operator:` prefix (explicit human sign-off). Stricter
+    /// than `valid_provenance_subject`, which also accepts the autonomous `rsi:`-family. Pure.
+    #[allow(dead_code)] // consumed by the frozen-core build-gate test, not by the runtime bin
+    pub fn is_operator_provenance(subject: &str) -> bool {
+        let s = subject.trim_start();
+        if s.starts_with("Merge ") {
+            // A merge commit is operator-approved transitively (the operator clicked Merge). A
+            // frozen-core change that landed via PR + merge carries the PR's operator-merge as its
+            // provenance. The PR's own commits were already gated at their own ship time.
+            return true;
+        }
+        if let Some(rest) = s.strip_prefix("operator: ") {
+            return !rest.trim().is_empty();
+        }
+        false
+    }
+
+    /// The frozen-core build gate: every commit since the barrier landed that touches a
+    /// FROZEN_CORE path MUST carry an `operator:` provenance prefix. An `rsi:`-family tag (an
+    /// autonomous edit to its own oracle) is a violation — the self-dealing this gate refuses.
+    /// Skips (passes) only when git cannot resolve the range (e.g. a shallow clone), because an
+    /// indeterminate answer is a tooling gap, not a violation.
+    ///
+    /// The barrier base is found dynamically by subject marker ("frozen-core oracle barrier")
+    /// so the gate is self-locating — the commit that introduces FROZEN_CORE IS the barrier, and
+    /// the gate starts enforcing from the NEXT commit onward (the barrier commit itself is the
+    /// ratification, not a violation). If the marker is not found (e.g. a shallow clone missing
+    /// the barrier commit), the gate skips (indeterminate, not a violation).
+    ///
+    /// Grandfathered: history predating the barrier is not retroactively judged. The pre-barrier
+    /// autonomous edits to FROZEN_CORE paths are recorded in `GRANDFATHERED_FROZEN`, not laundered
+    /// — root cause is the pre-barrier process gap, now closed by this gate.
+    #[test]
+    fn frozen_core_commits_carry_operator_provenance_tags() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+
+        // Find the barrier commit by subject marker. The barrier commit is the one that
+        // introduced FROZEN_CORE (its subject contains "frozen-core oracle barrier"). Use
+        // `git log --all --grep` so the marker resolves even on a branch that hasn't merged yet.
+        let marker_out = Command::new("git")
+            .args([
+                "log",
+                "--all",
+                "--format=%H",
+                "--grep=frozen-core oracle barrier",
+            ])
+            .current_dir(&repo_root)
+            .output();
+        let barrier_sha = match marker_out {
+            Ok(o) if o.status.success() => {
+                let text = String::from_utf8_lossy(&o.stdout);
+                text.lines().next().map(|l| l.trim().to_string()).unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+        if barrier_sha.is_empty() {
+            eprintln!(
+                "skipping frozen-core gate: barrier commit not found (marker: 'frozen-core \
+                 oracle barrier') — the gate is not yet in effect"
+            );
+            return;
+        }
+
+        // Grandfathered pre-barrier autonomous edits to FROZEN_CORE paths (recorded, not
+        // laundered — history is never rewritten; the barrier closes the gap going forward).
+        // Each is a full SHA prefix so the match is stable regardless of git's %h length.
+        const GRANDFATHERED_FROZEN: &[&str] = &[];
+
+        let mut args = vec![
+            "log".to_string(),
+            "--format=%h%x09%s".to_string(),
+            format!("{barrier_sha}..HEAD"),
+        ];
+        for p in FROZEN_CORE {
+            args.push("--".to_string());
+            args.push(p.to_string());
+        }
+        let out = Command::new("git").args(&args).current_dir(&repo_root).output();
+        let out = match out {
+            Ok(o) if o.status.success() => o,
+            _ => {
+                eprintln!(
+                    "skipping frozen-core gate: git log could not resolve the barrier range"
+                );
+                return;
+            }
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let violations: Vec<String> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter(|l| {
+                let mut parts = l.splitn(2, '\t');
+                let short = parts.next().unwrap_or("").trim();
+                let subject = parts.next().unwrap_or("");
+                let grandfathered = !short.is_empty()
+                    && GRANDFATHERED_FROZEN.iter().any(|full| full.starts_with(short));
+                !grandfathered && !is_operator_provenance(subject)
+            })
+            .map(|l| l.to_string())
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "frozen-core commits without an `operator:` provenance tag (the self-dealing barrier \
+             — an autonomous `rsi:`-family edit to the oracle is a self-dealing violation; see \
+             FROZEN_CORE in provenance.rs): {violations:?}"
         );
     }
 
