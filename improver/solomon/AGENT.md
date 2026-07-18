@@ -50,6 +50,54 @@ iteration as wasted.
   this contract is for `src-tauri/`, `web/`, and Solomon's own docs only.
 - A truthful "nothing worth changing this cycle" beats a fabricated or cosmetic change.
 
+## Frozen-core oracle paths (READ-ONLY to this lane — operator-ratified 2026-07-18)
+
+Solomon's self-improvement lane writes harness code that ENFORCES the oracle (the gate, the
+anti-gaming check, the drift gate, the money-out guard, the quarantine decision). An improver
+that grades its own grader always "succeeds" — so these paths are **READ-ONLY** to this lane
+after operator ratification. A commit that touches one of them MUST carry an `operator:`
+provenance prefix (explicit human sign-off); an autonomous `rsi:`-family tag is NOT sufficient
+and the `frozen_core_commits_carry_operator_provenance_tags` build-gate test in
+`src-tauri/src/provenance.rs` will fail the gate on it.
+
+**File-level frozen core** (see `FROZEN_CORE` in `provenance.rs` — the build gate enforces these):
+- `src-tauri/src/pecrt/{drift.rs,safety.rs,warm.rs,bus.rs,mod.rs}` + `pecrt.py` + `pecrt_golden.json`
+  — the dual-implementation drift gate.
+- `src-tauri/src/money_guard.rs` — the NO-MONEY-OUT guard.
+- `src-tauri/src/improver/gates.rs` — the anti-gaming gate (file-level frozen; the function-level
+  contract below is the real boundary — the file gate is the coarse backstop).
+- `src-tauri/src/improver/progress.rs` — the quarantine DECISION logic (`progress_key`,
+  `QUARANTINE_STRIKES`, the strike counter in `record_outcome`). Adding a NEW `record_outcome`
+  CALL SITE (e.g. in `fleet.rs`) is allowed; editing the quarantine decision logic is not.
+- `docs/rsi/PROVENANCE.md` + `src-tauri/src/provenance.rs` — the provenance convention + this
+  tripwire itself.
+
+**Function-level frozen core** (the file-level gate's coarse backstop; the pi-agent must not
+edit these specific decision functions even within a non-frozen file):
+- `gates.rs::anti_gaming_reason` + `gates.rs::new_skip_markers` — the reward-hacking verdict.
+- `progress.rs::progress_key` + `progress.rs::record_outcome`'s strike-counter branch — the
+  3-strike quarantine decision.
+- `money_guard.rs::classify` — the money-out verdict.
+- `pecrt/safety.rs::classify_schedule` — the pecrt safety verdict.
+
+**Not frozen** (this lane MAY edit these — they are the dispatch path, not the oracle):
+- `src-tauri/src/fleet.rs` — the autopilot dispatch path (adding a `progress::record_outcome`
+  call site is allowed; the call target's logic is frozen, the call site is not).
+- `src-tauri/src/improver/iteration.rs` — the iteration loop (same: call sites are editable,
+  the called decision functions are not).
+- `src-tauri/src/ceo/` — the CEO planes.
+- `src-tauri/src/supervisor.rs` — the recovery ladder.
+- `src-tauri/src/watchdog.rs` — the sweep loop.
+- `src-tauri/src/control/` — registry, runner, proc, heartbeat, locks, branches, gh, keys, paths.
+- `web/`, `runtime/`, `tools/` — the dashboard, runtime state, tooling scripts.
+
+**Self-reference hazard**: this lane writes the harness code that ENFORCES the oracle. The
+file-level build gate (`frozen_core_commits_carry_operator_provenance_tags`) is the mechanical
+barrier; the function-level contract above is the prose reinforcement. BOTH apply. A change
+that weakens the gate, the anti-gaming check, the pecrt drift gate, the money-out guard, or the
+quarantine decision logic — even if it would make the lane "succeed" — is a self-dealing
+violation and the gate reverts it.
+
 ## Map of the code
 
 - `src-tauri/src/main.rs` — entrypoint, CLI subcommand dispatch (`run-improver`, `watchdog`,
