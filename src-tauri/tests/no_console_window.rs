@@ -253,7 +253,7 @@ fn scan(root: &Path) -> (Vec<Violation>, usize, usize) {
             }
         }
 
-        for (_idx, &line1) in sites.iter().enumerate() {
+        for &line1 in sites.iter() {
             if in_test_mod(line1, tests_start) {
                 continue; // test code — exempt
             }
@@ -265,13 +265,13 @@ fn scan(root: &Path) -> (Vec<Violation>, usize, usize) {
             // Exemption 1: non-console program literal (Unix shell, dead on Windows).
             let is_non_console_literal = arg
                 .as_deref()
-                .map(|a| NON_CONSOLE_PROGRAM_LITERALS.iter().any(|lit| *lit == a))
+                .map(|a| NON_CONSOLE_PROGRAM_LITERALS.contains(&a))
                 .unwrap_or(false);
 
             // Exemption 2: explicit (file, line) allowlist for intentional browser-open spawns.
             let is_browser_open = BROWSER_OPEN_SITES
                 .iter()
-                .any(|(p, l)| *p == &rel && *l == line1);
+                .any(|(p, l)| *p == rel.as_str() && *l == line1);
 
             if is_non_console_literal || is_browser_open {
                 guarded_total += 1;
@@ -283,8 +283,8 @@ fn scan(root: &Path) -> (Vec<Violation>, usize, usize) {
             // single later guard; stopping at the sibling would falsely flag the first branch).
             let window_end = (line0 + 1 + GUARD_WINDOW).min(lines.len());
             let mut window = String::new();
-            for li in (line0 + 1)..window_end {
-                window.push_str(strip_line_comment(lines[li]));
+            for line in lines.iter().take(window_end).skip(line0 + 1) {
+                window.push_str(strip_line_comment(line));
                 window.push('\n');
             }
 

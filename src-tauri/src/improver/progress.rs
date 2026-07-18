@@ -607,6 +607,74 @@ mod tests {
         assert!(quarantined(&c, &key), "future quarantined_until => blocked");
     }
 
+    // ---- proof_required emit-bypass quarantine (the proof-required-ledger-fix cycle, 2026-07-18) ----
+    //
+    // The fleet.rs proof_required emit-bypass (fleet.rs:861) calls proof() + bump_stuck_counter()
+    // but, before this cycle, NEVER progress::record_outcome — so the progress ledger had no
+    // record of the zero-delta proof_required completions. The cycle wires record_outcome into the
+    // emit-bypass; this test proves the LEDGER MECHANISM: progress_key("proof_required", goal,
+    // diagnosis) + note_selected + 3x record_outcome("noop") → the key is quarantined in the
+    // ledger (observable in runtime/<name>/progress.json).
+    //
+    // NOTE (reviewer finding, 2026-07-18): the iteration path's `filter_quarantined_selection`
+    // queries a DIFFERENT key shape (progress_key(ctx.phase="implement", goal,
+    // current_diagnosis)) — so the quarantine this test arms is NOT currently consulted by the
+    // iteration path's selector. The PRIMARY retry-theater killer remains `bump_stuck_counter` →
+    // `proof_cooldown` → the autonomous re-spec path in fleet.rs. This `record_outcome` call is
+    // DEFENSE-IN-DEPTH OBSERVABILITY: it records the zero-delta completion in the ledger so the
+    // quarantine state is observable + so a future extension of the selector to consult
+    // proof_required keys gets the strikes for free. This test proves the ledger mechanism, not
+    // the selector behavior.
+    //
+    // The "noop" outcome word is the inert-arm discipline (proof_required does no mutation; never
+    // "shipped" — same discipline as orchestrator.rs:655-660). A diagnosis change (e.g.
+    // gh_not_ready -> ok) yields a different key, so a healed lane is not blocked by the stale
+    // diagnosis's quarantine.
+    #[test]
+    fn proof_required_emit_bypass_quarantines_after_3_zero_delta_completions() {
+        let mut c = test_ctx();
+        let goal = "OPERATOR GOAL — Fleet autopilot: run the whole fleet safely with zero babysitting";
+        // The key shape fleet.rs now uses: progress_key("proof_required", goal, diagnosis).
+        let key_gh_not_ready = progress_key("proof_required", goal, "gh_not_ready");
+        note_selected(&c, &key_gh_not_ready, goal);
+        let pre = state_hash(&c);
+
+        // 3 zero-delta proof_required completions (the emit-bypass fires once per sweep).
+        record_outcome(&mut c, &key_gh_not_ready, &pre, "noop");
+        assert!(!quarantined(&c, &key_gh_not_ready), "1 strike is below the limit");
+        record_outcome(&mut c, &key_gh_not_ready, &pre, "noop");
+        assert!(!quarantined(&c, &key_gh_not_ready), "2 strikes is below the limit");
+        record_outcome(&mut c, &key_gh_not_ready, &pre, "noop");
+        assert!(
+            quarantined(&c, &key_gh_not_ready),
+            "3rd zero-delta proof_required completion quarantines the key in the ledger"
+        );
+        assert!(entry_i64(&c, &key_gh_not_ready, "quarantined_until") > unix_now());
+
+        // A DIFFERENT diagnosis (e.g. the lane healed: gh_not_ready -> ok) yields a different key,
+        // so the healed lane is NOT blocked by the stale diagnosis's quarantine. This is the
+        // quarantine-reset-on-diagnosis-change semantics the iteration path already honors
+        // (progress::current_diagnosis folds the escalation category into the key).
+        let key_ok = progress_key("proof_required", goal, "ok");
+        assert_ne!(key_gh_not_ready, key_ok, "different diagnosis => different key");
+        assert!(
+            !quarantined(&c, &key_ok),
+            "a healed lane (ok diagnosis) is not blocked by the stale gh_not_ready quarantine"
+        );
+
+        // And a real state delta (a ship on a DIFFERENT key) does not clear the quarantine on
+        // THIS key — quarantine is per-key, not per-lane (a shipped implement iteration does not
+        // un-quarantine a proof_required key; only a non-zero-delta completion of THIS key does).
+        // (record_outcome on the healed key with a delta resets the healed key's counter, not
+        // the stale key's — confirmed by reading the ledger.)
+        record_outcome(&mut c, &key_ok, "a-deliberately-different-pre-hash", "shipped");
+        assert!(
+            quarantined(&c, &key_gh_not_ready),
+            "a ship on a different key does not clear this key's quarantine"
+        );
+        assert_eq!(entry_i64(&c, &key_ok, "count_no_delta"), 0, "shipped resets the healed key");
+    }
+
     #[test]
     fn empty_key_is_inert() {
         // beautify/solomon lanes compute no key — every API must no-op, creating no ledger.
