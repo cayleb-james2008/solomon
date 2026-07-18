@@ -59,6 +59,24 @@ pub const PROOF_COOLDOWN_S: i64 = 14_400;
 /// spend ceiling on top of this.
 pub const DIVERSIFY_DAILY_CAP: u64 = 3;
 
+/// Bounded self-spec CATEGORIES the autonomous re-spec rotates through (operator-directed
+/// full-autonomy directive 2026-07-18). Each self-generated spec targets exactly ONE category so
+/// consecutive attempts are MATERIALLY different work, not the same failing change reworded. Order
+/// matters: it is the rotation order, and `reliability` leads because a parked lane's most likely
+/// real problem is a defect, not a missing feature.
+pub const SELF_SPEC_CATEGORIES: [&str; 4] = ["reliability", "tests", "docs_hygiene", "feature"];
+
+/// Consecutive trailing self-spec failures IN THE SAME CATEGORY before the next self-spec is
+/// FORCED onto a different category. 2 = one same-category retry (with the failed approach
+/// explicitly excluded from the goal text) is allowed, then the spec family is abandoned — the
+/// anti-gaming reverts of 2026-07-17 were the same spec family retried until the rail caught it.
+pub const SELF_SPEC_FAMILY_FAIL_LIMIT: usize = 2;
+
+/// Last-N self-spec attempts kept per lane in `autopilot_state.json` (`st["self_specs"][name]`).
+/// The differentiation guard consults this window; older attempts age out so a category is not
+/// banned forever by ancient failures.
+pub const SELF_SPEC_HISTORY_CAP: usize = 8;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Job {
     name: String,
@@ -72,6 +90,19 @@ struct Job {
     /// charges the lane's per-day diversify budget when THIS job actually dispatches (job_started)
     /// — plan_jobs only routes on the count and never spends (see charge_diversify_dispatch).
     diversify: bool,
+    /// The self-generated FRESH spec for a diversify attempt: the bounded goal text `run_repo_once`
+    /// dispatches INSTEAD of the standing repos.json goal (operator directive 2026-07-18: park
+    /// expiry re-arms autonomous re-spec with NEW goal text). None = run the standing goal.
+    spec_goal: Option<String>,
+    /// The self-spec's category (a member of [`SELF_SPEC_CATEGORIES`]); recorded in the per-lane
+    /// spec ledger at dispatch so the differentiation guard can rotate families. None unless
+    /// `spec_goal` is Some.
+    spec_category: Option<String>,
+    /// True iff this implement job is the one-shot HUMAN WAKE override dispatch (the operator
+    /// ack'd the lane; run their standing spec even though the diagnosis is unhealthy). `once()`
+    /// consumes the wake flag when THIS job actually dispatches — same charge-at-dispatch rule as
+    /// `diversify` (a plan that loses the slot must not eat the wake).
+    wake_override: bool,
 }
 
 struct AutopilotLease {
@@ -243,9 +274,21 @@ pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
     st["last_dispatched"] = json!(job.name.clone());
     // Diversify budget is charged HERE, at actual dispatch — a planned re-spec that lost the
     // single_agent slot costs nothing (plan-time bumping read 3/3 spent on a day with ZERO
-    // job_started events for the starved lanes; see the Job.diversify doc).
+    // job_started events for the starved lanes; see the Job.diversify doc). The dispatched
+    // self-spec is recorded in the lane's spec ledger at the same moment so the differentiation
+    // guard sees exactly what actually ran (never a planned-but-undispatched spec).
     if job.diversify {
         charge_diversify_dispatch(&mut st, &job.name);
+        if let (Some(cat), Some(goal)) = (job.spec_category.as_deref(), job.spec_goal.as_deref()) {
+            record_self_spec_dispatch(&mut st, &job.name, cat, goal);
+        }
+    }
+    // The one-shot human wake override is consumed at ACTUAL dispatch (same rule as the diversify
+    // budget): a wake whose job lost the slot stays pending for the next sweep. A pending wake is
+    // also consumed when the lane dispatches ANY implement (a healthy lane's normal implement IS
+    // the attempt the ack asked for — the flag must not linger and override a much later park).
+    if job.wake_override || (job.kind == "implement" && human_wake_pending(&st, &job.name)) {
+        consume_human_wake(&mut st, &job.name);
     }
     let _ = write_state(&st);
     append_event(
@@ -286,11 +329,14 @@ pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
     // the watchdog's force-heal ladder still sees the full window. Purely additive state key;
     // read_state/write_state round-trip arbitrary JSON.
     let outcome_str = result.get("outcome").and_then(Value::as_str).unwrap_or("");
-    bump_stuck_counter(
-        &mut st,
-        &job.name,
-        outcome_str == "proof_required" || outcome_str == "needs_human_spec",
-    );
+    let inert_outcome = outcome_str == "proof_required" || outcome_str == "needs_human_spec";
+    bump_stuck_counter(&mut st, &job.name, inert_outcome);
+    // Resolve the dispatched self-spec in the lane's spec ledger: an inert outcome (incl. an
+    // anti-gaming REVERT, which lands as proof_required) marks the spec FAILED so the
+    // differentiation guard rotates away from its family; any real outcome marks it MOVED.
+    if job.diversify {
+        resolve_self_spec_outcome(&mut st, &job.name, inert_outcome);
+    }
     // SURFACE-ONCE bookkeeping: this dispatch just filed the lane's needs_human_spec need (the
     // proof record + job_finished event — the one operator notification). Record it so plan_jobs
     // parks identical re-dispatches (see nhs_already_surfaced) instead of starving real jobs.
@@ -348,11 +394,17 @@ pub fn wake(auto_push: bool, only_name: Option<&str>) -> Value {
     let cfg = registry::autopilot_config();
     let mut st = read_state(&cfg);
     st["paused"] = Value::Bool(false);
-    // HUMAN ACK: an explicit per-lane wake un-parks the lane's surfaced needs_human_spec need —
-    // the operator reviewed/spec'd it, so the need re-checks the lane's current state and (if it
-    // still holds) re-surfaces exactly once instead of staying silently parked.
+    // HUMAN ACK (an override, no longer the only exit — operator directive 2026-07-18): an
+    // explicit per-lane wake means the operator reviewed the blocker and (re)spec'd the standing
+    // goal. Reset the lane's park + stuck streak + surfaced-need marker (`bump_stuck_counter`'s
+    // real-move arm, reused so the accounting stays identical) and arm the ONE-SHOT wake override
+    // so the next dispatch runs a normal gated implement on the operator's standing spec — even
+    // while the diagnosis is still unhealthy — instead of the autonomous self-respec. The
+    // self-spec ledger is deliberately KEPT: past failures still inform differentiation if the
+    // lane wedges again.
     if let Some(n) = only_name {
-        clear_nhs_surfaced(&mut st, n);
+        bump_stuck_counter(&mut st, n, false);
+        arm_human_wake(&mut st, n);
     }
     st["ts"] = json!(now());
     st["config"] = public_config(&cfg);
@@ -429,7 +481,7 @@ fn run_ai_job(job: &Job, repos: &[Value], cfg: &Value, auto_push: bool, st: &mut
     append_event(
         &json!({"event": "agent_call_started", "repo": job.name, "provider": cfg["provider"], "model": cfg["model"]}),
     );
-    let out = run_repo_once(repo, cfg, auto_push, key_env, &key_value);
+    let out = run_repo_once(repo, cfg, auto_push, key_env, &key_value, job.spec_goal.as_deref());
     let quota = pi::is_quota_error_output(&out.stdout, &out.stderr)
         || out.stdout.contains("\"reason\":\"quota_error\"")
         || out.stderr.contains("quota_error");
@@ -586,6 +638,9 @@ fn plan_jobs(
                 reason: "repo is listed in autopilot targets but missing from registry".into(),
                 next_action: "fix repos.json target/path".into(),
                 diversify: false,
+                spec_goal: None,
+                spec_category: None,
+                wake_override: false,
             });
             continue;
         };
@@ -695,19 +750,41 @@ fn plan_jobs(
                 "hold",
             )
         };
-        // AUTONOMOUS RE-SPEC (operator directive: NO human park). A lane that would otherwise be
-        // parked for a human spec — either STRUCTURALLY stuck (stranded/unmerged branch, hung PID,
-        // un-pushed base) OR hit the proof_required COOLDOWN (PROOF_COOLDOWN_THRESHOLD consecutive
-        // inert proof_required sweeps) — instead gets a BOUNDED autonomous diversification: dispatch
-        // a gated AI implement iteration that tries a FRESH, DIFFERENT approach via the MoA brain
-        // (whose own anti-thrash/escalation forces a different goal — never the identical failing
-        // change), capped at DIVERSIFY_DAILY_CAP per lane per day. Past the cap, BACK OFF to
-        // low-frequency autonomous retry (the inert proof_required emit-bypass below — no LLM spend,
-        // rate-limited by the cooldown cadence, re-attempting when the daily count resets). Never a
-        // human park, never infinite spend. Anti-gaming stays intact: the gated implement can never
-        // merge a bad change (the RSI gates + the improver's hypothesis/freshness/progress ledgers
-        // police fake metric progress); fleet only decides to keep ATTEMPTING autonomously rather
-        // than waiting on a human. `needs_human_spec` is never chosen.
+        // HUMAN WAKE OVERRIDE (operator directive 2026-07-18: the wake STAYS as an exit, it is
+        // just no longer the ONLY one). An explicit per-lane wake() ack'd this lane: the operator
+        // reviewed the blocker and (re)spec'd the standing repos.json goal. Route the lane to a
+        // NORMAL gated implement on THAT spec — bypassing both the inert proof_required arm and
+        // the autonomous self-respec (no diversify budget charged, no generated goal). One-shot:
+        // `once()` consumes the flag when this job actually dispatches (charge-at-dispatch, same
+        // rule as the diversify budget — a plan that loses the slot must not eat the wake).
+        let mut wake_job = false;
+        if kind == "proof_required" && human_wake_pending(st, &name) {
+            wake_job = true;
+            kind = "implement";
+            state = "queued";
+            requires_ai = true;
+            reason = "operator wake ack — running one gated RSI iteration on the operator's \
+                      standing spec (human override of the autonomous re-spec loop)";
+            next_action = "run one gated RSI iteration under the operator-reviewed standing goal";
+        }
+        // AUTONOMOUS RE-SPEC (operator directive: NO human requirement in the lane loop — a lane
+        // must never park indefinitely waiting for a human spec). A lane that would otherwise sit
+        // inert — either STRUCTURALLY stuck (stranded/unmerged branch, hung PID, un-pushed base)
+        // OR carrying a proof_required park entry (PROOF_COOLDOWN_THRESHOLD consecutive inert
+        // sweeps armed it), whether that park is ACTIVE **or EXPIRED** — instead gets a BOUNDED
+        // autonomous self-respec: `generate_self_spec` produces a FRESH bounded spec (NEW goal
+        // text, category-rotated and materially different from the last failed specs — see the
+        // self-spec ledger) and the lane dispatches it as a real gated AI implement iteration.
+        // PARK EXPIRY RE-ARMS THIS PATH: an expired-but-present park entry (nothing cleared it —
+        // no human wake, no real outcome) routes straight back here instead of the old inert
+        // proof_required re-fire + re-arm rotation. Capped at DIVERSIFY_DAILY_CAP per lane per
+        // day; past the cap, BACK OFF to low-frequency autonomous retry (the inert proof_required
+        // emit-bypass below — no LLM spend) and resume when the daily count resets. Never a human
+        // park, never infinite spend. Anti-gaming stays intact: the gated implement can never
+        // merge a bad change (the RSI gates + anti-gaming revert rails + the improver's
+        // hypothesis/freshness/progress ledgers police fake progress); fleet only decides to keep
+        // ATTEMPTING autonomously — with better-differentiated specs — rather than waiting on a
+        // human. `needs_human_spec` is never chosen.
         // Holds the diversify/backoff reason string; assigned (and `reason` re-pointed at it) only on
         // the would_park path, so it must outlive the borrow until `jobs.push` below.
         let diversify_reason: String;
@@ -717,15 +794,21 @@ fn plan_jobs(
         // slot — plan-time bumping burned 3/3 with ZERO job_started events for the lane (the
         // 2026-07-17 asmodeus+solomon ~20h proof_required starvation).
         let mut diversify_job = false;
+        // The generated fresh spec (goal text + category) for a diversify attempt; carried on the
+        // Job so `once()` records the SAME spec it dispatches in the self-spec ledger.
+        let mut spec_goal: Option<String> = None;
+        let mut spec_category: Option<String> = None;
         let would_park = kind == "proof_required"
             && (supervisor::is_structurally_stuck(diag_cat)
-                || proof_cooldown_active_at(st, &name, Utc::now()));
+                || proof_cooldown_entry(st, &name).is_some());
         if would_park {
             let today = today_local();
             if diversify_count(st, &name, &today) < DIVERSIFY_DAILY_CAP {
                 // n = the attempt number IF this job dispatches; the count itself is only bumped
                 // by charge_diversify_dispatch when once() actually starts the job.
                 let n = diversify_count(st, &name, &today) + 1;
+                let standing_goal = registry::project_goal(repo);
+                let (category, goal) = generate_self_spec(st, &name, reason, &standing_goal);
                 diversify_job = true;
                 kind = "implement";
                 state = "queued";
@@ -734,12 +817,14 @@ fn plan_jobs(
                 // as a diversification attempt so the dashboard shows WHY an AI iteration is running.
                 diversify_reason = format!(
                     "autonomous diversification {n}/{DIVERSIFY_DAILY_CAP} (no human park): repeated \
-                     proof_required — trying a FRESH, DIFFERENT approach via the MoA brain, not the \
-                     identical failing change. Blocker: {reason}"
+                     proof_required — dispatching a FRESH, DIFFERENT self-generated spec \
+                     (category: {category}), not the identical failing change. Blocker: {reason}"
                 );
                 reason = &diversify_reason;
                 next_action = "run one gated RSI iteration taking a DIFFERENT approach from the prior \
                                failing change; the RSI gates still decide (no fake progress)";
+                spec_goal = Some(goal);
+                spec_category = Some(category.to_string());
             } else {
                 // Daily diversification budget spent — BACK OFF to low-frequency autonomous retry:
                 // keep proof_required (the inert emit-bypass below — no LLM spend, rate-limited) and
@@ -788,6 +873,9 @@ fn plan_jobs(
                 reason: reason.to_string(),
                 next_action: next_action.to_string(),
                 diversify: false,
+                spec_goal: None,
+                spec_category: None,
+                wake_override: false,
             };
             let _ = proof(
                 &job,
@@ -813,6 +901,9 @@ fn plan_jobs(
             reason: reason.into(),
             next_action: next_action.into(),
             diversify: diversify_job,
+            spec_goal,
+            spec_category,
+            wake_override: wake_job,
         });
     }
     jobs.sort_by(|a, b| {
@@ -828,12 +919,18 @@ fn plan_jobs(
     jobs
 }
 
+/// Run one gated `run-improver --once` iteration for the repo. `goal_override` (a self-generated
+/// FRESH spec from the autonomous re-spec path — see `generate_self_spec`) replaces the standing
+/// repos.json goal for THIS dispatch only; None runs the standing goal. The override is goal text
+/// only — provider/model/gate/ship stay exactly the configured ones, so every safety rail
+/// (RSI gates, anti-gaming reverts, provenance) applies unchanged to self-spec runs.
 fn run_repo_once(
     repo: &Value,
     cfg: &Value,
     auto_push: bool,
     key_env: &str,
     key_value: &str,
+    goal_override: Option<&str>,
 ) -> proc::RunOut {
     let program = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
@@ -870,7 +967,9 @@ fn run_repo_once(
         "--max-iterations".into(),
         "1".into(),
         "--goal".into(),
-        registry::project_goal(repo),
+        goal_override
+            .map(str::to_string)
+            .unwrap_or_else(|| registry::project_goal(repo)),
         "--once".into(),
     ];
     run_with_env(
@@ -1240,10 +1339,15 @@ pub fn reset_stuck_sweeps(name: &str) -> std::io::Result<()> {
 //
 // A lane that fires `proof_required` (the inert non-AI arm) PROOF_COOLDOWN_THRESHOLD sweeps in a
 // row arms this cooldown; `plan_jobs` then routes the lane to a BOUNDED autonomous diversification
-// (a gated AI attempt at a fresh approach), never a human park. The state lives in
+// (a gated AI attempt at a FRESH self-generated spec), never a human park. The state lives in
 // `autopilot_state.json` under `st["proof_cooldowns"][name] = {"until": <iso>, "armed_at": <iso>,
 // "consecutive": N}` so it round-trips with the existing read_state/write_state. The pure helpers
-// below are unit-tested; `plan_jobs` gates the proof_required branch on `proof_cooldown_active`.
+// below are unit-tested. ROUTING NOTE (operator directive 2026-07-18): `plan_jobs` routes on entry
+// PRESENCE (`proof_cooldown_entry(..).is_some()`), not on `until` still being in the future — an
+// EXPIRED-but-present entry is "park expiry with no human wake and no real outcome", and it
+// re-arms the autonomous re-spec path directly instead of an inert proof_required re-fire. The
+// entry is cleared only by a real outcome (`bump_stuck_counter`'s move arm) or a human wake ack.
+// `until` still matters to `bump_stuck_counter`'s one-shot re-arm bookkeeping and the dashboard.
 
 /// Read a lane's proof_required cooldown entry from autopilot state. None when the lane is not
 /// parked (entry absent) or the state is unreadable. Pure (no IO): the caller passes the state it
@@ -1300,7 +1404,7 @@ fn arm_proof_cooldown(st: &mut Value, name: &str, consecutive: u64, now_utc: Dat
             "until": until.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             "armed_at": now_utc.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             "consecutive": consecutive,
-            "reason": "proof_required retry theater — parked for a human spec",
+            "reason": "proof_required retry theater — pacing autonomous re-spec (no human park)",
         }),
     );
 }
@@ -1356,6 +1460,264 @@ fn bump_diversify_count(st: &mut Value, name: &str, today: &str) {
     let next = diversify_count(st, name, today) + 1;
     if let Some(m) = st.get_mut("diversify").and_then(Value::as_object_mut) {
         m.insert(name.to_string(), json!({"date": today, "count": next}));
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// SELF-SPEC generation + differentiation — the fresh bounded spec a parked lane dispatches
+// --------------------------------------------------------------------------- //
+//
+// Operator directive 2026-07-18 (full autonomy): the root cause of the solomon lane's
+// consecutive=28 park was NOT the anti-gaming rail (that rail correctly reverted runs that
+// introduced skip/xfail markers) — it was that every autonomous re-spec dispatched the SAME
+// standing goal, so each fresh `run-improver --once` process replayed the same spec family at
+// escalation rung 0 (the improver's anti-thrash memory is in-process only and dies with each
+// --once run) and the rail kept catching the same bad idea. The fix is fleet-level, PERSISTED
+// spec differentiation: each self-respec dispatches a FRESH bounded goal text whose CATEGORY
+// rotates away from families that keep failing, with the failed approaches explicitly excluded
+// in the goal text. Generation is deterministic templates (no LLM at plan time — plan_jobs runs
+// on every state() poll); the creative work stays inside the gated improver run, BOUNDED by the
+// generated spec. The ledger lives in `st["self_specs"][name] = [{"at", "category", "goal",
+// "outcome": "dispatched"|"failed"|"moved"}, ...]` (newest LAST, capped at
+// SELF_SPEC_HISTORY_CAP) and round-trips with read_state/write_state like `stuck`/`diversify`.
+
+/// The lane's self-spec ledger entries (oldest→newest). Empty when absent/malformed.
+fn self_spec_history(st: &Value, name: &str) -> Vec<Value> {
+    st.get("self_specs")
+        .and_then(|m| m.get(name))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Entry accessor: the spec's category ("" when malformed).
+fn spec_entry_category(e: &Value) -> &str {
+    e.get("category").and_then(Value::as_str).unwrap_or("")
+}
+
+/// True iff the ledger entry did NOT produce a real outcome: explicitly "failed", or still
+/// "dispatched" (an attempt that never resolved — a crashed run — is treated as failed so the
+/// rotation never repeats it on faith).
+fn spec_entry_failed(e: &Value) -> bool {
+    matches!(
+        e.get("outcome").and_then(Value::as_str),
+        Some("failed") | Some("dispatched") | None
+    )
+}
+
+/// Normalize a goal text for material-difference comparison: lowercase, whitespace collapsed.
+fn normalize_spec(goal: &str) -> String {
+    goal.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// True iff `candidate` differs materially from every FAILED spec in the lane's ledger window
+/// (normalized full-text inequality — the generator guarantees more by construction: a different
+/// category or an exclusion clause naming the prior failed approach).
+fn self_spec_differs_from_failed(candidate: &str, history: &[Value]) -> bool {
+    let cand = normalize_spec(candidate);
+    !history.iter().filter(|e| spec_entry_failed(e)).any(|e| {
+        e.get("goal")
+            .and_then(Value::as_str)
+            .map(|g| normalize_spec(g) == cand)
+            .unwrap_or(false)
+    })
+}
+
+/// Pick the next self-spec CATEGORY from the ledger (pure). Rule set (operator directive #2):
+///   * no attempts yet → the first category in [`SELF_SPEC_CATEGORIES`];
+///   * the trailing consecutive FAILED attempts end in category C with fewer than
+///     [`SELF_SPEC_FAMILY_FAIL_LIMIT`] same-category failures → stay on C (one in-family retry,
+///     with the failed approach excluded in the goal text);
+///   * C has [`SELF_SPEC_FAMILY_FAIL_LIMIT`]+ trailing consecutive failures → FORCE a different
+///     category: the next one in rotation order after C.
+///   * the newest attempt MOVED (real outcome) → restart the rotation at the first category.
+fn pick_self_spec_category(history: &[Value]) -> &'static str {
+    let Some(newest) = history.last() else {
+        return SELF_SPEC_CATEGORIES[0];
+    };
+    if !spec_entry_failed(newest) {
+        return SELF_SPEC_CATEGORIES[0];
+    }
+    let newest_cat = spec_entry_category(newest);
+    let trailing_same_family = history
+        .iter()
+        .rev()
+        .take_while(|e| spec_entry_failed(e) && spec_entry_category(e) == newest_cat)
+        .count();
+    let idx = SELF_SPEC_CATEGORIES
+        .iter()
+        .position(|c| *c == newest_cat)
+        .unwrap_or(0);
+    if trailing_same_family >= SELF_SPEC_FAMILY_FAIL_LIMIT {
+        SELF_SPEC_CATEGORIES[(idx + 1) % SELF_SPEC_CATEGORIES.len()]
+    } else {
+        SELF_SPEC_CATEGORIES[idx]
+    }
+}
+
+/// The bounded per-category spec body. Every body demands ONE small, complete, honestly-gated
+/// increment and explicitly forbids the exact anti-gaming failure modes that got prior runs
+/// reverted (skip/xfail markers, weakened gates) — the spec steers WITH the rails, never around
+/// them.
+fn self_spec_body(category: &str) -> &'static str {
+    match category {
+        "reliability" => {
+            "Fix ONE concrete reliability defect you can reproduce or demonstrate from the code \
+             (a real bug, race, silent error swallow, resource leak, or crash path) and add a \
+             regression test that fails without the fix."
+        }
+        "tests" => {
+            "Add ONE meaningful test (or small test group) covering REAL currently-untested \
+             behavior of an important code path, asserting on actual observable outcomes."
+        }
+        "docs_hygiene" => {
+            "Fix ONE docs/hygiene debt item: a doc that contradicts actual behavior, a dead or \
+             misleading comment/README section, a stale config example, or a small lint/dead-code \
+             cleanup — and make the docs match VERIFIED behavior."
+        }
+        _ => {
+            "Implement ONE small, complete, user-visible improvement end-to-end (smallest useful \
+             increment of the north-star goal), with a test proving the new behavior."
+        }
+    }
+}
+
+/// Generate the FRESH bounded self-spec for a parked lane (pure, deterministic — no LLM, no IO):
+/// (category, goal_text). The category comes from [`pick_self_spec_category`] (rotating away from
+/// spec families that failed [`SELF_SPEC_FAMILY_FAIL_LIMIT`]x); the goal text embeds the blocker
+/// evidence, the standing north-star for context, an explicit DO-NOT-REPEAT exclusion of the
+/// most recent failed attempts, and the anti-gaming ground rules. A belt-and-braces guard walks
+/// the rotation until the text differs materially from every failed spec in the ledger window
+/// (guaranteed to terminate: category alone changes the text).
+fn generate_self_spec(st: &Value, name: &str, blocker: &str, standing_goal: &str) -> (&'static str, String) {
+    let history = self_spec_history(st, name);
+    let mut category = pick_self_spec_category(&history);
+    for _ in 0..SELF_SPEC_CATEGORIES.len() {
+        let goal = compose_self_spec_goal(category, blocker, standing_goal, &history);
+        if self_spec_differs_from_failed(&goal, &history) {
+            return (category, goal);
+        }
+        let idx = SELF_SPEC_CATEGORIES.iter().position(|c| *c == category).unwrap_or(0);
+        category = SELF_SPEC_CATEGORIES[(idx + 1) % SELF_SPEC_CATEGORIES.len()];
+    }
+    // Unreachable in practice (4 distinct category bodies vs a cap-8 window of failures whose
+    // exclusion lists differ); fall through with the last candidate anyway — dispatching a
+    // repeat-risk spec still beats parking forever, and the RSI gates police the result.
+    (category, compose_self_spec_goal(category, blocker, standing_goal, &history))
+}
+
+/// Render the self-spec goal text for `category` (see [`generate_self_spec`]).
+fn compose_self_spec_goal(
+    category: &str,
+    blocker: &str,
+    standing_goal: &str,
+    history: &[Value],
+) -> String {
+    let exclusions: Vec<String> = history
+        .iter()
+        .rev()
+        .filter(|e| spec_entry_failed(e))
+        .take(3)
+        .filter_map(|e| e.get("goal").and_then(Value::as_str))
+        .map(|g| format!("- {}", g.chars().take(140).collect::<String>()))
+        .collect();
+    let exclusion_block = if exclusions.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nDO NOT REPEAT these previously-failed self-spec directions (pick clearly \
+             different work):\n{}\n",
+            exclusions.join("\n")
+        )
+    };
+    let north_star = if standing_goal.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\nNorth-star context (do not chase it directly this iteration; stay on the bounded spec): {standing_goal}\n")
+    };
+    format!(
+        "SELF-SPEC (autonomous re-spec, category: {category}). {body}\n\
+         Ground rules: ONE bounded increment; leave the working tree gate-green; NEVER add \
+         skip/xfail/ignore markers, never weaken, disable, or game any test or gate — reverted \
+         attempts did exactly that and were correctly rolled back.\n\
+         Known lane blocker (context, not necessarily the thing to fix): {blocker}\n\
+         {exclusion_block}{north_star}",
+        body = self_spec_body(category),
+    )
+}
+
+/// Record a DISPATCHED self-spec in the lane's ledger (called by `once()` at actual dispatch,
+/// beside the diversify-budget charge — never at plan time). Caps the ledger at
+/// [`SELF_SPEC_HISTORY_CAP`] (oldest dropped).
+fn record_self_spec_dispatch(st: &mut Value, name: &str, category: &str, goal: &str) {
+    if !st.get("self_specs").map(Value::is_object).unwrap_or(false) {
+        st["self_specs"] = json!({});
+    }
+    let entry = json!({"at": now(), "category": category, "goal": goal, "outcome": "dispatched"});
+    if let Some(m) = st.get_mut("self_specs").and_then(Value::as_object_mut) {
+        let list = m.entry(name.to_string()).or_insert_with(|| json!([]));
+        if let Some(arr) = list.as_array_mut() {
+            arr.push(entry);
+            while arr.len() > SELF_SPEC_HISTORY_CAP {
+                arr.remove(0);
+            }
+        }
+    }
+}
+
+/// Resolve the newest DISPATCHED self-spec to "failed" (inert outcome — incl. an anti-gaming
+/// revert) or "moved" (real outcome). Called by `once()` after the run. No-op when the ledger has
+/// no pending dispatch (defensive; never panics on malformed state).
+fn resolve_self_spec_outcome(st: &mut Value, name: &str, failed: bool) {
+    let verdict = if failed { "failed" } else { "moved" };
+    if let Some(arr) = st
+        .get_mut("self_specs")
+        .and_then(|m| m.get_mut(name))
+        .and_then(Value::as_array_mut)
+    {
+        if let Some(e) = arr
+            .iter_mut()
+            .rev()
+            .find(|e| e.get("outcome").and_then(Value::as_str) == Some("dispatched"))
+        {
+            e["outcome"] = json!(verdict);
+        }
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// HUMAN WAKE override flag — the one-shot operator ack (an exit, not the only one)
+// --------------------------------------------------------------------------- //
+//
+// `st["human_wake"][name] = {"at": <iso>}` — armed by `wake(Some(name))` (the operator's explicit
+// per-lane ack), consumed by `once()` when the override implement job ACTUALLY dispatches (same
+// charge-at-dispatch rule as the diversify budget). While pending, `plan_jobs` routes the lane's
+// proof_required verdict to a NORMAL gated implement on the operator's STANDING repos.json goal —
+// bypassing the autonomous self-respec (no diversify budget, no generated goal). Round-trips with
+// read_state/write_state like `stuck`/`diversify`/`self_specs`.
+
+/// True iff the operator armed a wake override for this lane that has not yet dispatched.
+fn human_wake_pending(st: &Value, name: &str) -> bool {
+    st.get("human_wake")
+        .and_then(Value::as_object)
+        .map(|m| m.contains_key(name))
+        .unwrap_or(false)
+}
+
+/// Arm the one-shot wake override (called by `wake(Some(name))` — the human ack).
+fn arm_human_wake(st: &mut Value, name: &str) {
+    if !st.get("human_wake").map(Value::is_object).unwrap_or(false) {
+        st["human_wake"] = json!({});
+    }
+    if let Some(m) = st.get_mut("human_wake").and_then(Value::as_object_mut) {
+        m.insert(name.to_string(), json!({"at": now()}));
+    }
+}
+
+/// Consume the wake override (called by `once()` when the override job actually dispatches).
+fn consume_human_wake(st: &mut Value, name: &str) {
+    if let Some(m) = st.get_mut("human_wake").and_then(Value::as_object_mut) {
+        m.remove(name);
     }
 }
 
@@ -1480,6 +1842,8 @@ fn job_value(j: &Job) -> Value {
         "requires_ai": j.requires_ai,
         "reason": j.reason,
         "next_action": j.next_action,
+        "spec_category": j.spec_category.clone().map(Value::from).unwrap_or(Value::Null),
+        "spec_goal": j.spec_goal.clone().map(Value::from).unwrap_or(Value::Null),
     })
 }
 
@@ -2153,10 +2517,11 @@ mod tests {
     // proof_required COOLDOWN — kill retry theater
     // ===================================================================== #
     //
-    // After PROOF_COOLDOWN_THRESHOLD (3) consecutive inert proof_required sweeps, a lane is parked
-    // for PROOF_COOLDOWN_S (4h) and a `needs_human_spec` need is filed instead of dispatching
-    // another inert proof_required job. The cooldown clears when the lane produces a real (non
-    // proof_required / non needs_human_spec) outcome.
+    // After PROOF_COOLDOWN_THRESHOLD (3) consecutive inert proof_required sweeps, a lane's park
+    // entry arms for PROOF_COOLDOWN_S (4h) and the scheduler routes the lane to the BOUNDED
+    // autonomous self-respec instead of dispatching another inert proof_required job. The entry
+    // clears when the lane produces a real (non proof_required / non needs_human_spec) outcome or
+    // an operator wake ack.
 
     #[test]
     fn proof_cooldown_active_reads_until_stamp() {
@@ -2209,7 +2574,7 @@ mod tests {
         assert_eq!(st["proof_cooldowns"]["dotz"]["consecutive"], json!(3));
         assert_eq!(
             st["proof_cooldowns"]["dotz"]["reason"],
-            json!("proof_required retry theater — parked for a human spec")
+            json!("proof_required retry theater — pacing autonomous re-spec (no human park)")
         );
     }
 
@@ -2254,9 +2619,11 @@ mod tests {
         assert!(st.get("stuck").unwrap().get("dotz").is_none());
     }
 
-    // plan_jobs gates the proof_required branch on the cooldown: a lane with an ACTIVE cooldown is
-    // DIVERSIFIED (a bounded gated AI attempt), never parked for a human; past the daily cap it backs
-    // off to inert proof_required; an EXPIRED cooldown re-fires proof_required.
+    // plan_jobs routes the proof_required branch on the PARK ENTRY: a lane with an ACTIVE cooldown
+    // is DIVERSIFIED (a bounded gated AI attempt at a FRESH self-generated spec), never parked for
+    // a human; past the daily cap it backs off to inert proof_required; an EXPIRED-but-present
+    // cooldown (park expiry with no human wake) RE-ARMS the self-respec path directly (operator
+    // directive 2026-07-18) instead of an inert proof_required re-fire.
     #[test]
     fn plan_jobs_diversifies_when_proof_cooldown_active_and_bounds_it() {
         // Drive a lane into a non-AI proof_required diagnosis (status=error, auto_safe!=true).
@@ -2347,7 +2714,9 @@ mod tests {
         );
         assert!(job.reason.contains("backing off"), "the backoff is explicit: {}", job.reason);
 
-        // EXPIRED cooldown (until in the past): proof_required re-fires (the lane is no longer parked).
+        // EXPIRED-but-present cooldown (park expiry, no human wake, no real outcome): the
+        // self-respec path RE-ARMS directly — a fresh self-generated spec is planned, never an
+        // inert proof_required rotation, never a human park (operator directive 2026-07-18).
         let past = Utc::now() - ChronoDuration::seconds(3600);
         let mut st_expired = json!({
             "manual_queue": [],
@@ -2363,8 +2732,13 @@ mod tests {
         );
         let job = jobs.iter().find(|j| j.name == name).expect("job planned");
         assert_eq!(
-            job.kind, "proof_required",
-            "an EXPIRED cooldown lets proof_required re-fire (lane re-surfaces, not parked forever)"
+            job.kind, "implement",
+            "park EXPIRY re-arms the autonomous re-spec (a gated AI attempt), not an inert re-fire"
+        );
+        assert!(job.diversify, "the expiry re-spec is budget-charged at dispatch like any diversify");
+        assert!(
+            job.spec_goal.is_some(),
+            "the expiry re-spec dispatches a FRESH self-generated goal text"
         );
 
         let _ = std::fs::remove_dir_all(rt);
@@ -2635,6 +3009,274 @@ mod tests {
         assert_eq!(diversify_count(&st, &lane, &today_local()), 1);
 
         let _ = std::fs::remove_dir_all(rt);
+    }
+
+    // ===================================================================== #
+    // FULL AUTONOMY — park expiry re-arms self-respec; human wake stays an override
+    // (operator-directed full-autonomy directive 2026-07-18)
+    // ===================================================================== #
+
+    /// Writes the standard non-structural unhealthy lane fixture (needs_goal heartbeat) and
+    /// returns (name, repo, runtime_dir). Callers must remove the runtime dir when done.
+    fn unhealthy_lane_fixture(tag: &str) -> (String, Value, PathBuf) {
+        let name = format!("{tag}_{}", std::process::id());
+        let repo = json!({"name": name.clone(), "path": format!("C:/p/{name}")});
+        let rt = paths::runtime_dir(&repo).unwrap();
+        let _ = std::fs::remove_dir_all(&rt);
+        std::fs::create_dir_all(&rt).unwrap();
+        std::fs::write(
+            rt.join("heartbeat.json"),
+            serde_json::to_string(&json!({
+                "status": "error",
+                "reason": "needs_goal",
+                "last_summary": "no north-star GOAL and no actionable backlog",
+                "updated_at": now(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        (name, repo, rt)
+    }
+
+    /// A park entry whose `until` is `secs_ago` seconds in the past (an EXPIRED park).
+    fn expired_park(name: &str, secs_ago: i64) -> Value {
+        let past = Utc::now() - ChronoDuration::seconds(secs_ago);
+        json!({name: {
+            "until": past.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "consecutive": 28,
+        }})
+    }
+
+    // Directive test 1: park expiry with NO human wake dispatches a self-respec (budget
+    // available) on the DISPATCH path — a fresh self-generated goal, not an inert rotation,
+    // never a needs_human_spec park.
+    #[test]
+    fn park_expiry_with_no_wake_dispatches_a_self_respec() {
+        let (name, repo, rt) = unhealthy_lane_fixture("expiry_respec_lane");
+        let cfg = json!({"provider": "openrouter", "targets": [name.clone()]});
+        let mut st = json!({
+            "manual_queue": [],
+            "proof_cooldowns": expired_park(&name, 3600),
+        });
+        let jobs = plan_jobs(
+            std::slice::from_ref(&repo),
+            &cfg,
+            &json!({"projects": {}}),
+            &mut st,
+            None,
+            true, // the DISPATCH path — this is what once() actually runs
+        );
+        let job = jobs.iter().find(|j| j.name == name).expect("self-respec planned");
+        assert_eq!(
+            job.kind, "implement",
+            "park expiry with no wake dispatches a real gated implement attempt: {job:?}"
+        );
+        assert!(job.requires_ai && job.diversify);
+        assert!(!job.wake_override, "no human was involved");
+        let goal = job.spec_goal.as_deref().expect("a FRESH self-generated goal text");
+        assert!(
+            goal.contains("SELF-SPEC") && goal.contains("category:"),
+            "the goal is a bounded self-spec, not the standing goal: {goal}"
+        );
+        assert!(
+            goal.contains("NEVER add") && goal.contains("skip/xfail"),
+            "the spec bakes the anti-gaming ground rules in (steer WITH the rails): {goal}"
+        );
+        assert_eq!(
+            job.spec_category.as_deref(),
+            Some(SELF_SPEC_CATEGORIES[0]),
+            "no spec history -> the rotation starts at the first category"
+        );
+        assert_eq!(
+            diversify_count(&st, &name, &today_local()),
+            0,
+            "planning charges nothing; the budget moves at dispatch"
+        );
+        assert!(
+            !jobs.iter().any(|j| j.kind == "needs_human_spec"),
+            "never a human park: {jobs:?}"
+        );
+        let _ = std::fs::remove_dir_all(rt);
+    }
+
+    // Directive test 2: with the daily budget exhausted, the expired-park lane stays parked
+    // QUIETLY (inert emit-bypassed backoff — no AI spend, no needs_human_spec, slot freed) and
+    // the self-respec resumes by itself when the per-day budget resets (yesterday's count is
+    // dead) — no human wake required at any point.
+    #[test]
+    fn park_expiry_budget_exhausted_stays_parked_quietly_until_daily_reset() {
+        let (name, repo, rt) = unhealthy_lane_fixture("expiry_budget_lane");
+        let cfg = json!({"provider": "openrouter", "targets": [name.clone()]});
+        let ops = json!({"projects": {}});
+
+        // Budget spent TODAY: the dispatch path emit-bypasses the lane (quiet backoff).
+        let mut st = json!({
+            "manual_queue": [],
+            "proof_cooldowns": expired_park(&name, 3600),
+            "diversify": {name.clone(): {"date": today_local(), "count": DIVERSIFY_DAILY_CAP}},
+        });
+        let jobs = plan_jobs(std::slice::from_ref(&repo), &cfg, &ops, &mut st, None, true);
+        assert!(
+            !jobs.iter().any(|j| j.name == name),
+            "budget exhausted -> the lane backs off quietly (emit-bypassed, slot freed): {jobs:?}"
+        );
+        assert!(
+            !jobs.iter().any(|j| j.kind == "needs_human_spec"),
+            "quiet does not mean parked for a human: {jobs:?}"
+        );
+        // The display path still shows WHY (inert proof_required backoff), so the dashboard is honest.
+        let jobs = plan_jobs(std::slice::from_ref(&repo), &cfg, &ops, &mut st, None, false);
+        let shown = jobs.iter().find(|j| j.name == name).expect("display job planned");
+        assert_eq!(shown.kind, "proof_required");
+        assert!(shown.reason.contains("backing off"), "backoff is explicit: {}", shown.reason);
+
+        // A NEW DAY (the stored count is yesterday's): the budget reads 0 and the self-respec
+        // re-arms with NO human wake — the cap resets naturally per-day, which is the rate limit.
+        let mut st_new_day = json!({
+            "manual_queue": [],
+            "proof_cooldowns": expired_park(&name, 3600),
+            "diversify": {name.clone(): {"date": "2001-01-01", "count": DIVERSIFY_DAILY_CAP}},
+        });
+        let jobs = plan_jobs(std::slice::from_ref(&repo), &cfg, &ops, &mut st_new_day, None, true);
+        let job = jobs.iter().find(|j| j.name == name).expect("self-respec re-armed");
+        assert_eq!(job.kind, "implement", "the daily reset re-arms the self-respec: {job:?}");
+        assert!(job.diversify && job.spec_goal.is_some());
+
+        let _ = std::fs::remove_dir_all(rt);
+    }
+
+    // Directive test 3: the human wake STAYS a working override. A pending wake ack routes the
+    // parked lane to a NORMAL gated implement on the operator's STANDING spec (no self-generated
+    // goal, no diversify budget), and the wake state helpers behave one-shot.
+    #[test]
+    fn human_wake_still_works_as_override() {
+        let (name, repo, rt) = unhealthy_lane_fixture("wake_override_lane");
+        let cfg = json!({"provider": "openrouter", "targets": [name.clone()]});
+
+        // wake()'s state seam: the ack resets park + stuck + surfaced-need and arms the flag.
+        let mut st = json!({
+            "manual_queue": [],
+            "proof_cooldowns": expired_park(&name, 3600),
+            "stuck": {name.clone(): {"sweeps": 28, "ts": now()}},
+        });
+        bump_stuck_counter(&mut st, &name, false); // wake() reuses the real-move arm
+        arm_human_wake(&mut st, &name);
+        assert!(proof_cooldown_entry(&st, &name).is_none(), "the ack clears the park");
+        assert!(human_wake_pending(&st, &name), "the ack arms the one-shot override");
+
+        // Planning with the flag pending: a NORMAL implement on the standing spec — even though
+        // the diagnosis is still unhealthy (proof_required verdict).
+        let jobs = plan_jobs(
+            std::slice::from_ref(&repo),
+            &cfg,
+            &json!({"projects": {}}),
+            &mut st,
+            None,
+            true,
+        );
+        let job = jobs.iter().find(|j| j.name == name).expect("override job planned");
+        assert_eq!(job.kind, "implement", "the wake override dispatches a real attempt: {job:?}");
+        assert!(job.wake_override, "marked for the dispatch-time flag consumption");
+        assert!(!job.diversify, "a human-ack'd run never charges the diversify budget");
+        assert!(
+            job.spec_goal.is_none(),
+            "the override runs the operator's STANDING spec, not a generated one"
+        );
+        assert!(job.reason.contains("operator wake ack"), "reason names the ack: {}", job.reason);
+
+        // One-shot: consuming at dispatch clears the flag; a second plan (still unhealthy, no
+        // park entry) falls back to the ordinary proof_required ladder — not a repeat override.
+        consume_human_wake(&mut st, &name);
+        assert!(!human_wake_pending(&st, &name), "the override is one-shot");
+        let jobs = plan_jobs(
+            std::slice::from_ref(&repo),
+            &cfg,
+            &json!({"projects": {}}),
+            &mut st,
+            None,
+            false,
+        );
+        let job = jobs.iter().find(|j| j.name == name).expect("job planned");
+        assert_eq!(job.kind, "proof_required", "after the one shot the normal ladder resumes");
+        consume_human_wake(&mut st, "never_armed"); // no-op, never panics
+
+        let _ = std::fs::remove_dir_all(rt);
+    }
+
+    // Directive test 4: spec differentiation. A self-generated spec must differ materially from
+    // the last failed specs, and a spec family that failed SELF_SPEC_FAMILY_FAIL_LIMIT times in a
+    // row is forced onto a different category.
+    #[test]
+    fn self_spec_differentiation_forces_category_rotation() {
+        // No history: rotation starts at the first category.
+        assert_eq!(pick_self_spec_category(&[]), SELF_SPEC_CATEGORIES[0]);
+
+        // One failure in a family: one in-family retry is allowed, but the goal text must differ
+        // materially (the exclusion block quotes the failed attempt).
+        let mut st = json!({});
+        let (cat1, goal1) = generate_self_spec(&st, "lane", "blocker evidence", "standing goal");
+        assert_eq!(cat1, SELF_SPEC_CATEGORIES[0]);
+        record_self_spec_dispatch(&mut st, "lane", cat1, &goal1);
+        resolve_self_spec_outcome(&mut st, "lane", true); // failed (e.g. anti-gaming revert)
+        let (cat2, goal2) = generate_self_spec(&st, "lane", "blocker evidence", "standing goal");
+        assert_eq!(cat2, cat1, "one failure allows one in-family retry");
+        assert_ne!(
+            normalize_spec(&goal2),
+            normalize_spec(&goal1),
+            "the retry differs materially from the failed spec"
+        );
+        assert!(
+            goal2.contains("DO NOT REPEAT"),
+            "the failed direction is explicitly excluded: {goal2}"
+        );
+        assert!(
+            self_spec_differs_from_failed(&goal2, &self_spec_history(&st, "lane")),
+            "the differentiation guard accepts the fresh spec"
+        );
+        assert!(
+            !self_spec_differs_from_failed(&goal1, &self_spec_history(&st, "lane")),
+            "re-dispatching the exact failed spec is rejected"
+        );
+
+        // Second consecutive failure in the SAME family: the category is FORCED to rotate.
+        record_self_spec_dispatch(&mut st, "lane", cat2, &goal2);
+        resolve_self_spec_outcome(&mut st, "lane", true);
+        let (cat3, goal3) = generate_self_spec(&st, "lane", "blocker evidence", "standing goal");
+        assert_ne!(
+            cat3, cat1,
+            "a spec family that failed {SELF_SPEC_FAMILY_FAIL_LIMIT}x is abandoned"
+        );
+        assert_eq!(cat3, SELF_SPEC_CATEGORIES[1], "rotation order is deterministic");
+        assert!(goal3.contains(&format!("category: {cat3}")));
+
+        // A real MOVE resets the rotation to the first category.
+        record_self_spec_dispatch(&mut st, "lane", cat3, &goal3);
+        resolve_self_spec_outcome(&mut st, "lane", false); // moved
+        assert_eq!(
+            pick_self_spec_category(&self_spec_history(&st, "lane")),
+            SELF_SPEC_CATEGORIES[0],
+            "a lane that moved restarts the rotation fresh"
+        );
+
+        // The ledger is capped: old attempts age out.
+        for i in 0..(SELF_SPEC_HISTORY_CAP + 3) {
+            record_self_spec_dispatch(&mut st, "lane", "tests", &format!("goal {i}"));
+            resolve_self_spec_outcome(&mut st, "lane", true);
+        }
+        assert_eq!(
+            self_spec_history(&st, "lane").len(),
+            SELF_SPEC_HISTORY_CAP,
+            "the ledger window is bounded"
+        );
+
+        // An unresolved "dispatched" entry counts as failed (a crashed run is never repeated on faith).
+        let st2 = json!({"self_specs": {"lane": [
+            {"category": "reliability", "goal": "g1", "outcome": "dispatched"},
+        ]}});
+        assert!(
+            !self_spec_differs_from_failed("g1", &self_spec_history(&st2, "lane")),
+            "an in-flight/crashed spec is treated as failed for differentiation"
+        );
     }
 
     // ===================================================================== #
