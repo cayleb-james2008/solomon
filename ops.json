@@ -177,7 +177,7 @@
                 "id": "process",
                 "kind": "process",
                 "process_name": "Sover.exe",
-                "path_contains": "sover-live"
+                "path_contains": "sover"
             }
         ]
     },
