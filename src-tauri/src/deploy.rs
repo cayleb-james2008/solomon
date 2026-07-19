@@ -41,6 +41,14 @@ const MAX_DEPLOYS_PER_SWEEP: usize = 1;
 /// How long to wait after relaunch before confirming the process came up (seconds).
 const LAUNCH_CONFIRM_S: u64 = 5;
 
+/// Default min seconds between auto-revives for a repo when `live_deploy.revive_cooldown_s` is
+/// absent. Shorter than the deploy cooldown — a revive is a lightweight relaunch with no rebuild.
+const DEFAULT_REVIVE_COOLDOWN_S: i64 = 300;
+
+/// Max managed-app revives per watchdog sweep across ALL repos. Separate from the deploy budget
+/// so a revive (launch-only, no rebuild) never starves a needed redeploy (heavy rebuild).
+const MAX_REVIVES_PER_SWEEP: usize = 1;
+
 // --------------------------------------------------------------------------- //
 // TRIGGER — pure, the load-bearing safety predicate
 // --------------------------------------------------------------------------- //
@@ -65,7 +73,7 @@ pub fn should_redeploy(
     if !has_live_deploy(repo_cfg) {
         return false; // no live_deploy config -> NEVER auto-deploy (human-gated)
     }
-    if !(deploy_gap && app_down) {
+    if !deploy_gap || !app_down {
         return false; // both required: stale binary AND app down (never interrupt a healthy app)
     }
     if !drain_ok {
@@ -92,6 +100,55 @@ pub fn cooldown_s(repo_cfg: &Value) -> i64 {
         .and_then(|d| d.get("cooldown_s"))
         .and_then(Value::as_i64)
         .unwrap_or(DEFAULT_COOLDOWN_S)
+}
+
+// --------------------------------------------------------------------------- //
+// REVIVE PREDICATE — pure, the launch-only sibling of should_redeploy
+// --------------------------------------------------------------------------- //
+
+/// The revive predicate: relaunch a repo's LIVE app binary IFF ALL of:
+///   - it has a `live_deploy` config, AND
+///   - its ops probes show the app is DOWN (process probe says "NOT running") BUT the binary is
+///     CURRENT (no "deploy gap" in reasons — the binary_current probe is green), so a relaunch
+///     without a rebuild is sufficient, AND
+///   - the revive cooldown has elapsed (`last_revive_age_s` is None or > the repo's revive
+///     cooldown), AND
+///   - drain is safe (`drain_ok` — no lane mid-ship, no live-money lane with an open trade).
+///
+/// Never fires when there IS a deploy gap (that's `should_redeploy`'s job — a rebuild is needed)
+/// or when the app is UP. Pure — the caller collects the ops probes + drain state + cooldown age
+/// (IO) and passes them in.
+pub fn should_revive(
+    repo_cfg: &Value,
+    deploy_gap: bool,
+    app_down: bool,
+    last_revive_age_s: Option<i64>,
+    drain_ok: bool,
+) -> bool {
+    if !has_live_deploy(repo_cfg) {
+        return false;
+    }
+    // Must be: app DOWN, binary CURRENT (no deploy gap).
+    if !app_down || deploy_gap {
+        return false;
+    }
+    if !drain_ok {
+        return false;
+    }
+    match last_revive_age_s {
+        Some(age) => age > revive_cooldown_s(repo_cfg),
+        None => true,
+    }
+}
+
+/// The repo's per-revive cooldown (seconds) — `live_deploy.revive_cooldown_s`, default
+/// DEFAULT_REVIVE_COOLDOWN_S.
+pub fn revive_cooldown_s(repo_cfg: &Value) -> i64 {
+    repo_cfg
+        .get("live_deploy")
+        .and_then(|d| d.get("revive_cooldown_s"))
+        .and_then(Value::as_i64)
+        .unwrap_or(DEFAULT_REVIVE_COOLDOWN_S)
 }
 
 // --------------------------------------------------------------------------- //
@@ -148,6 +205,36 @@ fn last_deploy_age_s(name: &str) -> Option<i64> {
 fn stamp_last_deploy(name: &str) {
     let _ = (|| -> std::io::Result<()> {
         let p = last_deploy_path(name);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        std::fs::write(&p, ts)
+    })();
+}
+
+// --------------------------------------------------------------------------- //
+// REVIVE COOLDOWN MARKER
+// --------------------------------------------------------------------------- //
+
+/// The per-repo last-revive marker path (`runtime/<name>/_last_revive`).
+fn last_revive_path(name: &str) -> PathBuf {
+    paths::here().join("runtime").join(name).join("_last_revive")
+}
+
+/// Age (seconds) since the last managed-app revive for `name`, or None when there was none.
+fn last_revive_age_s(name: &str) -> Option<i64> {
+    let raw = std::fs::read_to_string(last_revive_path(name)).ok()?;
+    let last = chrono::NaiveDateTime::parse_from_str(raw.trim(), "%Y-%m-%dT%H:%M:%SZ")
+        .ok()?
+        .and_utc();
+    Some((chrono::Utc::now() - last).num_seconds())
+}
+
+/// Stamp the per-repo last-revive marker (cooldown sentinel). Best-effort.
+fn stamp_last_revive(name: &str) {
+    let _ = (|| -> std::io::Result<()> {
+        let p = last_revive_path(name);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -315,6 +402,67 @@ fn page(name: &str, from_sha: &str, success: bool, detail: &str) {
 }
 
 // --------------------------------------------------------------------------- //
+// REVIVE EXECUTE — relaunch only (skip rebuild — the binary is already CURRENT)
+// --------------------------------------------------------------------------- //
+
+/// Run one managed-app revive for `repo_cfg`: skip the rebuild (the binary is already CURRENT per
+/// the ops probe), run the optional `kill` argv to clean up any zombie process, then relaunch the
+/// app; briefly confirm the process came up. Stamps the revive cooldown marker regardless of outcome.
+/// Pages the operator LOUDLY. Returns Ok(()) on a successful relaunch, Err(msg) on any failure.
+fn maybe_revive_managed_app(repo_cfg: &Value) -> Result<(), String> {
+    let name = paths::repo_name(repo_cfg);
+    let path = paths::repo_path(repo_cfg);
+    let cwd = PathBuf::from(&path);
+    let head = short_head(&path);
+
+    // Stamp the cooldown FIRST so a launch that fails cannot re-fire before the cooldown.
+    stamp_last_revive(&name);
+
+    let launch = live_deploy_argv(repo_cfg, "launch")
+        .ok_or_else(|| format!("{name}: live_deploy.launch missing/empty"))?;
+
+    // Validate the launch path BEFORE attempting anything.
+    if let Err(e) = launch_argv_sane(&launch, &cwd) {
+        let msg = format!("{name}: {e}");
+        page_revive(&name, &head, false, &msg);
+        return Err(msg);
+    }
+
+    // Optional kill argv: run before launch to clean up any zombie process the process probe may
+    // have missed. Best-effort — a kill failure does not block the revive (the app is already DOWN
+    // per the probe; this is belt-and-suspenders).
+    if let Some(kill) = live_deploy_argv(repo_cfg, "kill") {
+        let _ = proc::run(&kill, Some(&cwd), Some(Duration::from_secs(30)));
+    }
+
+    // Relaunch the app. A launch failure is a real, paged failure.
+    let lr = proc::run(&launch, Some(&cwd), Some(Duration::from_secs(60)))
+        .map_err(|e| format!("{name}: launch spawn failed: {e}"))?;
+    if !lr.ok() {
+        let msg = format!("{name}: revive relaunch FAILED (code {}) at {head}", lr.code);
+        page_revive(&name, &head, false, &format!("relaunch exit {}", lr.code));
+        return Err(msg);
+    }
+
+    // Briefly confirm the process came up.
+    std::thread::sleep(Duration::from_secs(LAUNCH_CONFIRM_S));
+    let up = app_process_up(repo_cfg);
+    page_revive(&name, &head, true, if up { "process confirmed up" } else { "launched (process not yet visible)" });
+    Ok(())
+}
+
+/// Page the operator LOUDLY about a managed-app revive (a real state change).
+fn page_revive(name: &str, from_sha: &str, success: bool, detail: &str) {
+    let body = format!("{name}: {from_sha} -> HEAD ({detail})");
+    let notice = if success {
+        crate::notify::Notice::recovered(format!("Solomon: {name} revived"), body)
+    } else {
+        crate::notify::Notice::red(format!("Solomon: {name} revive FAILED"), body)
+    };
+    let _ = crate::notify::send(&notice);
+}
+
+// --------------------------------------------------------------------------- //
 // ORCHESTRATOR — the watchdog-sweep entry
 // --------------------------------------------------------------------------- //
 
@@ -358,6 +506,45 @@ pub fn maybe_redeploy_managed_apps(ops_status: &Value) {
         // succeeds or fails (a heavy build ran either way — the cooldown gates the next attempt).
         deploys_left -= 1;
         let _ = maybe_redeploy_managed_app(&repo_cfg);
+    }
+}
+
+/// The managed-app revive check, wired into the watchdog sweep after the redeploy check. Reads the
+/// fresh `ops_status` payload, and for each repo with a `live_deploy` config whose app is DOWN but
+/// whose binary is CURRENT (no deploy gap — the binary_current probe is green), relaunches without
+/// a rebuild — at most ONE revive per sweep across ALL repos.
+///
+/// A revive is lightweight (no cargo build), so it runs in the same thread as the redeploy check.
+/// catch_unwind is the caller's responsibility. A launch failure does NOT loop — the cooldown gates
+/// the next attempt.
+pub fn maybe_revive_managed_apps(ops_status: &Value) {
+    let projects = match ops_status.get("projects").and_then(Value::as_object) {
+        Some(p) => p,
+        None => return,
+    };
+    let drain_ok = crate::redeploy::drain_window_now();
+
+    let mut revives_left = MAX_REVIVES_PER_SWEEP;
+    for repo_cfg in registry::load_repos() {
+        if revives_left == 0 {
+            break;
+        }
+        if !has_live_deploy(&repo_cfg) {
+            continue;
+        }
+        let name = paths::repo_name(&repo_cfg);
+        let project = match projects.get(&name) {
+            Some(p) => p,
+            None => continue,
+        };
+        let deploy_gap = project_deploy_gap(project);
+        let app_down = project_app_down(project);
+        let age = last_revive_age_s(&name);
+        if !should_revive(&repo_cfg, deploy_gap, app_down, age, drain_ok) {
+            continue;
+        }
+        revives_left -= 1;
+        let _ = maybe_revive_managed_app(&repo_cfg);
     }
 }
 
@@ -577,5 +764,80 @@ mod tests {
         ];
         assert!(launch_argv_sane(&argv, &dir).is_ok());
         let _ = std::fs::remove_file(&script);
+    }
+
+    // -------- should_revive: the full-condition decision table --------
+    #[test]
+    fn should_revive_true_only_when_app_down_and_binary_current() {
+        let repo = live_repo();
+        // App DOWN + binary CURRENT (no deploy gap) + no prior revive -> revive
+        assert!(should_revive(&repo, false, true, None, true), "app down + binary current -> revive");
+        // Cooldown elapsed (age > 300) -> revive
+        assert!(should_revive(&repo, false, true, Some(301), true));
+    }
+
+    #[test]
+    fn should_revive_repo_without_live_deploy_never() {
+        let repo = asmodeus_shaped();
+        assert!(
+            !should_revive(&repo, false, true, None, true),
+            "a repo without live_deploy must NEVER revive"
+        );
+        assert!(!should_revive(&json!({}), false, true, None, true));
+    }
+
+    #[test]
+    fn should_revive_cooldown_blocks() {
+        let repo = live_repo();
+        // Within cooldown (age <= 300) -> blocked
+        assert!(!should_revive(&repo, false, true, Some(300), true), "== cooldown -> blocked");
+        assert!(!should_revive(&repo, false, true, Some(5), true), "recent revive -> blocked");
+        // Default cooldown (no revive_cooldown_s) is 300s
+        let repo_default = json!({
+            "name": "x",
+            "live_deploy": {"rebuild": ["a"], "launch": ["b"]}
+        });
+        assert!(!should_revive(&repo_default, false, true, Some(300), true));
+        assert!(should_revive(&repo_default, false, true, Some(301), true));
+    }
+
+    #[test]
+    fn should_revive_drain_unsafe_blocks() {
+        let repo = live_repo();
+        assert!(
+            !should_revive(&repo, false, true, None, false),
+            "drain unsafe -> never revive"
+        );
+    }
+
+    #[test]
+    fn should_revive_app_up_or_deploy_gap_false() {
+        let repo = live_repo();
+        // App UP -> no revive (nothing to restart)
+        assert!(!should_revive(&repo, false, false, None, true), "app up -> no revive");
+        // Deploy gap (stale binary) -> no revive (that's should_redeploy's job — rebuild needed)
+        assert!(!should_revive(&repo, true, true, None, true), "deploy gap -> no revive (needs rebuild)");
+        // Both deploy gap AND app up -> no revive
+        assert!(!should_revive(&repo, true, false, None, true));
+        // Neither (both false) -> no revive
+        assert!(!should_revive(&repo, false, false, None, true));
+    }
+
+    // -------- revive_cooldown_s --------
+    #[test]
+    fn revive_cooldown_honors_config_and_default() {
+        assert_eq!(revive_cooldown_s(&live_repo()), DEFAULT_REVIVE_COOLDOWN_S);
+        assert_eq!(
+            revive_cooldown_s(&json!({"live_deploy": {"revive_cooldown_s": 120}})),
+            120
+        );
+        assert_eq!(revive_cooldown_s(&json!({"live_deploy": {}})), DEFAULT_REVIVE_COOLDOWN_S);
+        assert_eq!(revive_cooldown_s(&json!({})), DEFAULT_REVIVE_COOLDOWN_S);
+    }
+
+    // -------- per-sweep revive cap --------
+    #[test]
+    fn per_sweep_revive_cap_is_one() {
+        assert_eq!(MAX_REVIVES_PER_SWEEP, 1, "one revive per sweep — separate from the deploy budget");
     }
 }
