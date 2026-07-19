@@ -248,7 +248,7 @@
         "ship": "auto-merge",
         "pr_target_branch": "main",
         "gate": "cd src-tauri && cargo test",
-        "interval": 120,
+        "interval": 420,
         "max_iterations": 0,
         "reasoning": "xhigh",
         "freshness": {
