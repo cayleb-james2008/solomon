@@ -1295,7 +1295,11 @@ pub fn main() -> i32 {
     let ops_payload_for_deploy = ops_payload.clone();
     std::thread::spawn(move || {
         let _ = std::panic::catch_unwind(|| {
-            crate::deploy::maybe_redeploy_managed_apps(&ops_payload_for_deploy)
+            crate::deploy::maybe_redeploy_managed_apps(&ops_payload_for_deploy);
+            // Revive check: relaunch apps that are DOWN but whose binary is CURRENT (no rebuild
+            // needed). Runs after the redeploy check in the same thread — revive is lightweight
+            // (no cargo build), so it doesn't need its own thread.
+            crate::deploy::maybe_revive_managed_apps(&ops_payload_for_deploy);
         });
     });
     // SELF-REDEPLOY: the periodic check that swaps Solomon's OWN production binary when the checkout
