@@ -857,6 +857,46 @@ hallucinated its file edits; counting as a no-op",
         ctx.log("beautify: gate skipped (docs-only)");
         tests = Value::Null;
     } else {
+        // PRE-GATE SKIP-MARKER SCAN (the model-skip-marker-behavior fix, 2026-07-19): the MoA
+        // implementer model (deepseek-v4-pro) sometimes adds #[ignore]/#[skip]/xfail markers to
+        // make failing tests "pass" the gate. The post-gate anti-gaming scan (line ~933) catches
+        // this, but only AFTER the expensive ~2-min cargo test gate runs. This PRE-GATE scan
+        // checks the working-tree diff for skip markers BEFORE the gate, aborting the iteration
+        // immediately with a clear "your diff contains a skip marker, abort" signal — saving the
+        // gate cycle + giving the model a faster, clearer rejection. The scan reuses the existing
+        // gates::new_skip_markers pure function (NOT a new scanner — the same one the post-gate
+        // anti-gaming check uses, just invoked earlier). If skip markers are found, record the
+        // revert + drop the branch (same as the post-gate anti-gaming path below).
+        gitops::git_add_all(ctx);
+        let pre_diff = ctx.git(&["diff", "--cached", &base_branch], 120).stdout;
+        let pre_skips = gates::new_skip_markers(&pre_diff);
+        if !pre_skips.is_empty() {
+            let why = format!(
+                "pre-gate skip-marker scan: diff contains {} skip/xfail marker(s) — aborting \
+                 BEFORE the gate. The MoA directive explicitly forbids this (brain.rs). If a test \
+                 is failing, FIX THE IMPLEMENTATION, not the test. If you cannot make the test \
+                 pass, DO NOT commit — abort the iteration. The pre-gate scan caught this early \
+                 to save the gate cycle. The markers found: {}",
+                pre_skips.len(),
+                pre_skips.join(", ")
+            );
+            ctx.log(&format!("anti-gaming (pre-gate): {why}"));
+            progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "reverted");
+            escalation::note_revert(
+                ctx,
+                &goal,
+                &why,
+                NOTE_LIMIT,
+            );
+            gitops::drop_branch(
+                ctx,
+                &branch,
+                "reverted",
+                &format!("Reverted — pre-gate skip-marker scan: {why}. {summary}"),
+                "sleeping",
+            );
+            return;
+        }
         // BUILD SEMAPHORE: cap how many lanes run their cargo gate at once (each build is separately
         // --jobs-capped; this bounds the AGGREGATE across separate lane processes). RAII — `_slot`
         // releases on EVERY exit of this else block: the test/lint/anti-gaming/cross-repo/eval
