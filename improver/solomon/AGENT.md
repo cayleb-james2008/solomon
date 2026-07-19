@@ -20,12 +20,10 @@ priority on the classes of problem the operator has actually hit in production:
 - **Stale heartbeat/escalation state**: a lane that self-stopped on a real failure that was later
   fixed, but whose `heartbeat.json`/`stop` sentinel never gets re-observed as green because nothing
   re-triggers a gate run after a manual fix lands.
-- **The `paused` sentinel not actually pausing a running iteration**: `paused` only blocks the
-  watchdog from *restarting* a crashed loop — it does not stop an already-running one. The
-  documented clean-stop is `runtime/<lane>/stop`, but an operator (or future agent) reaching for
-  `paused` expecting an immediate halt will be surprised. Consider whether `paused` should also
-  write `stop` for a currently-running lane, or whether the docs/UI should make the distinction
-  explicit.
+- **Monitoring theater**: a green internal signal (heartbeat, lane iteration) standing in for a
+  real outcome (a post published, a trade filled, a training run fired). The ops plane's probes
+  are the honest signal; a green heartbeat with red ops probes is monitoring theater. Harden the
+  supervisor + ops plane against it.
 
 Otherwise: fix a genuine bug, harden gate execution / lock & heartbeat handling / subprocess
 lifecycle, improve crash-recovery or the dashboard, or add missing test coverage. One coherent
