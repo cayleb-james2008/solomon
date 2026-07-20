@@ -75,7 +75,7 @@ pub fn has_origin(path: &str) -> bool {
     match proc::run(
         &[git.as_str(), "-C", path, "remote", "get-url", "origin"],
         None,
-        None,
+        Some(std::time::Duration::from_secs(30)),
     ) {
         Ok(r) => r.code == 0,
         Err(_) => false, // spawn failure == Python `except OSError: return False`
