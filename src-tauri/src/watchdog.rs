@@ -519,7 +519,10 @@ fn base_is_clean(path: &str) -> bool {
         return false;
     }
     // control._run(["git", "-C", path, "status", "--porcelain"]) — windowless, guarded spawn.
-    let r = match control::proc::run(&["git", "-C", path, "status", "--porcelain"], None, None) {
+    // 60s timeout: a hung git (credential prompt, slow NFS, locked index) must NEVER wedge the
+    // watchdog tick forever — the tick stalls + the whole fleet stops dispatching (observed
+    // 2026-07-20: stuck git processes from prior iterations accumulated + blocked the tick body).
+    let r = match control::proc::run(&["git", "-C", path, "status", "--porcelain"], None, Some(Duration::from_secs(60))) {
         Ok(r) => r,
         Err(_) => return false, // OSError -> False
     };
@@ -536,11 +539,12 @@ fn base_is_pushed(path: &str, base: &str) -> bool {
         return false;
     }
     // git -C path rev-list --count origin/<base>..<base> -> "0" when base is not ahead of origin.
+    // 60s timeout: same rationale as base_gate_clean — a hung git must never wedge the tick.
     let range = format!("origin/{base}..{base}");
     let r = match control::proc::run(
         &["git", "-C", path, "rev-list", "--count", range.as_str()],
         None,
-        None,
+        Some(Duration::from_secs(60)),
     ) {
         Ok(r) => r,
         Err(_) => return false, // OSError -> False
