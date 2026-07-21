@@ -1626,7 +1626,15 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
                 }
                 runner::stop(repo);
                 actions.push("stop".into());
-                for _ in 0..10 {
+                // 5s grace window (was 10s originally, then 3s, now 5s). 3s risked false-escalating
+                // a legitimately-slow loop shutdown (a pi agent writing a large heartbeat, a git
+                // index refresh, Windows process-group teardown can take 4-9s) to "manual kill
+                // required". 5s is the compromise: still keeps the tick moving when several lanes
+                // need stop+restart in one sweep (each extra second is serial sleep on the tick
+                // thread), but gives a healthy loop enough headroom to exit cleanly. The
+                // "manual kill required" escalation path is unchanged — only the wait is shorter
+                // than the original 10s.
+                for _ in 0..5 {
                     // grace window for the loop to exit cleanly
                     if !locks::is_running(repo) {
                         break;
@@ -1736,7 +1744,8 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
         }
         runner::stop(repo);
         actions.push("stop".into());
-        for _ in 0..10 {
+        // 5s grace window — see the noop_streak branch above for the rationale.
+        for _ in 0..5 {
             // grace window for the loop to exit cleanly
             if !locks::is_running(repo) {
                 break;

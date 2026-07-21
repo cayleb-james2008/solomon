@@ -356,8 +356,13 @@ pub fn enrich_contract(repo: &Value, background: bool) -> Value {
         };
     }
     // 7. blocking capture.
+    // 660s ceiling — 10% over the `run-improver --provision` child's internal 600s wall
+    // (`TIMEOUT_PHASE_600` in pi.rs), so the external kill only fires when the child has actually
+    // wedged past its own self-imposed limit (orphaned pipe, stuck LLM HTTP read, dead grandchild),
+    // never on a healthy run. Mirrors the 4bbfd99 watchdog tick discipline: a hung subprocess must
+    // NEVER wedge the caller indefinitely. `Err(TimedOut)` maps to the existing `error` branch.
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let r = match proc::run(&argv_refs, Some(Path::new(&path)), None) {
+    let r = match proc::run(&argv_refs, Some(Path::new(&path)), Some(Duration::from_secs(660))) {
         Ok(o) => o,
         Err(e) => return json!({"ok": false, "error": e.to_string()}),
     };
@@ -391,8 +396,14 @@ pub fn ideate(repo: &Value) -> Value {
     // 6. argv (differs from enrich only by the final flag).
     let argv = provision_argv(repo, &program, "run-improver", &path, &name, &prov, "--ideate");
     // 7. blocking capture.
+    // 660s ceiling — 10% over the `run-improver --ideate` child's internal 600s wall
+    // (`TIMEOUT_PHASE_600` in pi.rs). `ideate` runs on the watchdog tick path
+    // (`supervisor::recover` → `runner::ideate`), so an unbounded spawn here is the exact wedge
+    // class 4bbfd99 bounded in `watchdog::base_is_clean`/`branches::git_c` — a stuck LLM HTTP read
+    // or orphaned cargo grandchild would hang the whole sweep. `Err(TimedOut)` maps to the existing
+    // `error` branch so the lane escalates instead of hanging the tick.
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let r = match proc::run(&argv_refs, Some(Path::new(&path)), None) {
+    let r = match proc::run(&argv_refs, Some(Path::new(&path)), Some(Duration::from_secs(660))) {
         Ok(o) => o,
         Err(e) => return json!({"ok": false, "error": e.to_string()}),
     };

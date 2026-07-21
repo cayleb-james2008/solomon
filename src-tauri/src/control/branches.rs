@@ -13,6 +13,15 @@
 use crate::control::{paths, proc};
 use serde_json::{json, Value};
 use std::path::Path;
+use std::time::Duration;
+
+/// 60s ceiling on every branches git call — mirrors the 4bbfd99 fix for `watchdog::base_is_clean`/
+/// `base_is_pushed`. A hung git (credential prompt on null stdin, slow network, locked index,
+/// orphaned pipe) must NEVER wedge the watchdog tick — `proc::run`'s timeout branch kills the
+/// child and returns `Err(TimedOut)`, which every caller here maps to `ok:false` / `[]` (the
+/// same shape as the existing OSError branch). No behavioral change on the happy path
+/// (status/prune/checkout finish in <1s); only the pathological-hang path changes.
+const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Python `s.strip()[:200]`: strip leading/trailing ASCII whitespace, then take the first 200
 /// chars (Unicode code points, not bytes — Python slices by code point).
@@ -35,7 +44,7 @@ fn git_c(git: &Path, path: &str, args: &[&str]) -> std::io::Result<proc::RunOut>
     full.push("-C");
     full.push(path);
     full.extend_from_slice(args);
-    proc::run(&full, None, None)
+    proc::run(&full, None, Some(GIT_TIMEOUT))
 }
 
 // --------------------------------------------------------------------------- //
@@ -66,7 +75,7 @@ pub fn local_rsi_branches(repo: &Value) -> Vec<String> {
     let r = match proc::run(
         &[git.as_ref(), "branch", "--list", pattern.as_str()],
         Some(Path::new(&path)), // cwd=path (not -C path) — the lone exception
-        None,
+        Some(GIT_TIMEOUT),
     ) {
         Ok(r) => r,
         Err(_) => return Vec::new(), // OSError / spawn failure -> []
