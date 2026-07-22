@@ -104,11 +104,11 @@
         "ship": "auto-merge",
         "pr_target_branch": "main",
         "freshness": {
-            "cmd": ".venv\\Scripts\\python tools\\freshness.py",
+            "cmd": "python tools\\freshness.py",
             "min_new_samples": 1,
             "hard": false,
             "max_starve_cycles": 4,
-            "comment": "2026-07-10: changed hard=true to hard=false so code improvements still run when starved (operator wants full autonomy, not evidence-gated halts). max_starve_cycles=4 means after 4 starved cycles, a non-metric upkeep cycle runs. The freshness gate still parks when there's genuinely no data, but it doesn't block code improvements when the operator wants the loop running."
+            "comment": "2026-07-22: dropped the stale '.venv\\Scripts\\python' prefix — the Sover project was rewritten from Python to Rust (2026-07-01/02) and the .venv no longer exists. The bare 'python' resolves to the system Python312 (on PATH since the pi CLI install). The freshness.py script at tools/freshness.py still works — it reads the LIVE post_registry.json written by the Rust Sover.exe. The 2026-07-10 hard=false/max_starve_cycles=4 settings are preserved."
         },
         "interval": 120,
         "max_iterations": 0,
