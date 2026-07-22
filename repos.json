@@ -5,18 +5,18 @@
             "mission": "Autonomously improve, ship, monitor, and grow managed projects toward their stated end goals with one efficient Solomon agent, preserving safety gates and proof. CEO MANDATE (operator 2026-07-12): for the public OSS apps (sover, maki, dotz, ...), Solomon also acts as CEO \u2014 automatically marketing, scaling, and growing them for max reach and profit with zero human involvement; all public output under each app's own brand/agent persona, never the operator's personal name.",
             "provider": "ollama-cloud",
             "api_key": "OLLAMA_API_KEY",
-            "model": "glm-5.2",
+            "model": "minimax-m3",
             "max_concurrent_agent_calls": 2,
             "cooldown_s": 86400,
             "daily_call_budget": 1500,
             "adaptive_phase_policy": "cheap_by_default_deep_on_red_noop_critical_or_campaign",
             "brain": {
                 "enabled": true,
-                "aggregator": "glm-5.2",
-                "verifier": "glm-5.2",
+                "aggregator": "minimax-m3",
+                "verifier": "minimax-m3",
                 "workers": {
-                    "plan": "kimi-k2.7-code",
-                    "implement": "deepseek-v4-pro",
+                    "plan": "minimax-m3",
+                    "implement": "minimax-m3",
                     "ideate": "minimax-m3",
                     "probe": "minimax-m3"
                 },
@@ -38,7 +38,7 @@
         "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\maki",
         "public": true,
         "provider": "ollama-cloud",
-        "model": "glm-5.2",
+        "model": "minimax-m3",
         "api_key": "OLLAMA_API_KEY",
         "ship": "auto-merge",
         "pr_target_branch": "main",
@@ -66,7 +66,7 @@
             "mode": "live",
             "publish": ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\\build-release.ps1"],
             "cwd": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\maki",
-            "comment": "2026-07-14 (Phase 2): maki publish ladder wired DRY-RUN-FIRST. The sanctioned publish one-shot is the signed-release builder (scripts/build-release.ps1 -> src-tauri/target/release/bundle/nsis/Maki_<ver>_x64-setup.exe + .sig). The operator promotes mode to \"live\" only after reviewing the dry-run would_run argv + a clean gated dry run. NOTE: build-release.ps1 produces the signed installer + signature; the GitHub-release upload (latest.json + asset) is a separate manual operator step documented in the script header â€” the sanctioned lane builds the artifact, the operator ships it. Dry-run validates the argv WITHOUT spawning, so the cwd/publish argv correctness is confirmed before any real build runs."
+            "comment": "2026-07-14 (Phase 2): maki publish ladder wired DRY-RUN-FIRST. The sanctioned publish one-shot is the signed-release builder (scripts/build-release.ps1 -> src-tauri/target/release/bundle/nsis/Maki_<ver>_x64-setup.exe + .sig). The operator promotes mode to \"live\" only after reviewing the dry-run would_run argv + a clean gated dry run. NOTE: build-release.ps1 produces the signed installer + signature; the GitHub-release upload (latest.json + asset) is a separate manual operator step documented in the script header Ã¢â‚¬â€ the sanctioned lane builds the artifact, the operator ships it. Dry-run validates the argv WITHOUT spawning, so the cwd/publish argv correctness is confirmed before any real build runs."
         }
     },
     {
@@ -99,7 +99,7 @@
         "gate": "cargo test --bin sover",
         "goal": "OPERATOR GOAL 2026-07-12 (tier-1, supersedes where in tension): Sover is a REVENUE ENGINE \u2014 the single fitness number is dollars earned per week across all profiles; followers/engagement/reach are input metrics that feed it, not the objective. Money-out stays human-gated. PERSONA RULE (operator 2026-07-12): all public-facing content this lane produces (README, release notes, posts, social, discussions) is authored under the project's own brand or its agent persona \u2014 NEVER the operator's personal name.\n\nNORTH STAR (baked into every Sover iteration, heavily weighted): Every social account is run by an autonomous executive whose standing goal is ALWAYS more followers, more engagement, and monetization -- pursued creatively and autonomously, with money-out the only human-gated step. A FRESH profile boots as the SIMPLEST possible thing: a chat-only \"social-media executive\" (the existing POST /sover/chat SSE surface) that talks to the operator to learn the brand, reads live state, and can do exactly three verbs -- trigger onboarding, file a proposal, and scaffold its first capability. From there it EXPANDS ITSELF: the executive and the supervisor walk a capability dependency tree (RESEARCH -> COMPOSE -> RENDER -> MEASURE -> MONETIZE), and at each cadence the supervisor proposes the single highest-leverage UNLOCKED node -- scored by how much it shrinks \"days to the next follower/engagement/monetization milestone\" -- and scaffolds it via the already-built-but-uncalled capabilities.scaffold() loop. The profile literally grows new routes, lanes, and panels INTO itself over time; if a capability cannot be done yet, the agent BUILDS it by authoring a new capability node from vetted templates rather than editing frozen core.\n\nABSOLUTE CONSTRAINT -- REUSE, DON'T REINVENT: The discovery/approval/rebuild spine is 100% shipped and inert (capabilities.scaffold/decide, api/app.py:109 routers_for, lane_runner.py:315 + sover_supervisor.py:163 + standalone.py:137 lane_specs merges, rebuild_relaunch_exe.py, the X-Operator-Confirm + proposals.py + monetization_gate ledger gates). Sover's job each iteration is to connect a CALLER and a PLANNER to that loaded loop -- never to build a new agent runtime, approval system, or rebuild path. Self-modification stays additive and human-approved; frozen core stays frozen; every dollar crosses a human's desk. Simplicity-first is binding: anything beyond a prompt action-parser, a genesis route, honest docs, a template-based scaffolder, and a tree-walking planner is gold-plating to be rejected.\n\nLIVE DEPLOYMENT CONTEXT -- GAINS.GOD.GROWTH: Sover is now running live as the autonomous social-media executive for the Gains.God.Growth brand (faith + discipline + gym motivation) across Instagram, TikTok, and YouTube. The GGG profile now uses minimax-m3 via native Ollama Cloud for all LLM roles (creative, brain, chat) -- operator model decision 2026-07-01, staying within the operator's approved-tools list (Ollama Cloud / Claude subscription / brokerage+Kalshi only, no other paid services). The operator has set auto_post=true and publish_platforms includes all three platforms. Content voice: raw, masculine, encouraging, NEVER cynical; faith-and-iron. Short punchy quotes for 10-second reels, 2-4 lines each. Hashtag mix: #gains #god #growth #faith #discipline #gymmotivation (core) plus a pool of fitness/christian/strength tags. 3 posts/day, best hours 6AM/12PM/6PM/9PM, cross-posted to all 3 platforms.\n\nITERATE FROM MISTAKES: Each Solomon RSI iteration MUST read the Sover agent's recent run logs (.runtime/ggg/pi_runner_heartbeat.json, data/ggg/strategy.json, lane_state.json, the CGO's markdown briefs) and identify MISTAKES the agent made -- silent lane failures, off-brand content, missed posting windows, broken browser automation, poor hashtag selection, content that didn't perform, voice drift, reward-hacking, capability scaffolds that don't actually work. THE MEASURED FAILURE MODE TO KILL (verified from the live post registry 2026-07-01): multi-day posting outages that nobody notices -- June 16-23 and June 25-29 had ZERO posts on any platform, and cadence since is ~1 reel/day against the 3/day target; one June 30 TikTok entry claims published_at with an EMPTY url (a publish claim with no evidence). Prioritize fixes that make posting throughput hit the 3/day target and make every publish claim carry a verifiable URL. The iteration's improvement should FIX the highest-leverage mistake found, making the agent better at autonomously expanding GGG on the next run. The loop's fitness signal is: did the fix make Sover post more, post better, or grow the accounts faster? A fix that prevents a recurring silent failure is worth more than a cosmetic improvement. Prioritize: (1) posting reliability and throughput, (2) content quality and on-brand-ness, (3) platform automation robustness (browser_harness, CDP, DOM selectors), (4) analytics accuracy, (5) capability tree progression. The goal does not shrink to fit budget -- a truthful null (no mistake found worth fixing this cycle) beats a fabricated improvement.",
         "provider": "ollama-cloud",
-        "model": "glm-5.2",
+        "model": "minimax-m3",
         "api_key": "OLLAMA_API_KEY",
         "ship": "auto-merge",
         "pr_target_branch": "main",
@@ -152,7 +152,7 @@
             ],
             "cwd": "C:\\Users\\Cayleb\\sover-live",
             "profile_env": "ggg",
-            "comment": "2026-07-14 (Phase 2): sover publish ladder wired DRY-RUN-FIRST. The sanctioned publish lane for growth content (showcase reels, release-notes posts) is sover's OWN --live --lane post one-shot â€” the same sanctioned binary produce_boost uses, NOT a raw external post Solomon composes. The operator promotes mode to \"live\" only after reviewing the dry-run would_run argv + a clean gated dry run. profile_env=ggg is carried by the lane binary's own --live + cwd (the ggg profile root), not by this config block; it is documented here for the operator."
+            "comment": "2026-07-14 (Phase 2): sover publish ladder wired DRY-RUN-FIRST. The sanctioned publish lane for growth content (showcase reels, release-notes posts) is sover's OWN --live --lane post one-shot Ã¢â‚¬â€ the same sanctioned binary produce_boost uses, NOT a raw external post Solomon composes. The operator promotes mode to \"live\" only after reviewing the dry-run would_run argv + a clean gated dry run. profile_env=ggg is carried by the lane binary's own --live + cwd (the ggg profile root), not by this config block; it is documented here for the operator."
         }
     },
     {
@@ -164,7 +164,7 @@
         "ship": "auto-merge",
         "pr_target_branch": "main",
         "provider": "ollama-cloud",
-        "model": "glm-5.2",
+        "model": "minimax-m3",
         "api_key": "OLLAMA_API_KEY",
         "freshness": {
             "cmd": "python tools\\freshness.py",
@@ -212,7 +212,7 @@
         "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\dotz",
         "public": true,
         "provider": "ollama-cloud",
-        "model": "glm-5.2",
+        "model": "minimax-m3",
         "api_key": "OLLAMA_API_KEY",
         "ship": "auto-merge",
         "pr_target_branch": "main",
@@ -243,7 +243,7 @@
         "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\solomon",
         "public": true,
         "provider": "ollama-cloud",
-        "model": "glm-5.2",
+        "model": "minimax-m3",
         "api_key": "OLLAMA_API_KEY",
         "ship": "auto-merge",
         "pr_target_branch": "main",

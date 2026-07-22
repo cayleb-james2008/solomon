@@ -1898,7 +1898,7 @@ fn public_config(cfg: &Value) -> Value {
         "api_key": cfg.get("api_key").cloned().unwrap_or(json!("OLLAMA_API_KEY")),
         "model": cfg.get("model").cloned().unwrap_or(json!("glm-5.2")),
         "max_concurrent_agent_calls": cfg.get("max_concurrent_agent_calls").cloned().unwrap_or(json!(1)),
-        "cooldown_s": cfg.get("cooldown_s").cloned().unwrap_or(json!(86400)),
+        "cooldown_s": cfg.get("cooldown_s").cloned().unwrap_or(json!(300)),
         "daily_call_budget": cfg.get("daily_call_budget").cloned().unwrap_or(json!(40)),
         "adaptive_phase_policy": cfg.get("adaptive_phase_policy").cloned().unwrap_or(json!("cheap_by_default_deep_on_red_noop_critical_or_campaign")),
         "targets": cfg.get("targets").cloned().unwrap_or(json!(["sover", "dotz", "asmodeus", "maki", "solomon"])),
@@ -2090,7 +2090,7 @@ fn quota_heartbeat_matches_config(repo: &Value, cfg: &Value) -> bool {
     let cooldown_s = cfg
         .get("cooldown_s")
         .and_then(Value::as_i64)
-        .unwrap_or(86400)
+        .unwrap_or(300)
         .max(0) as f64;
     match heartbeat::heartbeat_age(&hb) {
         Some(age) if age <= cooldown_s => {}

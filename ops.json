@@ -64,7 +64,7 @@
             {
                 "id": "kill_breaker",
                 "kind": "cmd",
-                "command": "python -c \"import sqlite3,os; db=os.path.expandvars(r'%LOCALAPPDATA%\\Asmodeus\\state\\asmodeus.db'); con=sqlite3.connect('file:'+db+'?mode=ro',uri=True); k=con.execute('SELECT engaged FROM kill_switch WHERE id=1').fetchone()[0]; b=con.execute('SELECT state FROM breaker_state WHERE id=1').fetchone()[0]; frozen=os.path.exists(os.path.expandvars(r'%LOCALAPPDATA%\\Asmodeus\\state\\LIVE_TRADING_FROZEN')); print(2 if (k or (b!='open' and not frozen)) else (1 if b!='open' else 0))\"",
+                "command": "\"C:\\Users\\Cayleb\\AppData\\Local\\Programs\\Python\\Python312\\python.exe\" -c \"import sqlite3,os; db=os.path.expandvars(r'%LOCALAPPDATA%\\Asmodeus\\state\\asmodeus.db'); con=sqlite3.connect('file:'+db+'?mode=ro',uri=True); k=con.execute('SELECT engaged FROM kill_switch WHERE id=1').fetchone()[0]; b=con.execute('SELECT state FROM breaker_state WHERE id=1').fetchone()[0]; frozen=os.path.exists(os.path.expandvars(r'%LOCALAPPDATA%\\Asmodeus\\state\\LIVE_TRADING_FROZEN')); print(2 if (k or (b!='open' and not frozen)) else (1 if b!='open' else 0))\"",
                 "mode": "number",
                 "yellow_at": 0.5,
                 "red_at": 1.5,

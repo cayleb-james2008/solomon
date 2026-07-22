@@ -1,10 +1,22 @@
 # Sover self-improvement contract
 
-Sover is an autonomous social-media brand supervisor: each profile gets a dedicated direct-LLM Chief Growth Officer, self-extending capability routes/lanes/subagents, and an operator dashboard. The RSI loop is intentionally scoped to agents + supervisor + brand; the frozen core (`dgm.py`, `scorer.py`, `brand_safety.py`, `master.py`, the money gate, and the hard invariants in `pi/AGENTS.md`) must never be edited by the loop. This contract frames every run as shipping one small, real, verified improvement toward that goal — always with a test and a green gate.
+Sover is an autonomous social-media brand supervisor: each profile gets a dedicated direct-LLM
+Chief Growth Officer, self-extending capability routes/lanes/subagents, and an operator dashboard.
+The RSI loop is intentionally scoped to agents + supervisor + brand; the frozen core (`src/engine/catalog.rs`,
+`src/engine/cgo.rs`, the money gate, and the hard invariants in `AGENTS.md`) must never be edited by
+the loop. This contract frames every run as shipping one small, real, verified improvement toward
+that goal — always with a test and a green gate.
 
 ## Your job this run (exactly one improvement)
 
-Populate `next_run` in `.runtime/<profile>/lane_state.json` and surface it in `GET /sover/lanes` so the dashboard Activity tab can show when each lane is scheduled to run next. Today `lane_runner._record()` only writes `last_run`, `last_status`, `detail`, and `enabled`, so the API's `_lanes()` returns `next_run: None` for every row. Add a per-lane interval lookup (core lane intervals in `lane_runner.py`, capability lane intervals from `capabilities.lane_specs()`), compute `next_run = last_run + interval`, and persist it in `_record()`. Update `tests/test_lane_runner.py` to assert `next_run` is populated and plausible, then run the gate and confirm green.
+**Audit and harden the lane freshness watchdog.** The `next_run` field is already populated in
+`lane_state.json` by `src/engine/lanes.rs::record()` (computes `next_run = last_run + interval`
+from a single UTC instant) and surfaced in `GET /sover/lanes` (`src/api/lanes.rs`). The freshness
+watchdog in `src/capabilities/ops_watchdog.rs` checks that each enabled, schedulable lane whose
+`last_run` exceeds its interval is flagged. Review the watchdog's staleness threshold logic,
+identify an edge case (e.g. a lane that ran but wrote an empty `last_run`, or a disabled lane
+whose `last_run` is stale but should not trigger a watchdog alert), add a test for it, run the
+gate, and confirm green.
 
 ## Rules
 
@@ -17,30 +29,29 @@ Populate `next_run` in `.runtime/<profile>/lane_state.json` and surface it in `G
 
 ## Cross-platform tests
 
-The real gate is pytest, configured in `pyproject.toml`. Run it exactly as the repo's own `AGENTS.md` requires:
+The real gate is `cargo test --bin sover` (hermetic: no network, no browser, no live LLM). Run it
+exactly as the repo's own `AGENTS.md` requires:
 
 ```bash
-env -u PYTHONPATH -u PYTHONHOME SOVER_PROFILE=starter .venv/Scripts/python.exe -m pytest -q
+cargo test --bin sover
 ```
 
-The suite must pass before any run is considered complete. Tests exercise the API with FastAPI's `TestClient` and use disposable temp directories, so they stay offline and GUI-free.
+The suite must pass before any run is considered complete. Tests exercise the engine and API with
+disposable temp directories, so they stay offline and GUI-free.
 
 ## Map of the code
 
-- `scripts/run_api.py` — FastAPI/uvicorn driver; binds `127.0.0.1` and serves the static dashboard.
-- `scripts/api/app.py:create_app()` — app factory; wires core routes in `scripts/api/routes/`, auto-discovers active capability routes, and mounts `dashboard/dist`.
-- `scripts/api/routes/` — API surfaces: `profiles`, `onboarding`, `chat`, `proposals`, `capabilities`, `autonomy`, `jobs`, `lanes`, `control`, `surface`, `browser`, `providers`, `update`.
-- `scripts/run_pi.py` — per-profile CGO loop (`--once` or `--interval`); direct-LLM brief, frozen-core tripwires, bounded action execution, capability scaffold via `capability_plan.propose_next()`, and full-autonomy sweep.
-- `scripts/lane_runner.py` — content-engine worker dispatcher; runs one lane and records status in `.runtime/<profile>/lane_state.json`.
-- `scripts/supervisor.py` / `scripts/meta_improver.py` — live state gathering and Darwin-Gödel improvement step.
-- `scripts/capabilities.py` + `scripts/capability_plan.py` + `scripts/capability_templates.py` — self-extension system: route/lane discovery, dependency-tree planner, and vetted template generation.
-- `scripts/onboarding.py` — learns how an account posts, synthesizes a brand draft + `SOUL.md`, and gates content lanes until accepted.
-- `scripts/proposals.py` / `scripts/needs.py` / `scripts/review_queue.py` / `scripts/monetization_gate.py` — operator approval gates for ideas, human actions, code/money hard gate, and money streams.
-- `scripts/autonomy.py` — full-autonomy sweep (auto-approves only non-money gates).
-- `scripts/config.py` + `scripts/sover_profile.py` — per-profile paths and runtime; active profile selected via `SOVER_PROFILE` env var.
-- `bin/sover_app.py` / `scripts/standalone.py` / `bin/sover_app.spec` — desktop window, in-process API/CGO/lane scheduler, and PyInstaller spec.
-- `scripts/gen_ecosystem.py` / `ecosystem.config.js` — PM2 dev process layout generated from the profile registry.
-- `dashboard/dist/cockpit/` — static operator surface (chat + Browser/Activity/Approvals tabs). It is NOT an RSI target.
-- `tests/` — pytest suite; `tests/conftest.py` and `tests/_bootstrap.py` set `sys.path` so `scripts/` modules resolve.
-- `pi/SYSTEM.md`, `pi/CONTROL.md`, `pi/ONBOARD.md`, `pi/AGENTS.md` — operating procedures and hard invariants for the CGO, chat, onboarding, and agents.
+- `src/main.rs` — binary entry point; CLI dispatch.
+- `src/api/app.rs` — app factory; wires core routes in `src/api/routes/`.
+- `src/api/routes/` — API surfaces: `profiles`, `onboarding`, `chat`, `proposals`, `capabilities`, `autonomy`, `jobs`, `lanes`, `control`, `surface`, `browser`, `providers`, `update`.
+- `src/engine/supervisor.rs` / `src/engine/cgo.rs` — live state gathering and Darwin-Gödel improvement step.
+- `src/engine/lanes.rs` — content-engine worker dispatcher; runs one lane and records status in `<runtime>/lane_state.json`. Writes `last_run`, `next_run`, `last_status`, `detail`, `enabled`.
+- `src/engine/catalog.rs` — lane catalog and scheduling.
+- `src/capabilities/ops_watchdog.rs` — lane freshness watchdog: flags enabled, schedulable lanes whose `last_run` exceeds their interval.
+- `src/capabilities/` — self-extension system: route/lane discovery, dependency-tree planner, and vetted template generation.
+- `src/onboarding.rs` — learns how an account posts, synthesizes a brand draft + `SOUL.md`, and gates content lanes until accepted.
+- `src/proposals.rs` / `src/needs.rs` / `src/review_queue.rs` / `src/monetization_gate.rs` — operator approval gates for ideas, human actions, code/money hard gate, and money streams.
+- `src/autonomy.rs` — full-autonomy sweep (auto-approves only non-money gates).
+- `src/config.rs` + `src/sover_profile.rs` — per-profile paths and runtime; active profile selected via `SOVER_PROFILE` env var.
+- `bin/sover_app.rs` / `src/standalone.rs` / `bin/sover_app.spec` — desktop window, in-process API/CGO/lane scheduler, and PyInstaller spec.
 - `AGENTS.md` (repo root) — top-level entry guide; read it first.

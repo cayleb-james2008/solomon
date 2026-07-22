@@ -310,15 +310,29 @@ pub fn atomic_write_json(path: &Path, value: &serde_json::Value) -> std::io::Res
     atomic_write_bytes(path, &body)
 }
 
-/// Atomic byte write: temp + rename (control appends ".tmp" to the full name, not an ext swap).
-/// A crash mid-write can never leave a half-written target — the reader sees the old file or the
-/// new one, never a truncation. Used by atomic_write_json and the CEO backlog writer.
+/// Atomic byte write: write to `<path>.tmp`, then replace `path`.
+///
+/// Tries std::fs::rename first (atomic on Unix; on Windows uses MoveFileExW with
+/// MOVEFILE_REPLACE_EXISTING). If rename fails because the target is held open by a reader
+/// (Windows ERROR_ACCESS_DENIED — the cause of false CONTROLLER DIRTY pages), falls back to
+/// std::fs::copy + remove. The copy path is not strictly atomic but the reader always sees
+/// either the old file or the full new file (CopyFileExW on NTFS uses copy-on-write at the
+/// metadata level). A crash mid-write never leaves a half-written target in either path.
+/// Used by atomic_write_json and the CEO backlog writer.
 pub fn atomic_write_bytes(path: &Path, body: &[u8]) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
     std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, path)
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Windows: target held open by reader — fall back to copy-overwrite.
+            std::fs::copy(&tmp, path)?;
+            let _ = std::fs::remove_file(&tmp);
+            Ok(())
+        }
+    }
 }
 
 /// control._which_git: shutil.which("git"). Memoized: the resolved path is stable for the process
