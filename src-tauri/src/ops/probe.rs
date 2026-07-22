@@ -803,14 +803,20 @@ fn eval_cmd(cfg: &Value, repo_path: &str) -> ProbeOutcome {
         ),
     };
     let timeout = Duration::from_secs(cfg_i64(cfg, "timeout_s").unwrap_or(60).max(1) as u64);
-    let argv: Vec<&str> = if cfg!(windows) {
-        vec!["cmd", "/C", command.as_str()]
+    // Windows: pass the command via raw_arg so cmd.exe receives it BYTE-FOR-BYTE.
+    // Rust's Command::arg() applies its own quoting (wrapping in "..."), which when combined
+    // with cmd /C's quote-stripping (finds LAST quote) mangles any command whose first arg
+    // is a quoted path. run_win_shell bypasses Rust's quoting entirely.
+    let r = if cfg!(windows) {
+        match proc::run_win_shell(&command, None, Some(timeout)) {
+            Ok(r) => r,
+            Err(e) => return unobservable(&threshold, format!("spawn failed: {e}")),
+        }
     } else {
-        vec!["/bin/sh", "-c", command.as_str()]
-    };
-    let r = match proc::run(&argv, None, Some(timeout)) {
-        Ok(r) => r,
-        Err(e) => return unobservable(&threshold, format!("spawn failed: {e}")),
+        match proc::run(&["/bin/sh", "-c", command.as_str()], None, Some(timeout)) {
+            Ok(r) => r,
+            Err(e) => return unobservable(&threshold, format!("spawn failed: {e}")),
+        }
     };
     match mode {
         "number" | "json_array_len" => {
