@@ -372,9 +372,9 @@ mod tests {
 
     fn boost_cfg() -> Value {
         json!({
-            "bin": ["C:\\Users\\Cayleb\\sover-live\\target\\release\\sover.exe", "--live", "--lane", "post"],
-            "produce": ["C:\\Users\\Cayleb\\sover-live\\target\\release\\sover.exe", "--live", "--lane", "produce"],
-            "cwd": "C:\\Users\\Cayleb\\sover-live",
+            "bin": ["C:\\test\\sover\\target\\release\\sover.exe", "--live", "--lane", "post"],
+            "produce": ["C:\\test\\sover\\target\\release\\sover.exe", "--live", "--lane", "produce"],
+            "cwd": "C:\\test\\sover",
             "profile_env": "ggg",
             "cooldown_s": 3600,
             "max_extra_per_day": 3
@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(
             boost_argv(&cfg, "produce"),
             Some(vec![
-                "C:\\Users\\Cayleb\\sover-live\\target\\release\\sover.exe".to_string(),
+                "C:\\test\\sover\\target\\release\\sover.exe".to_string(),
                 "--live".to_string(),
                 "--lane".to_string(),
                 "produce".to_string(),
@@ -505,7 +505,7 @@ mod tests {
         assert_eq!(
             boost_argv(&cfg, "bin"),
             Some(vec![
-                "C:\\Users\\Cayleb\\sover-live\\target\\release\\sover.exe".to_string(),
+                "C:\\test\\sover\\target\\release\\sover.exe".to_string(),
                 "--live".to_string(),
                 "--lane".to_string(),
                 "post".to_string(),

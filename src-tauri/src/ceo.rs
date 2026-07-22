@@ -106,7 +106,7 @@ use crate::pecrt::warm::{LongTermAdapter, ObservationLog, ReconstructedContext, 
 use chrono::{Timelike, Utc};
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Local-time due hours (operator's wall clock, not UTC).
 const PLAN_HOUR: u32 = 7;
@@ -118,6 +118,10 @@ const MAX_ATTEMPTS: i64 = 3;
 const CEO_MODEL: &str = "minimax-m3";
 /// A reopened app that was blind longer than this notifies the gap (seconds).
 const BLIND_NOTICE_S: f64 = 21_600.0;
+/// The ops-RED graft is file-only and normally completes in milliseconds. A five-minute lease lets
+/// a crashed GUI/watchdog process recover while preventing concurrent Solomon processes from both
+/// reading the same dedupe snapshot and paging the same stopped lane.
+const DEAD_RED_LOCK_STALE_S: u64 = 300;
 
 /// HERE/runtime/_ceo_state.json — {"plan": {...}, "summary": {...}} day-gate state.
 fn state_path() -> PathBuf {
@@ -925,6 +929,106 @@ fn dead_red_status_path() -> PathBuf {
     paths::here().join("runtime").join("_dead_red.json")
 }
 
+fn dead_red_lock_path() -> PathBuf {
+    paths::here().join("runtime").join("_dead_red.lock")
+}
+
+struct DeadRedLease {
+    path: PathBuf,
+    token: String,
+    file: Option<std::fs::File>,
+    acquired_at: Instant,
+    stale_after: Duration,
+}
+
+impl Drop for DeadRedLease {
+    fn drop(&mut self) {
+        // Release Windows' deny-share handle before deleting our own marker. While this handle is
+        // live, competing stale reclaimers cannot delete/replace the file (closing the TOCTOU gap
+        // between stale metadata observation and remove/create).
+        drop(self.file.take());
+        // Never delete a successor's lease after this owner aged out and was replaced. During the
+        // valid lease window no contender may replace this file; the token check handles explicit
+        // stale recovery and external tampering without an ABA delete.
+        if self.acquired_at.elapsed() >= self.stale_after {
+            return;
+        }
+        if std::fs::read_to_string(&self.path).ok().as_deref() == Some(self.token.as_str()) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn dead_red_lock_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{}-{nanos}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Cross-process, fail-closed lease for the read/notify/write dead-RED transaction. GUI ticks and
+/// the out-of-band sentinel can run in distinct OS processes, so an in-process mutex cannot prevent
+/// both from observing the old `_dead_red.json` and sending the same page.
+fn try_acquire_dead_red_lock_at(path: &std::path::Path, stale_after: Duration) -> Option<DeadRedLease> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let create = || -> std::io::Result<DeadRedLease> {
+        let token = dead_red_lock_token();
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(0);
+        }
+        let mut file = options.open(path)?;
+        if let Err(e) = std::io::Write::write_all(&mut file, token.as_bytes()) {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(e);
+        }
+        Ok(DeadRedLease {
+            path: path.to_path_buf(),
+            token,
+            file: Some(file),
+            acquired_at: Instant::now(),
+            stale_after,
+        })
+    };
+    match create() {
+        Ok(lease) => Some(lease),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let stale = std::fs::metadata(path)
+                .ok()?
+                .modified()
+                .ok()?
+                .elapsed()
+                .ok()?
+                >= stale_after;
+            if !stale || std::fs::remove_file(path).is_err() {
+                return None;
+            }
+            create().ok()
+        }
+        Err(_) => None,
+    }
+}
+
+fn try_acquire_dead_red_lock() -> Option<DeadRedLease> {
+    try_acquire_dead_red_lock_at(
+        &dead_red_lock_path(),
+        Duration::from_secs(DEAD_RED_LOCK_STALE_S),
+    )
+}
+
 /// Pure (unit-tested): page the operator about a RED outcome on a STOPPED lane iff the lane is NOT
 /// running AND the probe is RED AND we have not already paged for this (lane, probe). A stopped lane
 /// consumes NO backlog, so the ops-auto fix we still file is theater until the operator Starts it —
@@ -934,6 +1038,10 @@ pub fn should_page_dead_red(running: bool, probe_red: bool, already_paged: bool)
 }
 
 fn ops_red_backlog_graft() {
+    let _lease = match try_acquire_dead_red_lock() {
+        Some(lease) => lease,
+        None => return,
+    };
     let status: Value = std::fs::read(ops::outcomes::ops_status_path())
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -2683,6 +2791,117 @@ mod tests {
         assert!(!should_page_dead_red(false, false, false));
         // already paged this (lane, probe) -> suppressed (one deduped page while it persists).
         assert!(!should_page_dead_red(false, true, true));
+    }
+
+    #[test]
+    fn dead_red_lock_is_exclusive_and_released_on_drop() {
+        let dir = std::env::temp_dir().join(format!(
+            "solomon_dead_red_lock_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("_dead_red.lock");
+        let first = try_acquire_dead_red_lock_at(&path, Duration::from_secs(300))
+            .expect("first process acquires the lease");
+        assert!(
+            try_acquire_dead_red_lock_at(&path, Duration::from_secs(300)).is_none(),
+            "a concurrent process must fail closed"
+        );
+        drop(first);
+        let second = try_acquire_dead_red_lock_at(&path, Duration::from_secs(300))
+            .expect("dropping the first lease releases it");
+        drop(second);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn orphaned_stale_dead_red_lock_is_recovered() {
+        let dir = std::env::temp_dir().join(format!(
+            "solomon_dead_red_stale_lock_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("_dead_red.lock");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "orphaned-owner").unwrap();
+        filetime::set_file_mtime(
+            &path,
+            filetime::FileTime::from_unix_time(1, 0),
+        )
+        .unwrap();
+        let replacement = try_acquire_dead_red_lock_at(&path, Duration::from_secs(300))
+            .expect("a stale lease can be recovered");
+        assert!(
+            try_acquire_dead_red_lock_at(&path, Duration::from_secs(300)).is_none(),
+            "the replacement remains exclusive"
+        );
+        drop(replacement);
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_stale_dead_red_reclaim_has_one_winner() {
+        let dir = std::env::temp_dir().join(format!(
+            "solomon_dead_red_reclaim_race_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("_dead_red.lock");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "orphaned-owner").unwrap();
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+
+        const CONTENDERS: usize = 8;
+        let start = std::sync::Arc::new(std::sync::Barrier::new(CONTENDERS + 1));
+        let release = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut threads = Vec::new();
+        for _ in 0..CONTENDERS {
+            let path = path.clone();
+            let start = std::sync::Arc::clone(&start);
+            let release = std::sync::Arc::clone(&release);
+            let tx = tx.clone();
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                let lease = try_acquire_dead_red_lock_at(&path, Duration::from_secs(300));
+                tx.send(lease.is_some()).unwrap();
+                if lease.is_some() {
+                    let (lock, wake) = &*release;
+                    let mut done = lock.lock().unwrap();
+                    while !*done {
+                        done = wake.wait(done).unwrap();
+                    }
+                }
+                drop(lease);
+            }));
+        }
+        drop(tx);
+        start.wait();
+        let mut winners = 0;
+        for _ in 0..CONTENDERS {
+            if rx.recv().expect("every contender reports its result") {
+                winners += 1;
+            }
+        }
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(winners, 1, "stale reclaim must preserve cross-process exclusivity");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

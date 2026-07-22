@@ -28,6 +28,9 @@ const PROOF_FILE: &str = "autopilot_proof.json";
 const LEGACY_STATE_FILE: &str = "fleet_state.json";
 const LEGACY_PROOF_FILE: &str = "fleet_proof.json";
 const DEFAULT_RUN_TIMEOUT_S: u64 = 3_600;
+/// A completed proof owns the lane's retry slot for this long while its diagnosis/ops fingerprint
+/// is unchanged. A new RED/YELLOW fingerprint or manual wake bypasses the hold immediately.
+const PROOF_FRESH_HOURS: i64 = 12;
 
 /// Consecutive autopilot sweeps a lane must be `proof_required` before the watchdog's
 /// autopilot recover pass is allowed to force a stop→ideate→restart heal on it. This is the
@@ -104,6 +107,9 @@ struct Job {
     /// consumes the wake flag when THIS job actually dispatches — same charge-at-dispatch rule as
     /// `diversify` (a plan that loses the slot must not eat the wake).
     wake_override: bool,
+    /// Stable snapshot of the diagnosis category + ops probe statuses that caused this job. A
+    /// proof only suppresses another attempt while this fingerprint is unchanged.
+    state_fingerprint: String,
 }
 
 struct AutopilotLease {
@@ -460,6 +466,16 @@ fn run_ai_job(job: &Job, repos: &[Value], cfg: &Value, auto_push: bool, st: &mut
     else {
         return proof(job, "blocked", "repo not found", None, None);
     };
+    let repo_path = paths::repo_path(repo);
+    if !Path::new(&repo_path).is_dir() {
+        return proof(
+            job,
+            "blocked",
+            &format!("configured repo path does not exist or is not a directory: {repo_path}"),
+            Some(json!({"configured_path": repo_path})),
+            Some(repo),
+        );
+    }
     let provider = cfg
         .get("provider")
         .and_then(Value::as_str)
@@ -642,6 +658,7 @@ fn plan_jobs(
                 spec_goal: None,
                 spec_category: None,
                 wake_override: false,
+                state_fingerprint: "registry_missing".into(),
             });
             continue;
         };
@@ -674,13 +691,10 @@ fn plan_jobs(
             .and_then(Value::as_str)
             .unwrap_or("grey");
         let manual_hit = manual.iter().any(|v| v.as_str() == Some(name.as_str()));
-        let last_proof = read_proof(&name);
-        let proof_fresh = last_proof
-            .as_ref()
-            .and_then(|p| p.get("ts").and_then(Value::as_str))
-            .and_then(parse_ts)
-            .map(|t| Utc::now() - t < ChronoDuration::hours(12))
-            .unwrap_or(false);
+        let state_fingerprint = retry_state_fingerprint(&ops_project, diag_cat);
+        let same_state_proof_fresh = proof_matches_fresh_state(&name, &state_fingerprint);
+        let normal_proof_fresh = same_state_proof_fresh
+            || (ops_status != "red" && ops_status != "yellow" && explicit_proof_is_fresh(&name));
         let mut priority = match ops_status {
             "red" => 10,
             "yellow" => 30,
@@ -728,15 +742,15 @@ fn plan_jobs(
                     .unwrap_or("project is unhealthy"),
                 "surface blocker and avoid retry theater",
             )
-        } else if ops_status == "red" || ops_status == "yellow" || manual_hit || !proof_fresh {
+        } else if manual_hit || !normal_proof_fresh {
             (
                 "implement",
                 "queued",
                 true,
-                if ops_status == "red" || ops_status == "yellow" {
-                    "ops outcome needs improvement"
-                } else if manual_hit {
+                if manual_hit {
                     "manual autopilot wake request"
+                } else if ops_status == "red" || ops_status == "yellow" {
+                    "ops outcome needs improvement; prior proof is stale or missing"
                 } else {
                     "proof record is stale or missing"
                 },
@@ -747,7 +761,7 @@ fn plan_jobs(
                 "complete",
                 "complete",
                 false,
-                "fresh proof exists and ops are not red/yellow",
+                "fresh proof owns this retry window; hold unchanged ops state",
                 "hold",
             )
         };
@@ -871,6 +885,13 @@ fn plan_jobs(
         // picks different work (the autonomous re-spec path above). The outcome word is "noop"
         // (proof_required is inert — never "shipped"; same discipline as orchestrator.rs:655-660).
         if kind == "proof_required" && emit_proofs {
+            // A proof is the durable record of this inert diagnosis. Re-emitting the same blocker
+            // every sweep creates duplicate pages/events and can race across watchdog processes;
+            // keep the stuck streak moving, but let the existing proof own the retry window.
+            if same_state_proof_fresh {
+                bump_stuck_counter(st, &name, true);
+                continue;
+            }
             let ops_project = ops_payload
                 .get("projects")
                 .and_then(|p| p.get(&name))
@@ -888,6 +909,7 @@ fn plan_jobs(
                 spec_goal: None,
                 spec_category: None,
                 wake_override: false,
+                state_fingerprint: state_fingerprint.clone(),
             };
 
             // Progress-ledger wiring: seed the entry + snapshot the pre-state BEFORE proof() (so
@@ -976,6 +998,7 @@ fn plan_jobs(
             spec_goal,
             spec_category,
             wake_override: wake_job,
+            state_fingerprint,
         });
     }
     jobs.sort_by(|a, b| {
@@ -1140,6 +1163,7 @@ fn proof(
         "requires_ai": job.requires_ai,
         "priority": job.priority,
         "next_action": job.next_action,
+        "state_fingerprint": job.state_fingerprint,
         "extra": extra.unwrap_or(Value::Null),
     });
     if let Some(r) = repo {
@@ -1180,6 +1204,73 @@ fn read_proof(name: &str) -> Option<Value> {
         .last()
         .and_then(|h| proof_from_history(name, h));
     freshest_proof(file_proof, history_proof)
+}
+
+fn proof_matches_fresh_state(name: &str, state_fingerprint: &str) -> bool {
+    read_explicit_proof(name)
+        .filter(|proof| {
+            proof.get("state_fingerprint").and_then(Value::as_str) == Some(state_fingerprint)
+        })
+        .as_ref()
+        .map(proof_is_recent)
+        .unwrap_or(false)
+}
+
+fn explicit_proof_is_fresh(name: &str) -> bool {
+    read_explicit_proof(name)
+        .as_ref()
+        .map(proof_is_recent)
+        .unwrap_or(false)
+}
+
+fn read_explicit_proof(name: &str) -> Option<Value> {
+    let rt = paths::runtime_dir(&json!({"name": name}))?;
+    std::fs::read(rt.join(PROOF_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+}
+
+fn proof_is_recent(proof: &Value) -> bool {
+    proof_time(proof)
+        .map(|ts| Utc::now().signed_duration_since(ts))
+        .map(|age| {
+            age >= ChronoDuration::zero() && age < ChronoDuration::hours(PROOF_FRESH_HOURS)
+        })
+        .unwrap_or(false)
+}
+
+/// Stable retry identity: details such as "age 37.2h" intentionally do not participate because
+/// they change every sweep. A diagnosis-category or per-probe status transition does participate,
+/// so a genuinely new RED/YELLOW state bypasses an old proof immediately.
+fn retry_state_fingerprint(ops_project: &Value, diagnosis_category: &str) -> String {
+    let mut probes: Vec<String> = ops_project
+        .get("probes")
+        .and_then(Value::as_object)
+        .map(|p| {
+            p.iter()
+                .map(|(id, status)| {
+                    format!("{id}={}", status.as_str().unwrap_or("invalid"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    probes.sort();
+    format!(
+        "diag={diagnosis_category}|ops={}|restart_forbidden={}|operator_gated={}|probes={}",
+        ops_project
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("grey"),
+        ops_project
+            .get("restart_forbidden")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        ops_project
+            .get("red_operator_gated_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        probes.join(",")
+    )
 }
 
 fn proof_from_history(name: &str, h: &Value) -> Option<Value> {
@@ -2217,6 +2308,122 @@ mod tests {
         assert_eq!(jobs[0].name, a);
         assert_eq!(jobs[0].kind, "implement");
         assert!(jobs[0].requires_ai);
+    }
+
+    #[test]
+    fn plan_jobs_holds_unchanged_red_while_proof_is_fresh() {
+        let name = format!(
+            "autopilot_fresh_red_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let row = repo(&name);
+        let rt = paths::runtime_dir(&row).unwrap();
+        let _ = std::fs::remove_dir_all(&rt);
+        let unchanged = json!({
+            "status": "red",
+            "probes": {"cdp_alive": "red", "process": "green"}
+        });
+        let fingerprint = retry_state_fingerprint(&unchanged, "ok");
+        write_proof_value_at(
+            &rt,
+            &json!({
+                "ts": now(),
+                "repo": name.clone(),
+                "outcome": "blocked",
+                "state_fingerprint": fingerprint
+            }),
+        );
+        let cfg = json!({"provider": "openrouter", "targets": [name.clone()]});
+        let mut projects = Map::new();
+        projects.insert(name.clone(), unchanged.clone());
+        let ops = json!({"projects": Value::Object(projects)});
+        let jobs = plan_jobs(
+            std::slice::from_ref(&row),
+            &cfg,
+            &ops,
+            &mut json!({"manual_queue": []}),
+            None,
+            false,
+        );
+        assert!(
+            jobs.is_empty(),
+            "a fresh proof must own the retry window even while ops remain red: {jobs:?}"
+        );
+
+        let changed = json!({
+            "status": "red",
+            "probes": {"cdp_alive": "green", "post_failures": "red", "process": "green"}
+        });
+        let mut changed_projects = Map::new();
+        changed_projects.insert(name.clone(), changed);
+        let changed_jobs = plan_jobs(
+            std::slice::from_ref(&row),
+            &cfg,
+            &json!({"projects": Value::Object(changed_projects)}),
+            &mut json!({"manual_queue": []}),
+            None,
+            false,
+        );
+        assert_eq!(changed_jobs.len(), 1, "a new RED fingerprint bypasses the old proof");
+        assert_eq!(changed_jobs[0].kind, "implement");
+        assert!(
+            !proof_matches_fresh_state(
+                &name,
+                &retry_state_fingerprint(&unchanged, "needs_goal")
+            ),
+            "a changed diagnosis category must bypass the old proof"
+        );
+        let _ = std::fs::remove_dir_all(rt);
+    }
+
+    #[test]
+    fn run_ai_job_blocks_a_missing_repo_before_key_or_budget_spend() {
+        let name = format!(
+            "autopilot_missing_repo_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let missing = std::env::temp_dir().join(&name);
+        let _ = std::fs::remove_dir_all(&missing);
+        let row = json!({"name": name, "path": missing});
+        let job = Job {
+            name: name.clone(),
+            kind: "implement".into(),
+            state: "queued".into(),
+            priority: 10,
+            requires_ai: true,
+            reason: "test".into(),
+            next_action: "test".into(),
+            diversify: false,
+            spec_goal: None,
+            spec_category: None,
+            wake_override: false,
+            state_fingerprint: "missing_repo".into(),
+        };
+        let mut st = json!({});
+        let result = run_ai_job(
+            &job,
+            &[row],
+            &json!({"provider": "openrouter", "api_key": "UNSET_TEST_KEY"}),
+            false,
+            &mut st,
+        );
+        assert_eq!(result["outcome"], json!("blocked"));
+        assert!(result["summary"]
+            .as_str()
+            .unwrap_or("")
+            .contains("configured repo path does not exist"));
+        assert_eq!(daily_used(&st), 0, "preflight failure must not spend the daily AI budget");
+        if let Some(rt) = paths::runtime_dir(&json!({"name": name})) {
+            let _ = std::fs::remove_dir_all(rt);
+        }
     }
 
     #[test]

@@ -86,7 +86,10 @@
                 "/c",
                 "launch_ggg.bat"
             ],
-            "cooldown_s": 1800
+            "cooldown_s": 1800,
+            "revive_cooldown_s": 1800,
+            "profile_env_key": "SOVER_PROFILE",
+            "profile_env": "ggg"
         },
         "private_paths": [
             "profiles/ggg/",
@@ -104,8 +107,11 @@
         "ship": "auto-merge",
         "pr_target_branch": "main",
         "freshness": {
-            "no_objective": true,
-            "comment": "2026-07-22: marked no_objective (was python tools\\freshness.py). The post_registry.json is missing because the Sover publishing pipeline isn't running (cdp_alive probe has been red — the Sover.exe CDP endpoint on port 9242 is unreachable, likely because the browser isn't launched with --remote-debugging-port=9242). Without the pipeline running, the freshness probe has no real data to read — fabricating a green 'tests pass' freshness would be the exact monitoring-theater trap the gate exists to kill. The Sover pi agent should fix the publishing pipeline first (see the [chore] backlog item: 'Bring Sover.exe online, restore the CDP browser endpoint...'), then the freshness probe will start flowing real data and this no_objective sentinel can be replaced with a real emitter. Until then, the lane runs every cycle as before (no false RED, no fabricated park). The 2026-07-10 hard=false/max_starve_cycles=4 settings are obsolete under no_objective (freshness_cfg returns None)."
+            "cmd": "python tools\\freshness.py",
+            "min_new_samples": 1,
+            "hard": true,
+            "max_starve_cycles": 4,
+            "comment": "2026-07-22 recovery: live-app objective telemetry is fail-closed. The real emitter reads %LOCALAPPDATA%\\Sover; a missing post registry or broken publishing pipeline is UNOBSERVABLE and halts blind RSI mutation instead of being masked by no_objective."
         },
         "interval": 120,
         "max_iterations": 0,
@@ -123,18 +129,18 @@
         },
         "produce_boost": {
             "bin": [
-                "C:\\Users\\Cayleb\\sover-live\\target\\release\\sover.exe",
+                "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\sover\\target\\release\\sover.exe",
                 "--live",
                 "--lane",
                 "post"
             ],
             "produce": [
-                "C:\\Users\\Cayleb\\sover-live\\target\\release\\sover.exe",
+                "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\sover\\target\\release\\sover.exe",
                 "--live",
                 "--lane",
                 "produce"
             ],
-            "cwd": "C:\\Users\\Cayleb\\sover-live",
+            "cwd": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\sover",
             "profile_env": "ggg",
             "cooldown_s": 3600,
             "max_extra_per_day": 3
@@ -142,14 +148,15 @@
         "growth_publish": {
             "mode": "live",
             "publish": [
-                "C:\\Users\\Cayleb\\sover-live\\target\\release\\sover.exe",
+                "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\sover\\target\\release\\sover.exe",
                 "--live",
                 "--lane",
                 "post"
             ],
-            "cwd": "C:\\Users\\Cayleb\\sover-live",
+            "cwd": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\sover",
+            "profile_env_key": "SOVER_PROFILE",
             "profile_env": "ggg",
-            "comment": "2026-07-14 (Phase 2): sover publish ladder wired DRY-RUN-FIRST. The sanctioned publish lane for growth content (showcase reels, release-notes posts) is sover's OWN --live --lane post one-shot Ã¢â‚¬â€ the same sanctioned binary produce_boost uses, NOT a raw external post Solomon composes. The operator promotes mode to \"live\" only after reviewing the dry-run would_run argv + a clean gated dry run. profile_env=ggg is carried by the lane binary's own --live + cwd (the ggg profile root), not by this config block; it is documented here for the operator."
+            "comment": "2026-07-22 recovery: the sanctioned Sover --live --lane post one-shot runs from the real source checkout and explicitly receives SOVER_PROFILE=ggg. It remains the project's own publish path; Solomon does not compose a raw external post."
         }
     },
     {
@@ -166,9 +173,9 @@
         "freshness": {
             "cmd": "python tools\\freshness.py",
             "min_new_samples": 1,
-            "hard": false,
+            "hard": true,
             "max_starve_cycles": 4,
-            "comment": "2026-07-10: changed hard=true to hard=false so code improvements still run when starved (operator wants full autonomy, not evidence-gated halts). max_starve_cycles=4 means after 4 starved cycles, a non-metric upkeep cycle runs."
+            "comment": "2026-07-22 recovery: Asmodeus is a live-money app, so stale or unobservable live telemetry must gate blind RSI mutation. max_starve_cycles=4 retains one bounded upkeep escape cycle to repair the data path."
         },
         "interval": 180,
         "max_iterations": 0,
@@ -194,7 +201,15 @@
                 "-File",
                 "C:/Users/Cayleb/Desktop/workspace/solomon/tools/asmodeus_keepalive.ps1"
             ],
-            "cooldown_s": 3600
+            "cooldown_s": 3600,
+            "recovery_require_green": [
+                "kill_breaker",
+                "reconciliation_clear",
+                "auth_health",
+                "heartbeat_fresh",
+                "equity_fresh",
+                "equity_value"
+            ]
         },
         "growth_publish": {
             "mode": "live",

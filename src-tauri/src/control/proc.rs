@@ -94,6 +94,22 @@ pub fn run<S: AsRef<OsStr>>(
     run_prepared(build(args, cwd), timeout)
 }
 
+/// `run` with a small, caller-supplied environment overlay applied after the standard secret/path
+/// scrub. This is for non-secret runtime selectors such as `SOVER_PROFILE`; credentials still stay
+/// out of tracked config and are inherited through their existing provider-specific paths.
+pub fn run_with_env<S: AsRef<OsStr>>(
+    args: &[S],
+    cwd: Option<&Path>,
+    timeout: Option<Duration>,
+    env: &[(&str, &str)],
+) -> std::io::Result<RunOut> {
+    let mut cmd = build(args, cwd);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    run_prepared(cmd, timeout)
+}
+
 /// Windows-only: run the operator's custom base-gate command via `cmd /C <gate>` with the gate string
 /// passed through `raw_arg` so cmd.exe receives it BYTE-FOR-BYTE. Rust's normal arg quoting is NOT
 /// cmd.exe's parsing algorithm, so a gate command containing a quoted path-with-spaces (or other
@@ -403,6 +419,28 @@ mod tests {
         let out = run(&["echo", "hello"], None, None).unwrap();
         assert_eq!(out.code, 0);
         assert!(out.stdout.contains("hello"));
+    }
+
+    #[test]
+    fn run_with_env_applies_the_overlay() {
+        #[cfg(windows)]
+        let out = run_with_env(
+            &["cmd", "/c", "echo", "%SOLOMON_PROC_TEST_VALUE%"],
+            None,
+            None,
+            &[("SOLOMON_PROC_TEST_VALUE", "present")],
+        )
+        .unwrap();
+        #[cfg(not(windows))]
+        let out = run_with_env(
+            &["sh", "-c", "printf '%s' \"$SOLOMON_PROC_TEST_VALUE\""],
+            None,
+            None,
+            &[("SOLOMON_PROC_TEST_VALUE", "present")],
+        )
+        .unwrap();
+        assert_eq!(out.code, 0);
+        assert!(out.stdout.contains("present"));
     }
 
     // The timeout branch must drain pipes concurrently: a child emitting far more than the ~64KB OS

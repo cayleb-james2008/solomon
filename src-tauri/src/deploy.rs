@@ -8,8 +8,8 @@
 //!
 //! HARD SAFETY CONTRACT:
 //!   - A repo is auto-deployed ONLY IFF it carries a `live_deploy` config (opt-in per repo). A repo
-//!     WITHOUT `live_deploy` is NEVER auto-deployed — money-out / live-money stays human-gated
-//!     (asmodeus explicitly: no `live_deploy` -> never touched here).
+//!     WITHOUT `live_deploy` is NEVER auto-deployed. Live-money apps additionally fail closed on
+//!     restart-forbidden rollups and their configured `recovery_require_green` probe set.
 //!   - A deploy fires ONLY when the deployed binary is STALE (a probe detail says "deploy gap") AND
 //!     the app is DOWN (a process probe says the app is NOT running) — rebuild+relaunch then loses
 //!     nothing. Never when the app is UP and current (do not interrupt a healthy running app).
@@ -168,6 +168,42 @@ pub fn project_app_down(project: &Value) -> bool {
     reason_contains(project, "NOT running")
 }
 
+/// Fail-closed recovery readiness for an app that is about to be rebuilt/relaunched. A RED probe
+/// marked `restart_forbidden_on_red` blocks every automatic recovery. Repos may additionally name
+/// the exact probes that must be GREEN in `live_deploy.recovery_require_green`; a present but empty
+/// or malformed list is rejected instead of silently weakening the gate.
+pub fn project_recovery_ready(repo_cfg: &Value, project: &Value) -> bool {
+    if project
+        .get("restart_forbidden")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let Some(required) = repo_cfg
+        .get("live_deploy")
+        .and_then(|d| d.get("recovery_require_green"))
+    else {
+        return true;
+    };
+    let Some(required) = required.as_array() else {
+        return false;
+    };
+    if required.is_empty() {
+        return false;
+    }
+    let Some(probes) = project.get("probes").and_then(Value::as_object) else {
+        return false;
+    };
+    required.iter().all(|id| {
+        id.as_str()
+            .filter(|id| !id.trim().is_empty())
+            .and_then(|id| probes.get(id))
+            .and_then(Value::as_str)
+            == Some("green")
+    })
+}
+
 /// True iff any rollup `reasons` entry contains `needle`. The reasons array carries each non-green
 /// probe as `"{id}={status} ({detail})"`, so the probe detail is embedded there.
 fn reason_contains(project: &Value, needle: &str) -> bool {
@@ -265,6 +301,33 @@ fn live_deploy_argv(repo_cfg: &Value, field: &str) -> Option<Vec<String>> {
     }
 }
 
+/// Optional non-secret Sover profile selector carried by a managed launch. The tracked registry is
+/// not allowed to set arbitrary process variables such as PATH/COMSPEC/RUSTFLAGS; only the bounded
+/// `SOVER_PROFILE=<profile-name>` contract is accepted.
+fn live_deploy_profile_env(repo_cfg: &Value) -> Option<(&str, &str)> {
+    let deploy = repo_cfg.get("live_deploy")?;
+    let key = deploy.get("profile_env_key")?.as_str()?.trim();
+    let value = deploy.get("profile_env")?.as_str()?.trim();
+    let valid_value = !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    (key == "SOVER_PROFILE" && valid_value).then_some((key, value))
+}
+
+fn run_live_deploy_command(
+    repo_cfg: &Value,
+    argv: &[String],
+    cwd: &Path,
+    timeout: Duration,
+) -> std::io::Result<proc::RunOut> {
+    match live_deploy_profile_env(repo_cfg) {
+        Some(pair) => proc::run_with_env(argv, Some(cwd), Some(timeout), &[pair]),
+        None => proc::run(argv, Some(cwd), Some(timeout)),
+    }
+}
+
 /// Validate a launch argv BEFORE spending minutes on a rebuild. Fails loudly if any element carries
 /// an ASCII control character (exactly how the asmodeus `scripts...keepalive` corruption
 /// shipped — `\a` mangled into a JSON BEL escape) or names a script that does not exist on disk.
@@ -342,7 +405,12 @@ fn maybe_redeploy_managed_app(repo_cfg: &Value) -> Result<(), String> {
 
     // Rebuild the current HEAD in the repo cwd. Long timeout — a clean release build is minutes; a
     // timeout aborts the child and returns Err (no relaunch).
-    let r = proc::run(&rebuild, Some(&cwd), Some(Duration::from_secs(60 * 30)))
+    let r = run_live_deploy_command(
+        repo_cfg,
+        &rebuild,
+        &cwd,
+        Duration::from_secs(60 * 30),
+    )
         .map_err(|e| format!("{name}: rebuild spawn failed: {e}"))?;
     if !r.ok() {
         let tail: String = r.stderr.trim().chars().take(300).collect();
@@ -352,7 +420,7 @@ fn maybe_redeploy_managed_app(repo_cfg: &Value) -> Result<(), String> {
     }
 
     // Relaunch the app. A launch failure is a real, paged failure (the fix built but did not deploy).
-    let lr = proc::run(&launch, Some(&cwd), Some(Duration::from_secs(60)))
+    let lr = run_live_deploy_command(repo_cfg, &launch, &cwd, Duration::from_secs(60))
         .map_err(|e| format!("{name}: launch spawn failed: {e}"))?;
     if !lr.ok() {
         let msg = format!("{name}: relaunch FAILED (code {}) at {head}", lr.code);
@@ -432,11 +500,11 @@ fn maybe_revive_managed_app(repo_cfg: &Value) -> Result<(), String> {
     // have missed. Best-effort — a kill failure does not block the revive (the app is already DOWN
     // per the probe; this is belt-and-suspenders).
     if let Some(kill) = live_deploy_argv(repo_cfg, "kill") {
-        let _ = proc::run(&kill, Some(&cwd), Some(Duration::from_secs(30)));
+        let _ = run_live_deploy_command(repo_cfg, &kill, &cwd, Duration::from_secs(30));
     }
 
     // Relaunch the app. A launch failure is a real, paged failure.
-    let lr = proc::run(&launch, Some(&cwd), Some(Duration::from_secs(60)))
+    let lr = run_live_deploy_command(repo_cfg, &launch, &cwd, Duration::from_secs(60))
         .map_err(|e| format!("{name}: launch spawn failed: {e}"))?;
     if !lr.ok() {
         let msg = format!("{name}: revive relaunch FAILED (code {}) at {head}", lr.code);
@@ -499,7 +567,9 @@ pub fn maybe_redeploy_managed_apps(ops_status: &Value) {
         let deploy_gap = project_deploy_gap(project);
         let app_down = project_app_down(project);
         let age = last_deploy_age_s(&name);
-        if !should_redeploy(&repo_cfg, deploy_gap, app_down, age, drain_ok) {
+        if !project_recovery_ready(&repo_cfg, project)
+            || !should_redeploy(&repo_cfg, deploy_gap, app_down, age, drain_ok)
+        {
             continue;
         }
         // Fire the one deploy this repo is eligible for; consume the per-sweep budget whether it
@@ -540,7 +610,9 @@ pub fn maybe_revive_managed_apps(ops_status: &Value) {
         let deploy_gap = project_deploy_gap(project);
         let app_down = project_app_down(project);
         let age = last_revive_age_s(&name);
-        if !should_revive(&repo_cfg, deploy_gap, app_down, age, drain_ok) {
+        if !project_recovery_ready(&repo_cfg, project)
+            || !should_revive(&repo_cfg, deploy_gap, app_down, age, drain_ok)
+        {
             continue;
         }
         revives_left -= 1;
@@ -581,7 +653,7 @@ mod tests {
         })
     }
 
-    // A repo cfg shaped like asmodeus (live-money, NO live_deploy) — must NEVER deploy.
+    // A generic live-money repo with NO live_deploy opt-in must NEVER deploy.
     fn asmodeus_shaped() -> Value {
         json!({"name": "asmodeus", "live_money": true, "gate": "cargo test --workspace"})
     }
@@ -598,7 +670,7 @@ mod tests {
 
     #[test]
     fn should_redeploy_repo_without_live_deploy_never() {
-        // asmodeus-shaped: live-money, NO live_deploy — NEVER auto-deploy even with every other
+        // Live-money shaped but NO live_deploy — NEVER auto-deploy even with every other
         // condition screaming deploy. This is the money-out human-gate invariant.
         let repo = asmodeus_shaped();
         assert!(
@@ -692,6 +764,39 @@ mod tests {
         assert!(!project_app_down(&json!({"status": "red"})));
     }
 
+    #[test]
+    fn project_recovery_readiness_is_fail_closed() {
+        let guarded = json!({
+            "live_deploy": {
+                "recovery_require_green": ["kill_breaker", "reconciliation_clear"]
+            }
+        });
+        let ready = json!({
+            "restart_forbidden": false,
+            "probes": {"kill_breaker": "green", "reconciliation_clear": "green"}
+        });
+        assert!(project_recovery_ready(&guarded, &ready));
+
+        let forbidden = json!({
+            "restart_forbidden": true,
+            "probes": {"kill_breaker": "green", "reconciliation_clear": "green"}
+        });
+        assert!(!project_recovery_ready(&guarded, &forbidden));
+        assert!(!project_recovery_ready(
+            &guarded,
+            &json!({"probes": {"kill_breaker": "green", "reconciliation_clear": "red"}})
+        ));
+        assert!(!project_recovery_ready(
+            &guarded,
+            &json!({"probes": {"kill_breaker": "green"}})
+        ));
+        assert!(!project_recovery_ready(
+            &json!({"live_deploy": {"recovery_require_green": []}}),
+            &ready
+        ));
+        assert!(project_recovery_ready(&live_repo(), &json!({})), "legacy repos still honor the global restart_forbidden flag without requiring a probe list");
+    }
+
     // -------- per-sweep cap: at most ONE managed-app deploy across all repos --------
     // The cap is MAX_DEPLOYS_PER_SWEEP; asserting the constant here documents the disk-meltdown
     // guard (a cargo build is heavy — 6-at-once melted the disk on 2026-07-02). The orchestrator
@@ -720,6 +825,33 @@ mod tests {
         assert_eq!(live_deploy_argv(&json!({"live_deploy": {"rebuild": []}}), "rebuild"), None);
         // no live_deploy at all -> None
         assert_eq!(live_deploy_argv(&json!({}), "rebuild"), None);
+    }
+
+    #[test]
+    fn live_deploy_profile_env_requires_a_complete_pair() {
+        let repo = json!({"live_deploy": {
+            "profile_env_key": "SOVER_PROFILE",
+            "profile_env": "ggg"
+        }});
+        assert_eq!(live_deploy_profile_env(&repo), Some(("SOVER_PROFILE", "ggg")));
+        assert_eq!(
+            live_deploy_profile_env(&json!({"live_deploy": {"profile_env_key": "SOVER_PROFILE"}})),
+            None
+        );
+        assert_eq!(
+            live_deploy_profile_env(&json!({"live_deploy": {"profile_env_key": "", "profile_env": "ggg"}})),
+            None
+        );
+        assert_eq!(
+            live_deploy_profile_env(&json!({"live_deploy": {"profile_env_key": "PATH", "profile_env": "ggg"}})),
+            None,
+            "tracked config cannot override arbitrary process environment"
+        );
+        assert_eq!(
+            live_deploy_profile_env(&json!({"live_deploy": {"profile_env_key": "SOVER_PROFILE", "profile_env": "..\\other"}})),
+            None,
+            "profile selectors are names, not paths"
+        );
     }
 
     // -------- launch_argv_sane: reject the corruption class BEFORE a wasteful rebuild --------

@@ -529,10 +529,10 @@ pub fn project_sandbox(repo: &Value) -> Value {
 // freshness disposition (Phase A.2) — the startup CONTRACT the fleet must satisfy
 // --------------------------------------------------------------------------- #
 //
-// Every fleet lane must have a HONEST freshness disposition so the improver never optimizes a
+// Every fleet lane must have an HONEST freshness disposition so the improver never optimizes a
 // blind objective (freshness.rs failure catalog #1 "value-blind objective"): a lane is EITHER
 //   (a) explicitly `no_objective: true` — a documented sentinel: this lane has no settled
-//       real-world metric to gate on today (a code-quality lane), so freshness is off and the
+//       real-world metric to gate on today (a non-live code-quality lane), so freshness is off and the
 //       lane runs legacy (never a fabricated green, never a false RED); OR
 //   (b) a real emitter: `freshness.cmd` whose script FILE EXISTS on disk, resolved against the
 //       lane's repo `path`. A missing/wrong emitter path is the DOCUMENTED trap (sover code:
@@ -1625,7 +1625,8 @@ pub(crate) mod tests {
     }
 
     /// THE STARTUP CONTRACT (Phase A.2 acceptance b): every FLEET lane in the REAL repos.json is
-    /// EITHER explicitly `no_objective: true` OR has a `freshness.cmd` whose emitter SCRIPT exists
+    /// EITHER has a `freshness.cmd` whose emitter SCRIPT exists OR, for a non-live code lane only,
+    /// explicitly declares `no_objective: true`. A live app may not opt out of objective telemetry.
     /// on disk (resolved against the lane's repo `path`). A missing/wrong emitter path FAILS this
     /// test loudly — it does NOT let a healthy lane silently starve UNOBSERVABLE (the documented
     /// sover/asmodeus trap). A fleet lane with NO freshness disposition at all also fails: the
@@ -1661,7 +1662,13 @@ pub(crate) mod tests {
                 .unwrap_or("?")
                 .to_string();
             match freshness_disposition(row) {
-                FreshnessDisposition::NoObjective => { /* explicit honest opt-out — OK */ }
+                FreshnessDisposition::NoObjective => {
+                    if row.get("live_app").and_then(Value::as_bool) == Some(true) {
+                        failures.push(format!(
+                            "{name}: live_app=true cannot use freshness.no_objective; configure a real objective emitter"
+                        ));
+                    }
+                }
                 FreshnessDisposition::Emitter {
                     ref cmd,
                     emitter: None,

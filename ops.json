@@ -94,6 +94,16 @@
                 "comment": "breaker_state 'open' is the NORMAL state (open|pause_entries|halt, schema.rs:165). Tri-state: engaged kill-switch OR a breaker trip WITHOUT the operator freeze marker -> 2 (red, restart_forbidden \u2014 never blind-restart over an UNEXPECTED trip). Breaker not-open WITH state\\LIVE_TRADING_FROZEN present -> 1 (yellow: the deliberate operator freeze; paper trading is the intended mode and the keepalive MAY relaunch). 2026-07-16: the old equals-0 sqlite probe read the deliberate freeze as red+restart_forbidden, so when a lane ship triggered asmodeus's own deploy-gap rebuild shutdown, nothing was allowed to relaunch it \u2014 the whole fleet stayed dead (~2:50 PM outage)."
             },
             {
+                "id": "reconciliation_clear",
+                "kind": "log_grep",
+                "file": "%LOCALAPPDATA%\\Asmodeus\\heartbeats\\fleet_ticker.json",
+                "pattern": "blocked=[1-9][0-9]*|phantoms=[1-9][0-9]*|orphans=[1-9][0-9]*",
+                "red_on": 1,
+                "tail_bytes": 65536,
+                "restart_forbidden_on_red": true,
+                "comment": "A live-money restart is forbidden while broker/local reconciliation reports blocked submissions, phantom positions, or orphan positions. Missing or stale heartbeat data is separately gated by heartbeat_fresh."
+            },
+            {
                 "id": "process",
                 "kind": "process",
                 "process_name": "Asmodeus.exe",

@@ -6,9 +6,10 @@
 //! at the very top of `iteration::one_iteration`, BEFORE any git preflight, gate run, ideate, or pi
 //! call, and a skipped cycle does NOT increment the iteration counter.
 //!
-//! Everything here is per-repo opt-in via repos.json (read fresh each cycle). A repo row with no
-//! `freshness` / `cycle_budget` keys gets byte-identical legacy behavior: `short_circuit` returns
-//! false without writing any runtime file.
+//! Everything here is configured per repo via repos.json (read fresh each cycle). Non-live repos
+//! with no `freshness` / `cycle_budget` keys keep byte-identical legacy behavior. A `live_app` is
+//! fail-closed: omitting its objective probe is itself UNOBSERVABLE and halts before token spend or
+//! mutation, so `no_objective` cannot mask a broken live data pipeline.
 //!
 //! CONFIG (repos.json per-repo row, all keys optional):
 //!   "freshness":    {"cmd": "<shell cmd>", "min_new_samples": 1, "hard": true, "max_starve_cycles": 16}
@@ -405,12 +406,22 @@ pub fn short_circuit(ctx: &mut Ctx) -> bool {
         return true;
     }
 
-    // (b) no freshness config => feature off, legacy behavior.
+    // (b) no freshness config => feature off for legacy/code lanes. A live app cannot safely make
+    // decisions against an absent objective: fail closed instead of allowing `no_objective` to
+    // disguise a broken live telemetry pipeline.
     let name = ctx.name.clone();
     let row = gitops::repo_row(ctx, &name);
     let cfg = match freshness_cfg(&row) {
         Some(c) => c,
         None => {
+            if row.get("live_app").and_then(Value::as_bool) == Some(true) {
+                unobservable_halt(
+                    ctx,
+                    Some("live_app_objective"),
+                    "live_app=true requires a non-empty freshness.cmd",
+                );
+                return true;
+            }
             reset_cycle_budget(ctx);
             return false;
         }
@@ -810,6 +821,21 @@ mod tests {
         let mut c = test_ctx(Some(rows));
         assert!(!short_circuit(&mut c));
         assert!(!ledger_path(&c).exists());
+    }
+
+    #[test]
+    fn live_app_without_an_objective_probe_fails_closed() {
+        let rows = json!([{
+            "name": "freshtest",
+            "live_app": true,
+            "freshness": {"no_objective": true}
+        }]);
+        let mut c = test_ctx(Some(rows));
+        assert!(short_circuit(&mut c), "a live app may not optimize a blind objective");
+        assert_eq!(hb_str(&c, "status"), "error");
+        assert_eq!(hb_str(&c, "reason"), "metric_unobservable");
+        assert!(hb_str(&c, "last_summary").contains("requires a non-empty freshness.cmd"));
+        assert!(!budget_path(&c).exists(), "no AI cycle budget may open on this halt");
     }
 
     // ---- the acceptance shape: first run proceeds, second skips with no_new_data ----
