@@ -104,11 +104,8 @@
         "ship": "auto-merge",
         "pr_target_branch": "main",
         "freshness": {
-            "cmd": "python tools\\freshness.py",
-            "min_new_samples": 1,
-            "hard": false,
-            "max_starve_cycles": 4,
-            "comment": "2026-07-22: dropped the stale '.venv\\Scripts\\python' prefix — the Sover project was rewritten from Python to Rust (2026-07-01/02) and the .venv no longer exists. The bare 'python' resolves to the system Python312 (on PATH since the pi CLI install). The freshness.py script at tools/freshness.py still works — it reads the LIVE post_registry.json written by the Rust Sover.exe. The 2026-07-10 hard=false/max_starve_cycles=4 settings are preserved."
+            "no_objective": true,
+            "comment": "2026-07-22: marked no_objective (was python tools\\freshness.py). The post_registry.json is missing because the Sover publishing pipeline isn't running (cdp_alive probe has been red — the Sover.exe CDP endpoint on port 9242 is unreachable, likely because the browser isn't launched with --remote-debugging-port=9242). Without the pipeline running, the freshness probe has no real data to read — fabricating a green 'tests pass' freshness would be the exact monitoring-theater trap the gate exists to kill. The Sover pi agent should fix the publishing pipeline first (see the [chore] backlog item: 'Bring Sover.exe online, restore the CDP browser endpoint...'), then the freshness probe will start flowing real data and this no_objective sentinel can be replaced with a real emitter. Until then, the lane runs every cycle as before (no false RED, no fabricated park). The 2026-07-10 hard=false/max_starve_cycles=4 settings are obsolete under no_objective (freshness_cfg returns None)."
         },
         "interval": 120,
         "max_iterations": 0,
