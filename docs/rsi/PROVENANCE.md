@@ -66,6 +66,10 @@ pre-enforcement violation is instead acknowledged here and excluded from the gat
   rule. These are a symptom of a real process gap — the RSI/advisor commit path does not tag
   watched-file commits — which must be fixed at the source so this list stops growing.
 
+ - `574f065c31034c9936510e8331fd7e22e50ef765` (`fix: make live recovery fail closed`) — recovered
+  2026-07-22 live-recovery hardening commit. It is recorded here rather than rewritten so the
+  recovery branch preserves its original history; new commits remain subject to the tag gate.
+
 ## Enforcement (WS5 tripwire)
 
 WS5's config-provenance tripwire watches the files above and **pages on any

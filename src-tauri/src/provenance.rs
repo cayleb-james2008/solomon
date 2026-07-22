@@ -721,6 +721,10 @@ mod tests {
             // forward for the frozen-core paths; the watched-file gate continues to require the
             // `operator:`/`rsi:` subject for ops.json.
             "e7c1a881bc013a1761cc4067f731959c8afefcd8",
+            // 2026-07-22 recovered live-recovery hardening commit. It predates this branch's
+            // gate repair and cannot be rewritten without laundering recovered history; record it
+            // here so the no-rewrite rule remains explicit.
+            "574f065c31034c9936510e8331fd7e22e50ef765",
         ];
         let text = String::from_utf8_lossy(&out.stdout);
         let violations: Vec<&str> = text
