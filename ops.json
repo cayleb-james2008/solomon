@@ -36,6 +36,27 @@
                 "null_status": "green"
             },
             {
+                "id": "equity_value",
+                "kind": "sqlite_query",
+                "db": "%LOCALAPPDATA%\\Asmodeus\\state\\asmodeus.db",
+                "query": "SELECT 1.0/MAX(equity_usd) FROM equity WHERE mode='live' AND equity_usd > 0",
+                "mode": "number",
+                "yellow_at": 0.1,
+                "red_at": 1.0,
+                "comment": "2026-07-22: anti-monitoring-theater probe. equity_fresh only checks timestamp freshness (would show green even if equity dropped to $0). This probes 1.0/equity so the number-mode 'higher = worse' semantics work: yellow_at=0.1 fires when 1/equity >= 0.1, i.e. equity < $10. red_at=1.0 fires when equity < $1. Reads MAX(equity_usd) WHERE equity_usd > 0 to guard against divide-by-zero if equity ever hits 0 (the venue would have auto-liquidated, but the DB row might briefly show 0 between writes)."
+            },
+            {
+                "id": "equity_drop_1h",
+                "kind": "sqlite_query",
+                "db": "%LOCALAPPDATA%\\Asmodeus\\state\\asmodeus.db",
+                "query": "SELECT (SELECT equity_usd FROM equity WHERE mode='live' AND ts <= datetime('now','-1 hour') ORDER BY ts DESC LIMIT 1) - (SELECT equity_usd FROM equity WHERE mode='live' ORDER BY ts DESC LIMIT 1)",
+                "mode": "number",
+                "yellow_at": 5.0,
+                "red_at": 50.0,
+                "null_status": "green",
+                "comment": "2026-07-22: detects 1-hour equity DROP (inverted: 1h_ago minus current, so positive = drop). yellow_at=5 fires when drop >= $5, red_at=50 when drop >= $50. null_status=green: if no equity row exists from 1h ago (fresh deploy), the subtraction yields NULL and the probe stays green. The $198.156 / $308.76 values shown in earlier verdicts were ALWAYS the age in seconds of equity_fresh, never dollar values — this probe is the first to read the actual equity delta."
+            },
+            {
                 "id": "auth_health",
                 "kind": "log_grep",
                 "file": "%LOCALAPPDATA%\\Asmodeus\\logs\\fleet_ticker.log",
