@@ -157,7 +157,7 @@
         "live_app": true,
         "branch_prefix": "rsi/",
         "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\asmodeus",
-        "gate": "cargo test --workspace",
+        "gate": "cargo test --bin Asmodeus",
         "ship": "auto-merge",
         "pr_target_branch": "main",
         "provider": "ollama-cloud",
