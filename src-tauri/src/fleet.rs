@@ -1206,6 +1206,20 @@ fn read_proof(name: &str) -> Option<Value> {
     freshest_proof(file_proof, history_proof)
 }
 
+/// True iff the lane's most recent dispatch recorded a SUBPROCESS SPAWN FAILURE
+/// (`command_code == -1`, e.g. the configured repo path does not exist → `os error 267`).
+/// Used by `supervisor::diagnose` to distinguish a lane that was DISPATCHED and failed to
+/// spawn (monitoring-theater: diagnose would otherwise read a stale/absent heartbeat and
+/// report "ok/idle/healthy:true") from a lane that has simply never been dispatched. The
+/// proof file is the dispatch's own record — a test fixture that never dispatched writes
+/// no proof, so this never fires for unit-test lanes.
+pub fn lane_spawn_failed(repo: &Value) -> bool {
+    read_proof(&paths::repo_name(repo))
+        .and_then(|p| p.get("extra").and_then(|e| e.get("command_code")).and_then(Value::as_i64))
+        .map(|c| c == -1)
+        .unwrap_or(false)
+}
+
 fn proof_matches_fresh_state(name: &str, state_fingerprint: &str) -> bool {
     read_explicit_proof(name)
         .filter(|proof| {

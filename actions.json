@@ -22,6 +22,7 @@
     "unknown_error": { "action": "restart_lane", "ttl_s": 7200, "fallback": "restart_lane", "max_fallback_runs": 3 },
     "running_stalled": { "action": "page_operator_deduped", "ttl_s": 7200, "fallback": "page_operator_deduped", "max_fallback_runs": 3 },
     "metric_unobservable": { "action": "page_operator_deduped", "ttl_s": 3600, "fallback": "page_operator_deduped", "max_fallback_runs": 3 },
-    "stranded_unmerged_branch": { "action": "page_operator_deduped", "ttl_s": 86400, "fallback": "page_operator_deduped", "max_fallback_runs": 3 }
+    "stranded_unmerged_branch": { "action": "page_operator_deduped", "ttl_s": 86400, "fallback": "page_operator_deduped", "max_fallback_runs": 3 },
+    "missing_repo": { "action": "page_operator_deduped", "ttl_s": 86400, "fallback": "page_operator_deduped", "max_fallback_runs": 3 }
   }
 }

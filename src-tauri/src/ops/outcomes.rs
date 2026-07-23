@@ -596,8 +596,19 @@ fn print_table(payload: &Value, only: Option<&str>) {
             }
         }
         let rollup = proj.get("status").and_then(Value::as_str).unwrap_or("?");
+        // `red_operator_gated_only` must be on the rollup line: ops.json's own doctrine comment
+        // ("the ops rollup marks red_operator_gated_only when no ungated probe is also red")
+        // names this exact flag, the sweep computes it (sweep_project), and growth's compose
+        // gate reads it — but the human `probe` table dropped it, so an operator looking at the
+        // output cannot tell an operator-gated RED (human platform session down) from an engine
+        // RED (the lane is actually dead). Surfacing it here matches what the JSON rollup already
+        // carries and what the dashboard reads; only the human table omitted it.
+        let gated = proj
+            .get("red_operator_gated_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         println!(
-            "{:<10} {:<20} {:<7} healthy={} restart_forbidden={}",
+            "{:<10} {:<20} {:<7} healthy={} restart_forbidden={}{}",
             name,
             "== rollup ==",
             rollup.to_uppercase(),
@@ -607,6 +618,7 @@ fn print_table(payload: &Value, only: Option<&str>) {
             proj.get("restart_forbidden")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            if gated { " operator_gated" } else { "" },
         );
     }
     if let Some(b) = payload.get("blind_window_s").and_then(Value::as_f64) {

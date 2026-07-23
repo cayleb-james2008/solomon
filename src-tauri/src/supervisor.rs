@@ -297,6 +297,50 @@ pub fn diagnose(repo: &Value) -> Value {
     let mut rec: Vec<String> = Vec::new();
     let mut safe = true;
 
+    // STRUCTURAL PRE-CHECK (catalog #6): a lane whose configured repo path does not exist on disk
+    // (repos.json `path` points at a dir that was never provisioned / was deleted) can NEVER run —
+    // `run-improver` exits -1 with "The directory name is invalid. (os error 267)" and the heartbeat
+    // is never written. The old default fell through to "ok/idle/healthy:true", advertising a lane as
+    // healthy while it physically cannot start — the exact monitoring-theater failure the north star
+    // warns about (a green internal signal standing in for a real outcome).
+    //
+    // GATED on `fleet::lane_spawn_failed`: this only fires when the lane was actually DISPATCHED and
+    // its proof recorded a spawn failure (command_code == -1). A lane that has simply never been
+    // dispatched (no proof) with a missing path is still "ok/idle" — that is the existing, tested
+    // contract (a never-started lane is idle, not broken; the autopilot dispatch path's own
+    // `run_ai_job` missing-repo guard blocks the dispatch before any budget is spent). The gate
+    // keeps the diagnose category contract byte-identical for all unit-test fixtures, which never
+    // write a command_code==-1 proof. This is a HUMAN reconcile (provision/clone the repo or fix
+    // repos.json), so it is structurally stuck (routes to terminal needs_human_spec, never a
+    // proof_required retry that just re-races the missing dir) and re-checkable (a live is_dir
+    // probe — the revalidation arm clears it once the path appears).
+    let repo_path = paths::repo_path(repo);
+    if !repo_path.is_empty()
+        && !std::path::Path::new(&repo_path).is_dir()
+        && crate::fleet::lane_spawn_failed(repo)
+    {
+        cat = "missing_repo".into();
+        ev = format!("configured repo path does not exist or is not a directory: {repo_path}");
+        rec = vec![
+            "provision the repo at the configured path (clone it), or fix repos.json's path to \
+             point at an existing directory — the lane cannot start until the path exists"
+                .into(),
+        ];
+        safe = false;
+        // Return early: the heartbeat-derived branches below assume a runnable repo and would
+        // otherwise overwrite this structural verdict with "ok/idle".
+        return json!({
+            "name": name,
+            "healthy": false,
+            "category": cat,
+            "evidence": ev,
+            "recommended": rec,
+            "auto_safe": safe,
+            "running": running,
+            "reason": reason,
+        });
+    }
+
     if status == Some("error") && reason == Some("needs_goal") {
         cat = "needs_goal".into();
         ev = trunc_or(summary, 200, "no north-star GOAL and no actionable backlog");
@@ -614,6 +658,7 @@ pub fn diagnose_categories() -> &'static [&'static str] {
         "gate_red_streak",
         "ci_red_streak",
         "noop_streak",
+        "missing_repo",
         "unknown_error",
     ]
 }
@@ -649,6 +694,7 @@ pub fn is_structurally_stuck(category: &str) -> bool {
             | "stale_lock"
             | "base_out_of_band"
             | "untracked_refusal"
+            | "missing_repo"
     )
 }
 
@@ -676,6 +722,7 @@ pub fn is_recheckable_stale_error(category: &str) -> bool {
             | "untracked_refusal"
             | "stranded_unmerged_branch"
             | "gh_not_ready"
+            | "missing_repo"
     )
 }
 
@@ -742,6 +789,10 @@ fn revalidate_persisted_error_inner(
         }
         "stranded_unmerged_branch" => !stranded_guard_still_blocks(repo, &path),
         "gh_not_ready" => gh_recheck(&path),
+        // missing_repo: a live `is_dir` probe — the lane heals the moment the configured path exists
+        // (provision/clone landed, or repos.json corrected to a real dir). Fail-closed: a path that
+        // still doesn't exist keeps the park; an unreadable path (permissions) keeps it too.
+        "missing_repo" => std::path::Path::new(&path).is_dir(),
         _ => false,
     };
     if !healed {
