@@ -773,7 +773,15 @@ fn plan_jobs(
         // `once()` consumes the flag when this job actually dispatches (charge-at-dispatch, same
         // rule as the diversify budget — a plan that loses the slot must not eat the wake).
         let mut wake_job = false;
-        if kind == "proof_required" && human_wake_pending(st, &name) {
+        // Wake override covers EITHER the inert proof_required arm OR the `complete` fresh-proof
+        // dedupe (the planner can dedupe a self-healed lane whose diagnosis still says `ok` and
+        // whose proof-fingerprint matches the previous attempt — without this override the
+        // operator's explicit `autopilot-wake <name>` silently produces an empty plan). Other
+        // short-circuit kinds (maintenance/cooldown/blocked) are gated to their normal arms: a
+        // wake on a `cooldown` lane must wait for the provider cooldown, not eat the wake budget.
+        if (kind == "proof_required" || kind == "complete")
+            && human_wake_pending(st, &name)
+        {
             wake_job = true;
             kind = "implement";
             state = "queued";
