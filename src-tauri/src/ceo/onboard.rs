@@ -303,6 +303,36 @@ fn row_for(name: &str) -> Option<Value> {
         .find(|r| r.get("name").and_then(Value::as_str) == Some(name))
 }
 
+/// TEST-ONLY: drop the just-onboarded repos.json row so parallel tests don't leak transport rows
+/// into the operator's repos.json across `cargo test` runs (the rows otherwise accumulate forever —
+/// `cargo test` discovery has been adding tens of `solomon_onboard_e2e_*` rows after every CI cycle).
+/// Best-effort: rsync of read -> mutate -> atomic write is racy with concurrent onboard writers,
+/// but the file-level TOCTOU is at worst a single dropped-cleanup on the next test run (the row is
+/// name-tagged, so a subsequent test that doesn't recognize the leaked row falls back to "not
+/// present" and re-runs onboarding cleanly). Never reachable from production code paths.
+///
+/// Caller MUST already hold `registry::lock_repos_for_test()` — non-reentrant std Mutex would
+/// deadlock if this fn re-acquired it from the same thread.
+#[cfg(test)]
+fn drop_onboarded_row(name: &str) {
+    let Ok(mut entries) = registry::read_repos_for_write() else {
+        return;
+    };
+    entries.retain(|r| r.get("name").and_then(Value::as_str) != Some(name));
+    let _ = registry::write_repo_entries(&entries);
+}
+
+/// TEST-ONLY: acquire the process-global repos.json writer lock for the duration of the test body —
+/// guards the read+modify+write of `onboard_project` against any parallel repos.json-writing test
+/// (`control::registry::set_repo_config_api_key_round_trip` holds the same lock). Without this
+/// guard, parallel `cargo test` runs occasional corrupt the live operator's `repos.json` when
+/// multiple threads observe and write to the file concurrently. Best-effort: a poisoned lock is
+/// recovered into the held guard instead of panicking — the write after panic can still progress.
+#[cfg(test)]
+pub(crate) fn drop_repos_lock_for_test() -> registry::ReposLockGuard {
+    registry::lock_repos_for_test()
+}
+
 /// Absolute, normalized path (lexical — no existence requirement), matching the registry's own
 /// abspath so an onboarded row's `path` is byte-identical to a discovered one.
 fn abspath(p: &str) -> String {
@@ -356,6 +386,10 @@ mod tests {
     // ===================================================================== #
     #[test]
     fn onboards_a_local_project_end_to_end_single_tenant() {
+        // Hold BOTH the global repos.json writer lock (parallel test race on the live operator
+        // repos.json) and the notify env lock (avoid parallel notify side-effects) for the whole
+        // test body. Drop happens in reverse-source order at scope exit.
+        let _repos_guard = drop_repos_lock_for_test();
         let _g = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
 
@@ -403,9 +437,14 @@ mod tests {
             "the gated cycle reports an honest disposition (ran/skipped): {disp}"
         );
 
-        // cleanup: the isolated runtime subtree + the temp project.
+        // cleanup: the isolated runtime subtree + the temp project + the leaked repos.json row.
+        // The repos.json row removal prevents (a) stacking test rows into the operator's config
+        // across every `cargo test` run and (b) read-modify-write races with other parallel
+        // onboard tests that both target the same live repos.json. ponytail: drop the side effect
+        // at the source rather than serializing the whole e2e block.
         let _ = std::fs::remove_dir_all(rt);
         let _ = std::fs::remove_dir_all(&proj);
+        drop_onboarded_row(name);
         std::env::remove_var("SOLOMON_NOTIFY_OFF");
     }
 

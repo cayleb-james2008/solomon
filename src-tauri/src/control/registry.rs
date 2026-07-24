@@ -265,6 +265,23 @@ pub fn write_repo_entries(entries: &[Value]) -> std::io::Result<()> {
     proc::atomic_write_json(&path, &Value::Array(entries.to_vec()))
 }
 
+// --------------------------------------------------------------------------- //
+// TEST-ONLY repos.json writer lock — serialize any test that does a
+// read+modify+write of the live operator repos.json against parallel tests.
+// `control::registry::tests::set_repo_config_api_key_round_trip` already held
+// `REPOS_LOCK`; this exposes the same lock to other `#[cfg(test)]` modules
+// (e.g. `ceo::onboard::tests::onboards_a_local_project_end_to_end_single_tenant`)
+// so the parallel `cargo test` TOCTOU on repos.json stays contained.
+// --------------------------------------------------------------------------- //
+#[cfg(test)]
+pub(crate) static REPOS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(test)]
+pub(crate) struct ReposLockGuard(std::sync::MutexGuard<'static, ()>);
+#[cfg(test)]
+pub(crate) fn lock_repos_for_test() -> ReposLockGuard {
+    ReposLockGuard(REPOS_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// control.load_repos: merge auto-discovered projects with repos.json config. Discovered entries
 /// seed a name->entry map; repos.json dict entries (matched by name) are layered on top
 /// (base.update(r)), name re-forced, branch_prefix defaulted to "rsi/". Non-dict / nameless config
@@ -1983,8 +2000,8 @@ pub(crate) mod tests {
     // ---- set_repo_config: per-repo api_key round-trip (writes the real repos.json; serialized) ----
     // The crate's other file-touching suites (keys::EnvGuard, api::StateGuard) backup+restore the
     // real operator file under a process-wide mutex; mirror that for repos.json so the test is
-    // hermetic and serializes against any future repos.json-writing test.
-    pub(crate) static REPOS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // hermetic and serializes against REPOS_LOCK (see the `#[cfg(test)]` helpers at module top —
+    // they're exposed crate-wide so EVERY repos.json-writing test can serialize itself).
 
     struct ReposGuard {
         saved: Option<Vec<u8>>,

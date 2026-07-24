@@ -1784,7 +1784,7 @@ mod tests {
     // ---- refresh_config_from_registry: provider_name stays in sync with pi_provider ----
     // Writes the real repos.json (paths::here()/repos.json); serialize against registry's
     // repos.json-touching tests via the shared REPOS_LOCK, and save/restore the file.
-    use crate::control::registry::tests::REPOS_LOCK as SHARED_REPOS_LOCK;
+    use crate::control::registry::REPOS_LOCK as SHARED_REPOS_LOCK;
 
     struct ReposGuard {
         saved: Option<Vec<u8>>,

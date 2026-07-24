@@ -326,7 +326,7 @@ pub fn atomic_write_json(path: &Path, value: &serde_json::Value) -> std::io::Res
     atomic_write_bytes(path, &body)
 }
 
-/// Atomic byte write: write to `<path>.tmp`, then replace `path`.
+/// Atomic byte write: write to `<path>.tmp.<pid>.<nanos>`, then replace `path`.
 ///
 /// Tries std::fs::rename first (atomic on Unix; on Windows uses MoveFileExW with
 /// MOVEFILE_REPLACE_EXISTING). If rename fails because the target is held open by a reader
@@ -335,20 +335,37 @@ pub fn atomic_write_json(path: &Path, value: &serde_json::Value) -> std::io::Res
 /// either the old file or the full new file (CopyFileExW on NTFS uses copy-on-write at the
 /// metadata level). A crash mid-write never leaves a half-written target in either path.
 /// Used by atomic_write_json and the CEO backlog writer.
+///
+/// The `.tmp.<pid>.<nanos>` suffix (vs the legacy single `.tmp`) makes the tempfile UNIQUE per
+/// concurrent caller — `cargo test` runs the parallel e2e `onboard_project` test against the SAME
+/// `repos.json`, and two threads writing the SAME `<repos.json>.tmp` race (one's `write` overwrites
+/// the other's body, the other thread's `rename` then finds the tmp file gone — Windows os error
+/// 2 The system cannot find the file specified). Tagging the tmp with pid+nanos keeps each
+/// thread safe; the rename target stays the same so atomicity against readers is unaffected.
 pub fn atomic_write_bytes(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".tmp.{}.{}", std::process::id(), nanos));
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, body)?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            // Windows: target held open by reader — fall back to copy-overwrite.
-            std::fs::copy(&tmp, path)?;
-            let _ = std::fs::remove_file(&tmp);
-            Ok(())
+    let result = (|| -> std::io::Result<()> {
+        std::fs::write(&tmp, body)?;
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                // Windows: target held open by reader — fall back to copy-overwrite.
+                std::fs::copy(&tmp, path)?;
+                let _ = std::fs::remove_file(&tmp);
+                Ok(())
+            }
         }
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
+    result
 }
 
 /// control._which_git: shutil.which("git"). Memoized: the resolved path is stable for the process
