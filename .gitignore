@@ -56,3 +56,6 @@ web/assets/_exe_icon_verify.png
 
 # Churn file written by the watchdog each sweep — gitignored so the controller-clean preflight stops tripping
 improver/kairos/hypothesis-ledger.md
+solomon.egg-info/
+uv.lock
+.venv/

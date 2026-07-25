@@ -1,0 +1,26 @@
+[project]
+name = "solomon"
+version = "2.0.0"
+description = "Solomon v2 — Autonomous Profit CEO with stealth browser + multiple income channels"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.0",
+    "playwright>=1.40",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+    "pydantic>=2.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[tool.setuptools]
+packages = ["solomon", "solomon.channels"]
+
+[project.scripts]
+solomon = "solomon.__main__:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
