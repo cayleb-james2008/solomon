@@ -1,5 +1,6 @@
 """CLI dispatcher — routes solomon subcommands to the right handler."""
 import asyncio
+import os
 import sys
 
 from rich.console import Console
@@ -23,6 +24,8 @@ async def run_cli(args):
 
     if args.command == "run":
         await _cmd_run(cfg, once=args.once, dry=args.dry)
+    elif args.command == "loop":
+        await _cmd_loop(cfg)
     elif args.command == "dashboard":
         await _cmd_dashboard(cfg)
     elif args.command == "test-browser":
@@ -33,6 +36,8 @@ async def run_cli(args):
         await _cmd_test_llm(cfg)
     elif args.command == "guard-check":
         await _cmd_guard_check(cfg)
+    elif args.command == "webhook":
+        _cmd_webhook(cfg)
 
 
 async def _cmd_run(cfg: Config, once: bool, dry: bool):
@@ -58,6 +63,45 @@ async def _cmd_run(cfg: Config, once: bool, dry: bool):
         return
 
     await ceo.run(once=once, dry=dry)
+
+
+async def _cmd_loop(cfg: Config):
+    """Run the CEO continuously — infinite cycles with sleep between."""
+    console.print(Panel(
+        f"[cyan]Solomon v2 — Continuous CEO Loop[/cyan]\n"
+        f"  Cycle sleep: {cfg.cycle_sleep}s\n"
+        f"  Channels: freelance={cfg.channel_freelance}, content={cfg.channel_content}, "
+        f"microtask={cfg.channel_microtask}, ai_wrapper={cfg.channel_ai_wrapper}\n"
+        f"  Auto-submit: {cfg.auto_submit}\n"
+        f"  Press Ctrl+C to stop.",
+        title="Solomon v2",
+    ))
+    ceo = CEO(cfg)
+    if cfg.channel_freelance:
+        from .channels.freelance import FreelanceChannel
+        ceo.register_channel("freelance", FreelanceChannel())
+    if cfg.channel_content:
+        from .channels.content import ContentChannel
+        ceo.register_channel("content", ContentChannel())
+    if cfg.channel_microtask:
+        from .channels.microtask import MicrotaskChannel
+        ceo.register_channel("microtask", MicrotaskChannel())
+    if cfg.channel_ai_wrapper:
+        from .channels.ai_wrapper import AIWrapperChannel
+        ceo.register_channel("ai_wrapper", AIWrapperChannel())
+    if not ceo.channels:
+        console.print("[red]No channels enabled.[/red]")
+        return
+    # Force infinite loop for the loop command
+    ceo.cfg.max_cycles = 0
+    await ceo.run(once=False, dry=False)
+
+
+def _cmd_webhook(cfg: Config):
+    """Start the Polar webhook listener for automatic revenue logging."""
+    from .webhook import run_webhook_server
+    port = int(os.getenv("SOLOMON_WEBHOOK_PORT", "8019"))
+    run_webhook_server(port=port)
 
 
 async def _cmd_dashboard(cfg: Config):

@@ -1,6 +1,8 @@
 """Tests for the config module."""
 import os
 from pathlib import Path
+from unittest.mock import patch
+
 from solomon.config import Config
 
 
@@ -10,11 +12,13 @@ def test_config_loads_defaults():
     for key in list(os.environ):
         if key.startswith("SOLOMON_"):
             del os.environ[key]
-    cfg = Config.load()
-    assert cfg.llm_model == "glm-4-flash"
+    # Mock dotenv to not load the actual .env file
+    with patch("solomon.config.load_dotenv"):
+        cfg = Config.load()
     assert cfg.channel_freelance is True
     assert cfg.channel_content is True
     assert cfg.channel_microtask is True
+    assert cfg.channel_ai_wrapper is True
     assert cfg.auto_submit is False  # safety default
     assert cfg.max_cycles == 1
 
