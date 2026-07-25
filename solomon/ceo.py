@@ -96,6 +96,10 @@ class CEO:
         channel_name = decision.get("channel")
         if channel_name and channel_name in self.channels:
             try:
+                # Merge the channel's observation data into the decision so
+                # act() has access to the opportunities discovered during observe
+                if channel_name in observations:
+                    decision["opportunities"] = observations[channel_name].get("opportunities", [])
                 result = await self.channels[channel_name].act(
                     self.browser, self.llm, self.vlm, decision
                 )
