@@ -5,6 +5,7 @@ the LLM, and saves them to runtime/articles/ as markdown for review. Medium/Dev.
 publishing via their API is a config-gated submit (off by default).
 """
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -95,12 +96,64 @@ class ContentChannel(Channel):
         )
 
         if browser.cfg.auto_submit:
-            # TODO: implement Medium/Dev.to API publishing when operator trust is established
-            return {"summary": f"article published to Medium/Dev.to", "revenue_usd": None, "source": "content"}
+            # Try to publish to Dev.to if we have an API token
+            result = await self._publish_devto(browser, topic, article, ts)
+            return result
         else:
             return {
                 "summary": f"article drafted and saved to {article_path.name} (operator review required)",
                 "revenue_usd": None,
                 "source": "content",
                 "note": f"Draft saved to {article_path}",
+            }
+
+    async def _publish_devto(self, browser, title: str, body_markdown: str, ts: str) -> dict:
+        """Publish an article to Dev.to via their free API.
+
+        Requires DEVTO_API_KEY in .env. Get one at https://dev.to/settings/extensions
+        """
+        api_key = os.getenv("DEVTO_API_KEY", "")
+        if not api_key:
+            return {
+                "summary": "DEVTO_API_KEY not set — article draft saved, cannot auto-publish",
+                "revenue_usd": None,
+                "source": "content",
+                "note": "Set DEVTO_API_KEY in .env to enable Dev.to publishing",
+            }
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    "https://dev.to/api/articles",
+                    headers={"api-key": api_key, "content-type": "application/json"},
+                    json={
+                        "article": {
+                            "title": title,
+                            "body_markdown": body_markdown,
+                            "published": True,
+                            "tags": ["ai", "automation"],
+                        }
+                    },
+                )
+                if resp.status_code in (200, 201):
+                    data = resp.json()
+                    url = data.get("url", "")
+                    return {
+                        "summary": f"article published to Dev.to: {url}",
+                        "revenue_usd": None,
+                        "source": "content",
+                        "note": f"Published at {url}",
+                    }
+                else:
+                    return {
+                        "summary": f"Dev.to publish failed: HTTP {resp.status_code}",
+                        "revenue_usd": None,
+                        "source": "content",
+                        "note": f"Error: {resp.text[:200]}",
+                    }
+        except Exception as e:
+            return {
+                "summary": f"Dev.to publish error: {e}",
+                "revenue_usd": None,
+                "source": "content",
             }

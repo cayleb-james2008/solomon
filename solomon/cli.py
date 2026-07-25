@@ -49,6 +49,9 @@ async def _cmd_run(cfg: Config, once: bool, dry: bool):
     if cfg.channel_microtask:
         from .channels.microtask import MicrotaskChannel
         ceo.register_channel("microtask", MicrotaskChannel())
+    if cfg.channel_ai_wrapper:
+        from .channels.ai_wrapper import AIWrapperChannel
+        ceo.register_channel("ai_wrapper", AIWrapperChannel())
 
     if not ceo.channels:
         console.print("[red]No channels enabled. Check .env SOLOMON_CHANNEL_* settings.[/red]")
@@ -84,9 +87,10 @@ async def _cmd_dashboard(cfg: Config):
 
     # Channel status
     console.print("\n[dim]Channels:[/dim]")
-    console.print(f"  freelance: {'[green]ON[/green]' if cfg.channel_freelance else '[red]OFF[/red]'}")
-    console.print(f"  content:   {'[green]ON[/green]' if cfg.channel_content else '[red]OFF[/red]'}")
-    console.print(f"  microtask: {'[green]ON[/green]' if cfg.channel_microtask else '[red]OFF[/red]'}")
+    console.print(f"  freelance:  {'[green]ON[/green]' if cfg.channel_freelance else '[red]OFF[/red]'}")
+    console.print(f"  content:    {'[green]ON[/green]' if cfg.channel_content else '[red]OFF[/red]'}")
+    console.print(f"  microtask:  {'[green]ON[/green]' if cfg.channel_microtask else '[red]OFF[/red]'}")
+    console.print(f"  ai_wrapper: {'[green]ON[/green]' if cfg.channel_ai_wrapper else '[red]OFF[/red]'}")
     console.print(f"  auto_submit: {'[red]ON[/red]' if cfg.auto_submit else '[green]OFF (safe)[/green]'}")
 
 
