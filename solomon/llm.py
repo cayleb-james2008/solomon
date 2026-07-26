@@ -39,7 +39,7 @@ class LLMClient:
             model=resp.model or self.model,
         )
 
-    async def ask(self, system: str, user: str, temperature: float = 0.7) -> str:
+    async def ask(self, system: str, user: str, temperature: float = 0.7, max_tokens: int = 2000) -> str:
         """Convenience: system+user → text response."""
         resp = await self.chat(
             messages=[
@@ -47,6 +47,7 @@ class LLMClient:
                 {"role": "user", "content": user},
             ],
             temperature=temperature,
+            max_tokens=max_tokens,
         )
         return resp.text
 

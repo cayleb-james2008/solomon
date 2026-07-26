@@ -51,7 +51,7 @@ async def _cmd_run(cfg: Config, once: bool, dry: bool):
         from .channels.freelance import FreelanceChannel
         ceo.register_channel("freelance", FreelanceChannel())
     if cfg.channel_content:
-        from .channels.content import ContentChannel
+        from .channels.content import ContentChannelV2 as ContentChannel
         ceo.register_channel("content", ContentChannel())
     if cfg.channel_microtask:
         from .channels.microtask import MicrotaskChannel
@@ -86,7 +86,7 @@ async def _cmd_loop(cfg: Config):
         from .channels.freelance import FreelanceChannel
         ceo.register_channel("freelance", FreelanceChannel())
     if cfg.channel_content:
-        from .channels.content import ContentChannel
+        from .channels.content import ContentChannelV2 as ContentChannel
         ceo.register_channel("content", ContentChannel())
     if cfg.channel_microtask:
         from .channels.microtask import MicrotaskChannel
