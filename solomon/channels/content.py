@@ -49,6 +49,22 @@ class ContentChannelV2(Channel):
         topics = []
         errors = []
 
+        # Check what we've already published (skip duplicates)
+        already_published = set()
+        try:
+            api_key = os.getenv("DEVTO_API_KEY", "")
+            if api_key:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.get(
+                        "https://dev.to/api/articles/me/published",
+                        headers={"api-key": api_key},
+                    )
+                    if resp.status_code == 200:
+                        for a in resp.json():
+                            already_published.add(a.get("title", "").lower().strip())
+        except Exception:
+            pass
+
         # Source 1: Hacker News top stories
         try:
             async with httpx.AsyncClient(timeout=15) as client:
@@ -59,13 +75,15 @@ class ContentChannelV2(Channel):
                     if ir.status_code == 200 and ir.json():
                         item = ir.json()
                         if item.get("title") and item.get("score", 0) > 50:
-                            topics.append({
-                                "title": item["title"],
-                                "source": "hackernews",
-                                "score": item.get("score", 0),
-                                "url": item.get("url", ""),
-                                "meta_keywords": self._extract_keywords(item["title"]),
-                            })
+                            title = item["title"]
+                            if title.lower().strip() not in already_published:
+                                topics.append({
+                                    "title": title,
+                                    "source": "hackernews",
+                                    "score": item.get("score", 0),
+                                    "url": item.get("url", ""),
+                                    "meta_keywords": self._extract_keywords(title),
+                                })
         except Exception as e:
             errors.append(f"hackernews: {e}")
 
@@ -75,14 +93,16 @@ class ContentChannelV2(Channel):
                 resp = await client.get("https://dev.to/api/articles?top=7&per_page=10")
                 resp.raise_for_status()
                 for article in resp.json()[:8]:
-                    topics.append({
-                        "title": article.get("title", ""),
-                        "source": "devto",
-                        "score": article.get("positive_reactions_count", 0),
-                        "url": article.get("url", ""),
-                        "tags": article.get("tag_list", []),
-                        "meta_keywords": self._extract_keywords(article.get("title", "")),
-                    })
+                    title = article.get("title", "")
+                    if title and title.lower().strip() not in already_published:
+                        topics.append({
+                            "title": title,
+                            "source": "devto",
+                            "score": article.get("positive_reactions_count", 0),
+                            "url": article.get("url", ""),
+                            "tags": article.get("tag_list", []),
+                            "meta_keywords": self._extract_keywords(title),
+                        })
         except Exception as e:
             errors.append(f"devto: {e}")
 
