@@ -38,18 +38,36 @@ Respond with JSON:
 
         user = "What AI tool should we build and sell? Think of something practical that doesn't exist yet or is poorly served by free tools."
 
+        # Discover what tools we've already built (dedup: never build the same tool twice)
+        existing = set()
+        try:
+            wrappers_dir = browser.cfg.runtime_dir / "ai_wrappers"
+            if wrappers_dir.exists():
+                for d in wrappers_dir.iterdir():
+                    if d.is_dir():
+                        # Dir names look like: tool-name_20260726_031501
+                        existing.add(d.name.rsplit("_", 2)[0].lower())
+        except Exception:
+            pass
+        exclusion = ""
+        if existing:
+            exclusion = f" We ALREADY built these, suggest something DIFFERENT: {', '.join(sorted(existing))}."
+
         try:
             raw = await llm.ask(
-                "You are a profit-focused AI CEO. Name ONE simple AI tool people would pay $5 for. Reply with ONLY the tool name (2-3 words, lowercase, hyphenated). Nothing else.",
-                "What tool should we build?",
-                temperature=0.5,
+                "You are a profit-focused AI CEO. Name ONE simple AI tool people would pay $5 for. Reply with ONLY the tool name (2-3 words, lowercase, hyphenated). Nothing else." + exclusion,
+                "What tool should we build?" + exclusion,
+                temperature=0.9,
                 max_tokens=20,
             )
             tool_name = raw.strip().lower().replace(" ", "-")[:30]
             # Clean it for Cloudflare Workers naming
             tool_name = "".join(c for c in tool_name if c.isalnum() or c == "-")
-            if not tool_name or len(tool_name) < 2:
+            if not tool_name or len(tool_name) < 2 or tool_name in existing:
                 tool_name = "ai-tool"
+            # Absolute last-resort: if somehow still a dupe, suffix it
+            if tool_name in existing:
+                tool_name = f"{tool_name}-pro"
 
             desc_raw = await llm.ask(
                 f"Write one sentence describing what '{tool_name}' does and who would pay $5 for it. Be specific.",
@@ -121,8 +139,10 @@ Output ONLY the JavaScript code, no explanations."""
 - Tool name: {tool_name}
 - Description: {description}
 - API type: {api_type}
-- The LLM endpoint is https://open.bigmodel.cn/api/paas/v4/chat/completions (OpenAI-compatible)
-- Use env.API_KEY for the LLM API key
+- The LLM endpoint MUST be exactly: https://openrouter.ai/api/v1/chat/completions
+- Model: meta-llama/llama-3.3-70b-instruct
+- Use env.API_KEY for the LLM API key (never hardcode it)
+- Route check for API calls: use request.url.endsWith('/api') — NEVER strict equality (url includes origin)
 - Make it a single worker.js file
 
 Generate the complete code."""
@@ -221,26 +241,29 @@ Revenue from this tool flows through Polar webhook → Solomon's revenue ledger.
         deployed_url = None
         try:
             import shutil
-            if shutil.which("npx"):
+            # Resolve full path: on Windows, subprocess can't find npx.CMD by
+            # bare name (CreateProcess doesn't use PATHEXT without shell=True)
+            npx_path = shutil.which("npx")
+            if npx_path:
                 import subprocess
                 # Set the API key as a wrangler secret first
                 api_key = os.getenv("SOLOMON_LLM_API_KEY", "") or os.getenv("OPENROUTER_API_KEY", "")
                 if api_key:
                     proc = subprocess.run(
-                        ["npx", "wrangler", "secret", "put", "API_KEY"],
+                        [npx_path, "wrangler", "secret", "put", "API_KEY"],
                         input=api_key,
                         capture_output=True,
                         text=True,
                         cwd=str(tool_dir),
-                        timeout=30,
+                        timeout=60,
                     )
                 # Deploy
                 proc = subprocess.run(
-                    ["npx", "wrangler", "deploy"],
+                    [npx_path, "wrangler", "deploy"],
                     capture_output=True,
                     text=True,
                     cwd=str(tool_dir),
-                    timeout=60,
+                    timeout=120,
                 )
                 if proc.returncode == 0:
                     # Extract the workers.dev URL from output
@@ -248,6 +271,18 @@ Revenue from this tool flows through Polar webhook → Solomon's revenue ledger.
                         if "workers.dev" in line:
                             deployed_url = line.strip()
                             break
+                    if not deployed_url:
+                        deployed_url = f"https://{tool_slug}.caylebalvarezjames.workers.dev"
+
+                    # Register tool + auto-update the landing page (self-scaling)
+                    try:
+                        from ..landing import register_tool, sync_landing_page
+                        register_tool(browser.cfg.runtime_dir / "ai_wrappers", tool_slug, description, deployed_url)
+                        landing_url = sync_landing_page(browser.cfg.runtime_dir / "ai_wrappers")
+                        if landing_url:
+                            deployed_url = deployed_url + f" | Landing: {landing_url}"
+                    except Exception:
+                        pass
         except Exception:
             pass
 

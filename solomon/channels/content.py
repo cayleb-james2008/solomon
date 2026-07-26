@@ -55,15 +55,26 @@ class ContentChannelV2(Channel):
             api_key = os.getenv("DEVTO_API_KEY", "")
             if api_key:
                 async with httpx.AsyncClient(timeout=10) as client:
-                    resp = await client.get(
-                        "https://dev.to/api/articles/me/published",
-                        headers={"api-key": api_key},
-                    )
-                    if resp.status_code == 200:
-                        for a in resp.json():
-                            already_published.add(a.get("title", "").lower().strip())
+                    # Check BOTH published and unpublished (dupes may be unpublished)
+                    for state in ("published", "unpublished"):
+                        resp = await client.get(
+                            f"https://dev.to/api/articles/me/{state}",
+                            headers={"api-key": api_key},
+                        )
+                        if resp.status_code == 200:
+                            for a in resp.json():
+                                already_published.add(self._normalize_title(a.get("title", "")))
         except Exception:
             pass
+
+        def _is_dupe(title: str, batch: list) -> bool:
+            """Fuzzy dedup: normalized title match against published + current batch."""
+            norm = self._normalize_title(title)
+            if not norm:
+                return True
+            if norm in already_published:
+                return True
+            return any(self._normalize_title(t["title"]) == norm for t in batch)
 
         # Source 1: Hacker News top stories
         try:
@@ -76,7 +87,7 @@ class ContentChannelV2(Channel):
                         item = ir.json()
                         if item.get("title") and item.get("score", 0) > 50:
                             title = item["title"]
-                            if title.lower().strip() not in already_published:
+                            if not _is_dupe(title, topics):
                                 topics.append({
                                     "title": title,
                                     "source": "hackernews",
@@ -94,7 +105,7 @@ class ContentChannelV2(Channel):
                 resp.raise_for_status()
                 for article in resp.json()[:8]:
                     title = article.get("title", "")
-                    if title and title.lower().strip() not in already_published:
+                    if title and not _is_dupe(title, topics):
                         topics.append({
                             "title": title,
                             "source": "devto",
@@ -131,7 +142,15 @@ Rules:
                 for pt in picked_titles:
                     if not any(pt.lower() in t["title"].lower() or t["title"].lower() in pt.lower() for t in picked_topics):
                         picked_topics.append({"title": pt, "source": "llm_pick", "score": 0, "meta_keywords": self._extract_keywords(pt)})
-                topics = picked_topics[:3]
+                # Intra-batch dedup (normalized titles, keep first occurrence)
+                seen = set()
+                unique_topics = []
+                for t in picked_topics:
+                    norm = self._normalize_title(t["title"])
+                    if norm and norm not in seen and norm not in already_published:
+                        seen.add(norm)
+                        unique_topics.append(t)
+                topics = unique_topics[:3]
             except Exception:
                 pass  # Use raw topics if LLM fails
 
@@ -242,6 +261,17 @@ Do NOT output markdown fences around the whole article. Start with the YAML fron
             tags = [t.strip() for t in tags.strip("[]").split(",") if t.strip()]
         tags = tags[:5]
 
+        # Inject CTA footer linking to our AI tools (converts article traffic to funnel)
+        if "solomon-tools.caylebalvarezjames.workers.dev" not in body:
+            body += (
+                "\n\n---\n\n"
+                "*Enjoyed this? I build simple, powerful AI tools — try the free "
+                "[Text Summarizer](https://text-summarizer.caylebalvarezjames.workers.dev) "
+                "or browse the full toolkit at "
+                "[Solomon AI Tools](https://solomon-tools.caylebalvarezjames.workers.dev). "
+                "No signup, no subscription.*"
+            )
+
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
@@ -278,6 +308,13 @@ Do NOT output markdown fences around the whole article. Start with the YAML fron
                 "revenue_usd": None,
                 "source": "content",
             }
+
+    @staticmethod
+    def _normalize_title(title: str) -> str:
+        """Normalize a title for fuzzy dedup: lowercase, alphanumeric words only."""
+        import re
+        words = re.sub(r"[^a-z0-9 ]", "", (title or "").lower()).split()
+        return " ".join(words)
 
     def _extract_keywords(self, title: str) -> list[str]:
         """Extract potential SEO keywords from a title."""
