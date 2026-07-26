@@ -61,7 +61,7 @@ class LLMClient:
             {"role": "system", "content": system + "\nRespond with valid JSON only, no markdown fences."},
             {"role": "user", "content": user},
         ]
-        resp = await self.chat(messages, temperature=0.3)
+        resp = await self.chat(messages, temperature=0.3, max_tokens=4000)
         text = resp.text.strip()
         # Strip markdown fences if present
         if text.startswith("```"):

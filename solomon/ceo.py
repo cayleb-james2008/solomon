@@ -90,6 +90,7 @@ class CEO:
 
         # 2. THINK — ask the LLM which channel to prioritize
         decision = await self._think(observations)
+        decision = self._enforce_profit_priority(decision, observations)
         console.print(f"  [blue]→[/blue] Decision: {decision.get('channel', 'none')} — {decision.get('action', 'none')}")
 
         # 3. ACT — execute the chosen channel's action (money guard checks inside)
@@ -167,6 +168,24 @@ Respond with JSON: {"channel": "<name or null>", "action": "<description>", "rea
         except Exception as e:
             console.print(f"  [yellow]LLM think failed ({e}), defaulting to wait[/yellow]")
             return {"channel": None, "action": "wait", "reasoning": "LLM error"}
+
+    @staticmethod
+    def _enforce_profit_priority(decision: dict, observations: dict) -> dict:
+        """Keep ready product traffic ahead of speculative channel expansion."""
+        content = observations.get("content", {}) if isinstance(observations, dict) else {}
+        opportunities = content.get("opportunities", []) if isinstance(content, dict) else []
+        has_spotlight = any(
+            isinstance(opp, dict) and isinstance(opp.get("spotlight"), dict)
+            for opp in opportunities
+        )
+        if not has_spotlight or decision.get("channel") == "content":
+            return decision
+        return {
+            **decision,
+            "channel": "content",
+            "action": "publish_tool_spotlight",
+            "reasoning": "Ready bottom-funnel tool spotlight outranks speculative channel work.",
+        }
 
     def _print_dashboard(self):
         """Print the revenue dashboard."""

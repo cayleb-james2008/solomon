@@ -61,13 +61,24 @@ class ContentChannelV2(Channel):
         already_published = set()
         try:
             api_key = os.getenv("DEVTO_API_KEY", "")
+            # Keep a tiny local ledger as a fail-safe when Dev.to intermittently
+            # returns 401 from this host. Remote state is still authoritative;
+            # local state prevents Solomon from repeating its own last success.
+            local_state = browser.cfg.runtime_dir / "content_published_titles.json"
+            if local_state.exists():
+                saved = json.loads(local_state.read_text(encoding="utf-8"))
+                if isinstance(saved, list):
+                    already_published.update(
+                        self._normalize_title(t) for t in saved if isinstance(t, str)
+                    )
             if api_key:
                 async with httpx.AsyncClient(timeout=10) as client:
                     # Check BOTH published and unpublished (dupes may be unpublished)
                     for state in ("published", "unpublished"):
                         resp = await client.get(
                             f"https://dev.to/api/articles/me/{state}",
-                            headers={"api-key": api_key},
+                            params={"per_page": 30},
+                            headers={"api-key": api_key, "user-agent": "SolomonBot/1.0"},
                         )
                         if resp.status_code == 200:
                             for a in resp.json():
@@ -156,10 +167,6 @@ Rules:
                         if pt.lower() in t["title"].lower() or t["title"].lower() in pt.lower():
                             picked_topics.append(t)
                             break
-                # If no match, use the raw picked string as a topic
-                for pt in picked_titles:
-                    if not any(pt.lower() in t["title"].lower() or t["title"].lower() in pt.lower() for t in picked_topics):
-                        picked_topics.append({"title": pt, "source": "llm_pick", "score": 0, "meta_keywords": self._extract_keywords(pt)})
                 # Intra-batch dedup (normalized titles, keep first occurrence)
                 seen = set()
                 unique_topics = []
@@ -168,7 +175,8 @@ Rules:
                     if norm and norm not in seen and norm not in already_published:
                         seen.add(norm)
                         unique_topics.append(t)
-                topics = unique_topics[:3]
+                if unique_topics:
+                    topics = unique_topics[:3]
             except Exception:
                 pass  # Use raw topics if LLM fails
 
@@ -354,6 +362,7 @@ Rules:
                 if resp.status_code in (200, 201):
                     data = resp.json()
                     url = data.get("url", "")
+                    self._record_published_title(browser, title)
                     return {
                         "summary": f"PUBLISHED on Dev.to: {url}",
                         "revenue_usd": None,
@@ -372,6 +381,24 @@ Rules:
                 "revenue_usd": None,
                 "source": "content",
             }
+
+    def _record_published_title(self, browser, title: str) -> None:
+        """Persist successful titles so transient API failures cannot cause repeats."""
+        runtime_dir = getattr(browser.cfg, "runtime_dir", None)
+        if runtime_dir is None:
+            return
+        state_path = runtime_dir / "content_published_titles.json"
+        try:
+            saved = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else []
+            if not isinstance(saved, list):
+                saved = []
+            normalized = self._normalize_title(title)
+            if normalized and normalized not in saved:
+                saved.append(normalized)
+            state_path.write_text(json.dumps(saved[-500:], indent=2), encoding="utf-8")
+        except Exception:
+            # Publishing succeeded; state persistence is only a duplicate guard.
+            pass
 
     def _next_spotlight(self, tools: list, already_published: set) -> dict | None:
         """First tool lacking an 'I built' article, else None (rotation exhausts)."""

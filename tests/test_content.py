@@ -90,3 +90,17 @@ def test_publish_short_title_falls_back_to_topic(monkeypatch):
         topic_title="SIMD for Collision Detection in Games: A Practical Guide",
     ))
     assert _FakeClient.captured["article"]["title"] == "SIMD for Collision Detection in Games: A Practical Guide"
+
+
+def test_successful_title_is_recorded_locally(tmp_path):
+    cfg = SimpleNamespace(runtime_dir=tmp_path)
+    browser = SimpleNamespace(cfg=cfg)
+    channel = _channel()
+    channel._record_published_title(browser, "I Built a Free Text Summarizer — No Signup")
+    channel._record_published_title(browser, "I Built a Free Text Summarizer — No Signup")
+    saved = (tmp_path / "content_published_titles.json").read_text(encoding="utf-8")
+    assert saved.count("i built a free text summarizer no signup") == 1
+    assert channel._next_spotlight(
+        [{"name": "text-summarizer"}],
+        {"i built a free text summarizer no signup"},
+    ) is None

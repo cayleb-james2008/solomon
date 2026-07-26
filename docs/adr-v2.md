@@ -17,3 +17,9 @@ Decided: No public submission (gig application, article publish, survey completi
 
 ## ADR-05: GitHub Pages as the zero-credential distribution surface
 Decided: GitHub Pages is the primary publishing channel because it requires zero new credentials (uses existing gh CLI auth), deploys instantly via git push, and is free. Reasoning: research subagent identified "a distribution surface the agent doesn't yet own" as the key missing piece for affiliate farming + content revenue. GitHub Pages solves this with zero friction. The blog repo (cayleb-james2008/solomon-blog) is auto-created on first run and Solomon pushes Jekyll-formatted articles to main, which Pages auto-builds. Revisit if GitHub changes Pages policy or if we need a custom domain.
+
+## ADR-06: Local Ornith as the production brain with a local publish ledger
+Decided: Run Solomon's CEO decisions and content generation on local Ornith via Lemonade, and persist normalized successful Dev.to titles in `runtime/content_published_titles.json` alongside the remote Dev.to check. Reasoning: this removes recurring LLM cost and keeps the profit loop standalone, while the tiny local ledger closes the API-intermittency duplicate-publish failure without adding a service or database. Revisit if local inference misses a full cycle or measured cloud quality materially improves conversion.
+
+## ADR-07: Bottom-funnel tool spotlights before generic SEO topics
+Decided: When a live Solomon tool lacks an “I built this” article, publish that bottom-funnel spotlight before generic trend content. Reasoning: it links directly to a working product and one-time checkout, so the same article has a shorter path to revenue than an untargeted SEO post. Revisit if measured spotlight conversion trails generic content after 10 published posts.
