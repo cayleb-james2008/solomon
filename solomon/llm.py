@@ -21,7 +21,7 @@ class LLMClient:
         self.cfg = cfg
         self.client = AsyncOpenAI(
             base_url=cfg.llm_base_url,
-            api_key=cfg.llm_api_key or "sk-placeholder",
+            api_key=cfg.llm_api_key or "sk-no-key",
         )
         self.model = cfg.llm_model
 
@@ -33,8 +33,12 @@ class LLMClient:
             temperature=temperature,
             max_tokens=max_tokens,
         )
+        msg = resp.choices[0].message
+        # Reasoning models (e.g. Ornith) may put output in reasoning_content when
+        # content is empty (thinking ate max_tokens). Fall back so callers get text.
+        text = msg.content or getattr(msg, "reasoning_content", "") or ""
         return LLMResponse(
-            text=resp.choices[0].message.content or "",
+            text=text,
             usage=resp.usage.model_dump() if resp.usage else {},
             model=resp.model or self.model,
         )

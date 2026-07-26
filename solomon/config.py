@@ -52,7 +52,7 @@ class Config:
             llm_api_key=os.getenv("SOLOMON_LLM_API_KEY", ""),
             llm_model=os.getenv("SOLOMON_LLM_MODEL", "glm-4-flash"),
             vlm_base_url=os.getenv("SOLOMON_VLM_BASE_URL", "http://localhost:8012/v1"),
-            vlm_api_key=os.getenv("SOLOMON_VLM_API_KEY", "sk-no-key-needed"),
+            vlm_api_key=os.getenv("SOLOMON_VLM_API_KEY", ""),
             vlm_model=os.getenv("SOLOMON_VLM_MODEL", "MiniCPM-V-2.6"),
             browser_profile=os.getenv("SOLOMON_BROWSER_PROFILE", str(root / "runtime" / "browser-profile")),
             browser_headless=os.getenv("SOLOMON_BROWSER_HEADLESS", "false").lower() == "true",

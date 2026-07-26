@@ -262,13 +262,14 @@ Do NOT output markdown fences around the whole article. Start with the YAML fron
         tags = tags[:5]
 
         # Inject CTA footer linking to our AI tools (converts article traffic to funnel)
-        if "solomon-tools.caylebalvarezjames.workers.dev" not in body:
+        sub = os.getenv("CF_SUBDOMAIN", "solomontools")
+        if f"solomon-tools.{sub}.workers.dev" not in body:
             body += (
                 "\n\n---\n\n"
                 "*Enjoyed this? I build simple, powerful AI tools — try the free "
-                "[Text Summarizer](https://text-summarizer.caylebalvarezjames.workers.dev) "
+                f"[Text Summarizer](https://text-summarizer.{sub}.workers.dev) "
                 "or browse the full toolkit at "
-                "[Solomon AI Tools](https://solomon-tools.caylebalvarezjames.workers.dev). "
+                f"[Solomon Tools](https://solomon-tools.{sub}.workers.dev). "
                 "No signup, no subscription.*"
             )
 
