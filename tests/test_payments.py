@@ -80,6 +80,8 @@ def test_ensure_payment_link_creates_chain(monkeypatch):
     # price payload carries the $5 one-time amount
     _, _, price_data = calls[1]
     assert price_data["unit_amount"] == 500 and price_data["currency"] == "usd"
+    _, _, link_data = calls[2]
+    assert link_data["managed_payments"]["enabled"] is False
 
 
 def test_ensure_payment_link_idempotent(monkeypatch):

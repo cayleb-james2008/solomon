@@ -105,6 +105,12 @@ def ensure_payment_link(tool: dict) -> str | None:
         link = _req("POST", "/payment_links", {
             "line_items": [{"price": price["id"], "quantity": 1}],
             "metadata": {"solomon_tool": name},
+            # The account has Stripe Managed Payments enabled by default. We
+            # do not yet have a configured Stripe tax code for these digital
+            # tools, so disable that optional rail rather than creating a link
+            # that Stripe rejects. Tax handling can be enabled deliberately
+            # later once the operator selects the correct tax classification.
+            "managed_payments": {"enabled": False},
         })
         url = link.get("url")
         if url:

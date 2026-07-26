@@ -23,3 +23,6 @@ Decided: Run Solomon's CEO decisions and content generation on local Ornith via 
 
 ## ADR-07: Bottom-funnel tool spotlights before generic SEO topics
 Decided: When a live Solomon tool lacks an “I built this” article, publish that bottom-funnel spotlight before generic trend content. Reasoning: it links directly to a working product and one-time checkout, so the same article has a shorter path to revenue than an untargeted SEO post. Revisit if measured spotlight conversion trails generic content after 10 published posts.
+
+## ADR-08: Disable Stripe Managed Payments until tax classification is deliberate
+Decided: Create Solomon's one-time payment links with `managed_payments[enabled]=false` until the operator selects and configures the correct Stripe tax code for these digital tools. Reasoning: the live account rejects links without an eligible tax code when Managed Payments is enabled; disabling the optional rail keeps checkout operational without guessing at a legal/tax classification. Revisit before scaling sales or entering jurisdictions where automated tax collection is required.
