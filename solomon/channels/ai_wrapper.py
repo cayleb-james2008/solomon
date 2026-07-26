@@ -278,6 +278,13 @@ Revenue from this tool flows through Polar webhook → Solomon's revenue ledger.
                     try:
                         from ..landing import register_tool, sync_landing_page
                         register_tool(browser.cfg.runtime_dir / "ai_wrappers", tool_slug, description, deployed_url)
+                        # Auto-create Stripe payment links for any tool missing
+                        # one BEFORE the landing rebuild, so Buy buttons go live
+                        try:
+                            from ..payments import sync_links
+                            sync_links(browser.cfg.runtime_dir / "ai_wrappers")
+                        except Exception:
+                            pass  # rail offline (no key etc.) — tool still ships
                         landing_url = sync_landing_page(browser.cfg.runtime_dir / "ai_wrappers")
                         if landing_url:
                             deployed_url = deployed_url + f" | Landing: {landing_url}"

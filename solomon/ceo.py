@@ -121,6 +121,16 @@ class CEO:
         else:
             console.print("  [yellow]○ No action this cycle[/yellow]")
 
+        # 5. SETTLE — poll Stripe for newly completed payments (money-IN only).
+        # Guarded: a rail hiccup must never kill a cycle.
+        try:
+            from .payments import poll_revenue
+            n = poll_revenue(self.cfg.runtime_dir, self.ledger)
+            if n:
+                console.print(f"  [bold green]💰 Stripe settled {n} payment(s)[/bold green]")
+        except Exception as e:
+            console.print(f"  [dim]Stripe poll skipped: {e}[/dim]")
+
     async def _run_cycle_dry(self):
         """Dry run — no browser, just LLM + channel status."""
         console.print("[dim]Checking channel configs...[/dim]")

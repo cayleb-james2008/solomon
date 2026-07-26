@@ -67,12 +67,17 @@ def _card(tool: dict, idx: int) -> str:
     pretty = name.replace("-", " ").title()
     desc = tool.get("description", f"AI-powered {pretty} tool.")
     url = tool.get("url", f"https://{name}.caylebalvarezjames.workers.dev")
+    stripe = tool.get("stripe_link", "")
+    buy_btn = (
+        f'<a href="{stripe}" class="btn secondary" target="_blank">Buy $5 →</a>'
+        if stripe else ""
+    )
     return f"""      <div class="tool">
         <h2>{emoji} {pretty} <span class="badge">LIVE</span></h2>
         <p>{desc}</p>
         <span class="price">$5</span>
         <a href="{url}" class="btn" target="_blank">Try Free →</a>
-        <a href="https://polar.sh/solomon/{name}" class="btn secondary">Buy Pro →</a>
+        {buy_btn}
       </div>
 """
 
