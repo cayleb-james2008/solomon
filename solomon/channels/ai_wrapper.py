@@ -66,6 +66,9 @@ Respond with JSON:
 
         idea = opportunities[0] if isinstance(opportunities, list) else opportunities
         tool_name = idea.get("tool_name", "ai-tool")
+        # Cloudflare Workers requires lowercase alphanumeric with dashes
+        tool_slug = tool_name.lower().replace(" ", "-").replace("_", "-")
+        tool_slug = "".join(c for c in tool_slug if c.isalnum() or c == "-")[:30]
         description = idea.get("description", "")
         api_type = idea.get("api_type", "")
         price = idea.get("price", 5)
@@ -76,11 +79,15 @@ Respond with JSON:
 Requirements:
 - Single file: worker.js (ES module syntax, `export default { async fetch(request, env) { ... } }`)
 - Frontend: a clean, minimal HTML page with an input form and results display
-- Backend: fetch the LLM API (OpenAI-compatible) using the API key from env.API_KEY
-- The tool must work end-to-end: user fills input → calls the LLM → shows result
-- Include proper error handling
+- Backend: call the LLM API using OpenAI-compatible format:
+  - Endpoint: https://openrouter.ai/api/v1/chat/completions
+  - Authorization: Bearer ${env.API_KEY}
+  - Body: { "model": "meta-llama/llama-3.3-70b-instruct", "messages": [{"role":"system","content":"..."},{"role":"user","content":"..."}], "max_tokens": 200, "temperature": 0.3 }
+  - Parse response: data.choices[0].message.content
+- Frontend JS: POST to /api endpoint on the same worker, parse JSON response
+- Include proper error handling for API failures
 - Make it look professional (use inline CSS, no external deps)
-- Make the response readable and useful
+- Handle GET / (serve HTML) and POST /api (process request) routes separately
 
 Output ONLY the JavaScript code, no explanations."""
 
