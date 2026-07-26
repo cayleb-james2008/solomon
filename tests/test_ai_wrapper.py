@@ -24,7 +24,7 @@ def test_ai_wrapper_discover_returns_dict():
     llm.ask = AsyncMock(side_effect=["test-tool", "A test tool for developers"])
     browser = MagicMock()
     vlm = AsyncMock()
-    result = asyncio.get_event_loop().run_until_complete(ch.discover(browser, llm, vlm))
+    result = asyncio.run(ch.discover(browser, llm, vlm))
     assert "summary" in result
     assert "opportunities" in result
     assert len(result["opportunities"]) == 1
@@ -38,7 +38,7 @@ def test_ai_wrapper_discover_fallback_on_error():
     llm.ask = AsyncMock(side_effect=Exception("API down"))
     browser = MagicMock()
     vlm = AsyncMock()
-    result = asyncio.get_event_loop().run_until_complete(ch.discover(browser, llm, vlm))
+    result = asyncio.run(ch.discover(browser, llm, vlm))
     assert "opportunities" in result
     assert result["opportunities"][0]["tool_name"] == "commit-msg-ai"
 
@@ -57,7 +57,7 @@ def test_ai_wrapper_discover_dedupes_existing_tools(tmp_path):
     browser = MagicMock()
     browser.cfg.runtime_dir = tmp_path
     vlm = AsyncMock()
-    result = asyncio.get_event_loop().run_until_complete(ch.discover(browser, llm, vlm))
+    result = asyncio.run(ch.discover(browser, llm, vlm))
     name = result["opportunities"][0]["tool_name"]
     assert name not in ("test-tool", "other-tool")
 

@@ -160,7 +160,10 @@ Respond with JSON: {"channel": "<name or null>", "action": "<description>", "rea
         user = f"Current channel observations:\n{channel_list}\n\nWhich channel should we act on this cycle?"
 
         try:
-            return await self.llm.ask_json(system, user)
+            result = await self.llm.ask_json(system, user)
+            if not isinstance(result, dict):
+                raise ValueError(f"non-dict think response: {type(result).__name__}")
+            return result
         except Exception as e:
             console.print(f"  [yellow]LLM think failed ({e}), defaulting to wait[/yellow]")
             return {"channel": None, "action": "wait", "reasoning": "LLM error"}

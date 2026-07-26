@@ -35,7 +35,15 @@ AFFILIATE_LINKS = {
 }
 
 # Content categories that perform well on Dev.to
-DEVTO_TAGS = ["programming", "ai", "productivity", "webdev", "python", "javascript", "devops", "machinelearning"]
+DEVTO_TAGS = ["programming", "ai", "productivity", "webdev", "python", "javascript", "devops", "machinelearning", "tutorial", "beginners", "security", "showdev", "tooling", "opensource"]
+
+# Per-tool tags for spotlight ("I built this") posts — specific tags drive feed reach
+SPOTLIGHT_TAGS = {
+    "text-summarizer": ["showdev", "ai", "nlp", "productivity"],
+    "password-generator": ["showdev", "security", "webdev", "javascript"],
+    "summarizy": ["showdev", "ai", "productivity", "writing"],
+    "mood-analyzer": ["showdev", "ai", "machinelearning", "webdev"],
+}
 
 
 class ContentChannelV2(Channel):
@@ -117,6 +125,16 @@ class ContentChannelV2(Channel):
         except Exception as e:
             errors.append(f"devto: {e}")
 
+        # Source 3: tool spotlight — bottom-funnel "I built this" posts (highest conversion).
+        # Emit one tool that has no spotlight article yet; rotation exhausts naturally.
+        spotlight = None
+        try:
+            tools_path = browser.cfg.runtime_dir / "ai_wrappers" / "tools.json"
+            tools = json.loads(tools_path.read_text(encoding="utf-8"))
+            spotlight = self._next_spotlight(tools, already_published)
+        except Exception:
+            pass
+
         # Use LLM to pick the best topics for SEO content
         if topics:
             try:
@@ -155,7 +173,9 @@ Rules:
                 pass  # Use raw topics if LLM fails
 
         summary = f"{len(topics)} SEO topics ready" + (f": {'; '.join(t['title'][:40] for t in topics[:3])}" if topics else "")
-        return {"summary": summary, "opportunities": [{"topics": topics}], "errors": errors}
+        if spotlight:
+            summary += f" | spotlight: {spotlight['tool']['name']}"
+        return {"summary": summary, "opportunities": [{"topics": topics, "spotlight": spotlight}], "errors": errors}
 
     async def act(self, browser, llm, vlm, decision: dict) -> dict:
         """Generate an SEO-optimized article and publish it."""
@@ -165,6 +185,9 @@ Rules:
             return {"summary": "no topics to write about", "revenue_usd": None}
 
         opp = opportunities[0] if isinstance(opportunities, list) else opportunities
+        spotlight = opp.get("spotlight")
+        if spotlight:
+            return await self._act_spotlight(browser, llm, spotlight["tool"])
         topics = opp.get("topics", [])
         if not topics:
             return {"summary": "no trending topics", "revenue_usd": None}
@@ -195,7 +218,7 @@ Affiliate Integration:
 - Do NOT add a "sponsored" section — the mentions should be naturally part of the tutorial
 
 Format:
-- Start with `---` YAML frontmatter: title, published (bool), tags (max 5 from: {', '.join(DEVTO_TAGS)})
+- Start with `---` YAML frontmatter: title, published (bool), tags (pick 4-5 from: {', '.join(DEVTO_TAGS)} — mix 1-2 broad tags (programming/ai) with 2-3 specific/niche ones; NEVER use only programming+ai)
 - Then the article body in markdown
 - End with a brief author bio mentioning Solomon
 
@@ -226,7 +249,39 @@ Do NOT output markdown fences around the whole article. Start with the YAML fron
                 "note": f"Draft at {article_path}. Set SOLOMON_AUTO_SUBMIT=true + DEVTO_API_KEY to publish.",
             }
 
-    async def _publish_devto(self, browser, article_markdown: str, topic_title: str = "") -> dict:
+    async def _act_spotlight(self, browser, llm, tool: dict) -> dict:
+        """Write + publish an 'I built this' post for one of our live tools."""
+        name = tool["name"]
+        pretty = name.replace("-", " ").title()
+        url = tool.get("url", f"https://{name}.{os.getenv('CF_SUBDOMAIN', 'solomontools')}.workers.dev")
+        desc = tool.get("description", f"AI-powered {pretty}.")
+        title = f"I Built a Free {pretty} — No Signup, No Subscription"
+        tags = SPOTLIGHT_TAGS.get(name, ["showdev", "ai", "webdev", "tooling"])
+
+        system = f"""You are Solomon, an autonomous AI CEO who builds and ships real software. Write a dev.to showdev post about a tool you built and operate.
+
+Rules:
+- First-person builder voice: what it does, why you built it, how it works under the hood (Cloudflare Workers edge + AI inference), what you learned shipping it
+- Put the live link EARLY (right after the intro paragraph): {url} — readers must be able to try it instantly
+- Honest monetization: the tool is free to use; mention ONCE at the end that it's a one-time $5 on the landing page if it saves people time. No fake urgency, no fake scarcity, no fake testimonials
+- 700-1200 words, markdown, H2/H3 structure, include one small code or architecture snippet
+- Start with --- YAML frontmatter: title: "{title}", published: true, tags: [{', '.join(tags)}]
+- Do NOT wrap the whole article in markdown fences"""
+
+        user = f"Tool: {pretty}\nWhat it does: {desc}\nLive URL: {url}\n\nWrite the post."
+        try:
+            article = await llm.ask(system, user, temperature=0.7, max_tokens=3500)
+        except Exception as e:
+            return {"summary": f"spotlight LLM failed: {e}", "revenue_usd": None}
+
+        if browser.cfg.auto_submit:
+            return await self._publish_devto(browser, article, topic_title=title, force_title=True, tags_override=tags)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        article_path = browser.cfg.articles_dir / f"spotlight_{ts}_{name}.md"
+        article_path.write_text(article, encoding="utf-8")
+        return {"summary": f"spotlight drafted: {pretty} → {article_path.name}", "revenue_usd": None, "source": "content"}
+
+    async def _publish_devto(self, browser, article_markdown: str, topic_title: str = "", force_title: bool = False, tags_override: list | None = None) -> dict:
         """Publish an article to Dev.to via their free API."""
         api_key = os.getenv("DEVTO_API_KEY", "")
         if not api_key:
@@ -251,15 +306,24 @@ Do NOT output markdown fences around the whole article. Start with the YAML fron
                 except Exception:
                     frontmatter = {}
 
-        title = frontmatter.get("title", topic_title or "Untitled")
-        if isinstance(title, str):
-            title = title.strip().strip('"').strip("'")
+        if force_title and topic_title:
+            title = topic_title
         else:
-            title = topic_title or "Untitled"
-        tags = frontmatter.get("tags", ["programming", "ai"])
-        if isinstance(tags, str):
-            tags = [t.strip() for t in tags.strip("[]").split(",") if t.strip()]
-        tags = tags[:5]
+            title = frontmatter.get("title", topic_title or "Untitled")
+            if isinstance(title, str):
+                title = title.strip().strip('"').strip("'")
+            else:
+                title = topic_title or "Untitled"
+        # Guard: broken/truncated titles fall back to the topic title
+        if len(title) < 20 and topic_title and len(topic_title) >= 20:
+            title = topic_title
+        if tags_override:
+            tags = tags_override[:5]
+        else:
+            tags = frontmatter.get("tags", ["programming", "ai"])
+            if isinstance(tags, str):
+                tags = [t.strip() for t in tags.strip("[]").split(",") if t.strip()]
+            tags = tags[:5]
 
         # Inject CTA footer linking to our AI tools (converts article traffic to funnel)
         sub = os.getenv("CF_SUBDOMAIN", "solomontools")
@@ -298,10 +362,9 @@ Do NOT output markdown fences around the whole article. Start with the YAML fron
                     }
                 else:
                     return {
-                        "summary": f"Dev.to publish failed: HTTP {resp.status_code}",
+                        "summary": f"Dev.to publish failed: HTTP {resp.status_code} — {resp.text[:200]}",
                         "revenue_usd": None,
                         "source": "content",
-                        "note": f"Error: {resp.text[:200]}",
                     }
         except Exception as e:
             return {
@@ -309,6 +372,18 @@ Do NOT output markdown fences around the whole article. Start with the YAML fron
                 "revenue_usd": None,
                 "source": "content",
             }
+
+    def _next_spotlight(self, tools: list, already_published: set) -> dict | None:
+        """First tool lacking an 'I built' article, else None (rotation exhausts)."""
+        for t in tools:
+            pretty_norm = self._normalize_title(t["name"].replace("-", " "))
+            taken = any(pretty_norm in p and "built" in p for p in already_published)
+            if not taken:
+                return {
+                    "title": f"I Built a Free {t['name'].replace('-', ' ').title()} — No Signup, No Subscription",
+                    "tool": t,
+                }
+        return None
 
     @staticmethod
     def _normalize_title(title: str) -> str:

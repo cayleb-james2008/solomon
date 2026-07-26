@@ -30,7 +30,7 @@ def test_vlm_returns_error_for_missing_screenshot():
     import asyncio
     cfg = Config.load()
     vlm = VLMFallback(cfg)
-    result = asyncio.get_event_loop().run_until_complete(
+    result = asyncio.run(
         vlm.describe_screenshot("/nonexistent/path.png", "test")
     )
     assert "ERROR" in result
