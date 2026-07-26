@@ -38,6 +38,8 @@ async def run_cli(args):
         await _cmd_guard_check(cfg)
     elif args.command == "webhook":
         _cmd_webhook(cfg)
+    elif args.command == "discover":
+        await _cmd_discover(cfg)
 
 
 async def _cmd_run(cfg: Config, once: bool, dry: bool):
@@ -108,6 +110,35 @@ def _cmd_webhook(cfg: Config):
     from .webhook import run_webhook_server
     port = int(os.getenv("SOLOMON_WEBHOOK_PORT", "8019"))
     run_webhook_server(port=port)
+
+
+async def _cmd_discover(cfg: Config):
+    """Use the LLM to discover and rank new income channels."""
+    from .discover import discover_new_channels
+    console.print(Panel("[cyan]Discovering new income channels...[/cyan]", title="Solomon v2"))
+    llm = LLMClient(cfg)
+    methods = await discover_new_channels(llm)
+
+    table = Table(title="Income Channel Discovery — Ranked by Feasibility")
+    table.add_column("#", style="dim")
+    table.add_column("Channel", style="cyan")
+    table.add_column("Mechanism")
+    table.add_column("Revenue/mo", style="green")
+    table.add_column("Feasibility", justify="right", style="yellow")
+    table.add_column("Notes")
+
+    for i, m in enumerate(methods, 1):
+        table.add_row(
+            str(i),
+            m.get("name", ""),
+            m.get("mechanism", "")[:60],
+            m.get("revenue_potential", ""),
+            f"{m.get('feasibility', 0):.0%}",
+            m.get("notes", "")[:40],
+        )
+
+    console.print(table)
+    console.print("\n[dim]These are LLM-generated ideas. Evaluate before implementing.[/dim]")
 
 
 async def _cmd_dashboard(cfg: Config):
