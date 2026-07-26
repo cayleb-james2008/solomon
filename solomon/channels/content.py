@@ -172,7 +172,7 @@ Do NOT output markdown fences around the whole article. Start with the YAML fron
         # Extract frontmatter for Dev.to API
         is_published = False
         if browser.cfg.auto_submit:
-            result = await self._publish_devto(browser, article)
+            result = await self._publish_devto(browser, article, topic_title=topic_title)
             return result
         else:
             # Save as draft
@@ -187,7 +187,7 @@ Do NOT output markdown fences around the whole article. Start with the YAML fron
                 "note": f"Draft at {article_path}. Set SOLOMON_AUTO_SUBMIT=true + DEVTO_API_KEY to publish.",
             }
 
-    async def _publish_devto(self, browser, article_markdown: str) -> dict:
+    async def _publish_devto(self, browser, article_markdown: str, topic_title: str = "") -> dict:
         """Publish an article to Dev.to via their free API."""
         api_key = os.getenv("DEVTO_API_KEY", "")
         if not api_key:
@@ -198,27 +198,29 @@ Do NOT output markdown fences around the whole article. Start with the YAML fron
                 "note": "Set DEVTO_API_KEY in .env (get free token at dev.to/settings/extensions)",
             }
 
-        # Parse frontmatter
+        # Parse frontmatter with YAML (handles titles with colons)
         frontmatter = {}
         body = article_markdown
         if article_markdown.startswith("---"):
             parts = article_markdown.split("---", 2)
             if len(parts) >= 3:
+                import yaml
                 fm_text = parts[1].strip()
                 body = parts[2].strip()
-                for line in fm_text.split("\n"):
-                    if ":" in line:
-                        key, _, val = line.partition(":")
-                        val = val.strip().strip('"').strip("'")
-                        if key.strip() == "tags":
-                            frontmatter["tags"] = [t.strip() for t in val.strip("[]").split(",") if t.strip()]
-                        elif key.strip() == "title":
-                            frontmatter["title"] = val
-                        elif key.strip() == "published":
-                            frontmatter["published"] = val.lower() == "true"
+                try:
+                    frontmatter = yaml.safe_load(fm_text) or {}
+                except Exception:
+                    frontmatter = {}
 
-        title = frontmatter.get("title", "Untitled")
-        tags = frontmatter.get("tags", ["programming", "ai"])[:5]
+        title = frontmatter.get("title", topic_title or "Untitled")
+        if isinstance(title, str):
+            title = title.strip().strip('"').strip("'")
+        else:
+            title = topic_title or "Untitled"
+        tags = frontmatter.get("tags", ["programming", "ai"])
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.strip("[]").split(",") if t.strip()]
+        tags = tags[:5]
 
         try:
             async with httpx.AsyncClient(timeout=30) as client:
