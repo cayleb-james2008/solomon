@@ -14,3 +14,6 @@ Decided: Build content publishing first, then a Polar-sold AI-wrapper demo, then
 
 ## ADR-04: Operator approval gate before public submissions
 Decided: No public submission (gig application, article publish, survey completion) happens without operator review of the draft in `runtime/`. Reasoning: platform ToS risk — freelance/content platforms may ban AI-generated submissions. Operator reviews the draft and flips the config gate to `auto_submit=true` per channel after trust is established. Revisit per channel once the operator is satisfied with draft quality.
+
+## ADR-05: GitHub Pages as the zero-credential distribution surface
+Decided: GitHub Pages is the primary publishing channel because it requires zero new credentials (uses existing gh CLI auth), deploys instantly via git push, and is free. Reasoning: research subagent identified "a distribution surface the agent doesn't yet own" as the key missing piece for affiliate farming + content revenue. GitHub Pages solves this with zero friction. The blog repo (cayleb-james2008/solomon-blog) is auto-created on first run and Solomon pushes Jekyll-formatted articles to main, which Pages auto-builds. Revisit if GitHub changes Pages policy or if we need a custom domain.
