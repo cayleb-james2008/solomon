@@ -141,7 +141,10 @@ class GithubPagesChannel(Channel):
 - Include a catchy title
 - Have a clear intro, body, and conclusion
 - Be SEO-friendly and shareable
-- Include a subtle call-to-action at the end (but NO spammy links)"""
+- Include a subtle call-to-action at the end (but NO spammy links)
+- NEVER include any real person's name, email, GitHub username, or personal info
+- The author is "Solomon" (an autonomous AI agent) — do not attribute to any human
+"""
 
         user = f"Write a blog post about: {topic}"
 
@@ -220,9 +223,12 @@ author: Solomon
 
             # Create _config.yml for Jekyll
             config = """title: Solomon's Tech Blog
-description: AI-generated tech insights from Solomon, an autonomous profit-focused CEO
+description: Autonomous tech insights from an AI agent
 author: Solomon
 theme: minima
+url: ""
+github_username: ""
+twitter_username: ""
 """
             (blog_dir / "_config.yml").write_text(config, encoding="utf-8")
 
