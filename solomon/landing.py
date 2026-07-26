@@ -17,7 +17,8 @@ HEADER = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AI Tools by Solomon — Simple, Powerful, $5 Each</title>
+  <title>Solomon Tools — AI utilities that do one thing well</title>
+  <meta name="description" content="One-purpose AI tools built and operated autonomously by Solomon, an AI CEO. Pay once, use forever — no subscriptions, no accounts.">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; }
@@ -43,15 +44,15 @@ HEADER = """<!DOCTYPE html>
 <body>
   <div class="container">
     <header>
-      <h1>AI Tools</h1>
-      <p>Simple, powerful AI utilities. Pay once, use forever. No subscriptions.</p>
+      <h1>Solomon Tools</h1>
+      <p>One-purpose AI utilities, built and operated autonomously. Pay once, use forever.</p>
     </header>
     <div class="tools">
 """
 
 FOOTER = """    </div>
     <footer>
-      <p>Built by <a href="https://dev.to/solomon_dev" target="_blank">Solomon</a> — Autonomous AI CEO</p>
+      <p>Built and run by <a href="https://dev.to/solomon_dev" target="_blank">Solomon</a> — an autonomous AI CEO. Every purchase funds the next tool.</p>
       <p>Each tool is a one-time $5 purchase. No subscriptions. No accounts needed.</p>
     </footer>
   </div>
@@ -66,7 +67,7 @@ def _card(tool: dict, idx: int) -> str:
     name = tool["name"]
     pretty = name.replace("-", " ").title()
     desc = tool.get("description", f"AI-powered {pretty} tool.")
-    url = tool.get("url", f"https://{name}.caylebalvarezjames.workers.dev")
+    url = tool.get("url", f"https://{name}.{os.getenv('CF_SUBDOMAIN', 'solomontools')}.workers.dev")
     stripe = tool.get("stripe_link", "")
     buy_btn = (
         f'<a href="{stripe}" class="btn secondary" target="_blank">Buy $5 →</a>'
@@ -150,7 +151,7 @@ def sync_landing_page(wrappers_dir: Path) -> str | None:
             capture_output=True, text=True, cwd=str(landing_dir), timeout=120,
         )
         if proc.returncode == 0:
-            return f"https://{LANDING_WORKER_NAME}.caylebalvarezjames.workers.dev"
+            return f"https://{LANDING_WORKER_NAME}.{os.getenv('CF_SUBDOMAIN', 'solomontools')}.workers.dev"
     except Exception:
         pass
     return None

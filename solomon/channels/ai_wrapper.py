@@ -272,7 +272,8 @@ Revenue from this tool flows through Polar webhook → Solomon's revenue ledger.
                             deployed_url = line.strip()
                             break
                     if not deployed_url:
-                        deployed_url = f"https://{tool_slug}.caylebalvarezjames.workers.dev"
+                        subdomain = os.getenv("CF_SUBDOMAIN", "solomontools")
+                        deployed_url = f"https://{tool_slug}.{subdomain}.workers.dev"
 
                     # Register tool + auto-update the landing page (self-scaling)
                     try:
