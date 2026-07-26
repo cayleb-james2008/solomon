@@ -28,6 +28,7 @@ class Config:
     channel_content: bool
     channel_microtask: bool
     channel_ai_wrapper: bool
+    channel_github_pages: bool
 
     # Safety
     auto_submit: bool
@@ -60,6 +61,7 @@ class Config:
             channel_content=os.getenv("SOLOMON_CHANNEL_CONTENT", "true").lower() == "true",
             channel_microtask=os.getenv("SOLOMON_CHANNEL_MICROTASK", "true").lower() == "true",
             channel_ai_wrapper=os.getenv("SOLOMON_CHANNEL_AI_WRAPPER", "true").lower() == "true",
+            channel_github_pages=os.getenv("SOLOMON_CHANNEL_GITHUB_PAGES", "true").lower() == "true",
             auto_submit=os.getenv("SOLOMON_AUTO_SUBMIT", "false").lower() == "true",
             max_cycles=int(os.getenv("SOLOMON_MAX_CYCLES", "1")),
             cycle_sleep=int(os.getenv("SOLOMON_CYCLE_SLEEP", "300")),

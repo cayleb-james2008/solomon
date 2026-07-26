@@ -141,7 +141,8 @@ class CEO:
 Rules:
 - You NEVER spend money. You only collect.
 - You prefer channels with active opportunities over idle ones.
-- If a channel has an actionable opportunity, prioritize it.
+- If a channel has an actionable opportunity, ALWAYS prioritize it. Do not "wait" when there are trending topics or gigs available.
+- If there is only one active channel, ALWAYS act on it.
 - If no channel has an immediate opportunity, return {"channel": null, "action": "wait"}.
 
 Respond with JSON: {"channel": "<name or null>", "action": "<description>", "reasoning": "<one sentence>"}"""

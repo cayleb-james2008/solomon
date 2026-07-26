@@ -57,6 +57,9 @@ async def _cmd_run(cfg: Config, once: bool, dry: bool):
     if cfg.channel_ai_wrapper:
         from .channels.ai_wrapper import AIWrapperChannel
         ceo.register_channel("ai_wrapper", AIWrapperChannel())
+    if cfg.channel_github_pages:
+        from .channels.github_pages import GithubPagesChannel
+        ceo.register_channel("github_pages", GithubPagesChannel())
 
     if not ceo.channels:
         console.print("[red]No channels enabled. Check .env SOLOMON_CHANNEL_* settings.[/red]")
@@ -89,6 +92,9 @@ async def _cmd_loop(cfg: Config):
     if cfg.channel_ai_wrapper:
         from .channels.ai_wrapper import AIWrapperChannel
         ceo.register_channel("ai_wrapper", AIWrapperChannel())
+    if cfg.channel_github_pages:
+        from .channels.github_pages import GithubPagesChannel
+        ceo.register_channel("github_pages", GithubPagesChannel())
     if not ceo.channels:
         console.print("[red]No channels enabled.[/red]")
         return
@@ -134,7 +140,8 @@ async def _cmd_dashboard(cfg: Config):
     console.print(f"  freelance:  {'[green]ON[/green]' if cfg.channel_freelance else '[red]OFF[/red]'}")
     console.print(f"  content:    {'[green]ON[/green]' if cfg.channel_content else '[red]OFF[/red]'}")
     console.print(f"  microtask:  {'[green]ON[/green]' if cfg.channel_microtask else '[red]OFF[/red]'}")
-    console.print(f"  ai_wrapper: {'[green]ON[/green]' if cfg.channel_ai_wrapper else '[red]OFF[/red]'}")
+    console.print(f"  ai_wrapper:     {'[green]ON[/green]' if cfg.channel_ai_wrapper else '[red]OFF[/red]'}")
+    console.print(f"  github_pages:   {'[green]ON[/green]' if cfg.channel_github_pages else '[red]OFF[/red]'}")
     console.print(f"  auto_submit: {'[red]ON[/red]' if cfg.auto_submit else '[green]OFF (safe)[/green]'}")
 
 
