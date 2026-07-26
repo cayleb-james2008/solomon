@@ -19,15 +19,9 @@ def test_ai_wrapper_channel_inherits_channel():
 def test_ai_wrapper_discover_returns_dict():
     """discover should return a dict with summary and opportunities."""
     ch = AIWrapperChannel()
-    # Mock LLM with ask_json
     llm = AsyncMock()
-    llm.ask_json = AsyncMock(return_value={
-        "tool_name": "test-tool",
-        "description": "A test tool",
-        "target_audience": "devs",
-        "api_type": "text_in_text_out",
-        "price": 5,
-    })
+    # First call: tool name, second call: description
+    llm.ask = AsyncMock(side_effect=["test-tool", "A test tool for developers"])
     browser = MagicMock()
     vlm = AsyncMock()
     result = asyncio.get_event_loop().run_until_complete(ch.discover(browser, llm, vlm))
@@ -41,7 +35,7 @@ def test_ai_wrapper_discover_fallback_on_error():
     """discover should return a fallback idea if LLM fails."""
     ch = AIWrapperChannel()
     llm = AsyncMock()
-    llm.ask_json = AsyncMock(side_effect=Exception("API down"))
+    llm.ask = AsyncMock(side_effect=Exception("API down"))
     browser = MagicMock()
     vlm = AsyncMock()
     result = asyncio.get_event_loop().run_until_complete(ch.discover(browser, llm, vlm))

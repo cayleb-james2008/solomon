@@ -39,9 +39,35 @@ Respond with JSON:
         user = "What AI tool should we build and sell? Think of something practical that doesn't exist yet or is poorly served by free tools."
 
         try:
-            idea = await llm.ask_json(system, user)
+            raw = await llm.ask(
+                "You are a profit-focused AI CEO. Name ONE simple AI tool people would pay $5 for. Reply with ONLY the tool name (2-3 words, lowercase, hyphenated). Nothing else.",
+                "What tool should we build?",
+                temperature=0.5,
+                max_tokens=20,
+            )
+            tool_name = raw.strip().lower().replace(" ", "-")[:30]
+            # Clean it for Cloudflare Workers naming
+            tool_name = "".join(c for c in tool_name if c.isalnum() or c == "-")
+            if not tool_name or len(tool_name) < 2:
+                tool_name = "ai-tool"
+
+            desc_raw = await llm.ask(
+                f"Write one sentence describing what '{tool_name}' does and who would pay $5 for it. Be specific.",
+                "Describe the tool.",
+                temperature=0.5,
+                max_tokens=60,
+            )
+            description = desc_raw.strip().strip('"').strip("'")[:200]
+
+            idea = {
+                "tool_name": tool_name,
+                "description": description or f"AI-powered {tool_name} tool",
+                "target_audience": "developers and professionals",
+                "api_type": "text_in→processed_out",
+                "price": 5,
+            }
             return {
-                "summary": f"idea: {idea.get('tool_name', 'unknown')} — {idea.get('description', '')[:80]}",
+                "summary": f"idea: {idea['tool_name']} — {idea['description'][:80]}",
                 "opportunities": [idea],
             }
         except Exception as e:
@@ -191,9 +217,44 @@ Revenue from this tool flows through Polar webhook → Solomon's revenue ledger.
 </html>"""
         (tool_dir / "checkout.html").write_text(polar_html, encoding="utf-8")
 
+        # Auto-deploy to Cloudflare Workers if wrangler is available
+        deployed_url = None
+        try:
+            import shutil
+            if shutil.which("npx"):
+                import subprocess
+                # Set the API key as a wrangler secret first
+                api_key = os.getenv("SOLOMON_LLM_API_KEY", "") or os.getenv("OPENROUTER_API_KEY", "")
+                if api_key:
+                    proc = subprocess.run(
+                        ["npx", "wrangler", "secret", "put", "API_KEY"],
+                        input=api_key,
+                        capture_output=True,
+                        text=True,
+                        cwd=str(tool_dir),
+                        timeout=30,
+                    )
+                # Deploy
+                proc = subprocess.run(
+                    ["npx", "wrangler", "deploy"],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(tool_dir),
+                    timeout=60,
+                )
+                if proc.returncode == 0:
+                    # Extract the workers.dev URL from output
+                    for line in proc.stdout.split("\n"):
+                        if "workers.dev" in line:
+                            deployed_url = line.strip()
+                            break
+        except Exception:
+            pass
+
         return {
-            "summary": f"AI tool '{tool_name}' generated at {tool_dir.name} — deploy with wrangler, monetize via Polar",
+            "summary": f"AI tool '{tool_name}' generated at {tool_dir.name}" + (f" — DEPLOYED: {deployed_url}" if deployed_url else " — deploy with wrangler"),
             "revenue_usd": None,
             "source": "ai_wrapper",
-            "note": f"Tool saved to {tool_dir}. Deploy: cd {tool_dir} && wrangler deploy",
+            "note": f"Tool saved to {tool_dir}. Deploy: cd {tool_dir} && wrangler deploy" + (f" | Live: {deployed_url}" if deployed_url else ""),
+            "deployed_url": deployed_url,
         }
