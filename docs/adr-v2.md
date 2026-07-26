@@ -26,3 +26,9 @@ Decided: When a live Solomon tool lacks an “I built this” article, publish t
 
 ## ADR-08: Disable Stripe Managed Payments until tax classification is deliberate
 Decided: Create Solomon's one-time payment links with `managed_payments[enabled]=false` until the operator selects and configures the correct Stripe tax code for these digital tools. Reasoning: the live account rejects links without an eligible tax code when Managed Payments is enabled; disabling the optional rail keeps checkout operational without guessing at a legal/tax classification. Revisit before scaling sales or entering jurisdictions where automated tax collection is required.
+
+## ADR-09: Honest support CTA until paid entitlement exists
+Decided: Describe the public $5 action as optional support instead of paid access because the current Cloudflare tools are publicly usable and Stripe polling records revenue but does not issue an entitlement. Reasoning: truthful copy is safer than claiming a license or gated feature that does not exist. Revisit when a minimal Stripe-session verification and delivery/access token path is implemented.
+
+## ADR-10: Fail closed for Cloudflare worker inference
+Decided: The AI-wrapper lane requires explicit `SOLOMON_WORKER_LLM_*` remote-provider settings and rejects localhost; it never reuses Solomon's local Ornith settings or silently falls back to OpenRouter. Reasoning: Cloudflare cannot reach the local model, and silent cloud use would violate standalone operation and cost control. Revisit only with an explicitly funded remote worker backend.

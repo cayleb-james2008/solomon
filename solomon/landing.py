@@ -18,7 +18,7 @@ HEADER = """<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Solomon Tools — AI utilities that do one thing well</title>
-  <meta name="description" content="One-purpose AI tools built and operated autonomously by Solomon, an AI CEO. Pay once, use forever — no subscriptions, no accounts.">
+  <meta name="description" content="One-purpose AI tools built and operated autonomously by Solomon. Free to try, with optional one-time support — no subscriptions, no accounts.">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; }
@@ -45,15 +45,15 @@ HEADER = """<!DOCTYPE html>
   <div class="container">
     <header>
       <h1>Solomon Tools</h1>
-      <p>One-purpose AI utilities, built and operated autonomously. Pay once, use forever.</p>
+      <p>One-purpose AI utilities, built and operated autonomously. Free to try, with optional one-time support.</p>
     </header>
     <div class="tools">
 """
 
 FOOTER = """    </div>
     <footer>
-      <p>Built and run by <a href="https://dev.to/solomon_dev" target="_blank">Solomon</a> — an autonomous AI CEO. Every purchase funds the next tool.</p>
-      <p>Each tool is a one-time $5 purchase. No subscriptions. No accounts needed.</p>
+      <p>Built and run by <a href="https://dev.to/solomon_dev" target="_blank">Solomon</a> — an autonomous AI CEO. Every support purchase funds the next tool.</p>
+      <p>Tools are free to try. Optional $5 support helps fund the next tool; no subscriptions or accounts.</p>
     </footer>
   </div>
 </body>
@@ -70,7 +70,7 @@ def _card(tool: dict, idx: int) -> str:
     url = tool.get("url", f"https://{name}.{os.getenv('CF_SUBDOMAIN', 'solomontools')}.workers.dev")
     stripe = tool.get("stripe_link", "")
     buy_btn = (
-        f'<a href="{stripe}" class="btn secondary" target="_blank">Buy $5 →</a>'
+        f'<a href="{stripe}" class="btn secondary" target="_blank">Support with $5 →</a>'
         if stripe else ""
     )
     return f"""      <div class="tool">

@@ -1,15 +1,14 @@
-"""AI-wrapper product channel — Solomon builds and deploys a simple AI tool, collects payment via Polar.
+"""AI-wrapper product channel — Solomon builds and deploys a simple AI tool.
 
 This is the fastest first-dollar path per research (2026-07-25):
-- Polar doesn't require KYC at signup (bank-account page triggers at payout)
 - Cloudflare Workers free tier = zero hosting cost
 - Solomon controls the code, the tool, and the checkout
-- Money guard: Polar checkout is money-IN (collect), not money-OUT
+- Money guard: Stripe checkout is money-IN (collect), not money-OUT
 
 The channel:
 1. DISCOVER: LLM identifies a niche AI tool opportunity (something simple but useful)
-2. ACT: Generate the tool code, package for Cloudflare Workers, create Polar checkout link
-3. Revenue flows through Polar webhook → runtime/revenue.jsonl
+2. ACT: Generate the tool code, package for Cloudflare Workers, and register the tool
+3. Revenue flows through Stripe polling → runtime/revenue.jsonl
 """
 import json
 import os
@@ -24,8 +23,25 @@ from . import Channel
 class AIWrapperChannel(Channel):
     name = "ai_wrapper"
 
+    @staticmethod
+    def _worker_provider() -> dict | None:
+        """Return an explicit remote worker provider, never the local brain."""
+        base_url = os.getenv("SOLOMON_WORKER_LLM_BASE_URL", "").strip().rstrip("/")
+        model = os.getenv("SOLOMON_WORKER_LLM_MODEL", "").strip()
+        api_key = os.getenv("SOLOMON_WORKER_LLM_API_KEY", "").strip()
+        if not base_url or not model or not api_key:
+            return None
+        if base_url.startswith(("http://localhost", "http://127.0.0.1", "http://0.0.0.0")):
+            return None
+        return {"base_url": base_url, "model": model, "api_key": api_key}
+
     async def discover(self, browser, llm, vlm) -> dict:
         """Ask the LLM to identify a niche AI tool that could sell for $5."""
+        if not self._worker_provider():
+            return {
+                "summary": "ai_wrapper disabled: set an explicit remote worker provider",
+                "opportunities": [],
+            }
         system = """You are Solomon, a profit-focused AI CEO. Identify a simple, niche AI tool that:
 - Can be built as a single-file Cloudflare Worker (JS/TS)
 - Uses an LLM API for the core function
@@ -104,6 +120,13 @@ Respond with JSON:
 
     async def act(self, browser, llm, vlm, decision: dict) -> dict:
         """Generate the AI-wrapper tool code and save it for deployment."""
+        worker_provider = self._worker_provider()
+        if not worker_provider:
+            return {
+                "summary": "ai_wrapper disabled: set an explicit remote worker provider",
+                "revenue_usd": None,
+                "source": "ai_wrapper",
+            }
         opportunities = decision.get("opportunities", [])
         if not opportunities:
             return {"summary": "no tool idea to act on", "revenue_usd": None}
@@ -115,7 +138,6 @@ Respond with JSON:
         tool_slug = "".join(c for c in tool_slug if c.isalnum() or c == "-")[:30]
         description = idea.get("description", "")
         api_type = idea.get("api_type", "")
-        price = idea.get("price", 5)
 
         # Ask the LLM to generate the Cloudflare Worker code
         system = """You are Solomon, an autonomous AI engineer. Generate a complete, deployable Cloudflare Worker that implements the described AI tool.
@@ -124,9 +146,9 @@ Requirements:
 - Single file: worker.js (ES module syntax, `export default { async fetch(request, env) { ... } }`)
 - Frontend: a clean, minimal HTML page with an input form and results display
 - Backend: call the LLM API using OpenAI-compatible format:
-  - Endpoint: https://openrouter.ai/api/v1/chat/completions
-  - Authorization: Bearer ${env.API_KEY}
-  - Body: { "model": "meta-llama/llama-3.3-70b-instruct", "messages": [{"role":"system","content":"..."},{"role":"user","content":"..."}], "max_tokens": 200, "temperature": 0.3 }
+  - Endpoint: env.LLM_BASE_URL + "/chat/completions"
+  - Authorization: Bearer env.LLM_API_KEY
+  - Body: { "model": env.LLM_MODEL, "messages": [{"role":"system","content":"..."},{"role":"user","content":"..."}], "max_tokens": 200, "temperature": 0.3 }
   - Parse response: data.choices[0].message.content
 - Frontend JS: POST to /api endpoint on the same worker, parse JSON response
 - Include proper error handling for API failures
@@ -139,9 +161,8 @@ Output ONLY the JavaScript code, no explanations."""
 - Tool name: {tool_name}
 - Description: {description}
 - API type: {api_type}
-- The LLM endpoint MUST be exactly: https://openrouter.ai/api/v1/chat/completions
-- Model: meta-llama/llama-3.3-70b-instruct
-- Use env.API_KEY for the LLM API key (never hardcode it)
+- The LLM endpoint MUST be `${{env.LLM_BASE_URL}}/chat/completions`
+- Use `${{env.LLM_MODEL}}` and `${{env.LLM_API_KEY}}`; never hardcode a provider, model, or key
 - Route check for API calls: use request.url.endsWith('/api') — NEVER strict equality (url includes origin)
 - Make it a single worker.js file
 
@@ -172,7 +193,9 @@ main = "worker.js"
 compatibility_date = "2024-01-01"
 
 [vars]
-# Set API_KEY via: wrangler secret put API_KEY
+LLM_BASE_URL = "{worker_provider['base_url']}"
+LLM_MODEL = "{worker_provider['model']}"
+# Set LLM_API_KEY via: wrangler secret put LLM_API_KEY
 '''
         (tool_dir / "wrangler.toml").write_text(wrangler_toml, encoding="utf-8")
 
@@ -191,51 +214,25 @@ npm install -g wrangler
 wrangler login
 
 # 3. Set the LLM API key as a secret
-wrangler secret put API_KEY
+wrangler secret put LLM_API_KEY
 # Paste your API key when prompted
 
 # 4. Deploy
 wrangler deploy
 ```
 
-## Monetize via Polar
+## Monetize via Solomon Stripe
 
-1. Create a Polar product at https://polar.sh (no KYC needed at signup)
-2. Set the price to ${price}
-3. Add the Polar checkout link to the worker's HTML
-4. Gate the tool behind the checkout (or use Polar's usage-based billing)
+1. Register the worker in Solomon's `runtime/ai_wrappers/tools.json`
+2. Run `uv run python -m solomon.payments sync-links`
+3. Add the generated Stripe link to the landing page
+4. Gate the tool behind checkout before claiming paid access
 
 ## Revenue
 
-Revenue from this tool flows through Polar webhook → Solomon's revenue ledger.
+Revenue from this tool flows through Stripe polling → Solomon's revenue ledger.
 """
         (tool_dir / "README.md").write_text(readme, encoding="utf-8")
-
-        # Generate a Polar checkout page (inline HTML for the tool)
-        polar_html = f"""<!DOCTYPE html>
-<html>
-<head>
-  <title>{tool_name}</title>
-  <style>
-    body {{ font-family: -apple-system, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }}
-    .price {{ font-size: 3em; font-weight: bold; color: #2563eb; }}
-    .checkout {{ display: inline-block; padding: 12px 32px; background: #2563eb; color: white;
-                text-decoration: none; border-radius: 8px; font-weight: bold; margin: 20px 0; }}
-    .checkout:hover {{ background: #1d4ed8; }}
-  </style>
-</head>
-<body>
-  <h1>{tool_name}</h1>
-  <p>{description}</p>
-  <div class="price">${price}</div>
-  <div>
-    <!-- Replace POLAR_CHECKOUT_URL with your Polar checkout link -->
-    <a href="POLAR_CHECKOUT_URL" class="checkout">Buy Now →</a>
-  </div>
-  <p>After purchase, you'll get instant access to the tool.</p>
-</body>
-</html>"""
-        (tool_dir / "checkout.html").write_text(polar_html, encoding="utf-8")
 
         # Auto-deploy to Cloudflare Workers if wrangler is available
         deployed_url = None
@@ -247,10 +244,10 @@ Revenue from this tool flows through Polar webhook → Solomon's revenue ledger.
             if npx_path:
                 import subprocess
                 # Set the API key as a wrangler secret first
-                api_key = os.getenv("SOLOMON_LLM_API_KEY", "") or os.getenv("OPENROUTER_API_KEY", "")
+                api_key = worker_provider["api_key"]
                 if api_key:
                     proc = subprocess.run(
-                        [npx_path, "wrangler", "secret", "put", "API_KEY"],
+                        [npx_path, "wrangler", "secret", "put", "LLM_API_KEY"],
                         input=api_key,
                         capture_output=True,
                         text=True,

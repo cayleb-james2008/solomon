@@ -79,6 +79,17 @@ def _req(method: str, path: str, data: dict | None = None) -> dict:
         raise StripeError(f"Stripe {method} {path} -> {e.code}: {detail}") from e
 
 
+def _managed_payments_config() -> tuple[bool, str]:
+    """Return deliberate Managed Payments settings; never guess a tax code."""
+    enabled = os.getenv("STRIPE_MANAGED_PAYMENTS_ENABLED", "false").strip().lower() == "true"
+    tax_code = os.getenv("STRIPE_TAX_CODE", "").strip()
+    if enabled and not tax_code:
+        raise StripeError(
+            "STRIPE_TAX_CODE is required when STRIPE_MANAGED_PAYMENTS_ENABLED=true"
+        )
+    return enabled, tax_code
+
+
 def ensure_payment_link(tool: dict) -> str | None:
     """Create (or reuse) a Stripe payment link for a tool registry entry.
 
@@ -92,11 +103,15 @@ def ensure_payment_link(tool: dict) -> str | None:
     name = tool.get("name", "ai-tool")
     pretty = name.replace("-", " ").title()
     try:
-        product = _req("POST", "/products", {
+        managed_enabled, tax_code = _managed_payments_config()
+        product_data = {
             "name": f"Solomon Tools — {pretty}",
             "description": tool.get("description", f"AI-powered {pretty}"),
             "metadata": {"solomon_tool": name},
-        })
+        }
+        if tax_code:
+            product_data["tax_code"] = tax_code
+        product = _req("POST", "/products", product_data)
         price = _req("POST", "/prices", {
             "currency": "usd",
             "unit_amount": DEFAULT_PRICE_CENTS,
@@ -105,12 +120,7 @@ def ensure_payment_link(tool: dict) -> str | None:
         link = _req("POST", "/payment_links", {
             "line_items": [{"price": price["id"], "quantity": 1}],
             "metadata": {"solomon_tool": name},
-            # The account has Stripe Managed Payments enabled by default. We
-            # do not yet have a configured Stripe tax code for these digital
-            # tools, so disable that optional rail rather than creating a link
-            # that Stripe rejects. Tax handling can be enabled deliberately
-            # later once the operator selects the correct tax classification.
-            "managed_payments": {"enabled": False},
+            "managed_payments": {"enabled": managed_enabled},
         })
         url = link.get("url")
         if url:

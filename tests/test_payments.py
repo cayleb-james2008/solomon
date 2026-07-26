@@ -15,6 +15,8 @@ from solomon.ledger import Ledger
 @pytest.fixture(autouse=True)
 def _stripe_key(monkeypatch):
     monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_fake")
+    monkeypatch.delenv("STRIPE_MANAGED_PAYMENTS_ENABLED", raising=False)
+    monkeypatch.delenv("STRIPE_TAX_CODE", raising=False)
 
 
 @pytest.fixture
@@ -82,6 +84,21 @@ def test_ensure_payment_link_creates_chain(monkeypatch):
     assert price_data["unit_amount"] == 500 and price_data["currency"] == "usd"
     _, _, link_data = calls[2]
     assert link_data["managed_payments"]["enabled"] is False
+
+
+def test_managed_payments_requires_explicit_tax_code(monkeypatch):
+    monkeypatch.setenv("STRIPE_MANAGED_PAYMENTS_ENABLED", "true")
+    assert payments.ensure_payment_link({"name": "taxed-tool"}) is None
+
+
+def test_managed_payments_passes_explicit_tax_code(monkeypatch):
+    monkeypatch.setenv("STRIPE_MANAGED_PAYMENTS_ENABLED", "true")
+    monkeypatch.setenv("STRIPE_TAX_CODE", "txcd_test")
+    calls = []
+    monkeypatch.setattr(payments, "_req", _fake_stripe(calls))
+    assert payments.ensure_payment_link({"name": "taxed-tool"})
+    assert calls[0][2]["tax_code"] == "txcd_test"
+    assert calls[2][2]["managed_payments"]["enabled"] is True
 
 
 def test_ensure_payment_link_idempotent(monkeypatch):
