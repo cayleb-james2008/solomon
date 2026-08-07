@@ -1,4 +1,4 @@
-# Solomon RSI engine v3 — operator requirements (Cayleb, 2026-07-06)
+# Solomon RSI engine v3 — operator requirements (operator, 2026-07-06)
 
 North star: Solomon is THE RSI engine (polsia-style) over the portfolio. First target: kairos,
 goal metric "$100 profit every 15 minutes on Kalshi across all positions/markets". Operator is

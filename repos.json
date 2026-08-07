@@ -2,7 +2,7 @@
     {
         "autopilot": {
             "mode": "single_agent",
-            "mission": "Autonomously improve, ship, monitor, and grow managed projects toward their stated end goals with one efficient Solomon agent, preserving safety gates and proof. CEO MANDATE (operator 2026-07-12): for the public OSS apps (sover, maki, dotz, ...), Solomon also acts as CEO \u2014 automatically marketing, scaling, and growing them for max reach and profit with zero human involvement; all public output under each app's own brand/agent persona, never the operator's personal name.",
+            "mission": "Autonomously improve, ship, monitor, and grow managed projects toward their stated end goals with one efficient Solomon agent, preserving safety gates and proof.",
             "provider": "ollama-cloud",
             "api_key": "OLLAMA_API_KEY",
             "model": "minimax-m3",
@@ -24,248 +24,27 @@
                 "fallback_provider": "openrouter"
             },
             "targets": [
-                "sover",
-                "asmodeus",
-                "dotz",
-                "solomon",
-                "maki"
+                "example-repo"
             ]
         }
     },
     {
-        "name": "maki",
+        "name": "example-repo",
         "branch_prefix": "rsi/",
-        "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\maki",
+        "path": "/path/to/your/repo",
         "public": true,
         "provider": "ollama-cloud",
         "model": "minimax-m3",
         "api_key": "OLLAMA_API_KEY",
         "ship": "auto-merge",
         "pr_target_branch": "main",
-        "gate": ".venv\\Scripts\\python -m pytest",
+        "gate": "cargo test",
         "reasoning": "xhigh",
-        "freshness": {
-            "no_objective": true,
-            "comment": "2026-07-07 (Phase A.2): maki is a CODE-QUALITY lane -- its objective today is 'one real, high-leverage code/docs improvement, tests green + ruff clean', NOT a settled real-world outcome that accumulates samples in a ledger. There is no honest metric source to gate on: maki has no tools/freshness.py, no settled-$/window db, no published-artifact registry. Marking this lane explicitly no_objective (a documented sentinel) is the HONEST state -- fabricating a freshness emitter that points at a green 'tests pass' would be the exact fake-green trap the freshness gate exists to kill (freshness.rs #1 'value-blind objective'). no_objective + no cmd => freshness_cfg() returns None => byte-identical legacy behavior (the lane runs every cycle as before; never a false RED, never a fabricated park). When maki's objective is reoriented to a real business metric (AI-CEO roadmap Phase C: usage/downloads), replace this sentinel with a real emitter cmd + min_new_samples/hard/max_starve_cycles. The startup contract test (control/registry.rs) asserts every fleet lane is EITHER no_objective OR has an emitter whose file exists -- a missing/wrong emitter path fails the test rather than silently starving."
-        },
-        "pipeline": {
-            "plan": false,
-            "review": false,
-            "ideate": false,
-            "reflect": false
-        },
-        "goal": "Improve maki (a local AI media-library desktop app: natural-language chat -> search/download/convert manga + video -> transfer to Kindle/device; pywebview + pi agent). Each iteration make ONE real, high-leverage improvement: fix a genuine bug, harden the download->KCC-convert->transfer pipeline, improve reliability/error-handling, or add missing test coverage. GROWTH IS IN SCOPE (operator decision 2026-07-01): when the day's backlog item is a growth goal, improve the ORGANIC public surface instead of code \u2014 README (screenshots, quickstart, feature tour), docs, examples, release notes, GitHub description/topics \u2014 free/organic only, no paid services or ad spend, and never degrade the code to do it. Keep all tests green and ruff clean. PONYTAIL STYLE: the laziest solution that fully works -- stdlib over deps, native over custom, delete over add; add no abstraction or dependency you do not need. A truthful 'nothing worth changing this cycle' beats a fabricated or cosmetic change. PERSONA RULE (operator 2026-07-12): all public-facing content this lane produces (README, release notes, posts, social, discussions) is authored under the project's own brand or its agent persona \u2014 NEVER the operator's personal name.",
-        "interval": 120,
-        "max_iterations": 0,
-        "scale": {
-            "min_interval_s": 90,
-            "step_s": 15,
-            "cooldown_s": 21600
-        },
-        "growth_publish": {
-            "mode": "live",
-            "publish": ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\\build-release.ps1"],
-            "cwd": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\maki",
-            "comment": "2026-07-14 (Phase 2): maki publish ladder wired DRY-RUN-FIRST. The sanctioned publish one-shot is the signed-release builder (scripts/build-release.ps1 -> src-tauri/target/release/bundle/nsis/Maki_<ver>_x64-setup.exe + .sig). The operator promotes mode to \"live\" only after reviewing the dry-run would_run argv + a clean gated dry run. NOTE: build-release.ps1 produces the signed installer + signature; the GitHub-release upload (latest.json + asset) is a separate manual operator step documented in the script header Ã¢â‚¬â€ the sanctioned lane builds the artifact, the operator ships it. Dry-run validates the argv WITHOUT spawning, so the cwd/publish argv correctness is confirmed before any real build runs."
-        }
-    },
-    {
-        "name": "sover",
-        "live_app": true,
-        "branch_prefix": "rsi/",
-        "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\sover",
-        "public": true,
-        "live_deploy": {
-            "rebuild": [
-                "cargo",
-                "build",
-                "--release"
-            ],
-            "launch": [
-                "cmd",
-                "/c",
-                "launch_ggg.bat"
-            ],
-            "cooldown_s": 1800,
-            "revive_cooldown_s": 1800,
-            "profile_env_key": "SOVER_PROFILE",
-            "profile_env": "ggg"
-        },
-        "private_paths": [
-            "profiles/ggg/",
-            "data/ggg/",
-            ".runtime/ggg/"
-        ],
-        "deny_terms": [
-            "gains.god.growth"
-        ],
-        "gate": "cargo test --bin sover",
-        "goal": "OPERATOR GOAL 2026-07-12 (tier-1, supersedes where in tension): Sover is a REVENUE ENGINE \u2014 the single fitness number is dollars earned per week across all profiles; followers/engagement/reach are input metrics that feed it, not the objective. Money-out stays human-gated. PERSONA RULE (operator 2026-07-12): all public-facing content this lane produces (README, release notes, posts, social, discussions) is authored under the project's own brand or its agent persona \u2014 NEVER the operator's personal name.\n\nNORTH STAR (baked into every Sover iteration, heavily weighted): Every social account is run by an autonomous executive whose standing goal is ALWAYS more followers, more engagement, and monetization -- pursued creatively and autonomously, with money-out the only human-gated step. A FRESH profile boots as the SIMPLEST possible thing: a chat-only \"social-media executive\" (the existing POST /sover/chat SSE surface) that talks to the operator to learn the brand, reads live state, and can do exactly three verbs -- trigger onboarding, file a proposal, and scaffold its first capability. From there it EXPANDS ITSELF: the executive and the supervisor walk a capability dependency tree (RESEARCH -> COMPOSE -> RENDER -> MEASURE -> MONETIZE), and at each cadence the supervisor proposes the single highest-leverage UNLOCKED node -- scored by how much it shrinks \"days to the next follower/engagement/monetization milestone\" -- and scaffolds it via the already-built-but-uncalled capabilities.scaffold() loop. The profile literally grows new routes, lanes, and panels INTO itself over time; if a capability cannot be done yet, the agent BUILDS it by authoring a new capability node from vetted templates rather than editing frozen core.\n\nABSOLUTE CONSTRAINT -- REUSE, DON'T REINVENT: The discovery/approval/rebuild spine is 100% shipped and inert (capabilities.scaffold/decide, api/app.py:109 routers_for, lane_runner.py:315 + sover_supervisor.py:163 + standalone.py:137 lane_specs merges, rebuild_relaunch_exe.py, the X-Operator-Confirm + proposals.py + monetization_gate ledger gates). Sover's job each iteration is to connect a CALLER and a PLANNER to that loaded loop -- never to build a new agent runtime, approval system, or rebuild path. Self-modification stays additive and human-approved; frozen core stays frozen; every dollar crosses a human's desk. Simplicity-first is binding: anything beyond a prompt action-parser, a genesis route, honest docs, a template-based scaffolder, and a tree-walking planner is gold-plating to be rejected.\n\nLIVE DEPLOYMENT CONTEXT -- GAINS.GOD.GROWTH: Sover is now running live as the autonomous social-media executive for the Gains.God.Growth brand (faith + discipline + gym motivation) across Instagram, TikTok, and YouTube. The GGG profile now uses minimax-m3 via native Ollama Cloud for all LLM roles (creative, brain, chat) -- operator model decision 2026-07-01, staying within the operator's approved-tools list (Ollama Cloud / Claude subscription / brokerage+Kalshi only, no other paid services). The operator has set auto_post=true and publish_platforms includes all three platforms. Content voice: raw, masculine, encouraging, NEVER cynical; faith-and-iron. Short punchy quotes for 10-second reels, 2-4 lines each. Hashtag mix: #gains #god #growth #faith #discipline #gymmotivation (core) plus a pool of fitness/christian/strength tags. 3 posts/day, best hours 6AM/12PM/6PM/9PM, cross-posted to all 3 platforms.\n\nITERATE FROM MISTAKES: Each Solomon RSI iteration MUST read the Sover agent's recent run logs (.runtime/ggg/pi_runner_heartbeat.json, data/ggg/strategy.json, lane_state.json, the CGO's markdown briefs) and identify MISTAKES the agent made -- silent lane failures, off-brand content, missed posting windows, broken browser automation, poor hashtag selection, content that didn't perform, voice drift, reward-hacking, capability scaffolds that don't actually work. THE MEASURED FAILURE MODE TO KILL (verified from the live post registry 2026-07-01): multi-day posting outages that nobody notices -- June 16-23 and June 25-29 had ZERO posts on any platform, and cadence since is ~1 reel/day against the 3/day target; one June 30 TikTok entry claims published_at with an EMPTY url (a publish claim with no evidence). Prioritize fixes that make posting throughput hit the 3/day target and make every publish claim carry a verifiable URL. The iteration's improvement should FIX the highest-leverage mistake found, making the agent better at autonomously expanding GGG on the next run. The loop's fitness signal is: did the fix make Sover post more, post better, or grow the accounts faster? A fix that prevents a recurring silent failure is worth more than a cosmetic improvement. Prioritize: (1) posting reliability and throughput, (2) content quality and on-brand-ness, (3) platform automation robustness (browser_harness, CDP, DOM selectors), (4) analytics accuracy, (5) capability tree progression. The goal does not shrink to fit budget -- a truthful null (no mistake found worth fixing this cycle) beats a fabricated improvement.",
-        "provider": "ollama-cloud",
-        "model": "minimax-m3",
-        "api_key": "OLLAMA_API_KEY",
-        "ship": "auto-merge",
-        "pr_target_branch": "main",
-        "freshness": {
-            "cmd": "python tools\\freshness.py",
-            "min_new_samples": 1,
-            "hard": true,
-            "max_starve_cycles": 4,
-            "comment": "2026-07-22 recovery: live-app objective telemetry is fail-closed. The real emitter reads %LOCALAPPDATA%\\Sover; a missing post registry or broken publishing pipeline is UNOBSERVABLE and halts blind RSI mutation instead of being masked by no_objective."
-        },
-        "interval": 120,
-        "max_iterations": 0,
-        "reasoning": "xhigh",
-        "pipeline": {
-            "plan": false,
-            "review": false,
-            "ideate": false,
-            "reflect": false
-        },
-        "scale": {
-            "min_interval_s": 90,
-            "step_s": 15,
-            "cooldown_s": 21600
-        },
-        "produce_boost": {
-            "bin": [
-                "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\sover\\target\\release\\sover.exe",
-                "--live",
-                "--lane",
-                "post"
-            ],
-            "produce": [
-                "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\sover\\target\\release\\sover.exe",
-                "--live",
-                "--lane",
-                "produce"
-            ],
-            "cwd": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\sover",
-            "profile_env": "ggg",
-            "cooldown_s": 3600,
-            "max_extra_per_day": 3
-        },
-        "growth_publish": {
-            "mode": "live",
-            "publish": [
-                "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\sover\\target\\release\\sover.exe",
-                "--live",
-                "--lane",
-                "post"
-            ],
-            "cwd": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\sover",
-            "profile_env_key": "SOVER_PROFILE",
-            "profile_env": "ggg",
-            "comment": "2026-07-22 recovery: the sanctioned Sover --live --lane post one-shot runs from the real source checkout and explicitly receives SOVER_PROFILE=ggg. It remains the project's own publish path; Solomon does not compose a raw external post."
-        }
-    },
-    {
-        "name": "asmodeus",
-        "live_app": true,
-        "branch_prefix": "rsi/",
-        "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\asmodeus",
-        "gate": "cargo test --bin Asmodeus",
-        "ship": "auto-merge",
-        "pr_target_branch": "main",
-        "provider": "ollama-cloud",
-        "model": "minimax-m3",
-        "api_key": "OLLAMA_API_KEY",
-        "freshness": {
-            "cmd": "python tools\\freshness.py",
-            "min_new_samples": 1,
-            "hard": true,
-            "max_starve_cycles": 4,
-            "comment": "2026-07-22 recovery: Asmodeus is a live-money app, so stale or unobservable live telemetry must gate blind RSI mutation. max_starve_cycles=4 retains one bounded upkeep escape cycle to repair the data path."
-        },
-        "interval": 180,
-        "max_iterations": 0,
-        "reasoning": "xhigh",
-        "goal": "OPERATOR GOAL 2026-07-12 \u2014 EDGE FACTORY (supersedes the 2026-07-01 capital-velocity contract where they conflict): Asmodeus autonomously discovers, validates (net of honest per-instrument costs), and promotes strategies into a LIVE-READY deployable set; ACTIVATING a new strategy on live capital or raising live capital stays a HUMAN trigger. Kill/breaker/capital_guard mechanisms unchanged, money-out human-gated.\n\nASMODEUS NORTH STAR (heavily weighted, operator end-goal 2026-07-01): VERY FAST, FREQUENT, AND LARGE PROFITS across different assets and short timeframes -- the three layers (hardcoded algo fleet, AI strategy builders, RSI meta-loop) exist to constantly MOVE and SCALE capital faster. Fitness is CAPITAL VELOCITY measured from the live db, never from green tests alone: live fills/day up, realized net PnL up, 24h equity delta up, validated candidates advancing through the anti-overfit funnel to live, and more assets/short timeframes covered by live-promoted strategies. The earlier builder tool-wiring bug is FIXED (verify it stays fixed via builder_*.log) -- do NOT keep re-fixing it. The operator has explicitly authorized tuning risk and promotion PARAMETERS (Kelly fraction, position-size caps, equity-utilization target, paper-trade promotion thresholds such as min_forward_trades) when the evidence supports it -- an over-tight promotion gate that strands every candidate in paper is itself a defect. However the kill-switch, circuit-breaker, and capital_guard MECHANISMS themselves must never be weakened, removed, or bypassed -- only the numeric thresholds they enforce are tunable, the safety rails always stay intact (this trades REAL money), and money-out stays human-gated. ITERATE FROM MISTAKES: each cycle read builder_*.log / meta_loop.log / fleet_ticker.log, the funnel state, AND improver/asmodeus/backlog.md -- the operator seeds VERIFIED defects there (equity recorder writing identical paper/live values every tick, recurring SQLite corruption/salvage events, the min_forward_trades bottleneck, Kalshi market_not_found rejects, TradeLocker 429 storms) -- and fix the highest-leverage blocker between capital and velocity. OPEN-SOURCE MILESTONE (standing, but do NOT act on it until the operator flips it): once the outcome ledger shows sustained profit and the system is polished, Asmodeus graduates to a plug-n-play open-source release -- so keep configuration over hardcoding and keep secrets in .env/local state only, never in the repo, making the eventual scrub cheap. No marketing and no public exposure while private. PONYTAIL STYLE: simplest solution that works, stdlib-first, delete > add. A truthful null beats a fabricated already-done -- never claim a fix you did not write and verify.",
-        "pipeline": {
-            "plan": false,
-            "review": true,
-            "ideate": false,
-            "reflect": false
-        },
-        "live_deploy": {
-            "rebuild": [
-                "cargo",
-                "build",
-                "--release"
-            ],
-            "launch": [
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                "C:/Users/Cayleb/Desktop/workspace/solomon/tools/asmodeus_keepalive.ps1"
-            ],
-            "cooldown_s": 3600,
-            "recovery_require_green": [
-                "kill_breaker",
-                "reconciliation_clear",
-                "auth_health",
-                "heartbeat_fresh",
-                "equity_fresh",
-                "equity_value"
-            ]
-        },
-        "growth_publish": {
-            "mode": "live",
-            "publish": ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\\publish_release.ps1"],
-            "cwd": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\asmodeus",
-            "comment": "2026-07-14 (Phase 2): asmodeus publish ladder wired DRY-RUN-FIRST. The sanctioned publish lane is the local file:// release builder (scripts/publish_release.ps1 -> %LOCALAPPDATA%\\Asmodeus\\releases\\latest.json + versioned exe asset), which the running app picks up via its auto-update check. The operator promotes mode to \"live\" only after reviewing the dry-run would_run argv + a clean gated dry run. NOTE: publish_release.ps1 requires a clean working tree + a release build; it is the artifact-publish path, not a social/content post. Dry-run validates the argv WITHOUT spawning, so the cwd/publish argv correctness is confirmed before any real build+publish runs."
-        }
-    },
-    {
-        "name": "dotz",
-        "branch_prefix": "rsi/",
-        "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\projects\\dotz",
-        "public": true,
-        "provider": "ollama-cloud",
-        "model": "minimax-m3",
-        "api_key": "OLLAMA_API_KEY",
-        "ship": "auto-merge",
-        "pr_target_branch": "main",
-        "gate": "cargo test -p dotz-core",
         "interval": 300,
         "max_iterations": 0,
-        "reasoning": "xhigh",
         "freshness": {
             "no_objective": true,
-            "comment": "2026-07-07 (Phase A.2): dotz (the native-Rust coding-agent dashboard) is a CODE-QUALITY lane -- its objective today is 'one additive, high-leverage code/docs improvement, green under cargo test -p dotz-core', NOT a settled real-world outcome that accumulates samples. There is no honest metric source to gate on: no tools/freshness.py, no settled-outcome db, no published-artifact registry. Marking this lane explicitly no_objective is the HONEST state -- fabricating a freshness emitter over a green test suite would be the exact fake-green trap the gate exists to kill (autopsy: 'dotz graded empty test suites green'). no_objective + no cmd => freshness_cfg() returns None => byte-identical legacy behavior. Reorient to a real usage/adoption metric under AI-CEO roadmap Phase C."
-        },
-        "goal": "Improve dotz -- a native-Rust (axum + Tauri/WebView2 + `ort` ONNX embeddings) Claude-Code-style multi-agent coding-agent dashboard. `dotz-core` is the axum server + dotz's OWN agent runtime (no third-party agent SDK) on 127.0.0.1:4317; `src-tauri` is the thin WebView2 shell with signed cross-device auto-update; the `web/` vanilla-JS cyberbrutalist UI binds over REST + WebSocket. (The legacy Electron/Fastify/pi-SDK TypeScript app was REMOVED 2026-06-24 -- there is no more `src/*.ts`, no npm typecheck; do NOT reintroduce it.) Make additive, high-leverage improvements: fix real bugs, harden the axum server / WebSocket event stream / Tauri lifecycle, improve agent/session reliability, memory (`ort` embeddings), the sandbox, the browser controller, error handling, and operator UX. GROWTH IS IN SCOPE (operator decision 2026-07-01): when the day's backlog item is a growth goal, improve the ORGANIC public surface instead of code \u2014 README (screenshots, quickstart, feature tour), docs, examples, release notes for the auto-updater releases, GitHub description/topics \u2014 free/organic only, no paid services or ad spend, and never degrade the code to do it. Keep every change green under the gate `cargo test -p dotz-core`, and add a Rust test (`#[test]` / `#[cfg(test)]`) covering your change in the repo's own framework when the change is code. Match the existing Rust style; do NOT add heavy dependencies or architectural layers (ponytail/simplicity-first) -- delete over add. Keep changes in `dotz-core` unless the shell is genuinely the right place. A truthful null beats a fabricated improvement -- never claim an edit you did not write. PERSONA RULE (operator 2026-07-12): all public-facing content this lane produces (README, release notes, posts, social, discussions) is authored under the project's own brand or its agent persona \u2014 NEVER the operator's personal name.",
-        "pipeline": {
-            "plan": false,
-            "review": false,
-            "ideate": false,
-            "reflect": false
-        },
-        "scale": {
-            "min_interval_s": 180,
-            "step_s": 30,
-            "cooldown_s": 21600
-        }
-    },
-    {
-        "name": "solomon",
-        "branch_prefix": "rsi/",
-        "path": "C:\\Users\\Cayleb\\Desktop\\workspace\\solomon",
-        "public": true,
-        "provider": "ollama-cloud",
-        "model": "minimax-m3",
-        "api_key": "OLLAMA_API_KEY",
-        "ship": "auto-merge",
-        "pr_target_branch": "main",
-        "gate": "cd src-tauri && cargo test",
-        "interval": 420,
-        "max_iterations": 0,
-        "reasoning": "xhigh",
-        "freshness": {
-            "no_objective": true,
-            "comment": "2026-07-07 (Phase A.2): solomon-improving-solomon is a CODE-QUALITY lane -- its objective today is 'one real, high-leverage improvement to the RSI control plane, cargo test green', NOT a settled real-world outcome that accumulates samples in a ledger. There is no honest tier-1 metric source to gate on: solomon has no tools/freshness.py and no settled-outcome db (the ops/CEO planes emit health probes, not an accumulating objective series). Marking this lane explicitly no_objective is the HONEST state -- fabricating a freshness emitter over its own green tests would be precisely the MONITORING-THEATER failure solomon's own goal warns against (a green internal signal standing in for a real outcome). no_objective + no cmd => freshness_cfg() returns None => byte-identical legacy behavior (never a false RED, never a fabricated park). If solomon's objective is ever reoriented to a real product/business metric (AI-CEO roadmap Phase C), replace this sentinel with a real emitter cmd."
+            "comment": "Set no_objective until your repo has a real outcome metric. Fabricating a freshness emitter over a green test suite is the exact fake-green trap the gate exists to prevent."
         },
         "pipeline": {
             "plan": false,
@@ -273,6 +52,6 @@
             "ideate": false,
             "reflect": false
         },
-        "goal": "OPERATOR GOAL 2026-07-12 \u2014 FLEET AUTOPILOT + CEO: Solomon's dream state is running the whole fleet visibly and safely with zero babysitting AND acting as CEO for the public OSS apps (sover, maki, dotz, ...) \u2014 automatically marketing, scaling, and growing them for max reach and profit with zero human involvement; every public-facing artifact is authored under each app's own brand/agent persona, NEVER the operator's personal name. Build path: docs/rsi/AI-CEO-ARCHITECTURE-2026-07-07.md Phases B-D.\n\nImprove Solomon itself -- the Rust/Tauri RSI control plane that runs autonomous improvement loops on other repos (the improver runner + supervisor recovery ladder + overnight watchdog + git/gh integration + the web dashboard), plus the v2 ops/CEO planes (ground-truth probes in ops.json, the outcomes ledger, ntfy/toast notifications, and the morning-plan/evening-summary rhythm in src/ceo.rs). Each iteration make ONE real, high-leverage improvement: fix a genuine bug, harden the improver loop / gate execution / lock & heartbeat handling / subprocess lifecycle, improve crash-recovery, the probe/ledger/notify/CEO planes, or the dashboard, or add missing test coverage. Pay special attention to the classes of management problem the operator has hit in practice: silent provider/model config drift (e.g. a per-repo provider and api_key going out of sync with no loud error), lanes thrashing/stalling without a real fix being found, stale heartbeat/escalation state that does not get re-observed after a fix lands, and MONITORING THEATER -- a green internal signal (heartbeat, lane iteration) standing in for a real outcome (a post published, a trade filled, a training run fired); harden the supervisor and the ops plane against these. Keep `cargo test` (run from src-tauri) green. PONYTAIL STYLE: the laziest solution that fully works -- stdlib over deps, native over custom, delete over add; add no abstraction or dependency you do not need. Much of the codebase is a deliberately bug-for-bug faithful port of the original Python (per-call-site truthiness mirrors, exact log strings, byte-identical argv) -- do NOT 'simplify' those away. A truthful 'nothing worth changing this cycle' beats a fabricated or cosmetic change."
+        "goal": "Replace this with your repo's improvement goal. Each iteration, make ONE real, high-leverage improvement: fix a genuine bug, harden error handling, improve reliability, or add missing test coverage. Keep tests green. A truthful 'nothing worth changing this cycle' beats a fabricated or cosmetic change."
     }
 ]

@@ -7,6 +7,7 @@ default-run = "solomon"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+winres = "0.1"
 
 [dependencies]
 tauri = { version = "2", features = [] }
@@ -22,12 +23,25 @@ regex = "1"
 # bundled so no system sqlite3 is required; opened SQLITE_OPEN_READ_ONLY only — never a write path.
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# Rust AI Desktop Tech Stack — recommended deps for local AI extension.
+# Available for future use; not required at runtime by current code.
+ort = { version = "2", optional = true }
+lancedb = { version = "0.18", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 # MoA brain (Slice 3, RSI_MOA_PLAN §2): the MoA workers reuse the proven `ollama_chat` curl path
 # (ponytail: reuse, don't reinvent) — no async-openai/reqwest/tokio-runtime dependency needed.
 # The brain.rs module orchestrates Layer-1 (plan/ideate) + Layer-2 (aggregate) sequentially via
 # ollama_chat; the implementer worker runs through the EXISTING pi::run_pi (real diff, real gate).
 # async-openai is reserved for a future streaming/parallel-fan-out Phase 2 if the sync path proves
 # too slow. See docs/RSI_MOA_RESEARCH.md §3.3 for the async-openai alternative.
+
+[features]
+default = []
+# Enable the local AI stack (ONNX Runtime inference + vector DB + async runtime)
+ai-stack = ["ort", "lancedb", "tokio"]
 
 [dev-dependencies]
 # test fixtures only: set file mtimes for the file_age probe's golden vectors

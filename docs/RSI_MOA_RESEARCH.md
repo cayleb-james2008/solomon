@@ -58,7 +58,7 @@ I now have complete primary-source grounding for all five research questions. Th
 
 ### 1.3 "Hermes MoE" — what the operator actually referenced
 
-**Finding**: The operator said "moe like hermes." Hermes Agent (Nous Research, MIT, https://github.com/NousResearch/hermes-agent, v0.18.2, 212k★) has a built-in **`moa` toolset** — explicitly named "Mixture of Agents" — listed in the toolset table at line 435 of `C:\Users\Cayleb\.claude\skills\autonomous-ai-agents\hermes-agent\SKILL.md`:
+**Finding**: The operator said "moe like hermes." Hermes Agent (Nous Research, MIT, https://github.com/NousResearch/hermes-agent, v0.18.2, 212k★) has a built-in **`moa` toolset** — explicitly named "Mixture of Agents" — listed in the toolset table at line 435 of `~/.claude/skills/autonomous-ai-agents/hermes-agent/SKILL.md`:
 
 > | `moa` | Mixture of Agents (off by default) |
 
@@ -230,7 +230,7 @@ The operator said "minimax." There are **two** MiniMax models on Ollama Cloud:
 
 ### 3.1 How OpenCode (this tool) spawns subagents via the Task tool
 
-**Sources**: read in full — `C:\Users\Cayleb\.config\opencode\skills\ultra-code\references\orchestration.md` ; `C:\Users\Cayleb\.config\opencode\agent\ultra-researcher.md` ; `ultra-planner.md` ; `ultra-implementer.md` ; `ultra-reviewer.md` ; `ultra-skeptic.md`.
+**Sources**: read in full — `~/.config/opencode/skills/ultra-code/references/orchestration.md` ; `~/.config/opencode/agent/ultra-researcher.md` ; `ultra-planner.md` ; `ultra-implementer.md` ; `ultra-reviewer.md` ; `ultra-skeptic.md`.
 
 **Mechanism (the pattern to mirror inside Solomon):**
 

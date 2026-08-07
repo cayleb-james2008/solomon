@@ -59,3 +59,6 @@ improver/kairos/hypothesis-ledger.md
 solomon.egg-info/
 uv.lock
 .venv/
+
+# Cloudflare build cache — never commit (contains account data)
+.wrangler/

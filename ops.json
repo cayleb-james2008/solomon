@@ -85,7 +85,7 @@
             {
                 "id": "kill_breaker",
                 "kind": "cmd",
-                "command": "\"C:\\Users\\Cayleb\\AppData\\Local\\Programs\\Python\\Launcher\\py.exe\" -3 ops\\kill_breaker_probe.py",
+                "command": "python -3 ops\\kill_breaker_probe.py",
                 "mode": "number",
                 "yellow_at": 0.5,
                 "red_at": 1.5,

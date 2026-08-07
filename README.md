@@ -11,7 +11,7 @@ watchdog, the git/`gh` integration, the CEO planner, and the web dashboard — o
 Python, no companion runtime.
 
 The canonical loop spec and its invariants live in [`SOLOMON_RSI.md`](./SOLOMON_RSI.md); the
-operator/agent guide lives in [`AGENTS.md`](./AGENTS.md). Read both before touching the harness.
+agent guide lives in [`AGENTS.md`](./AGENTS.md). Read both before touching the harness.
 
 ## What it does
 
@@ -35,7 +35,7 @@ cycle after cycle, without gambling the project, gaming its own metric, or repor
   PR loop it runs for every other repo.
 - **Fail-closed money guard.** A mandatory chokepoint denies any money-out action by default
   (details below).
-- **No background processes, ever.** Operator doctrine: no schtasks/cron/daemons. The watchdog
+- **No background processes, ever.** Design doctrine: no schtasks/cron/daemons. The watchdog
   lives inside the visibly open `Solomon.exe` (2-minute tick with an immediate catch-up sweep on
   open); the exe is launched manually, never auto-started.
 
@@ -73,7 +73,7 @@ solomon plan | report
 solomon state | start <name> | stop <name> | supervise [name] | serve-health [port]
 ```
 
-Operator configuration lives in `repos.json` (the managed lanes), `improver/<name>/AGENT.md` +
+Configuration lives in `repos.json` (the managed lanes), `improver/<name>/AGENT.md` +
 `backlog.md` (each lane's contract), and `.env` (provider API keys + the ntfy notification topic —
 `.env.example` documents every key the code reads). Secrets (`.env`, `.solomon.json`) and runtime
 state (`runtime/`, managed clones under `repos/`) are gitignored and never committed.
@@ -106,7 +106,9 @@ state (`runtime/`, managed clones under `repos/`) are gitignored and never commi
 - `tools/` — operator scripts, chiefly `build_safe.ps1` (the safe build-and-deploy path).
 - `docs/` — schemas and the AI-CEO architecture plan (`docs/rsi/`).
 
-## HARD gate: NO MONEY OUT (fail-closed)
+## Safety patterns
+
+### HARD gate: NO MONEY OUT (fail-closed)
 
 Solomon **never moves money out**. No withdrawal, transfer, deposit, funding, purchase, payment,
 paid signup, or ad spend is ever performed autonomously. This is enforced by a single mandatory,
@@ -119,7 +121,15 @@ preemptive chokepoint (`src-tauri/src/money_guard.rs`), not merely stated in doc
   money tool.
 - Today the money surface is **NONE** — there is no stripe/paypal/withdraw/payout/checkout
   integration anywhere, and the frontend API is a closed, money-free set. The guard welds that hole
-  shut before it can ever be cut, and pages the operator on any denied attempt.
+  shut before it can ever be cut, and pages the user on any denied attempt.
+
+### Additional safety guarantees
+
+- **Honest-green ship gate:** a lane ships only when the project-native test gate passes for real.
+- **Human-gated deploy:** a repo without explicit `live_deploy` is never auto-deployed.
+- **Single-instance enforcement:** refuses a second `Solomon.exe` launch.
+- **Recovery, not guesswork:** the supervisor walks a diagnosed recovery ladder; stuck lanes are
+  isolated, not silently retried.
 
 ## Honest status
 
@@ -127,10 +137,61 @@ preemptive chokepoint (`src-tauri/src/money_guard.rs`), not merely stated in doc
   watchdog, git/`gh` integration, and dashboard exist and are exercised by the `cargo test` gate.
 - **The AI-CEO / autonomous-profit vision is in progress, not achieved.** The CEO org, profit
   objective, and multi-lane allocation are implemented as scaffolding and planning rhythm; Solomon
-  does **not** claim autonomous profit. No verified real-money profit is asserted here. Live-money
-  lanes run their own bots under the human-gated money-out doctrine above.
+  does **not** claim autonomous profit. No verified real-money profit is asserted here.
 - **Safety posture is fail-closed by design:** honest-green ship gate, human-gated deploy, and the
   NO-MONEY-OUT chokepoint. When in doubt, the harness refuses rather than guesses.
+
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| **Language** | Rust (2021 edition) |
+| **GUI shell** | Tauri 2 (WebView2) |
+| **Frontend** | Vanilla HTML/CSS/JS (no framework, no build step) |
+| **Database** | `rusqlite` (bundled SQLite, read-only probes) |
+| **LLM integration** | OpenAI-compatible endpoints via curl (Ollama, OpenRouter, local) |
+| **VLM** | Vision-language model fallback for visual review |
+| **Notifications** | ntfy + Windows toast |
+| **Updater** | `tauri-plugin-updater` (GitHub Releases) |
+| **Windows binary** | `winres`-aware build; single self-contained `.exe` |
+| **Async runtime** | Sync-first design (tokio available for future async fan-out) |
+| **AI inference** | `ort` (ONNX Runtime) — available for local model work |
+| **Vector storage** | `lancedb` — available for semantic search over backlogs/docs |
+
+### Rust AI Desktop Tech Stack
+
+Solomon's `Cargo.toml` includes the recommended Rust AI desktop stack for future extension:
+
+- **`ort`** — ONNX Runtime bindings for local, GPU-accelerated model inference (DirectML on Windows)
+- **`lancedb`** — embedded vector database for semantic search over backlogs and improvement
+  history
+- **`tokio`** — async runtime (reserved for future parallel LLM fan-out)
+- **`tracing` / `tracing-subscriber`** — structured, level-filtered logging
+- **`rusqlite`** — bundled SQLite for read-only state probes (no system sqlite3 required)
+- **`winres`** — Windows resource compiler for embedding the app icon and manifest
+
+## Configuration
+
+Configuration is layered:
+
+- **`repos.json`** — the managed repo lanes (paths, names, objectives).
+- **`improver/<name>/AGENT.md`** — each lane's agent contract.
+- **`improver/<name>/backlog.md`** — prioritized work items per lane.
+- **`.env`** — provider API keys and notification settings (see `.env.example` for all variables).
+- **`.solomon.json`** — runtime secrets (gitignored).
+
+Key environment variables (documented in `.env.example`):
+
+| Variable | Purpose |
+|---|---|
+| `SOLOMON_LLM_BASE_URL` | OpenAI-compatible LLM endpoint |
+| `SOLOMON_LLM_API_KEY` | API key for the LLM provider (use `sk-no-key` for local) |
+| `SOLOMON_LLM_MODEL` | Model slug (e.g. `meta-llama/llama-3.3-70b-instruct`) |
+| `SOLOMON_VLM_BASE_URL` | Vision-language model endpoint |
+| `OPENROUTER_API_KEY` | OpenRouter API key for lane agents |
+| `SOLOMON_NTFY_TOPIC` | ntfy.sh topic for push notifications |
+| `SOLOMON_MAX_CYCLES` | Max improvement cycles per CEO run (default 1) |
+| `SOLOMON_CYCLE_SLEEP` | Seconds between cycles (default 300) |
 
 ## Development & gates
 
@@ -149,4 +210,6 @@ preemptive chokepoint (`src-tauri/src/money_guard.rs`), not merely stated in doc
 - **Code style:** ponytail — YAGNI, stdlib first, shortest working diff. Whole-repo `cargo fmt`
   is **not** a gate here; keep diffs surgical. See `AGENTS.md`.
 
-Private operator repo — no license file; all rights reserved.
+## License
+
+MIT — see [LICENSE](./LICENSE). Contributing guidelines in [CONTRIBUTING.md](./CONTRIBUTING.md).
