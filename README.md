@@ -155,14 +155,16 @@ preemptive chokepoint (`src-tauri/src/money_guard.rs`), not merely stated in doc
 | **Updater** | `tauri-plugin-updater` (GitHub Releases) |
 | **Windows binary** | `winres`-aware build; single self-contained `.exe` |
 | **Async runtime** | Sync-first design (tokio available for future async fan-out) |
-| **AI inference** | `ort` (ONNX Runtime) — available for local model work |
+| **AI inference** | `ort` (ONNX Runtime) — recommended; not pinned (no stable release yet) |
 | **Vector storage** | `lancedb` — available for semantic search over backlogs/docs |
 
 ### Rust AI Desktop Tech Stack
 
 Solomon's `Cargo.toml` includes the recommended Rust AI desktop stack for future extension:
 
-- **`ort`** — ONNX Runtime bindings for local, GPU-accelerated model inference (DirectML on Windows)
+- **`ort`** — ONNX Runtime for local, GPU-accelerated model inference (DirectML on Windows).
+  Recommended but not yet pinned: the 1.x line is yanked and 2.0 is pre-release — add
+  `ort = "2.0.0-rc.13"` when you're ready to pin an RC, or wait for a stable release.
 - **`lancedb`** — embedded vector database for semantic search over backlogs and improvement
   history
 - **`tokio`** — async runtime (reserved for future parallel LLM fan-out)

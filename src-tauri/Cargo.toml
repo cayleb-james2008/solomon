@@ -24,8 +24,8 @@ regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Rust AI Desktop Tech Stack — recommended deps for local AI extension.
-# Available for future use; not required at runtime by current code.
-ort = { version = "2", optional = true }
+# Note: `ort` (ONNX Runtime) is recommended but has no stable non-yanked release yet
+# (1.x yanked; 2.0 pre-release). Pin `ort = "2.0.0-rc.13"` when ready, or wait for stable.
 lancedb = { version = "0.18", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 tracing = "0.1"
@@ -41,7 +41,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [features]
 default = []
 # Enable the local AI stack (ONNX Runtime inference + vector DB + async runtime)
-ai-stack = ["ort", "lancedb", "tokio"]
+ai-stack = ["lancedb", "tokio"]
 
 [dev-dependencies]
 # test fixtures only: set file mtimes for the file_age probe's golden vectors
