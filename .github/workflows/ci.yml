@@ -1,0 +1,47 @@
+name: ci
+
+# Build, lint, and test the Rust backend on every push to main and every pull
+# request. This is the gate every PR must pass. The release workflow
+# (.github/workflows/release.yml) is separate and runs only on v* tags.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: run the test gate
+        working-directory: src-tauri
+        run: cargo test
+
+  lint:
+    name: cargo clippy
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: clippy (warnings denied)
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+  pecrt:
+    name: pecrt decision-mirror self-check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: run the pecrt.py self-check
+        run: python pecrt.py

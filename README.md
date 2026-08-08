@@ -2,7 +2,10 @@
 
 **Fleet autopilot for recursive self-improvement: one native exe that provisions, schedules, gates, ships, and recovers RSI loops across the repos it manages.**
 
+[![ci](https://github.com/cayleb-james2008/solomon/actions/workflows/ci.yml/badge.svg)](https://github.com/cayleb-james2008/solomon/actions/workflows/ci.yml)
 [![release](https://github.com/cayleb-james2008/solomon/actions/workflows/release.yml/badge.svg)](https://github.com/cayleb-james2008/solomon/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.77%2B-orange.svg)](https://www.rust-lang.org/)
 
 Solomon is the **RSI control plane**: a single self-contained Rust/Tauri binary that provisions,
 schedules, gates, ships, and recovers autonomous recursive-self-improvement (RSI) loops for the
@@ -214,4 +217,6 @@ Key environment variables (documented in `.env.example`):
 
 ## License
 
-MIT — see [LICENSE](./LICENSE). Contributing guidelines in [CONTRIBUTING.md](./CONTRIBUTING.md).
+MIT — see [LICENSE](./LICENSE). Contributing guidelines in [CONTRIBUTING.md](./CONTRIBUTING.md);
+code of conduct in [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md); security policy in
+[SECURITY.md](./SECURITY.md).
