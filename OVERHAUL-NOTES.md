@@ -86,3 +86,17 @@ was green in the prior pass after declaring the undeclared `pyyaml` dependency i
 No claim was removed from the README in this pass; the phase-1 pass had already corrected the
 test-count claim to a reproducible figure and added a "What works today" section. The counts in
 this file are the ones measured today and name their exact commands.
+
+## Dashboard modernization (`web/index.html` + `styles.css`)
+
+Audited with a static accessibility/hygiene check and fixed what it found:
+
+- **Keyboard skip-link** added (`<a class="skip-link" href="#workspace">Skip to main content</a>`),
+  focus-revealed by CSS so keyboard users can jump past the top bar. The existing `<main
+  id="workspace">` landmark is the target.
+- **`prefers-reduced-motion` support added.** The stylesheet had no reduced-motion handling; the
+  aurora drift, the loading spinner and the hover transitions now collapse to ~0 under the OS
+  "reduce motion" setting. Motion here is decorative, never load-bearing.
+
+Verified: HTML tag-balance check passes; all local `href`/`src` targets exist; the audit reports
+0 failures (lang, viewport, img alt, button names, field labels, link integrity). No JS changed.
