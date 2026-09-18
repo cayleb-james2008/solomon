@@ -100,3 +100,32 @@ Audited with a static accessibility/hygiene check and fixed what it found:
 
 Verified: HTML tag-balance check passes; all local `href`/`src` targets exist; the audit reports
 0 failures (lang, viewport, img alt, button names, field labels, link integrity). No JS changed.
+
+## Windows-native verification and the Windows-only bug it found (2026-09-18)
+
+All five apps are Windows-native by construction (Tauri 2 + NSIS target, `.ico` icons,
+`windows_subsystem = "windows"`, `winres` build-dep). That claim was previously only *asserted*;
+it is now **verified by cross-compiling the real Windows target** on this Linux host:
+
+```
+cargo xwin build --release --target x86_64-pc-windows-msvc
+```
+
+(installed with `cargo install cargo-xwin@0.19.2` — no sudo; it downloads the MSVC headers/libs.)
+Result for solomon: **exit 0**, producing
+`src-tauri/target/x86_64-pc-windows-msvc/release/solomon.exe` —
+`PE32+ executable for MS Windows (GUI), x86-64`, 15 MB, subsystem **2 = GUI** (which is the
+`windows_subsystem="windows"` attribute doing its job: no console window).
+
+**A real Windows-only bug was found and fixed because of this:** `attach_parent_console()`'s
+`extern "system"` block is `#[cfg(windows)]`, so no Linux build ever compiled it — and the
+edition-2024 bump (which requires `extern` blocks to be `unsafe`) had silently broken the Windows
+target. It is now `unsafe extern "system"`. Linux `cargo check` and the Windows build both exit 0.
+
+**Honest boundary:** cross-compiling proves the Windows native code compiles and links into a GUI
+executable. It does **not** prove runtime behavior on Windows. A Windows VM boot was attempted on
+this host (QEMU 11.0.1 under KVM; Windows LTSC eval ISO `sha256 e4ab2e35…`); Windows Setup loaded
+(646 MB of ISO read) but the unattended install did not complete in the time available. Runtime
+Windows testing remains NOT RUN.
+
+**Windows CI note:** the workflows run on `windows-latest`; this pass did not execute them.
