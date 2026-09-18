@@ -1516,7 +1516,7 @@ fn inject_fallback_goal(ctx: &mut Ctx) {
     if head > 0 {
         merged.push(String::new());
     }
-    merged.push(format!("- [ ] {}", EMPTY_IDEATE_FALLBACK_GOAL));
+    merged.push(format!("- [ ] {EMPTY_IDEATE_FALLBACK_GOAL}"));
     merged.extend(lines[head..].iter().map(|s| s.to_string()));
     let body = format!("{}\n", merged.join("\n").trim_end());
     if let Some(parent) = ctx.backlog.parent() {
@@ -2502,7 +2502,7 @@ The following:";
             c.consecutive_empty_ideate = i;
             inject_fallback_goal(&mut c);
             assert!(!c.stop_path.exists(),
-                "stop should not be written at consecutive_empty_ideate={}", i);
+                "stop should not be written at consecutive_empty_ideate={i}");
         }
 
         // K-th empty result: write stop.

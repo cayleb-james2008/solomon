@@ -990,7 +990,9 @@ mod tests {
         assert!(!rt.join("kairos").join("HOLD_META").exists());
         assert_eq!(out["files"]["repos.json"]["first_seen_drift"], 0.0);
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        unsafe {
+            std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        }
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -1000,7 +1002,9 @@ mod tests {
     #[test]
     fn env_drift_pages_holds_then_adopts_baseline() {
         let _env = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        unsafe {
+            std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        }
         let repo = tmp_git_repo("envdrift");
         std::fs::write(repo.join(".env"), b"KEY=old").unwrap();
         let rt = repo.join("runtime");
@@ -1032,7 +1036,9 @@ mod tests {
         let out = check_impl(&repo, &rt, &rows, t0 + 5000.0);
         assert!(out["actions"].as_array().unwrap().is_empty());
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        unsafe {
+            std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        }
         let _ = std::fs::remove_dir_all(&repo);
     }
 

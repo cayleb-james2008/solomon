@@ -662,7 +662,7 @@ fn py_rstrip(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     // Concurrent-drain regression for the wait-then-read deadlock class (also fixed in pi::run_pi,
     // visual::spawn_pi, visual::run_browser_cli): a child that floods stdout past the OS pipe buffer

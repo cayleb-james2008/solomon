@@ -459,15 +459,12 @@ mod tests {
         // Encode the invariant: at least 4 consecutive stamps must fit inside the staleness window.
         assert!(
             (HEARTBEAT_STAMP_INTERVAL_S as f64) * 4.0 <= STALE_AFTER_S,
-            "interval {}s * 4 must be <= STALE_AFTER_S {}s so several missed stamps never look dead",
-            HEARTBEAT_STAMP_INTERVAL_S,
-            STALE_AFTER_S
+            "interval {HEARTBEAT_STAMP_INTERVAL_S}s * 4 must be <= STALE_AFTER_S {STALE_AFTER_S}s so several missed stamps never look dead"
         );
         // And it must be a positive, sane short cadence (30–60 s per the design).
         assert!(
             (1..=60).contains(&HEARTBEAT_STAMP_INTERVAL_S),
-            "cadence {}s must be a short 1–60 s interval",
-            HEARTBEAT_STAMP_INTERVAL_S
+            "cadence {HEARTBEAT_STAMP_INTERVAL_S}s must be a short 1–60 s interval"
         );
     }
 

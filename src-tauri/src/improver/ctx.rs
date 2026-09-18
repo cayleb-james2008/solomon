@@ -1676,7 +1676,7 @@ mod tests {
         let k = or_key("uniquerandperrepo");
         c.api_key = k.clone();
         c.apply_api_key();
-        let text = format!("here is my key {} for you", k);
+        let text = format!("here is my key {k} for you");
         assert!(c.redact(&text).contains("[REDACTED]"), "per-repo key value must be redacted");
         assert!(!c.redact(&text).contains(&k));
     }

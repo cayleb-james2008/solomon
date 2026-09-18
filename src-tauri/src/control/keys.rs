@@ -120,7 +120,7 @@ pub fn set_key(provider: &str, value: &str) -> Value {
             Err(e) => return json!({"ok": false, "error": e.to_string()}),
         }
     }
-    let new_line = format!("{}={}", key, value);
+    let new_line = format!("{key}={value}");
     let mut found = false;
     for line in lines.iter_mut() {
         // line.split("=", 1)[0].strip() == key

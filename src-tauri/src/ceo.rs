@@ -2439,7 +2439,7 @@ mod tests {
                 .append(true)
                 .open(&path)
                 .expect("open outcomes.jsonl for the seed write");
-            writeln!(f, "{}", snapshot).unwrap();
+            writeln!(f, "{snapshot}").unwrap();
         }
 
         // (1) The REAL reader consulted the ledger and surfaced the win (proving it is READ, not

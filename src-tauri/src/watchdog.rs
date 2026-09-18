@@ -1812,7 +1812,7 @@ mod tests {
                 .current_dir(&git_dir)
                 .status()
                 .unwrap();
-            assert!(st.success(), "git {:?} failed in {:?}", args, git_dir);
+            assert!(st.success(), "git {args:?} failed in {git_dir:?}");
         }
         let repo = json!({"name": tag, "path": git_dir.to_string_lossy()});
         let rt = paths::runtime_dir(&repo).unwrap();
@@ -1895,7 +1895,7 @@ mod tests {
                 .current_dir(&git_dir)
                 .status()
                 .unwrap();
-            assert!(st.success(), "git {:?} failed in {:?}", args, git_dir);
+            assert!(st.success(), "git {args:?} failed in {git_dir:?}");
         }
         let repo = json!({"name": tag, "path": git_dir.to_string_lossy()});
         let rt = paths::runtime_dir(&repo).unwrap();
@@ -1967,7 +1967,9 @@ mod tests {
         let _env = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        unsafe {
+            std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        }
         let marker = standstill_marker();
         let _ = std::fs::remove_file(&marker);
         let now = Utc::now();
@@ -1997,7 +1999,9 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&marker);
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        unsafe {
+            std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        }
     }
 
     #[test]
@@ -2349,7 +2353,7 @@ mod tests {
                 .current_dir(&git_dir)
                 .status()
                 .unwrap();
-            assert!(st.success(), "git {:?} failed in {:?}", args, git_dir);
+            assert!(st.success(), "git {args:?} failed in {git_dir:?}");
         }
         let repo = json!({"name": tag, "path": git_dir.to_string_lossy()});
         let rt = paths::runtime_dir(&repo).unwrap();
@@ -2444,7 +2448,7 @@ mod tests {
         if let Ok(content) = std::fs::read_to_string(&mon) {
             let kept: Vec<&str> = content
                 .lines()
-                .filter(|line| !line.contains(&format!("\"repo\":\"{}\"", tag)))
+                .filter(|line| !line.contains(&format!("\"repo\":\"{tag}\"")))
                 .collect();
             let _ = std::fs::write(&mon, format!("{}\n", kept.join("\n")));
         }

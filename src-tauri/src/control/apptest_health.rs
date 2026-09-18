@@ -41,8 +41,7 @@ fn now() -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y, m, d, hh, mm, ss
+        "{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z"
     )
 }
 
@@ -253,7 +252,7 @@ impl AppTestManager {
         let started = now();
         let sid = session_id.clone();
         let handle = std::thread::Builder::new()
-            .name(format!("app-test-{}", name))
+            .name(format!("app-test-{name}"))
             .spawn(move || {
                 let _ = std::fs::create_dir_all(&runtime_dir);
                 // Wait until stop is signalled (mirrors `while not stop.wait(0.5): pass`).
@@ -359,7 +358,7 @@ fn manager() -> &'static AppTestManager {
 fn uuid_hex12() -> String {
     let mut bytes = [0u8; 6];
     getrandom_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Fill `buf` with pseudo-random bytes from a time/heap-address xorshift mix. The value only needs
@@ -906,7 +905,7 @@ mod tests {
         assert_eq!(r1.get("ok"), Some(&json!(true)));
         assert_eq!(r1.get("status"), Some(&json!("starting")));
         let sid = r1.get("sessionId").and_then(Value::as_str).unwrap().to_string();
-        assert!(sid.starts_with(&format!("{}-", name)));
+        assert!(sid.starts_with(&format!("{name}-")));
         assert_eq!(sid.len(), name.len() + 1 + 12); // <name>-<12 hex>
         assert!(sid.rsplit('-').next().unwrap().chars().all(|c| c.is_ascii_hexdigit()));
 

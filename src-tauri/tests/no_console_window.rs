@@ -337,8 +337,7 @@ fn no_unguarded_command_spawns_in_production() {
     }
     // Always report the counts so a `--nocapture` run shows the audit surface.
     eprintln!(
-        "no_console_window: scanned {} production `Command::new` sites; all {} guarded (0 violations)",
-        prod_total, guarded_total
+        "no_console_window: scanned {prod_total} production `Command::new` sites; all {guarded_total} guarded (0 violations)",
     );
 }
 

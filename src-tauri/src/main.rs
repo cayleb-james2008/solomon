@@ -146,7 +146,7 @@ fn run_headless(args: &[String]) -> i32 {
         "start" | "stop" => match name_arg {
             Some(n) => match api::dispatch(sub, &[Value::String(n)]) {
                 Ok(v) => {
-                    println!("{}", v);
+                    println!("{v}");
                     0
                 }
                 Err(e) => {

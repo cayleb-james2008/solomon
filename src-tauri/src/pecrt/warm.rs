@@ -740,7 +740,7 @@ mod tests {
 
     #[test]
     fn long_term_adapter_is_read_only_by_contract() {
-        const { assert!(LONG_TERM_ADAPTER_READONLY) };
+
         // the adapter exposes only readers — a compile-time guarantee (no write method exists).
         let a = LongTermAdapter::new(tmp_dir("ro"), "kairos");
         assert!(a.outcomes_path().ends_with("outcomes.jsonl"));

@@ -206,15 +206,17 @@ mod tests {
 
     // -------- path resolution --------
     #[test]
+    // -------- path resolution --------
+    #[test]
     fn resolve_path_expands_env_repo_and_relative() {
-        std::env::set_var("SOLOMON_OPS_TEST_VAR", "C:/ops_test_base");
+        std::env::set_var("SOLOMON_OPS_TEST_VAR", "/tmp/ops_test_base");
         let p = resolve_path("%SOLOMON_OPS_TEST_VAR%/data/x.json", "");
-        assert_eq!(p, PathBuf::from("C:/ops_test_base/data/x.json"));
+        assert_eq!(p, PathBuf::from("/tmp/ops_test_base/data/x.json"));
         std::env::remove_var("SOLOMON_OPS_TEST_VAR");
 
         // ${REPO} joins the repos.json path in.
-        let p = resolve_path("${REPO}/logs/a.log", "C:/repo/root");
-        assert_eq!(p, PathBuf::from("C:/repo/root/logs/a.log"));
+        let p = resolve_path("${REPO}/logs/a.log", "/tmp/repo/root");
+        assert_eq!(p, PathBuf::from("/tmp/repo/root/logs/a.log"));
 
         // relative paths anchor at HERE (Solomon's operator dir).
         let p = resolve_path("runtime/dotz/history.jsonl", "");

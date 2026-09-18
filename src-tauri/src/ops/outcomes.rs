@@ -622,7 +622,7 @@ fn print_table(payload: &Value, only: Option<&str>) {
         );
     }
     if let Some(b) = payload.get("blind_window_s").and_then(Value::as_f64) {
-        println!("blind window since last sweep: {:.0}s", b);
+        println!("blind window since last sweep: {b:.0}s");
     }
     println!("fleet: {}", payload_summary(payload));
 }

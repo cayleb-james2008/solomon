@@ -1096,7 +1096,7 @@ fn expanduser(s: &str) -> String {
     if let Some(rest) = s.strip_prefix('~') {
         if rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\') {
             if let Some(home) = home_dir() {
-                return format!("{}{}", home, rest);
+                return format!("{home}{rest}");
             }
         }
     }
@@ -1141,7 +1141,7 @@ fn expandvars(s: &str) -> String {
                     let name: String = bytes[i + 2..i + 2 + end].iter().collect();
                     match std::env::var(&name) {
                         Ok(v) => out.push_str(&v),
-                        Err(_) => out.push_str(&format!("${{{}}}", name)),
+                        Err(_) => out.push_str(&format!("${{{name}}}")),
                     }
                     i = i + 2 + end + 1;
                     continue;
@@ -1212,7 +1212,7 @@ fn normpath(p: &str) -> String {
     }
     let body = stack.join("/");
     let joined = if is_abs {
-        format!("{}/{}", prefix, body)
+        format!("{prefix}/{body}")
     } else if prefix.is_empty() {
         if body.is_empty() {
             ".".to_string()
@@ -1220,7 +1220,7 @@ fn normpath(p: &str) -> String {
             body
         }
     } else {
-        format!("{}{}", prefix, body)
+        format!("{prefix}{body}")
     };
     if win {
         joined.replace('/', &sep.to_string())

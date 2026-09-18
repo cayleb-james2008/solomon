@@ -35,7 +35,6 @@ use std::os::windows::process::CommandExt;
 
 use serde_json::{json, Map, Value};
 
-use crate::control::proc;
 use crate::improver::ctx::{self, Ctx};
 
 // ---------------------------------------------------------------------------
@@ -1298,7 +1297,7 @@ impl Sandbox {
             // Kill the whole tree (taskkill /F /T on Windows; kill() elsewhere).
             #[cfg(windows)]
             {
-                let _ = proc::run(
+                let _ = crate::control::proc::run(
                     &["taskkill", "/F", "/T", "/PID", &child.id().to_string()],
                     None,
                     Some(Duration::from_secs(10)),
@@ -1493,14 +1492,14 @@ fn http_get_200(url: &str) -> Result<bool, String> {
 
 #[cfg(windows)]
 fn apply_hidden(cmd: &mut Command) {
-    cmd.creation_flags(proc::CREATE_NO_WINDOW);
+    cmd.creation_flags(crate::control::proc::CREATE_NO_WINDOW);
 }
 #[cfg(not(windows))]
 fn apply_hidden(_cmd: &mut Command) {}
 
 #[cfg(windows)]
 fn apply_hidden_group(cmd: &mut Command) {
-    cmd.creation_flags(proc::CREATE_NO_WINDOW | proc::CREATE_NEW_PROCESS_GROUP);
+    cmd.creation_flags(crate::control::proc::CREATE_NO_WINDOW | crate::control::proc::CREATE_NEW_PROCESS_GROUP);
 }
 #[cfg(not(windows))]
 fn apply_hidden_group(_cmd: &mut Command) {}

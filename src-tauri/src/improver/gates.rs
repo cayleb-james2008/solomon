@@ -415,7 +415,7 @@ fn run_cargo(c: &mut Ctx, dir: &Path, args: &[&str], timeout: Option<Duration>) 
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => proc::RunOut {
             code: 124,
             stdout: String::new(),
-            stderr: format!("[lint gate timed out after {}s]", LINT_GATE_TIMEOUT),
+            stderr: format!("[lint gate timed out after {LINT_GATE_TIMEOUT}s]"),
         },
         Err(e) => proc::RunOut {
             code: -1,
@@ -1615,7 +1615,7 @@ mod tests {
         let dir = unique_tmp("solomon-lint-fmt");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let src = "fn main(){let x=1;println!(\"{}\",x);}\n";
+        let src = "fn main(){let x=1;println!(\"{x}\");}\n";
         assert!(init_temp_crate(&dir, src), "cargo init failed");
         let mut c = Ctx::configure(dir.to_str().unwrap(), "lintgatetest", "ollama-cloud", None);
         let (ok, reason) = run_judge_mirror_lint_gate(&mut c);
