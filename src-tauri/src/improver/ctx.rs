@@ -51,7 +51,13 @@ pub fn providers(name: &str) -> Option<ProviderInfo> {
         "openrouter" => Some(ProviderInfo {
             ext: "provider.ts",
             pi_provider: "openrouter",
-            default_model: "qwen/qwen3-coder",
+            // 2026-09-18: qwen/qwen3-coder is PAID (see cheap_model below) and the operator's
+            // OpenRouter accounts are free-tier-only. The operator's rule is to use the
+            // highest-rated FREE model: `deepseek/deepseek-v4-flash-0731:free` has the top
+            // intelligence_index (34.5) among free models that support tool calling (z-ai/glm-5.2
+            // free scores 34.0 but supports no tools). `qwen/qwen3.8-27b:free` (33.9) is the
+            // escalation fallback below — see the note there.
+            default_model: "deepseek/deepseek-v4-flash-0731:free",
         }),
         _ => None,
     }
@@ -71,10 +77,16 @@ fn providers_or_default(name: &str) -> ProviderInfo {
 /// this credit is NOT to be spent on paid inference. z-ai/glm-4.6 is a PAID model; escalating to it
 /// would silently burn that credit on every 2nd consecutive failure. Fall back to the SAME free model
 /// (no stronger alternative to escalate to, by design) rather than a paid one.
+///
+/// 2026-09-18: the openrouter fallback is now `qwen/qwen3.8-27b:free` — free, and the highest
+/// *agentic* index (46.5) among current free models, which is the property that matters when the
+/// primary has 429'd or parked. It also completes bounded tool-calling probes reliably (~105s),
+/// which the higher-raw-intelligence `deepseek/deepseek-v4-flash-0731:free` did not do in this
+/// environment (261s/521s/621s timeouts). Both are free; nothing here touches the funded credit.
 pub fn fallback_model(provider_name: &str) -> Option<&'static str> {
     match provider_name {
         "ollama-cloud" => Some("kimi-k2.7-code"),
-        "openrouter" => Some("nvidia/nemotron-3-ultra-550b-a55b:free"),
+        "openrouter" => Some("qwen/qwen3.8-27b:free"),
         _ => None,
     }
 }
@@ -1458,7 +1470,7 @@ mod tests {
         // openrouter
         let c3 = Ctx::configure("C:/x/z", "z", "openrouter", None);
         assert_eq!(c3.pi_provider, "openrouter");
-        assert_eq!(c3.pi_model, "qwen/qwen3-coder");
+        assert_eq!(c3.pi_model, "deepseek/deepseek-v4-flash-0731:free");
     }
 
     // ---- redact ----
@@ -1950,7 +1962,7 @@ mod tests {
             "provider_name must refresh on provider swap"
         );
         assert_eq!(c.pi_provider, "openrouter");
-        assert_eq!(c.pi_model, "qwen/qwen3-coder"); // openrouter default model
+        assert_eq!(c.pi_model, "deepseek/deepseek-v4-flash-0731:free"); // openrouter default model
     }
 
     #[test]

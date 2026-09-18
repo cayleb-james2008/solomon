@@ -17,10 +17,19 @@ use serde_json::{Map, Value, json};
 use std::path::Path;
 
 // control._PROVIDER_DEFAULT_MODEL — keep in sync with improver/run_improver.py PROVIDERS.
+//
+// OpenRouter default (2026-09-18): the highest-rated FREE model. The operator's standing rule is
+// free-model-only on OpenRouter (see improver/ctx.rs), and the previous default
+// (`qwen/qwen3-coder`) was NOT free. Ranked by the `artificial_analysis.intelligence_index`
+// OpenRouter publishes for every model, the top free models with tool support are
+// deepseek/deepseek-v4-flash-0731:free (34.5) then qwen/qwen3.8-27b:free (33.9); z-ai/glm-5.2:free
+// (34.0) supports no tool calling and so cannot drive an agent. deepseek is therefore the default,
+// and qwen/qwen3.8-27b:free (the highest *agentic* index among free models, 46.5) is the
+// escalation fallback in improver/ctx.rs.
 fn provider_default_model(provider: &str) -> &'static str {
     match provider {
         "ollama-cloud" => "glm-5.2",
-        "openrouter" => "qwen/qwen3-coder",
+        "openrouter" => "deepseek/deepseek-v4-flash-0731:free",
         // control falls back to the ollama-cloud default for any unknown provider.
         _ => "glm-5.2",
     }
@@ -1262,7 +1271,10 @@ pub(crate) mod tests {
     #[test]
     fn provider_default_model_table() {
         assert_eq!(provider_default_model("ollama-cloud"), "glm-5.2");
-        assert_eq!(provider_default_model("openrouter"), "qwen/qwen3-coder");
+        assert_eq!(
+            provider_default_model("openrouter"),
+            "deepseek/deepseek-v4-flash-0731:free"
+        );
         assert_eq!(provider_default_model("anything-else"), "glm-5.2");
     }
 
@@ -1291,7 +1303,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             project_model(&json!({"provider": "openrouter"})),
-            "qwen/qwen3-coder"
+            "deepseek/deepseek-v4-flash-0731:free"
         );
         assert_eq!(project_model(&json!({"provider": "anthropic"})), "glm-5.2");
         assert_eq!(project_model(&Value::Null), "glm-5.2");

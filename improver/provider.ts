@@ -21,7 +21,7 @@ const PROVIDERS: Record<string, {
   "openrouter": {
     baseUrl: "https://openrouter.ai/api/v1",
     apiKey: "OPENROUTER_API_KEY",
-    defaultModel: "qwen/qwen3-coder",
+    defaultModel: "deepseek/deepseek-v4-flash-0731:free",
     name: "",  // fall back to the model id as the display name
     input: ["text"],
     contextWindow: 200000,
