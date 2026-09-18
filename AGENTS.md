@@ -21,13 +21,15 @@ without operator sign-off.
 
 ## Run / test / build
 
-All commands run in `src-tauri/`. The shipped app is pure Rust — no Python venv, no pytest suite, no
-Python runtime dependency. One exception to "no Python in the repo": `pecrt.py` (repo root) is the
+All commands run in `src-tauri/`. The shipped exe is pure Rust — no Python venv is needed to build
+or run it. Python in this repo means two things: `pecrt.py` (repo root), the
 doctrine-mandated decision-identical Python MIRROR of `src-tauri/src/pecrt/`, held in lockstep with
 the Rust side by a drift gate (`pecrt_golden.json` + `src-tauri/src/pecrt/drift.rs` in `cargo test`,
 plus the `python pecrt.py` self-check). Never edit one side alone — update both + the golden together.
 
-- **Gate / tests:** `cargo test` in `src-tauri/` (≈400 unit tests in `#[cfg(test)]` modules).
+- **Gate / tests:** `cargo test` in `src-tauri/` (1,232 `#[test]` functions in `#[cfg(test)]`
+  modules — reproduce with `grep -rhoE '#\[(tokio::)?test\]' src-tauri/src | wc -l` from the repo root).
+  The Python `solomon/` package has its own pytest suite: `python -m pytest tests/` (57 tests).
 - **Dashboard:** `solomon.exe` with no args → the Tauri GUI (WebView2; frontend in `web/`).
 - **Build exe:** `cargo build --release` in `src-tauri/` → `src-tauri/target/release/solomon.exe`
   (copy to repo-root `Solomon.exe`); or the Tauri bundler for the NSIS installer.

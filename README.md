@@ -16,6 +16,12 @@ Python, no companion runtime.
 The canonical loop spec and its invariants live in [`SOLOMON_RSI.md`](./SOLOMON_RSI.md); the
 agent guide lives in [`AGENTS.md`](./AGENTS.md). Read both before touching the harness.
 
+**Who it is for:** operators running a small fleet of repos who want overnight, gated
+improvement loops — observe, implement, test, ship-or-revert — instead of silent drift.
+**To try it:** clone this repo, run the gate with `cd src-tauri && cargo test`, then launch the
+dashboard with `cargo run --release`. See [What works today](#what-works-today) for what was
+verified on Linux, and the Quickstart below for the headless commands.
+
 ## What it does
 
 Each managed repo gets a lane. A lane runs an event-driven improvement loop: observe the repo's
@@ -44,12 +50,16 @@ cycle after cycle, without gambling the project, gaming its own metric, or repor
 
 ## Quickstart
 
-All commands run from `src-tauri/`. The shipped app is pure Rust — no Python venv, no pytest suite,
-no Python runtime dependency. One exception to "no Python in the repo": `pecrt.py` (repo root) is
-the doctrine-mandated decision-identical Python MIRROR of `src-tauri/src/pecrt/` — not a runtime
-component. Both implementations are pinned to `pecrt_golden.json` by a drift gate
-(`src-tauri/src/pecrt/drift.rs` in `cargo test`, plus `python pecrt.py` self-check); change shared
-constants only by updating both sides + the golden together.
+All commands run from `src-tauri/`. The shipped exe is pure Rust — no Python venv is needed to
+build or run it. Python in this repo means exactly two things, neither of which ships inside the
+exe: (1) `pecrt.py` (repo root), the doctrine-mandated decision-identical Python MIRROR of
+`src-tauri/src/pecrt/` — not a runtime component. Both implementations are pinned to
+`pecrt_golden.json` by a drift gate (`src-tauri/src/pecrt/drift.rs` in `cargo test`, plus
+`python pecrt.py` self-check); change shared constants only by updating both sides + the golden
+together. (2) The `solomon/` Python package — the in-progress v2 profit engine (autonomous-CEO
+and income-channel experiments, see `CONTEXT.md`) — with its own pytest suite in `tests/`
+(`python -m pytest tests/`, 57 tests). It is experimental scaffolding, not part of the shipped
+app and not part of the CI gate.
 
 ```sh
 # Run the test gate (the gate every PR must pass)
@@ -144,6 +154,48 @@ preemptive chokepoint (`src-tauri/src/money_guard.rs`), not merely stated in doc
 - **Safety posture is fail-closed by design:** honest-green ship gate, human-gated deploy, and the
   NO-MONEY-OUT chokepoint. When in doubt, the harness refuses rather than guesses.
 
+## What works today
+
+Verified on this Linux host (x86-64, Rust 1.88) during the 2026-09-18 polish pass:
+
+- `python3 pecrt.py` (repo root) — passes: `pecrt.py self-check: OK (all decision-mirror
+  checks passed)`.
+- `python -m pytest tests/` — 57 passed (the Python `solomon/` v2 package suite). Note: the
+  checkout's `pyproject.toml` did not declare PyYAML even though
+  `solomon/channels/content.py` imports `yaml`; fixed by adding `pyyaml>=6.0`, after which
+  all 57 pass. Browser-channel tests run without a real browser installed.
+- `cargo test` (in `src-tauri/`, unpiped run, exit code 101) —
+  `test result: FAILED. 1189 passed; 2 failed; 1 ignored`. The crate did not compile on
+  Linux as shipped (`src/ops/probe.rs` called the Windows-only `proc::run_win_shell`
+  behind a runtime `cfg!(windows)` check — hard error E0425 outside Windows); fixed with a
+  compile-time `#[cfg]` gate that leaves Windows behaviour byte-identical, after which the
+  suite builds and runs. The 2 failures are Windows/toolchain assumptions, not product
+  defects: (1) `improver::gates::tests::lint_gate_auto_corrects_fmt_in_loop` — the test's
+  `linttest` fixture fails under this host's clippy 0.1.88 (`uninlined_format_args`,
+  a lint the author's toolchain did not emit), so its auto-fix loop never converges;
+  (2) `ops::registry::tests::resolve_path_expands_env_repo_and_relative` — asserts a
+  `C:/…` drive-letter path is absolute, which is false on Linux. Details in
+  `POLISH-NOTES.md`. The release workflow and primary test path remain Windows
+  (`windows-latest` in CI); the Linux build path is best-effort.
+- `cargo clippy --all-targets -- -D warnings` (in `src-tauri/`, exit code 101) — NOT clean
+  on this host: `error: could not compile \`solomon\` (bin "solomon" test) due to 25
+  previous errors` (clippy 0.1.88, rustc 1.88.0). The errors are 24× `uninlined_format_args`
+  (newer-clippy style lint), 1× unused `super::*` import, 1× unused `proc` import (both
+  imports are used on Windows — kept deliberately), and 1× `assert!(true)`. The lints were
+  left untouched; the author's Windows CI toolchain does not emit them.
+- CI (`.github/workflows/ci.yml`, `release.yml`) — both are valid YAML and every
+  referenced path/script/command exists in the repo. Both target `windows-latest`, so they
+  are NOT RUN on this Linux host by design, not by defect.
+
+Needs Windows, a GPU, credentials, or external services (untested here):
+
+- The Tauri GUI dashboard (`cargo run --release`, WebView2) and the NSIS/`latest.json`
+  release pipeline — Windows-only.
+- Lane-agent LLM calls (`SOLOMON_LLM_*`, `OPENROUTER_API_KEY`), ntfy topics, and any live
+  lane probes against real Rated.B, exchange, or provider endpoints.
+- The `ort` (ONNX) and `lancedb` entries in the tech stack are available-but-unpinned
+  future extension points, not exercised features.
+
 ## Tech stack
 
 | Layer | Technology |
@@ -200,8 +252,9 @@ Key environment variables (documented in `.env.example`):
 
 ## Development & gates
 
-- **Test gate:** `cargo test` in `src-tauri/` (1,100+ unit tests in `#[cfg(test)]` modules) is the
-  gate every PR must pass. The pecrt drift gate rides inside it — never change
+- **Test gate:** `cargo test` in `src-tauri/` (1,232 `#[test]` functions in `#[cfg(test)]`
+  modules — reproduce with `grep -rhoE '#\[(tokio::)?test\]' src-tauri/src | wc -l` from the repo
+  root) is the gate every PR must pass. The pecrt drift gate rides inside it — never change
   `pecrt.py` / `src-tauri/src/pecrt/` / `pecrt_golden.json` on one side alone.
 - **Safe deploy:** never copy a freshly built exe over a running one by hand. Use
   `powershell -File tools\build_safe.ps1` — cargo writes only to `src-tauri\target\`, and the

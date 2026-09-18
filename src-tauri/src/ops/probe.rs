@@ -807,16 +807,19 @@ fn eval_cmd(cfg: &Value, repo_path: &str) -> ProbeOutcome {
     // Rust's Command::arg() applies its own quoting (wrapping in "..."), which when combined
     // with cmd /C's quote-stripping (finds LAST quote) mangles any command whose first arg
     // is a quoted path. run_win_shell bypasses Rust's quoting entirely.
-    let r = if cfg!(windows) {
-        match proc::run_win_shell(&command, None, Some(timeout)) {
-            Ok(r) => r,
-            Err(e) => return unobservable(&threshold, format!("spawn failed: {e}")),
-        }
-    } else {
-        match proc::run(&["/bin/sh", "-c", command.as_str()], None, Some(timeout)) {
-            Ok(r) => r,
-            Err(e) => return unobservable(&threshold, format!("spawn failed: {e}")),
-        }
+    // NOTE (2026-09-18 polish): `cfg!(windows)` is a *runtime* check, so the Windows-only
+    // `proc::run_win_shell` (gated `#[cfg(windows)]` in control/proc.rs) must also be gated at
+    // *compile* time — otherwise the crate does not build on Linux at all. Behaviour is unchanged
+    // on either platform: Windows keeps the byte-exact cmd.exe path, elsewhere /bin/sh -c.
+    #[cfg(windows)]
+    let r = match proc::run_win_shell(&command, None, Some(timeout)) {
+        Ok(r) => r,
+        Err(e) => return unobservable(&threshold, format!("spawn failed: {e}")),
+    };
+    #[cfg(not(windows))]
+    let r = match proc::run(&["/bin/sh", "-c", command.as_str()], None, Some(timeout)) {
+        Ok(r) => r,
+        Err(e) => return unobservable(&threshold, format!("spawn failed: {e}")),
     };
     match mode {
         "number" | "json_array_len" => {
