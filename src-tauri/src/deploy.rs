@@ -224,7 +224,10 @@ fn reason_contains(project: &Value, needle: &str) -> bool {
 
 /// The per-repo last-deploy marker path (`runtime/<name>/_last_deploy`).
 fn last_deploy_path(name: &str) -> PathBuf {
-    paths::here().join("runtime").join(name).join("_last_deploy")
+    paths::here()
+        .join("runtime")
+        .join(name)
+        .join("_last_deploy")
 }
 
 /// Age (seconds) since the last managed-app deploy for `name`, or None when there was none / the
@@ -255,7 +258,10 @@ fn stamp_last_deploy(name: &str) {
 
 /// The per-repo last-revive marker path (`runtime/<name>/_last_revive`).
 fn last_revive_path(name: &str) -> PathBuf {
-    paths::here().join("runtime").join(name).join("_last_revive")
+    paths::here()
+        .join("runtime")
+        .join(name)
+        .join("_last_revive")
 }
 
 /// Age (seconds) since the last managed-app revive for `name`, or None when there was none.
@@ -294,11 +300,7 @@ fn live_deploy_argv(repo_cfg: &Value, field: &str) -> Option<Vec<String>> {
         .filter_map(Value::as_str)
         .map(str::to_string)
         .collect();
-    if argv.is_empty() {
-        None
-    } else {
-        Some(argv)
-    }
+    if argv.is_empty() { None } else { Some(argv) }
 }
 
 /// Optional non-secret Sover profile selector carried by a managed launch. The tracked registry is
@@ -347,7 +349,11 @@ fn launch_argv_sane(argv: &[String], cwd: &Path) -> Result<(), String> {
             || lower.ends_with(".exe");
         if is_script {
             let p = Path::new(a);
-            let resolved = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
+            let resolved = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                cwd.join(p)
+            };
             if !resolved.exists() {
                 return Err(format!("launch script not found: {}", resolved.display()));
             }
@@ -369,7 +375,11 @@ fn short_head(repo_path: &str) -> String {
     ) {
         Ok(r) if r.ok() => {
             let s = r.stdout.trim();
-            if s.is_empty() { "?".to_string() } else { s.to_string() }
+            if s.is_empty() {
+                "?".to_string()
+            } else {
+                s.to_string()
+            }
         }
         _ => "?".to_string(),
     }
@@ -405,12 +415,7 @@ fn maybe_redeploy_managed_app(repo_cfg: &Value) -> Result<(), String> {
 
     // Rebuild the current HEAD in the repo cwd. Long timeout — a clean release build is minutes; a
     // timeout aborts the child and returns Err (no relaunch).
-    let r = run_live_deploy_command(
-        repo_cfg,
-        &rebuild,
-        &cwd,
-        Duration::from_secs(60 * 30),
-    )
+    let r = run_live_deploy_command(repo_cfg, &rebuild, &cwd, Duration::from_secs(60 * 30))
         .map_err(|e| format!("{name}: rebuild spawn failed: {e}"))?;
     if !r.ok() {
         let tail: String = r.stderr.trim().chars().take(300).collect();
@@ -431,7 +436,16 @@ fn maybe_redeploy_managed_app(repo_cfg: &Value) -> Result<(), String> {
     // Briefly confirm the process came up — the app_down condition should clear on the next probe.
     std::thread::sleep(Duration::from_secs(LAUNCH_CONFIRM_S));
     let up = app_process_up(repo_cfg);
-    page(&name, &head, true, if up { "process confirmed up" } else { "launched (process not yet visible)" });
+    page(
+        &name,
+        &head,
+        true,
+        if up {
+            "process confirmed up"
+        } else {
+            "launched (process not yet visible)"
+        },
+    );
     Ok(())
 }
 
@@ -507,7 +521,10 @@ fn maybe_revive_managed_app(repo_cfg: &Value) -> Result<(), String> {
     let lr = run_live_deploy_command(repo_cfg, &launch, &cwd, Duration::from_secs(60))
         .map_err(|e| format!("{name}: launch spawn failed: {e}"))?;
     if !lr.ok() {
-        let msg = format!("{name}: revive relaunch FAILED (code {}) at {head}", lr.code);
+        let msg = format!(
+            "{name}: revive relaunch FAILED (code {}) at {head}",
+            lr.code
+        );
         page_revive(&name, &head, false, &format!("relaunch exit {}", lr.code));
         return Err(msg);
     }
@@ -515,7 +532,16 @@ fn maybe_revive_managed_app(repo_cfg: &Value) -> Result<(), String> {
     // Briefly confirm the process came up.
     std::thread::sleep(Duration::from_secs(LAUNCH_CONFIRM_S));
     let up = app_process_up(repo_cfg);
-    page_revive(&name, &head, true, if up { "process confirmed up" } else { "launched (process not yet visible)" });
+    page_revive(
+        &name,
+        &head,
+        true,
+        if up {
+            "process confirmed up"
+        } else {
+            "launched (process not yet visible)"
+        },
+    );
     Ok(())
 }
 
@@ -663,7 +689,10 @@ mod tests {
     fn should_redeploy_true_only_on_full_condition() {
         let repo = live_repo();
         // all conditions met (no prior deploy) -> deploy
-        assert!(should_redeploy(&repo, true, true, None, true), "full condition -> deploy");
+        assert!(
+            should_redeploy(&repo, true, true, None, true),
+            "full condition -> deploy"
+        );
         // cooldown elapsed (age > 1800) -> deploy
         assert!(should_redeploy(&repo, true, true, Some(1801), true));
     }
@@ -685,14 +714,26 @@ mod tests {
     fn should_redeploy_cooldown_blocks() {
         let repo = live_repo();
         // within cooldown (age <= 1800) -> blocked
-        assert!(!should_redeploy(&repo, true, true, Some(1800), true), "== cooldown -> blocked");
-        assert!(!should_redeploy(&repo, true, true, Some(5), true), "recent deploy -> blocked");
+        assert!(
+            !should_redeploy(&repo, true, true, Some(1800), true),
+            "== cooldown -> blocked"
+        );
+        assert!(
+            !should_redeploy(&repo, true, true, Some(5), true),
+            "recent deploy -> blocked"
+        );
         // default cooldown (no cooldown_s) is 1800s
         let repo_default = json!({
             "name": "x",
             "live_deploy": {"rebuild": ["a"], "launch": ["b"]}
         });
-        assert!(!should_redeploy(&repo_default, true, true, Some(1800), true));
+        assert!(!should_redeploy(
+            &repo_default,
+            true,
+            true,
+            Some(1800),
+            true
+        ));
         assert!(should_redeploy(&repo_default, true, true, Some(1801), true));
     }
 
@@ -709,9 +750,15 @@ mod tests {
     fn should_redeploy_app_up_or_current_false() {
         let repo = live_repo();
         // app UP (not down) but deploy gap -> do NOT interrupt a healthy running app
-        assert!(!should_redeploy(&repo, true, false, None, true), "app up -> no deploy");
+        assert!(
+            !should_redeploy(&repo, true, false, None, true),
+            "app up -> no deploy"
+        );
         // app down but binary CURRENT (no deploy gap) -> nothing to deploy
-        assert!(!should_redeploy(&repo, false, true, None, true), "binary current -> no deploy");
+        assert!(
+            !should_redeploy(&repo, false, true, None, true),
+            "binary current -> no deploy"
+        );
         // neither
         assert!(!should_redeploy(&repo, false, false, None, true));
     }
@@ -743,7 +790,10 @@ mod tests {
                 "process=red (Sover.exe NOT running)"
             ]
         });
-        assert!(project_deploy_gap(&project), "deploy gap detected from reasons");
+        assert!(
+            project_deploy_gap(&project),
+            "deploy gap detected from reasons"
+        );
         assert!(project_app_down(&project), "app-down detected from reasons");
 
         // a healthy rollup -> neither
@@ -794,7 +844,10 @@ mod tests {
             &json!({"live_deploy": {"recovery_require_green": []}}),
             &ready
         ));
-        assert!(project_recovery_ready(&live_repo(), &json!({})), "legacy repos still honor the global restart_forbidden flag without requiring a probe list");
+        assert!(
+            project_recovery_ready(&live_repo(), &json!({})),
+            "legacy repos still honor the global restart_forbidden flag without requiring a probe list"
+        );
     }
 
     // -------- per-sweep cap: at most ONE managed-app deploy across all repos --------
@@ -804,7 +857,10 @@ mod tests {
     // one sweep regardless of how many repos are gap+down.
     #[test]
     fn per_sweep_cap_is_one() {
-        assert_eq!(MAX_DEPLOYS_PER_SWEEP, 1, "one heavy build per sweep — the meltdown guard");
+        assert_eq!(
+            MAX_DEPLOYS_PER_SWEEP, 1,
+            "one heavy build per sweep — the meltdown guard"
+        );
     }
 
     // -------- live_deploy_argv: parse rebuild/launch argv --------
@@ -813,16 +869,30 @@ mod tests {
         let repo = live_repo();
         assert_eq!(
             live_deploy_argv(&repo, "rebuild"),
-            Some(vec!["cargo".to_string(), "build".to_string(), "--release".to_string()])
+            Some(vec![
+                "cargo".to_string(),
+                "build".to_string(),
+                "--release".to_string()
+            ])
         );
         assert_eq!(
             live_deploy_argv(&repo, "launch"),
-            Some(vec!["cmd".to_string(), "/c".to_string(), "launch_ggg.bat".to_string()])
+            Some(vec![
+                "cmd".to_string(),
+                "/c".to_string(),
+                "launch_ggg.bat".to_string()
+            ])
         );
         // missing field -> None
-        assert_eq!(live_deploy_argv(&json!({"live_deploy": {}}), "rebuild"), None);
+        assert_eq!(
+            live_deploy_argv(&json!({"live_deploy": {}}), "rebuild"),
+            None
+        );
         // empty argv -> None (never spawn an empty command)
-        assert_eq!(live_deploy_argv(&json!({"live_deploy": {"rebuild": []}}), "rebuild"), None);
+        assert_eq!(
+            live_deploy_argv(&json!({"live_deploy": {"rebuild": []}}), "rebuild"),
+            None
+        );
         // no live_deploy at all -> None
         assert_eq!(live_deploy_argv(&json!({}), "rebuild"), None);
     }
@@ -833,22 +903,31 @@ mod tests {
             "profile_env_key": "SOVER_PROFILE",
             "profile_env": "ggg"
         }});
-        assert_eq!(live_deploy_profile_env(&repo), Some(("SOVER_PROFILE", "ggg")));
+        assert_eq!(
+            live_deploy_profile_env(&repo),
+            Some(("SOVER_PROFILE", "ggg"))
+        );
         assert_eq!(
             live_deploy_profile_env(&json!({"live_deploy": {"profile_env_key": "SOVER_PROFILE"}})),
             None
         );
         assert_eq!(
-            live_deploy_profile_env(&json!({"live_deploy": {"profile_env_key": "", "profile_env": "ggg"}})),
+            live_deploy_profile_env(
+                &json!({"live_deploy": {"profile_env_key": "", "profile_env": "ggg"}})
+            ),
             None
         );
         assert_eq!(
-            live_deploy_profile_env(&json!({"live_deploy": {"profile_env_key": "PATH", "profile_env": "ggg"}})),
+            live_deploy_profile_env(
+                &json!({"live_deploy": {"profile_env_key": "PATH", "profile_env": "ggg"}})
+            ),
             None,
             "tracked config cannot override arbitrary process environment"
         );
         assert_eq!(
-            live_deploy_profile_env(&json!({"live_deploy": {"profile_env_key": "SOVER_PROFILE", "profile_env": "..\\other"}})),
+            live_deploy_profile_env(
+                &json!({"live_deploy": {"profile_env_key": "SOVER_PROFILE", "profile_env": "..\\other"}})
+            ),
             None,
             "profile selectors are names, not paths"
         );
@@ -878,7 +957,10 @@ mod tests {
         ];
         let err = launch_argv_sane(&argv, &dir).unwrap_err();
         assert!(err.contains("launch script not found"), "got: {err}");
-        assert!(err.contains("does_not_exist.ps1"), "err should name the path: {err}");
+        assert!(
+            err.contains("does_not_exist.ps1"),
+            "err should name the path: {err}"
+        );
     }
 
     #[test]
@@ -903,7 +985,10 @@ mod tests {
     fn should_revive_true_only_when_app_down_and_binary_current() {
         let repo = live_repo();
         // App DOWN + binary CURRENT (no deploy gap) + no prior revive -> revive
-        assert!(should_revive(&repo, false, true, None, true), "app down + binary current -> revive");
+        assert!(
+            should_revive(&repo, false, true, None, true),
+            "app down + binary current -> revive"
+        );
         // Cooldown elapsed (age > 300) -> revive
         assert!(should_revive(&repo, false, true, Some(301), true));
     }
@@ -922,8 +1007,14 @@ mod tests {
     fn should_revive_cooldown_blocks() {
         let repo = live_repo();
         // Within cooldown (age <= 300) -> blocked
-        assert!(!should_revive(&repo, false, true, Some(300), true), "== cooldown -> blocked");
-        assert!(!should_revive(&repo, false, true, Some(5), true), "recent revive -> blocked");
+        assert!(
+            !should_revive(&repo, false, true, Some(300), true),
+            "== cooldown -> blocked"
+        );
+        assert!(
+            !should_revive(&repo, false, true, Some(5), true),
+            "recent revive -> blocked"
+        );
         // Default cooldown (no revive_cooldown_s) is 300s
         let repo_default = json!({
             "name": "x",
@@ -946,9 +1037,15 @@ mod tests {
     fn should_revive_app_up_or_deploy_gap_false() {
         let repo = live_repo();
         // App UP -> no revive (nothing to restart)
-        assert!(!should_revive(&repo, false, false, None, true), "app up -> no revive");
+        assert!(
+            !should_revive(&repo, false, false, None, true),
+            "app up -> no revive"
+        );
         // Deploy gap (stale binary) -> no revive (that's should_redeploy's job — rebuild needed)
-        assert!(!should_revive(&repo, true, true, None, true), "deploy gap -> no revive (needs rebuild)");
+        assert!(
+            !should_revive(&repo, true, true, None, true),
+            "deploy gap -> no revive (needs rebuild)"
+        );
         // Both deploy gap AND app up -> no revive
         assert!(!should_revive(&repo, true, false, None, true));
         // Neither (both false) -> no revive
@@ -963,13 +1060,19 @@ mod tests {
             revive_cooldown_s(&json!({"live_deploy": {"revive_cooldown_s": 120}})),
             120
         );
-        assert_eq!(revive_cooldown_s(&json!({"live_deploy": {}})), DEFAULT_REVIVE_COOLDOWN_S);
+        assert_eq!(
+            revive_cooldown_s(&json!({"live_deploy": {}})),
+            DEFAULT_REVIVE_COOLDOWN_S
+        );
         assert_eq!(revive_cooldown_s(&json!({})), DEFAULT_REVIVE_COOLDOWN_S);
     }
 
     // -------- per-sweep revive cap --------
     #[test]
     fn per_sweep_revive_cap_is_one() {
-        assert_eq!(MAX_REVIVES_PER_SWEEP, 1, "one revive per sweep — separate from the deploy budget");
+        assert_eq!(
+            MAX_REVIVES_PER_SWEEP, 1,
+            "one revive per sweep — separate from the deploy budget"
+        );
     }
 }

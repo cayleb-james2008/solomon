@@ -26,7 +26,7 @@
 //! with zero new wiring), meters real spawns via [`record_call`], and classifies outcomes into
 //! [`record_quota`] / [`record_success`].
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -279,17 +279,10 @@ fn with_endpoint<T>(
     );
     let mut root = read_ledger(dir);
     let key = endpoint_key(provider, model);
-    let mut ep = endpoint_from(
-        root.get("endpoints").and_then(|e| e.get(&key)),
-        now,
-    );
+    let mut ep = endpoint_from(root.get("endpoints").and_then(|e| e.get(&key)), now);
     rollover(&mut ep, now);
     let r = f(&mut ep);
-    if !root
-        .get("endpoints")
-        .map(Value::is_object)
-        .unwrap_or(false)
-    {
+    if !root.get("endpoints").map(Value::is_object).unwrap_or(false) {
         root["endpoints"] = json!({});
     }
     root["endpoints"][&key] = endpoint_to_value(&ep);
@@ -462,7 +455,11 @@ pub fn effective_endpoint(ctx: &mut Ctx) -> (String, String, bool) {
         .get("fallback")
         .and_then(Value::as_object)
         .and_then(|f| {
-            let p = f.get("provider").and_then(Value::as_str).unwrap_or("").trim();
+            let p = f
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
             let m = f.get("model").and_then(Value::as_str).unwrap_or("").trim();
             if p.is_empty() || m.is_empty() {
                 None
@@ -518,7 +515,10 @@ fn nonce8() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    format!("{:08x}", (nanos ^ ((std::process::id() as u64) << 17)) as u32)
+    format!(
+        "{:08x}",
+        (nanos ^ ((std::process::id() as u64) << 17)) as u32
+    )
 }
 
 /// Exact-content check: the file must be the single line `CANARY-OK-<nonce>` (one trailing newline
@@ -635,7 +635,9 @@ line CANARY-OK-{nonce}. Do not do anything else."
     let out = match run_command_bounded(cmd, CANARY_TIMEOUT_S) {
         Some(o) => o,
         None => {
-            ctx.log(&format!("canary {provider}:{model} FAIL — pi did not spawn"));
+            ctx.log(&format!(
+                "canary {provider}:{model} FAIL — pi did not spawn"
+            ));
             return false;
         }
     };
@@ -654,7 +656,9 @@ line CANARY-OK-{nonce}. Do not do anything else."
             ep.last_canary_pass = now;
             ep.consecutive_429 = 0;
         });
-        ctx.log(&format!("canary {provider}:{model} PASS (diff-verified CANARY.txt)"));
+        ctx.log(&format!(
+            "canary {provider}:{model} PASS (diff-verified CANARY.txt)"
+        ));
     } else {
         ctx.log(&format!(
             "canary {provider}:{model} FAIL — CANARY.txt missing or wrong content (rc={})",
@@ -748,7 +752,11 @@ mod tests {
         assert_eq!(park_backoff_s(5), 14400);
         assert_eq!(park_backoff_s(6), 21600, "6th hits the 6h cap exactly");
         assert_eq!(park_backoff_s(7), 21600, "cap holds forever after");
-        assert_eq!(park_backoff_s(64), 21600, "shift clamp: no overflow at absurd counts");
+        assert_eq!(
+            park_backoff_s(64),
+            21600,
+            "shift clamp: no overflow at absurd counts"
+        );
         // explicitly NOT the Gen-2 86400s blanket
         assert!(park_backoff_s(64) < 86_400);
     }
@@ -767,7 +775,10 @@ mod tests {
         // a success resets the streak: the NEXT quota error starts back at 15min
         record_success_at(&dir, "p", "m", now + 3601);
         assert_eq!(read_ep(&dir, "p", "m")["consecutive_429"], json!(0));
-        assert_eq!(record_quota_at(&dir, "p", "m", now + 3700), now + 3700 + 900);
+        assert_eq!(
+            record_quota_at(&dir, "p", "m", now + 3700),
+            now + 3700 + 900
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -828,7 +839,10 @@ mod tests {
             json!({"window_cap_calls": 5, "window_started": t0, "spent_calls": 5,
                    "park_until": 0, "consecutive_429": 0, "last_canary_pass": 0}),
         );
-        assert!(preflight_at(&dir, "p", "m", t0).is_parked(), "cap spent -> parked");
+        assert!(
+            preflight_at(&dir, "p", "m", t0).is_parked(),
+            "cap spent -> parked"
+        );
         assert!(
             !preflight_at(&dir, "p", "m", t0 + WEEK_S + 1).is_parked(),
             "new window -> spend again"
@@ -883,7 +897,10 @@ mod tests {
     fn preflight_seeds_endpoint_on_first_sight_with_default_cap() {
         let dir = test_dir();
         let now = unix_now();
-        assert_eq!(preflight_at(&dir, "new-prov", "new-model", now), Decision::Proceed);
+        assert_eq!(
+            preflight_at(&dir, "new-prov", "new-model", now),
+            Decision::Proceed
+        );
         let ep = read_ep(&dir, "new-prov", "new-model");
         assert_eq!(ep["window_cap_calls"], json!(3500));
         assert_eq!(ep["spent_calls"], json!(0));
@@ -931,7 +948,14 @@ mod tests {
         );
         // parked, fallback canaried within 24h -> fallback
         assert_eq!(
-            choose_endpoint(prim, true, fb(), false, Some(CANARY_FRESH_S), &mut no_canary),
+            choose_endpoint(
+                prim,
+                true,
+                fb(),
+                false,
+                Some(CANARY_FRESH_S),
+                &mut no_canary
+            ),
             ("openrouter".to_string(), "nemo".to_string(), true)
         );
     }
@@ -949,7 +973,14 @@ mod tests {
             false
         };
         assert_eq!(
-            choose_endpoint(prim, true, fb(), false, Some(CANARY_FRESH_S + 1), &mut failing),
+            choose_endpoint(
+                prim,
+                true,
+                fb(),
+                false,
+                Some(CANARY_FRESH_S + 1),
+                &mut failing
+            ),
             ("maki-cloud".to_string(), "glm-5.2".to_string(), false),
             "an uncanaried fallback must NOT be adopted (dead-fallback guard)"
         );
@@ -1002,7 +1033,10 @@ mod tests {
         }]);
         let mut c = test_ctx(Some(rows));
         let (p, m, is_fb) = effective_endpoint(&mut c);
-        assert_eq!((p, m, is_fb), (c.pi_provider.clone(), c.pi_model.clone(), false));
+        assert_eq!(
+            (p, m, is_fb),
+            (c.pi_provider.clone(), c.pi_model.clone(), false)
+        );
 
         // parked primary + parked fallback -> primary (run_pi's preflight then refuses honestly)
         let rows = json!([{
@@ -1020,9 +1054,17 @@ mod tests {
         // parked primary + NO fallback key -> primary, and no canary attempted
         let mut c = test_ctx(Some(json!([{ "name": "budgettest" }])));
         let dir = fleet_runtime_dir(&c);
-        record_quota_at(&dir, &c.pi_provider.clone(), &c.pi_model.clone(), unix_now());
+        record_quota_at(
+            &dir,
+            &c.pi_provider.clone(),
+            &c.pi_model.clone(),
+            unix_now(),
+        );
         let (p, m, is_fb) = effective_endpoint(&mut c);
-        assert_eq!((p, m, is_fb), (c.pi_provider.clone(), c.pi_model.clone(), false));
+        assert_eq!(
+            (p, m, is_fb),
+            (c.pi_provider.clone(), c.pi_model.clone(), false)
+        );
     }
 
     // ---- canary content verification (manual file, wrong nonce) ----
@@ -1045,7 +1087,10 @@ mod tests {
         std::fs::write(&path, "I created the file!\nCANARY-OK-1a2b3c4d\n").unwrap();
         assert!(!canary_file_ok(&path, "1a2b3c4d"));
         std::fs::write(&path, "CANARY-OK-1a2b3c4d\n\n").unwrap();
-        assert!(!canary_file_ok(&path, "1a2b3c4d"), "two trailing newlines is not the single line");
+        assert!(
+            !canary_file_ok(&path, "1a2b3c4d"),
+            "two trailing newlines is not the single line"
+        );
         // missing file -> fail
         assert!(!canary_file_ok(&dir.join("NOPE.txt"), "1a2b3c4d"));
         // nonce shape: 8 hex chars
@@ -1074,9 +1119,15 @@ mod tests {
         // stale lock: a leftover lockfile older than the threshold is broken, not waited on
         std::fs::write(dir.join(LOCK_NAME), "dead-holder").unwrap();
         let g3 = acquire_lock(&dir, Duration::from_millis(400), Duration::from_secs(0));
-        assert!(g3.is_some(), "stale (0s threshold) lock must be broken and re-acquired");
+        assert!(
+            g3.is_some(),
+            "stale (0s threshold) lock must be broken and re-acquired"
+        );
         drop(g3);
-        assert!(!dir.join(LOCK_NAME).exists(), "guard drop removes the lockfile");
+        assert!(
+            !dir.join(LOCK_NAME).exists(),
+            "guard drop removes the lockfile"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -20,7 +20,7 @@
 
 use crate::control::{paths, proc};
 use chrono::Utc;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 /// A single operator notice. `priority` is the ntfy priority wire word:
@@ -36,16 +36,36 @@ pub struct Notice {
 
 impl Notice {
     pub fn red(title: String, body: String) -> Notice {
-        Notice { title, body, priority: "urgent", tags: "rotating_light" }
+        Notice {
+            title,
+            body,
+            priority: "urgent",
+            tags: "rotating_light",
+        }
     }
     pub fn recovered(title: String, body: String) -> Notice {
-        Notice { title, body, priority: "default", tags: "white_check_mark" }
+        Notice {
+            title,
+            body,
+            priority: "default",
+            tags: "white_check_mark",
+        }
     }
     pub fn report(title: String, body: String) -> Notice {
-        Notice { title, body, priority: "default", tags: "clipboard" }
+        Notice {
+            title,
+            body,
+            priority: "default",
+            tags: "clipboard",
+        }
     }
     pub fn plan(title: String, body: String) -> Notice {
-        Notice { title, body, priority: "low", tags: "sunrise" }
+        Notice {
+            title,
+            body,
+            priority: "low",
+            tags: "sunrise",
+        }
     }
 }
 
@@ -70,7 +90,10 @@ pub fn env_value(key: &str) -> Option<String> {
 
 /// The global kill-switch: process env OR .env line `SOLOMON_NOTIFY_OFF=1`.
 fn notify_off() -> bool {
-    if std::env::var("SOLOMON_NOTIFY_OFF").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("SOLOMON_NOTIFY_OFF")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         return true;
     }
     env_value("SOLOMON_NOTIFY_OFF").as_deref() == Some("1")
@@ -163,7 +186,13 @@ pub fn send(n: &Notice) -> Value {
             None => "skipped (no NTFY_TOPIC in .env)".to_string(),
         };
         let cmd = toast_command(&n.title, &n.body);
-        let toast_args = ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd.as_str()];
+        let toast_args = [
+            "powershell",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            cmd.as_str(),
+        ];
         let toast = match proc::run(&toast_args, None, Some(Duration::from_secs(10))) {
             Ok(r) if r.ok() => "shown".to_string(),
             Ok(r) => format!("error: powershell exit {}", r.code),
@@ -183,7 +212,10 @@ fn append_log(record: &Value) {
             std::fs::create_dir_all(parent)?;
         }
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
         writeln!(f, "{}", serde_json::to_string(record).unwrap_or_default())?;
         Ok(())
     })();
@@ -193,12 +225,21 @@ fn append_log(record: &Value) {
 /// Unknown/malformed records map to None and are silently skipped, never a panic.
 pub fn incident_notice(record: &Value) -> Option<Notice> {
     let event = record.get("event").and_then(Value::as_str)?;
-    let probe_id = record.get("probe_id").and_then(Value::as_str).unwrap_or("?");
+    let probe_id = record
+        .get("probe_id")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
     let detail = record.get("detail").and_then(Value::as_str).unwrap_or("");
     match event {
         "red" => Some(Notice::red(
             format!("Solomon: {probe_id} RED"),
-            format!("{detail}\nsince {}", record.get("first_red_ts").and_then(Value::as_str).unwrap_or("now")),
+            format!(
+                "{detail}\nsince {}",
+                record
+                    .get("first_red_ts")
+                    .and_then(Value::as_str)
+                    .unwrap_or("now")
+            ),
         )),
         "recovered" => Some(Notice::recovered(
             format!("Solomon: {probe_id} recovered"),
@@ -252,7 +293,10 @@ mod tests {
 
     #[test]
     fn xml_escape_vectors() {
-        assert_eq!(xml_escape("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+        assert_eq!(
+            xml_escape("a&b<c>d\"e'f"),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
         assert_eq!(xml_escape("plain"), "plain");
     }
 
@@ -288,21 +332,31 @@ mod tests {
     // but writes NOTHING to the delivery log.
     #[test]
     fn send_honors_kill_switch_and_does_not_pollute_the_log() {
-        let _env = super::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        let _env = super::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        }
         let path = paths::here().join("runtime").join("_notify.jsonl");
-        let lines_before = std::fs::read_to_string(&path).map(|s| s.lines().count()).unwrap_or(0);
+        let lines_before = std::fs::read_to_string(&path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
 
         let rec = send(&Notice::report("t".into(), "b".into()));
         assert_eq!(rec["ntfy"], "off");
         assert_eq!(rec["toast"], "off");
 
-        let lines_after = std::fs::read_to_string(&path).map(|s| s.lines().count()).unwrap_or(0);
+        let lines_after = std::fs::read_to_string(&path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
         assert_eq!(
             lines_after, lines_before,
             "a kill-switched send must not append to the live _notify.jsonl"
         );
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        unsafe {
+            std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        }
     }
 
     // -------- Part 2: an OUTCOME-probe RED transition pages the operator LOUDLY (urgent) --------
@@ -326,8 +380,14 @@ mod tests {
                 "first_red_ts": "2026-07-01T00:00:00Z"
             });
             let n = incident_notice(&red).expect("a red incident must map to a notice");
-            assert_eq!(n.priority, "urgent", "{probe} RED must page at urgent priority");
-            assert_eq!(n.tags, "rotating_light", "{probe} RED must carry the loud tag");
+            assert_eq!(
+                n.priority, "urgent",
+                "{probe} RED must page at urgent priority"
+            );
+            assert_eq!(
+                n.tags, "rotating_light",
+                "{probe} RED must carry the loud tag"
+            );
             assert!(n.title.contains(probe), "{probe} title: {}", n.title);
         }
     }

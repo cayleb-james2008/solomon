@@ -13,24 +13,24 @@
 //! preserves heartbeat key-insertion order (the dashboard reads `heartbeat.json` whole).
 #![allow(dead_code)]
 
-pub mod ctx;
-pub mod pi;
-pub mod brain;
-pub mod gitops;
-pub mod gates;
-pub mod build_sem;
-pub mod escalation;
 pub mod backlog;
-pub mod freshness;
-pub mod park;
+pub mod brain;
 pub mod budget;
+pub mod build_sem;
 pub mod calibration;
-pub mod outcome_critique;
-pub mod progress;
-pub mod ship;
-pub mod tiers;
-pub mod phases;
-pub mod visual;
+pub mod ctx;
+pub mod escalation;
+pub mod freshness;
+pub mod gates;
+pub mod gitops;
 pub mod iteration;
 pub mod oneshot;
+pub mod outcome_critique;
+pub mod park;
+pub mod phases;
+pub mod pi;
+pub mod progress;
 pub mod run;
+pub mod ship;
+pub mod tiers;
+pub mod visual;

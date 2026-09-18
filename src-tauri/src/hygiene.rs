@@ -41,7 +41,12 @@ impl HygieneIssue {
 /// PURE classifier. In-flight rsi loops are exempt (`running` => empty). Otherwise:
 /// tracked_dirty => Dirty; a resolvable branch that differs from a resolvable base
 /// (ANY prefix) => OffBase.
-pub fn classify(current: &str, base: &str, tracked_dirty: bool, running: bool) -> Vec<HygieneIssue> {
+pub fn classify(
+    current: &str,
+    base: &str,
+    tracked_dirty: bool,
+    running: bool,
+) -> Vec<HygieneIssue> {
     if running {
         return Vec::new();
     }
@@ -126,7 +131,10 @@ mod tests {
         // stranded on codex/* — the asmodeus key case branch_hygiene.off_base misses
         assert_eq!(classify("codex/x", "main", false, false), vec![OffBase]);
         // both problems at once, order Dirty then OffBase
-        assert_eq!(classify("codex/x", "main", true, false), vec![Dirty, OffBase]);
+        assert_eq!(
+            classify("codex/x", "main", true, false),
+            vec![Dirty, OffBase]
+        );
         // in-flight rsi loop is exempt even when dirty + off base
         assert_eq!(classify("rsi/iter-3", "main", true, true), vec![]);
         // unresolvable current branch: dirty only, no off_base

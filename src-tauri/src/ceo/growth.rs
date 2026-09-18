@@ -65,7 +65,7 @@ use crate::ceo::orchestrator::{Specialist, Task, TaskKind};
 use crate::control::{paths, proc};
 use crate::pecrt::warm::ObservationLog;
 use chrono::Utc;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -201,11 +201,7 @@ impl GrowthSpecialist {
             .filter_map(Value::as_str)
             .map(str::to_string)
             .collect();
-        if argv.is_empty() {
-            None
-        } else {
-            Some(argv)
-        }
+        if argv.is_empty() { None } else { Some(argv) }
     }
 
     /// Append the DRAFT growth-content fact to the lane's growth-drafts log (a LOCAL append under
@@ -319,7 +315,11 @@ impl GrowthSpecialist {
                 });
             }
         };
-        let cwd = cfg.get("cwd").and_then(Value::as_str).unwrap_or("").to_string();
+        let cwd = cfg
+            .get("cwd")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
 
         if !Self::is_live_publish(repo) {
             // DRY-RUN-FIRST: report the sanctioned lane that WOULD run, WITHOUT spawning it. The
@@ -691,7 +691,10 @@ pub(crate) fn eligible_repo(repo: &Value, north_star: &str, rollup: &Value) -> b
 /// as engine-dead — fail closed, so pre-flag rollups and sweep-panic entries keep the strict
 /// green-before-growth behavior. Pure — unit-tested.
 pub(crate) fn red_on_operator_gated_probes_only(rollup: &Value) -> bool {
-    rollup.get("red_operator_gated_only").and_then(Value::as_bool) == Some(true)
+    rollup
+        .get("red_operator_gated_only")
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 /// `runtime/<lane>/_growth_drafted_<YYYY-MM-DD>` — the per-lane per-day compose marker (a sibling
@@ -703,7 +706,9 @@ fn growth_stamp_path(repo: &Value, date: &str) -> Option<PathBuf> {
 /// True iff this lane already consumed today's compose attempt (the stamp exists). A NAMELESS row
 /// can never be stamped, so it reads as already-drafted (never attempted) — fail-closed.
 pub(crate) fn already_drafted(repo: &Value, date: &str) -> bool {
-    growth_stamp_path(repo, date).map(|p| p.exists()).unwrap_or(true)
+    growth_stamp_path(repo, date)
+        .map(|p| p.exists())
+        .unwrap_or(true)
 }
 
 /// Atomically CLAIM the day's compose attempt: create the stamp with `create_new` so exactly one
@@ -714,13 +719,19 @@ fn claim_growth_stamp(repo: &Value, date: &str) -> bool {
     use std::io::Write;
     (|| -> std::io::Result<()> {
         let p = growth_stamp_path(repo, date).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "nameless lane — no runtime dir")
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "nameless lane — no runtime dir",
+            )
         })?;
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&p)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p)?;
         f.write_all(format!("attempt {ts}").as_bytes())
     })()
     .is_ok()
@@ -732,7 +743,10 @@ fn claim_growth_stamp(repo: &Value, date: &str) -> bool {
 fn stamp_growth(repo: &Value, date: &str, note: &str) {
     let _ = (|| -> std::io::Result<()> {
         let p = growth_stamp_path(repo, date).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "nameless lane — no runtime dir")
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "nameless lane — no runtime dir",
+            )
         })?;
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
@@ -754,8 +768,14 @@ pub(crate) fn parse_growth_reply(reply: &str) -> Option<(String, String, String)
         Some(k @ ("readme" | "release_note" | "post")) => k.to_string(),
         _ => "post".to_string(),
     };
-    let title = super::cap_line(parsed.get("title").and_then(Value::as_str).unwrap_or(""), 120);
-    let body = super::cap_line(parsed.get("body").and_then(Value::as_str).unwrap_or(""), 800);
+    let title = super::cap_line(
+        parsed.get("title").and_then(Value::as_str).unwrap_or(""),
+        120,
+    );
+    let body = super::cap_line(
+        parsed.get("body").and_then(Value::as_str).unwrap_or(""),
+        800,
+    );
     if body.is_empty() {
         return None;
     }
@@ -951,7 +971,10 @@ fn compose_and_dispatch(
         stamp_growth(
             repo,
             today,
-            &format!("skip:dispatch_refused {}", super::cap_line(&out.to_string(), 160)),
+            &format!(
+                "skip:dispatch_refused {}",
+                super::cap_line(&out.to_string(), 160)
+            ),
         );
     }
 }
@@ -1039,13 +1062,19 @@ fn claim_published_day(repo: &Value, date: &str) -> bool {
     use std::io::Write;
     (|| -> std::io::Result<()> {
         let p = published_day_marker_path(repo, date).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "nameless lane — no runtime dir")
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "nameless lane — no runtime dir",
+            )
         })?;
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&p)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p)?;
         f.write_all(format!("publish attempt {ts}").as_bytes())
     })()
     .is_ok()
@@ -1059,7 +1088,11 @@ fn claim_published_day(repo: &Value, date: &str) -> bool {
 /// (surfaced for observability + the tests). This is content + persona safety, NOT a human gate.
 pub(crate) fn auto_publish_content_check(newest: &str) -> Result<String, &'static str> {
     // The composer writes `<date>\t<fact>` TEXT lines; publish the fact after an optional date tab.
-    let text = newest.split_once('\t').map(|(_d, rest)| rest).unwrap_or(newest).trim();
+    let text = newest
+        .split_once('\t')
+        .map(|(_d, rest)| rest)
+        .unwrap_or(newest)
+        .trim();
     if text.is_empty() {
         return Err("empty draft"); // nothing composed — never fabricate a publish
     }
@@ -1124,8 +1157,15 @@ where
         super::cap_line(&text, 200)
     );
     let out = dispatch(repo, &detail);
-    let published = out.get("published").and_then(Value::as_bool).unwrap_or(false);
-    let mode = out.get("mode").and_then(Value::as_str).unwrap_or("").to_string();
+    let published = out
+        .get("published")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mode = out
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     write_published_marker(repo, signature, published, &mode);
     // LOG the published:true/false result for observability; the publish_recency probe independently
     // confirms a live publish by reading the project's own post registry (no fleet_ledger row here).
@@ -1160,7 +1200,7 @@ pub fn maybe_auto_publish_growth(_snapshot: &Value, _status: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ceo::research::{is_external_mutation, EXTERNAL_MUTATION_MARKERS};
+    use crate::ceo::research::{EXTERNAL_MUTATION_MARKERS, is_external_mutation};
     use serde_json::json;
 
     fn plain_repo() -> Value {
@@ -1232,21 +1272,33 @@ mod tests {
         assert_eq!(out["ok"], true, "growth content task must succeed: {out}");
         assert_eq!(out["specialist"], "growth");
         assert_eq!(out["kind"], "growth_content");
-        assert_eq!(out["gated"], true, "the artifact must be GATED for human review");
+        assert_eq!(
+            out["gated"], true,
+            "the artifact must be GATED for human review"
+        );
         assert_eq!(out["published"], false, "NOTHING is published");
         assert_eq!(out["spent"], false, "NOTHING is spent");
         assert_eq!(out["organic"], true, "growth is organic-only");
         assert_eq!(out["provenance"], "rsi:", "the draft is provenance-tagged");
 
         // The artifact is REAL: read the growth-drafts log back off disk.
-        let artifact_path = out["artifact_path"].as_str().expect("artifact_path present");
-        let body = std::fs::read_to_string(artifact_path).expect("growth-drafts log exists on disk");
-        assert!(body.contains("rsi: growth DRAFT"), "line is provenance-tagged: {body}");
+        let artifact_path = out["artifact_path"]
+            .as_str()
+            .expect("artifact_path present");
+        let body =
+            std::fs::read_to_string(artifact_path).expect("growth-drafts log exists on disk");
+        assert!(
+            body.contains("rsi: growth DRAFT"),
+            "line is provenance-tagged: {body}"
+        );
         assert!(
             body.contains("[GATED, unpublished, organic]"),
             "line is marked gated+unpublished+organic: {body}"
         );
-        assert!(body.contains("README quickstart"), "the content directive is recorded: {body}");
+        assert!(
+            body.contains("README quickstart"),
+            "the content directive is recorded: {body}"
+        );
         assert!(
             body.lines().next().unwrap().contains('\t'),
             "the growth line is dated (iso-date TAB fact): {body}"
@@ -1276,8 +1328,16 @@ mod tests {
         // The canonical paid / money-out kinds the acceptance names, PLUS a wider spread — each must
         // be DENIED at gate() BEFORE run(), even on a whitelisted live-money lane.
         for money_kind in [
-            "buy_ads", "pay_invoice", "stripe_checkout", "ad_spend", "withdraw", "transfer",
-            "deposit", "send_money", "spend_treasury", "subscribe",
+            "buy_ads",
+            "pay_invoice",
+            "stripe_checkout",
+            "ad_spend",
+            "withdraw",
+            "transfer",
+            "deposit",
+            "send_money",
+            "spend_treasury",
+            "subscribe",
         ] {
             for repo in [plain_repo(), kairos_repo()] {
                 let money_task = Task {
@@ -1344,7 +1404,10 @@ mod tests {
         let after = GrowthSpecialist::drafts_log_path(&repo)
             .map(|p| std::fs::read_to_string(&p).unwrap_or_default())
             .unwrap_or_default();
-        assert_eq!(before, after, "a denied money probe must write NO growth draft line");
+        assert_eq!(
+            before, after,
+            "a denied money probe must write NO growth draft line"
+        );
         std::env::remove_var("SOLOMON_NOTIFY_OFF");
     }
 
@@ -1369,7 +1432,14 @@ mod tests {
             );
         }
         // Positive control: the markers DO catch real raw-post/pay tool names, so the guard has teeth.
-        for bad in ["post_to_x", "deploy_landing", "send_email", "git_push", "tweet", "buy_ads"] {
+        for bad in [
+            "post_to_x",
+            "deploy_landing",
+            "send_email",
+            "git_push",
+            "tweet",
+            "buy_ads",
+        ] {
             assert!(
                 is_external_mutation(bad) || crate::money_guard::is_money_capable(bad),
                 "'{bad}' should be caught as raw-external-mutation or money-capable"
@@ -1405,7 +1475,10 @@ mod tests {
         let out = dispatch_growth_publish(&repo, "publish the new release-notes reel");
         assert_eq!(out["specialist"], "growth");
         assert_eq!(out["kind"], "growth_publish");
-        assert_eq!(out["published"], false, "no growth_publish block -> NEVER publishes");
+        assert_eq!(
+            out["published"], false,
+            "no growth_publish block -> NEVER publishes"
+        );
         assert_eq!(out["spent"], false, "publishing never spends");
         assert_eq!(out["mode"], "not_opted_in");
 
@@ -1431,7 +1504,10 @@ mod tests {
             "cwd": ""
         });
         let out = dispatch_growth_publish(&repo, "publish the showcase reel");
-        assert_eq!(out["mode"], "dry_run", "an opted-in but non-live lane must DRY-RUN: {out}");
+        assert_eq!(
+            out["mode"], "dry_run",
+            "an opted-in but non-live lane must DRY-RUN: {out}"
+        );
         assert_eq!(out["published"], false, "a dry run publishes NOTHING");
         assert_eq!(out["spent"], false);
         assert_eq!(
@@ -1441,15 +1517,27 @@ mod tests {
         );
 
         // And the promotion gate is explicit: only mode:"live" flips is_live_publish true.
-        assert!(!GrowthSpecialist::is_live_publish(&repo), "dry_run is not live");
+        assert!(
+            !GrowthSpecialist::is_live_publish(&repo),
+            "dry_run is not live"
+        );
         let mut live = repo.clone();
         live["growth_publish"]["mode"] = json!("live");
-        assert!(GrowthSpecialist::is_live_publish(&live), "mode:live is live");
+        assert!(
+            GrowthSpecialist::is_live_publish(&live),
+            "mode:live is live"
+        );
         // absent block / absent mode / wrong type are all NOT live (default off).
         assert!(!GrowthSpecialist::is_live_publish(&plain_repo()));
-        assert!(!GrowthSpecialist::is_live_publish(&json!({"growth_publish": {"publish": ["x"]}})));
-        assert!(!GrowthSpecialist::is_live_publish(&json!({"growth_publish": {"mode": true}})));
-        assert!(!GrowthSpecialist::is_live_publish(&json!({"growth_publish": {}})));
+        assert!(!GrowthSpecialist::is_live_publish(
+            &json!({"growth_publish": {"publish": ["x"]}})
+        ));
+        assert!(!GrowthSpecialist::is_live_publish(
+            &json!({"growth_publish": {"mode": true}})
+        ));
+        assert!(!GrowthSpecialist::is_live_publish(
+            &json!({"growth_publish": {}})
+        ));
 
         std::env::remove_var("SOLOMON_NOTIFY_OFF");
     }
@@ -1478,10 +1566,19 @@ mod tests {
         let out = dispatch_growth_publish(&repo, "publish the release-notes reel");
         assert_eq!(out["specialist"], "growth");
         assert_eq!(out["kind"], "growth_publish");
-        assert_eq!(out["mode"], "live", "an opted-in live lane must run live: {out}");
+        assert_eq!(
+            out["mode"], "live",
+            "an opted-in live lane must run live: {out}"
+        );
         assert_eq!(out["ok"], true, "a clean sanctioned-lane exit is ok: {out}");
-        assert_eq!(out["published"], true, "a clean live publish reports published:true: {out}");
-        assert_eq!(out["spent"], false, "publishing NEVER spends (organic-only)");
+        assert_eq!(
+            out["published"], true,
+            "a clean live publish reports published:true: {out}"
+        );
+        assert_eq!(
+            out["spent"], false,
+            "publishing NEVER spends (organic-only)"
+        );
         assert_eq!(out["organic"], true);
         assert_eq!(out["exit_code"], 0);
 
@@ -1494,7 +1591,10 @@ mod tests {
         let fail = json!(["sh", "-c", "exit 3"]);
         repo_fail["growth_publish"] = json!({ "mode": "live", "publish": fail, "cwd": "" });
         let out_fail = dispatch_growth_publish(&repo_fail, "publish attempt that fails");
-        assert_eq!(out_fail["ok"], false, "a non-zero lane exit is not ok: {out_fail}");
+        assert_eq!(
+            out_fail["ok"], false,
+            "a non-zero lane exit is not ok: {out_fail}"
+        );
         assert_eq!(
             out_fail["published"], false,
             "a failed publish must NOT claim published:true (honesty floor): {out_fail}"
@@ -1555,8 +1655,16 @@ mod tests {
 
         let growth = GrowthSpecialist::new();
         // Any attempt to touch repos.json (where growth_publish.mode lives) is denied at the gate.
-        for target in ["repos.json", "repos.json#growth_publish", "repos.json growth_publish.mode"] {
-            let task = Task::new(TaskKind::Remediate("none"), target, "flip growth_publish to live");
+        for target in [
+            "repos.json",
+            "repos.json#growth_publish",
+            "repos.json growth_publish.mode",
+        ] {
+            let task = Task::new(
+                TaskKind::Remediate("none"),
+                target,
+                "flip growth_publish to live",
+            );
             let refusal = growth
                 .gate(&task, &plain_repo())
                 .expect("promoting the publish lane via repos.json must be DENIED");
@@ -1580,8 +1688,16 @@ mod tests {
         // kairos carries money_globs + protected — Growth must return NEITHER, only the drafts path.
         let globs = growth.scope_globs(&kairos_repo());
         assert_eq!(globs, vec!["runtime/kairos/growth_drafts.jsonl"]);
-        assert!(!globs.iter().any(|g| g.contains("trader.py") || g.contains("kalshi")));
-        assert!(!globs.iter().any(|g| g.contains("promote.py") || g.contains(".state")));
+        assert!(
+            !globs
+                .iter()
+                .any(|g| g.contains("trader.py") || g.contains("kalshi"))
+        );
+        assert!(
+            !globs
+                .iter()
+                .any(|g| g.contains("promote.py") || g.contains(".state"))
+        );
         // a nameless row yields no writable scope.
         assert!(growth.scope_globs(&json!({})).is_empty());
     }
@@ -1590,7 +1706,10 @@ mod tests {
     #[test]
     fn publish_cfg_is_opt_in_and_argv_parses() {
         // present, non-empty object -> Some
-        assert!(GrowthSpecialist::publish_cfg(&json!({"growth_publish": {"mode": "dry_run"}})).is_some());
+        assert!(
+            GrowthSpecialist::publish_cfg(&json!({"growth_publish": {"mode": "dry_run"}}))
+                .is_some()
+        );
         // absent / empty -> None (opt-in only)
         assert!(GrowthSpecialist::publish_cfg(&json!({"name": "x"})).is_none());
         assert!(GrowthSpecialist::publish_cfg(&json!({"growth_publish": {}})).is_none());
@@ -1608,15 +1727,25 @@ mod tests {
         );
         // missing/empty -> None (never spawn an empty command)
         assert_eq!(GrowthSpecialist::publish_argv(&json!({})), None);
-        assert_eq!(GrowthSpecialist::publish_argv(&json!({"publish": []})), None);
+        assert_eq!(
+            GrowthSpecialist::publish_argv(&json!({"publish": []})),
+            None
+        );
     }
 
     // ---- the draft fact is a provenance-tagged, dated, first-order fact ----
     #[test]
     fn draft_fact_is_provenance_tagged_and_a_valid_first_order_fact() {
-        let task = Task::new(TaskKind::Remediate("none"), "sover", "add a README badges section");
+        let task = Task::new(
+            TaskKind::Remediate("none"),
+            "sover",
+            "add a README badges section",
+        );
         let fact = GrowthSpecialist::draft_fact(&task, 1_783_000_000);
-        assert!(fact.starts_with("rsi: growth DRAFT [GATED, unpublished, organic]"), "{fact}");
+        assert!(
+            fact.starts_with("rsi: growth DRAFT [GATED, unpublished, organic]"),
+            "{fact}"
+        );
         assert!(fact.contains("lane=sover"));
         assert!(fact.contains("add a README badges section"));
         assert!(
@@ -1626,14 +1755,19 @@ mod tests {
         // even an empty detail still yields a valid fact (the epoch datum guarantees it).
         let empty = Task::new(TaskKind::Remediate("none"), "sover", "   ");
         let f2 = GrowthSpecialist::draft_fact(&empty, 1_783_000_001);
-        assert!(crate::pecrt::warm::ObservationLog::validate_fact(&f2).is_fact(), "{f2}");
+        assert!(
+            crate::pecrt::warm::ObservationLog::validate_fact(&f2).is_fact(),
+            "{f2}"
+        );
     }
 
     // ---- is_publish_task: only the explicit marker triggers the publish path ----
     #[test]
     fn only_the_publish_marker_selects_the_publish_path() {
         assert!(is_publish_task(&format!("{PUBLISH_MARKER} do the thing")));
-        assert!(is_publish_task(&format!("  {PUBLISH_MARKER} leading space")));
+        assert!(is_publish_task(&format!(
+            "  {PUBLISH_MARKER} leading space"
+        )));
         // an ordinary content directive NEVER triggers publish (defense against accidental publish).
         assert!(!is_publish_task("draft a README section"));
         assert!(!is_publish_task("publish the reel")); // the word 'publish' alone is not the marker
@@ -1670,19 +1804,36 @@ mod tests {
         assert!(!violates_persona(""));
         // A draft FACT built from a marker-carrying detail is refused too — the filter guards the
         // exact text that would land in the drafts log.
-        let task = Task::new(TaskKind::Remediate("none"), "sover", "post authored by Cayleb");
-        assert!(violates_persona(&GrowthSpecialist::draft_fact(&task, 1_783_000_000)));
+        let task = Task::new(
+            TaskKind::Remediate("none"),
+            "sover",
+            "post authored by Cayleb",
+        );
+        assert!(violates_persona(&GrowthSpecialist::draft_fact(
+            &task,
+            1_783_000_000
+        )));
     }
 
     // ---- HONEST TRIGGER: growth-directive keyword detection ----
     #[test]
     fn growth_directive_keyword_detection() {
-        assert!(is_growth_directive("- [ ] [chore] refresh the README quickstart section"));
-        assert!(is_growth_directive("- [ ] [feature] draft release notes for v0.4"));
+        assert!(is_growth_directive(
+            "- [ ] [chore] refresh the README quickstart section"
+        ));
+        assert!(is_growth_directive(
+            "- [ ] [feature] draft release notes for v0.4"
+        ));
         assert!(is_growth_directive("- [ ] add usage examples to docs"));
-        assert!(is_growth_directive("- [ ] [feature] publish a showcase post (organic)"));
-        assert!(!is_growth_directive("- [ ] [feature] fix the sqlite WAL checkpoint deadlock"));
-        assert!(!is_growth_directive("- [ ] [refactor] split the scheduler loop"));
+        assert!(is_growth_directive(
+            "- [ ] [feature] publish a showcase post (organic)"
+        ));
+        assert!(!is_growth_directive(
+            "- [ ] [feature] fix the sqlite WAL checkpoint deadlock"
+        ));
+        assert!(!is_growth_directive(
+            "- [ ] [refactor] split the scheduler loop"
+        ));
         assert!(!is_growth_directive(""));
     }
 
@@ -1695,16 +1846,21 @@ mod tests {
                        - [ ] [chore] polish the README intro (ceo 2026-07-01)\n";
         let d = growth_directive(backlog, marker).expect("today's growth line is found");
         assert!(d.contains("README quickstart"), "{d}");
-        assert!(!d.starts_with("- [ ]"), "the checkbox prefix is stripped: {d}");
+        assert!(
+            !d.starts_with("- [ ]"),
+            "the checkbox prefix is stripped: {d}"
+        );
         // yesterday's ceo goal alone does NOT fire (stale directives are not today's plan)
         assert!(growth_directive("- [ ] polish the README (ceo 2026-07-01)\n", marker).is_none());
         // checked / deferred lines never fire
         assert!(growth_directive("- [x] refresh the README (ceo 2026-07-13)\n", marker).is_none());
-        assert!(growth_directive(
-            "- [ ] refresh the README (ceo 2026-07-13)  (deferred: gave up)\n",
-            marker
-        )
-        .is_none());
+        assert!(
+            growth_directive(
+                "- [ ] refresh the README (ceo 2026-07-13)  (deferred: gave up)\n",
+                marker
+            )
+            .is_none()
+        );
         // an OPEN campaign growth step fires regardless of the day it was planned
         assert!(growth_directive(
             "- [ ] [feature] [campaign:sover-2026-07-12] (step 2) write the showcase page (campaign 2026-07-12)\n",
@@ -1728,11 +1884,23 @@ mod tests {
         let sover = json!({"name": "sover", "public": true});
         assert!(eligible_repo(&sover, "Post 3 verified reels/day", &green));
         // daedulus: explicitly public:false -> never composed
-        assert!(!eligible_repo(&json!({"name": "daedulus", "public": false}), "a goal", &green));
+        assert!(!eligible_repo(
+            &json!({"name": "daedulus", "public": false}),
+            "a goal",
+            &green
+        ));
         // asmodeus: NO public flag at all (private by omission; its goal forbids public exposure)
-        assert!(!eligible_repo(&json!({"name": "asmodeus"}), "capital velocity", &green));
+        assert!(!eligible_repo(
+            &json!({"name": "asmodeus"}),
+            "capital velocity",
+            &green
+        ));
         // a non-bool public value is NOT public (fail-closed truthiness)
-        assert!(!eligible_repo(&json!({"name": "x", "public": "yes"}), "a goal", &green));
+        assert!(!eligible_repo(
+            &json!({"name": "x", "public": "yes"}),
+            "a goal",
+            &green
+        ));
         // no north star = not a planned lane = never composed
         assert!(!eligible_repo(&sover, "   ", &green));
         // RED lane: don't market a dead engine (green-before-growth)
@@ -1760,11 +1928,17 @@ mod tests {
         // an ABSENT flag reads engine-dead (fail closed — pre-flag rollups, sweep-panic entries)
         assert!(!eligible_repo(&sover, "a goal", &json!({"status": "red"})));
         // non-bool junk is not a bypass
-        assert!(!eligible_repo(&sover, "a goal",
-            &json!({"status": "red", "red_operator_gated_only": "true"})));
+        assert!(!eligible_repo(
+            &sover,
+            "a goal",
+            &json!({"status": "red", "red_operator_gated_only": "true"})
+        ));
         // the flag is red-scoped: a non-red rollup is eligible with or without it
-        assert!(eligible_repo(&sover, "a goal",
-            &json!({"status": "yellow", "red_operator_gated_only": false})));
+        assert!(eligible_repo(
+            &sover,
+            "a goal",
+            &json!({"status": "yellow", "red_operator_gated_only": false})
+        ));
     }
 
     // ---- DAY-GATE: stamp-first — a stamped lane is a same-day no-op even when compose failed ----
@@ -1776,14 +1950,23 @@ mod tests {
         // STAMP FIRST (the pre-LLM write): the day's attempt is claimed ATOMICALLY — the first
         // claim wins, a second claim (the other OS process inside the same race window) loses.
         assert!(claim_growth_stamp(&repo, date), "first claim wins the day");
-        assert!(!claim_growth_stamp(&repo, date), "second claim loses: create_new is the gate");
-        assert!(already_drafted(&repo, date), "the stamp gates the rest of the day");
+        assert!(
+            !claim_growth_stamp(&repo, date),
+            "second claim loses: create_new is the gate"
+        );
+        assert!(
+            already_drafted(&repo, date),
+            "the stamp gates the rest of the day"
+        );
         // A NAMELESS row can never claim (fail closed).
         assert!(!claim_growth_stamp(&json!({}), date));
         // A failed compose OVERWRITES the note with a NAMED skip reason but keeps the gate closed
         // (one attempt/day — an LLM outage must not retry every 2-minute sweep).
         stamp_growth(&repo, date, "skip:llm_unavailable curl exit 22: 429");
-        assert!(already_drafted(&repo, date), "a failed compose still consumed the day");
+        assert!(
+            already_drafted(&repo, date),
+            "a failed compose still consumed the day"
+        );
         let body =
             std::fs::read_to_string(growth_stamp_path(&repo, date).expect("stamp path")).unwrap();
         assert!(
@@ -1809,14 +1992,19 @@ mod tests {
         let (kind, title, body) = parse_growth_reply(reply).expect("fenced JSON parses");
         assert_eq!(kind, "release_note");
         assert_eq!(title, "sover 0.4");
-        assert!(!body.contains('\n'), "the body is flattened to one line: {body}");
+        assert!(
+            !body.contains('\n'),
+            "the body is flattened to one line: {body}"
+        );
         assert!(body.contains("3 verified reels/day"));
         // an unknown kind degrades to "post" (a formatting nit, never a dropped draft)
         let (k2, ..) =
             parse_growth_reply("{\"kind\":\"tweetstorm\",\"title\":\"t\",\"body\":\"b\"}").unwrap();
         assert_eq!(k2, "post");
         // a blank/missing body is None — a blank draft is busywork, never dispatched
-        assert!(parse_growth_reply("{\"kind\":\"post\",\"title\":\"t\",\"body\":\"  \"}").is_none());
+        assert!(
+            parse_growth_reply("{\"kind\":\"post\",\"title\":\"t\",\"body\":\"  \"}").is_none()
+        );
         assert!(parse_growth_reply("{\"kind\":\"post\",\"title\":\"t\"}").is_none());
         assert!(parse_growth_reply("no json here at all").is_none());
     }
@@ -1864,18 +2052,34 @@ mod tests {
         // The exact detail shape compose_and_dispatch builds from a parsed reply + the directive.
         let detail = "[release_note] sover 0.4 — 3 verified reels/day now ship with URLs \
                       (directive: [chore] refresh the README quickstart (ceo 2026-07-13))";
-        assert!(!violates_persona(detail), "brand copy passes the persona filter");
+        assert!(
+            !violates_persona(detail),
+            "brand copy passes the persona filter"
+        );
 
         let out = dispatch_growth_content(&repo, detail);
-        assert_eq!(out["ok"], true, "the gated dispatch succeeds on an ordinary lane: {out}");
+        assert_eq!(
+            out["ok"], true,
+            "the gated dispatch succeeds on an ordinary lane: {out}"
+        );
         assert_eq!(out["gated"], true);
-        assert_eq!(out["published"], false, "draft-only — the publish ladder is never invoked");
+        assert_eq!(
+            out["published"], false,
+            "draft-only — the publish ladder is never invoked"
+        );
         assert_eq!(out["spent"], false);
         let path = out["artifact_path"].as_str().expect("artifact path");
         let body = std::fs::read_to_string(path).expect("drafts log exists");
-        assert_eq!(body.lines().count(), 1, "exactly ONE draft line landed: {body}");
+        assert_eq!(
+            body.lines().count(),
+            1,
+            "exactly ONE draft line landed: {body}"
+        );
         let line = body.lines().next().unwrap();
-        assert!(line.contains('\t'), "the draft line is dated (iso-date TAB fact): {line}");
+        assert!(
+            line.contains('\t'),
+            "the draft line is dated (iso-date TAB fact): {line}"
+        );
         assert!(line.contains("[release_note] sover 0.4"), "{line}");
         assert!(line.contains("[GATED, unpublished, organic]"), "{line}");
 
@@ -1893,7 +2097,9 @@ mod tests {
             "2026-07-15\trsi: growth DRAFT [GATED, unpublished, organic] lane=x: hi (t=1)"
         ));
         // Operator approval: a JSON object with a boolean-true `approved`, with or without the date tab.
-        assert!(draft_line_approved("2026-07-15\t{\"approved\": true, \"note\": \"ship it\"}"));
+        assert!(draft_line_approved(
+            "2026-07-15\t{\"approved\": true, \"note\": \"ship it\"}"
+        ));
         assert!(draft_line_approved("{\"approved\":true}"));
         // Fail-closed: string/int truthies and a false flag are NOT approval.
         assert!(!draft_line_approved("{\"approved\":\"true\"}"));
@@ -1911,10 +2117,16 @@ mod tests {
         let ok = auto_publish_content_check(
             "2026-07-15\trsi: growth DRAFT [GATED, unpublished, organic] lane=x: [post] honest copy (t=1)",
         );
-        assert!(ok.is_ok(), "a persona-clean composed draft must pass: {ok:?}");
+        assert!(
+            ok.is_ok(),
+            "a persona-clean composed draft must pass: {ok:?}"
+        );
         assert!(ok.unwrap().contains("honest copy"));
         // empty / control-JSON / persona-violating drafts are refused (fail-closed, named reason)
-        assert_eq!(auto_publish_content_check("2026-07-15\t   ").unwrap_err(), "empty draft");
+        assert_eq!(
+            auto_publish_content_check("2026-07-15\t   ").unwrap_err(),
+            "empty draft"
+        );
         assert_eq!(
             auto_publish_content_check("2026-07-15\t{\"approved\": true}").unwrap_err(),
             "control line, not content"
@@ -1957,7 +2169,11 @@ mod tests {
             called.set(called.get() + 1);
             json!({"published": false, "mode": "dry_run"})
         });
-        assert_eq!(called.get(), 1, "a composed draft MUST auto-publish without approved:true");
+        assert_eq!(
+            called.get(),
+            1,
+            "a composed draft MUST auto-publish without approved:true"
+        );
         assert_eq!(out["dispatched"], json!(true));
 
         // --- RATE cap: a SECOND publish on the SAME lane the SAME day is blocked ---
@@ -1965,7 +2181,11 @@ mod tests {
             called.set(called.get() + 1);
             json!({"published": false, "mode": "dry_run"})
         });
-        assert_eq!(called.get(), 1, "the per-lane-per-day rate cap blocks a second same-day publish");
+        assert_eq!(
+            called.get(),
+            1,
+            "the per-lane-per-day rate cap blocks a second same-day publish"
+        );
         assert_eq!(out_again["dispatched"], json!(false));
         assert_eq!(out_again["reason"], json!("daily publish cap reached"));
 
@@ -1984,7 +2204,11 @@ mod tests {
             called_p.set(called_p.get() + 1);
             json!({"published": true, "mode": "live"})
         });
-        assert_eq!(called_p.get(), 0, "a persona-violating draft must NOT dispatch");
+        assert_eq!(
+            called_p.get(),
+            0,
+            "a persona-violating draft must NOT dispatch"
+        );
         assert_eq!(out_p["reason"], json!("persona violation"));
         assert!(
             !published_day_marker_path(&repo_p, &today).unwrap().exists(),
@@ -1996,8 +2220,7 @@ mod tests {
         let rt_d = paths::runtime_dir(&repo_d).unwrap();
         let _ = std::fs::remove_dir_all(&rt_d);
         std::fs::create_dir_all(&rt_d).unwrap();
-        let line =
-            "2026-07-15\trsi: growth DRAFT [GATED, unpublished, organic] lane=x: [post] already live (t=3)";
+        let line = "2026-07-15\trsi: growth DRAFT [GATED, unpublished, organic] lane=x: [post] already live (t=3)";
         std::fs::write(rt_d.join("growth_drafts.jsonl"), format!("{line}\n")).unwrap();
         write_published_marker(&repo_d, line.trim(), true, "live"); // simulate a prior live publish
         let called_d = Cell::new(0u32);
@@ -2005,7 +2228,11 @@ mod tests {
             called_d.set(called_d.get() + 1);
             json!({"published": true, "mode": "live"})
         });
-        assert_eq!(called_d.get(), 0, "a draft already live-published must NOT be re-shipped");
+        assert_eq!(
+            called_d.get(),
+            0,
+            "a draft already live-published must NOT be re-shipped"
+        );
         assert_eq!(out_d["reason"], json!("already published"));
 
         std::env::remove_var("SOLOMON_NOTIFY_OFF");

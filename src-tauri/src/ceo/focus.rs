@@ -13,7 +13,7 @@
 //! lane, so a broken engine (e.g. a RED sover) is fixed by the ops-RED graft, never "focused".
 
 use crate::control::{paths, proc};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 
 /// Anti-starvation cap: rotate focus off a lane after this many days even if it stays top-ranked, so
@@ -171,17 +171,26 @@ pub fn maybe_focus(snapshot: &Value, status: &Value) {
     let mut slug = if changed {
         String::new()
     } else {
-        st.get("slug").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        st.get("slug")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
     };
     let mut planned = if changed {
         String::new()
     } else {
-        st.get("planned").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        st.get("planned")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
     };
     let mut milestone = if changed {
         String::new()
     } else {
-        st.get("milestone").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        st.get("milestone")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
     };
 
     // 5. Campaign lifecycle: when the campaign is DRAINED (0 open steps for its slug) AND we have not
@@ -206,7 +215,9 @@ pub fn maybe_focus(snapshot: &Value, status: &Value) {
                     if let Some(parent) = backlog_path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    if proc::atomic_write_bytes(&backlog_path, format!("{block}\n{cur}").as_bytes()).is_ok() {
+                    if proc::atomic_write_bytes(&backlog_path, format!("{block}\n{cur}").as_bytes())
+                        .is_ok()
+                    {
                         slug = new_slug;
                         milestone = ms.clone();
                         let _ = crate::notify::send(&crate::notify::Notice::report(
@@ -219,7 +230,9 @@ pub fn maybe_focus(snapshot: &Value, status: &Value) {
                     if let Some(parent) = backlog_path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    if proc::atomic_write_bytes(&backlog_path, format!("{block}\n").as_bytes()).is_ok() {
+                    if proc::atomic_write_bytes(&backlog_path, format!("{block}\n").as_bytes())
+                        .is_ok()
+                    {
                         slug = new_slug;
                         milestone = ms;
                     }
@@ -280,7 +293,10 @@ fn decompose_campaign(name: &str, snapshot: &Value) -> Option<(String, String, V
     let reply = super::ollama_chat(super::CEO_MODEL, system, &user).ok()?;
     let parsed = super::extract_json(&reply)?;
     let milestone = super::cap_line(
-        parsed.get("milestone").and_then(|v| v.as_str()).unwrap_or(""),
+        parsed
+            .get("milestone")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
         200,
     );
     let tier = match parsed.get("tier").and_then(|v| v.as_str()) {
@@ -312,7 +328,10 @@ mod tests {
 
     #[test]
     fn next_focus_adopts_top_when_none() {
-        assert_eq!(next_focus(None, Some("sover"), false, 0, 2).as_deref(), Some("sover"));
+        assert_eq!(
+            next_focus(None, Some("sover"), false, 0, 2).as_deref(),
+            Some("sover")
+        );
         assert_eq!(next_focus(None, None, false, 0, 2), None);
     }
 
@@ -320,13 +339,19 @@ mod tests {
     fn next_focus_is_sticky_while_candidate_and_under_cap() {
         // current still a candidate, under the cap, even though a DIFFERENT lane is top -> KEEP it
         // (a transient rank shuffle must not strand a half-finished campaign).
-        assert_eq!(next_focus(Some("sover"), Some("dotz"), true, 1, 2).as_deref(), Some("sover"));
+        assert_eq!(
+            next_focus(Some("sover"), Some("dotz"), true, 1, 2).as_deref(),
+            Some("sover")
+        );
     }
 
     #[test]
     fn next_focus_switches_when_current_not_candidate() {
         // current engine broke (no longer a positive-leverage candidate) -> move to top.
-        assert_eq!(next_focus(Some("sover"), Some("dotz"), false, 1, 2).as_deref(), Some("dotz"));
+        assert_eq!(
+            next_focus(Some("sover"), Some("dotz"), false, 1, 2).as_deref(),
+            Some("dotz")
+        );
         // ...and with no top either, hold the fleet.
         assert_eq!(next_focus(Some("sover"), None, false, 1, 2), None);
     }
@@ -334,9 +359,15 @@ mod tests {
     #[test]
     fn next_focus_rotates_after_cap_only_to_a_different_top() {
         // held past the cap AND a different top exists -> rotate (anti-starvation).
-        assert_eq!(next_focus(Some("sover"), Some("dotz"), true, 2, 2).as_deref(), Some("dotz"));
+        assert_eq!(
+            next_focus(Some("sover"), Some("dotz"), true, 2, 2).as_deref(),
+            Some("dotz")
+        );
         // held past the cap but current IS still the top -> stay (nowhere better to go).
-        assert_eq!(next_focus(Some("sover"), Some("sover"), true, 5, 2).as_deref(), Some("sover"));
+        assert_eq!(
+            next_focus(Some("sover"), Some("sover"), true, 5, 2).as_deref(),
+            Some("sover")
+        );
     }
 
     #[test]
@@ -348,8 +379,14 @@ mod tests {
         assert!(lines[0].ends_with("(campaign 2026-07-04)"));
         assert!(lines[1].contains("(step 2) do B"));
         // the picker ranks a campaign step at bucket 1, and strip_tier yields the real (deep) tier.
-        assert_eq!(crate::improver::backlog::backlog_item_rank(&lines[0][5..]), 1);
-        assert_eq!(crate::improver::backlog::strip_tier(lines[0][5..].trim()).1, "feature");
+        assert_eq!(
+            crate::improver::backlog::backlog_item_rank(&lines[0][5..]),
+            1
+        );
+        assert_eq!(
+            crate::improver::backlog::strip_tier(lines[0][5..].trim()).1,
+            "feature"
+        );
     }
 
     #[test]
@@ -362,7 +399,10 @@ mod tests {
         // OPEN + non-deferred campaign steps across ANY slug: step1(sc) + step1(other) = 2.
         // the [x] done step, the (deferred) step, and the plain line do NOT count.
         assert_eq!(open_campaign_steps(bl), 2);
-        assert_eq!(open_campaign_steps("- [ ] plain\n- [x] [campaign:x] done\n"), 0);
+        assert_eq!(
+            open_campaign_steps("- [ ] plain\n- [x] [campaign:x] done\n"),
+            0
+        );
         // a campaign fully stalled on a deferred step reads as DRAINED (re-plans) — the high-sev fix.
         assert_eq!(
             open_campaign_steps("- [ ] [feature] [campaign:z] (step 1) x  (deferred: y)\n"),

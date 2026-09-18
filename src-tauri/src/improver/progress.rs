@@ -22,7 +22,7 @@
 //! (record_history / mark_backlog_done / the escalation ladder's defer) — the iteration.rs call
 //! sites honor this ordering so the ledger measures AGENT progress, not the runner's bookkeeping.
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::path::PathBuf;
 
 use crate::improver::ctx::{self, Ctx};
@@ -56,7 +56,11 @@ pub fn current_diagnosis(ctx: &Ctx) -> String {
     std::fs::read_to_string(ctx.runtime.join("escalation.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| v.get("category").and_then(Value::as_str).map(str::to_string))
+        .and_then(|v| {
+            v.get("category")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .unwrap_or_default()
 }
 
@@ -275,7 +279,11 @@ pub struct Selection {
 /// re-selected key is ALSO quarantined, write the `all_quarantined` idle heartbeat + log and
 /// return None — the caller returns without any pi spend. The returned `pre_hash` is computed
 /// AFTER any defer (the defer rewrites the backlog, which is a state-hash component).
-pub fn filter_quarantined_selection(ctx: &mut Ctx, goal: String, tier: String) -> Option<Selection> {
+pub fn filter_quarantined_selection(
+    ctx: &mut Ctx,
+    goal: String,
+    tier: String,
+) -> Option<Selection> {
     let key = selection_key(ctx, &goal);
     // OUTCOME-CRITIQUE DOWN-WEIGHT (D3, wiring point A): the top item's backlog FAMILY (its
     // selection key) is DEMOTED when a prior shipped-green change of that family moved the tier-1
@@ -297,7 +305,12 @@ pub fn filter_quarantined_selection(ctx: &mut Ctx, goal: String, tier: String) -
         }
         let pre_hash = state_hash(ctx);
         note_selected(ctx, &key, &goal);
-        return Some(Selection { goal, tier, key, pre_hash });
+        return Some(Selection {
+            goal,
+            tier,
+            key,
+            pre_hash,
+        });
     }
     ctx.log(&format!(
         "progress: top backlog item '{}' is QUARANTINED (key {key}) — deferring and re-selecting once",
@@ -313,7 +326,12 @@ pub fn filter_quarantined_selection(ctx: &mut Ctx, goal: String, tier: String) -
     }
     let pre_hash = state_hash(ctx);
     note_selected(ctx, &key2, &goal2);
-    Some(Selection { goal: goal2, tier: tier2, key: key2, pre_hash })
+    Some(Selection {
+        goal: goal2,
+        tier: tier2,
+        key: key2,
+        pre_hash,
+    })
 }
 
 /// The no-work terminal of wiring point A: every selectable head is quarantined — idle out loudly
@@ -328,7 +346,7 @@ fn all_quarantined_bail(ctx: &mut Ctx) {
         "phase": Value::Null,
         "reason": "all_quarantined",
         "last_summary": "top backlog keys are quarantined (no state delta in 3 attempts each) — \
-idling until a quarantine expires (24h) or new backlog items arrive",
+    idling until a quarantine expires (24h) or new backlog items arrive",
     }));
     ctx.log(
         "SKIP iteration: all_quarantined — top backlog keys are quarantined (no state delta in \
@@ -356,7 +374,13 @@ fn head_chars(s: &str, n: usize) -> String {
 /// no hashing dependency; SHA-1 here is a stable fingerprint for ledger keys/state — not a
 /// security boundary. Pinned to the standard test vectors below.
 fn sha1_hex(data: &[u8]) -> String {
-    let mut h: [u32; 5] = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0];
+    let mut h: [u32; 5] = [
+        0x6745_2301,
+        0xEFCD_AB89,
+        0x98BA_DCFE,
+        0x1032_5476,
+        0xC3D2_E1F0,
+    ];
     let bit_len = (data.len() as u64).wrapping_mul(8);
     let mut msg = data.to_vec();
     msg.push(0x80);
@@ -457,7 +481,9 @@ mod tests {
     }
 
     fn entry_i64(c: &Ctx, key: &str, field: &str) -> i64 {
-        read_ledger_value(c)["keys"][key][field].as_i64().unwrap_or(-1)
+        read_ledger_value(c)["keys"][key][field]
+            .as_i64()
+            .unwrap_or(-1)
     }
 
     fn hb_str<'a>(c: &'a Ctx, key: &str) -> &'a str {
@@ -488,9 +514,17 @@ mod tests {
         let k = progress_key("implement", "fix the widget", "");
         assert_eq!(k, progress_key("implement", "fix the widget", ""), "stable");
         assert_eq!(k.len(), 40);
-        assert_ne!(k, progress_key("recovery", "fix the widget", ""), "job_kind");
+        assert_ne!(
+            k,
+            progress_key("recovery", "fix the widget", ""),
+            "job_kind"
+        );
         assert_ne!(k, progress_key("implement", "fix the gadget", ""), "goal");
-        assert_ne!(k, progress_key("implement", "fix the widget", "gate_red"), "diagnosis");
+        assert_ne!(
+            k,
+            progress_key("implement", "fix the widget", "gate_red"),
+            "diagnosis"
+        );
     }
 
     #[test]
@@ -518,10 +552,26 @@ mod tests {
     fn compose_state_hash_sensitive_to_each_component() {
         let h = compose_state_hash("sha", "bsha", 7, "{\"passed\":1}");
         assert_eq!(h, compose_state_hash("sha", "bsha", 7, "{\"passed\":1}"));
-        assert_ne!(h, compose_state_hash("SHA2", "bsha", 7, "{\"passed\":1}"), "base sha");
-        assert_ne!(h, compose_state_hash("sha", "other", 7, "{\"passed\":1}"), "backlog sha");
-        assert_ne!(h, compose_state_hash("sha", "bsha", 8, "{\"passed\":1}"), "history lines");
-        assert_ne!(h, compose_state_hash("sha", "bsha", 7, "{\"passed\":2}"), "gate counts");
+        assert_ne!(
+            h,
+            compose_state_hash("SHA2", "bsha", 7, "{\"passed\":1}"),
+            "base sha"
+        );
+        assert_ne!(
+            h,
+            compose_state_hash("sha", "other", 7, "{\"passed\":1}"),
+            "backlog sha"
+        );
+        assert_ne!(
+            h,
+            compose_state_hash("sha", "bsha", 8, "{\"passed\":1}"),
+            "history lines"
+        );
+        assert_ne!(
+            h,
+            compose_state_hash("sha", "bsha", 7, "{\"passed\":2}"),
+            "gate counts"
+        );
     }
 
     #[test]
@@ -558,14 +608,22 @@ mod tests {
         assert!(!quarantined(&c, &key), "2 strikes is below the limit");
         assert_eq!(entry_i64(&c, &key, "count_no_delta"), 2);
         record_outcome(&mut c, &key, &pre, "noop");
-        assert!(quarantined(&c, &key), "3rd zero-delta completion quarantines");
+        assert!(
+            quarantined(&c, &key),
+            "3rd zero-delta completion quarantines"
+        );
         assert!(entry_i64(&c, &key, "quarantined_until") > unix_now());
         let log = std::fs::read_to_string(&c.log_path).unwrap_or_default();
         assert!(
-            log.contains(&format!("QUARANTINE: key {key} (fix the flaky widget test)")),
+            log.contains(&format!(
+                "QUARANTINE: key {key} (fix the flaky widget test)"
+            )),
             "log: {log}"
         );
-        assert!(log.contains("completed 3x with zero observable state delta"), "log: {log}");
+        assert!(
+            log.contains("completed 3x with zero observable state delta"),
+            "log: {log}"
+        );
     }
 
     #[test]
@@ -591,7 +649,12 @@ mod tests {
         seed_quarantine(&c, &key, unix_now() + 3600);
         assert!(quarantined(&c, &key));
         // pre_hash deliberately different from the live post hash => observable delta
-        record_outcome(&mut c, &key, "a-stale-pre-hash-that-cannot-match", "reverted");
+        record_outcome(
+            &mut c,
+            &key,
+            "a-stale-pre-hash-that-cannot-match",
+            "reverted",
+        );
         assert_eq!(entry_i64(&c, &key, "count_no_delta"), 0);
         assert_eq!(entry_i64(&c, &key, "quarantined_until"), 0);
         assert!(!quarantined(&c, &key), "a real delta clears the quarantine");
@@ -602,7 +665,10 @@ mod tests {
         let c = test_ctx();
         let key = progress_key("implement", "expired item", "");
         seed_quarantine(&c, &key, unix_now() - 10);
-        assert!(!quarantined(&c, &key), "past quarantined_until => selectable again");
+        assert!(
+            !quarantined(&c, &key),
+            "past quarantined_until => selectable again"
+        );
         seed_quarantine(&c, &key, unix_now() + 1000);
         assert!(quarantined(&c, &key), "future quarantined_until => blocked");
     }
@@ -633,7 +699,8 @@ mod tests {
     #[test]
     fn proof_required_emit_bypass_quarantines_after_3_zero_delta_completions() {
         let mut c = test_ctx();
-        let goal = "OPERATOR GOAL — Fleet autopilot: run the whole fleet safely with zero babysitting";
+        let goal =
+            "OPERATOR GOAL — Fleet autopilot: run the whole fleet safely with zero babysitting";
         // The key shape fleet.rs now uses: progress_key("proof_required", goal, diagnosis).
         let key_gh_not_ready = progress_key("proof_required", goal, "gh_not_ready");
         note_selected(&c, &key_gh_not_ready, goal);
@@ -641,9 +708,15 @@ mod tests {
 
         // 3 zero-delta proof_required completions (the emit-bypass fires once per sweep).
         record_outcome(&mut c, &key_gh_not_ready, &pre, "noop");
-        assert!(!quarantined(&c, &key_gh_not_ready), "1 strike is below the limit");
+        assert!(
+            !quarantined(&c, &key_gh_not_ready),
+            "1 strike is below the limit"
+        );
         record_outcome(&mut c, &key_gh_not_ready, &pre, "noop");
-        assert!(!quarantined(&c, &key_gh_not_ready), "2 strikes is below the limit");
+        assert!(
+            !quarantined(&c, &key_gh_not_ready),
+            "2 strikes is below the limit"
+        );
         record_outcome(&mut c, &key_gh_not_ready, &pre, "noop");
         assert!(
             quarantined(&c, &key_gh_not_ready),
@@ -656,7 +729,10 @@ mod tests {
         // quarantine-reset-on-diagnosis-change semantics the iteration path already honors
         // (progress::current_diagnosis folds the escalation category into the key).
         let key_ok = progress_key("proof_required", goal, "ok");
-        assert_ne!(key_gh_not_ready, key_ok, "different diagnosis => different key");
+        assert_ne!(
+            key_gh_not_ready, key_ok,
+            "different diagnosis => different key"
+        );
         assert!(
             !quarantined(&c, &key_ok),
             "a healed lane (ok diagnosis) is not blocked by the stale gh_not_ready quarantine"
@@ -667,12 +743,21 @@ mod tests {
         // un-quarantine a proof_required key; only a non-zero-delta completion of THIS key does).
         // (record_outcome on the healed key with a delta resets the healed key's counter, not
         // the stale key's — confirmed by reading the ledger.)
-        record_outcome(&mut c, &key_ok, "a-deliberately-different-pre-hash", "shipped");
+        record_outcome(
+            &mut c,
+            &key_ok,
+            "a-deliberately-different-pre-hash",
+            "shipped",
+        );
         assert!(
             quarantined(&c, &key_gh_not_ready),
             "a ship on a different key does not clear this key's quarantine"
         );
-        assert_eq!(entry_i64(&c, &key_ok, "count_no_delta"), 0, "shipped resets the healed key");
+        assert_eq!(
+            entry_i64(&c, &key_ok, "count_no_delta"),
+            0,
+            "shipped resets the healed key"
+        );
     }
 
     #[test]
@@ -682,7 +767,10 @@ mod tests {
         assert!(!quarantined(&c, ""));
         note_selected(&c, "", "goal");
         record_outcome(&mut c, "", "pre", "noop");
-        assert!(!ledger_path(&c).exists(), "no ledger file written for an empty key");
+        assert!(
+            !ledger_path(&c).exists(),
+            "no ledger file written for an empty key"
+        );
     }
 
     #[test]
@@ -704,13 +792,20 @@ mod tests {
         // a re-selection refreshes last_seen but preserves first_seen
         note_selected(&c, &key, &long_goal);
         let led2 = read_ledger_value(&c);
-        assert_eq!(led2["keys"][&key]["first_seen"].as_str().unwrap(), first_seen);
+        assert_eq!(
+            led2["keys"][&key]["first_seen"].as_str().unwrap(),
+            first_seen
+        );
     }
 
     #[test]
     fn current_diagnosis_reads_the_escalation_category() {
         let c = test_ctx();
-        assert_eq!(current_diagnosis(&c), "", "no escalation.json => empty diagnosis");
+        assert_eq!(
+            current_diagnosis(&c),
+            "",
+            "no escalation.json => empty diagnosis"
+        );
         std::fs::write(
             c.runtime.join("escalation.json"),
             r#"{"category": "gate_red_persistent", "evidence": "x"}"#,
@@ -740,15 +835,26 @@ mod tests {
 
         let sel = filter_quarantined_selection(&mut c, g1.clone(), t1)
             .expect("second item is selectable");
-        assert!(sel.goal.starts_with("beta"), "re-selected the next item, got: {}", sel.goal);
+        assert!(
+            sel.goal.starts_with("beta"),
+            "re-selected the next item, got: {}",
+            sel.goal
+        );
         assert_eq!(sel.tier, "chore");
         assert_eq!(sel.key, selection_key(&c, &sel.goal));
-        assert_eq!(sel.pre_hash.len(), 40, "pre-hash captured for the terminals");
+        assert_eq!(
+            sel.pre_hash.len(),
+            40,
+            "pre-hash captured for the terminals"
+        );
         // the quarantined item was DEFERRED (moved to the bottom with the deferred note)
         let text = std::fs::read_to_string(&c.backlog).unwrap();
         assert!(text.contains("(deferred"), "backlog: {text}");
         let last_item_line = text.lines().rev().find(|l| l.contains("- [ ]")).unwrap();
-        assert!(last_item_line.contains("alpha"), "alpha sits at the bottom: {last_item_line}");
+        assert!(
+            last_item_line.contains("alpha"),
+            "alpha sits at the bottom: {last_item_line}"
+        );
         // and NOT the all_quarantined bail
         assert_ne!(hb_str(&c, "reason"), "all_quarantined");
     }
@@ -771,11 +877,21 @@ mod tests {
         );
         let sel = filter_quarantined_selection(&mut c, g1.clone(), t1)
             .expect("a demoted item still runs (down-weight, not a block)");
-        assert_eq!(sel.goal, g1, "the demoted item still runs — a demotion never strands a lane");
-        assert_ne!(hb_str(&c, "reason"), "all_quarantined", "a demotion never idles the lane out");
+        assert_eq!(
+            sel.goal, g1,
+            "the demoted item still runs — a demotion never strands a lane"
+        );
+        assert_ne!(
+            hb_str(&c, "reason"),
+            "all_quarantined",
+            "a demotion never idles the lane out"
+        );
         // the backlog is NOT destructively deferred by a demotion (unlike a quarantine)
         let text = std::fs::read_to_string(&c.backlog).unwrap();
-        assert!(!text.contains("(deferred"), "a demotion must not defer the item: {text}");
+        assert!(
+            !text.contains("(deferred"),
+            "a demotion must not defer the item: {text}"
+        );
         // the demotion IS observable in the loop's log
         let log = std::fs::read_to_string(&c.log_path).unwrap_or_default();
         assert!(log.contains("family is DEMOTED"), "demotion logged: {log}");
@@ -813,7 +929,10 @@ mod tests {
         assert_eq!(sel.goal, g1, "top item kept when not quarantined");
         let led = read_ledger_value(&c);
         assert!(
-            led["keys"][&sel.key]["sample_goal"].as_str().unwrap().starts_with("alpha"),
+            led["keys"][&sel.key]["sample_goal"]
+                .as_str()
+                .unwrap()
+                .starts_with("alpha"),
             "selection seeds the entry (sample_goal) for the terminal record_outcome"
         );
     }
@@ -835,12 +954,18 @@ mod tests {
             "both heads quarantined => no selection, no pi spend"
         );
         assert_eq!(hb_str(&c, "status"), "idle");
-        assert!(c.hb.get("phase").map(Value::is_null).unwrap_or(false), "phase: null");
+        assert!(
+            c.hb.get("phase").map(Value::is_null).unwrap_or(false),
+            "phase: null"
+        );
         assert_eq!(hb_str(&c, "reason"), "all_quarantined");
         // the summary must describe the REAL degraded mode (24h expiry / new items), never a
         // "forcing ideate" no-op lever that does not exist (skeptic finding 8, 2026-07-06)
         let summary = hb_str(&c, "last_summary");
-        assert!(summary.contains("idling until a quarantine expires"), "{summary}");
+        assert!(
+            summary.contains("idling until a quarantine expires"),
+            "{summary}"
+        );
         assert!(!summary.contains("forcing ideate"), "{summary}");
     }
 
@@ -850,7 +975,11 @@ mod tests {
         let mut c = test_ctx();
         std::fs::write(&c.backlog, TWO_ITEM_BACKLOG).unwrap();
         let key = selection_key(&c, "alpha improve the frobnicator pipeline end to end");
-        note_selected(&c, &key, "alpha improve the frobnicator pipeline end to end");
+        note_selected(
+            &c,
+            &key,
+            "alpha improve the frobnicator pipeline end to end",
+        );
         crate::improver::calibration::note_selection(&c, "feature");
         let fleet_dir = c.runtime.parent().unwrap().to_path_buf();
 

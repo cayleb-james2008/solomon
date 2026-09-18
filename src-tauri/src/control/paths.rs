@@ -35,7 +35,8 @@ pub fn here() -> &'static Path {
         // set SOLOMON_HOME explicitly and hit the branch above, so their behavior is unchanged.
         #[cfg(test)]
         {
-            let home = std::env::temp_dir().join(format!("solomon_test_home_{}", std::process::id()));
+            let home =
+                std::env::temp_dir().join(format!("solomon_test_home_{}", std::process::id()));
             let _ = std::fs::create_dir_all(home.join("improver"));
             home
         }
@@ -119,7 +120,12 @@ pub fn venv_python(repo: &Value) -> Option<PathBuf> {
     if p.is_empty() {
         None
     } else {
-        Some(Path::new(&p).join(".venv").join("Scripts").join("python.exe"))
+        Some(
+            Path::new(&p)
+                .join(".venv")
+                .join("Scripts")
+                .join("python.exe"),
+        )
     }
 }
 
@@ -204,7 +210,10 @@ mod tests {
 
     #[test]
     fn repo_name_prefers_name_then_basename() {
-        assert_eq!(repo_name(&json!({"name": "maki", "path": "C:/x/maki"})), "maki");
+        assert_eq!(
+            repo_name(&json!({"name": "maki", "path": "C:/x/maki"})),
+            "maki"
+        );
         assert_eq!(repo_name(&json!({"path": "C:/x/sover"})), "sover");
         assert_eq!(repo_name(&json!({"name": "", "path": "C:/x/dotz"})), "dotz");
         assert_eq!(repo_name(&json!({})), "");
@@ -219,7 +228,13 @@ mod tests {
     #[test]
     fn runtime_dir_none_without_name() {
         assert!(runtime_dir(&json!({})).is_none());
-        assert!(runtime_dir(&json!({"name": "x"})).unwrap().ends_with("runtime/x")
-            || runtime_dir(&json!({"name": "x"})).unwrap().ends_with("runtime\\x"));
+        assert!(
+            runtime_dir(&json!({"name": "x"}))
+                .unwrap()
+                .ends_with("runtime/x")
+                || runtime_dir(&json!({"name": "x"}))
+                    .unwrap()
+                    .ends_with("runtime\\x")
+        );
     }
 }

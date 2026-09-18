@@ -64,7 +64,10 @@ pub fn should_boost(
         Some(c) => c,
         None => return false, // no produce_boost config -> NEVER boost (opt-in only)
     };
-    let healthy = rollup.get("healthy").and_then(Value::as_bool).unwrap_or(false);
+    let healthy = rollup
+        .get("healthy")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let green = rollup.get("status").and_then(Value::as_str) == Some("green");
     if !(healthy && green) {
         return false; // only grow a healthy, green lane
@@ -183,7 +186,9 @@ fn run_lane(argv: &[String], cwd: &str, profile: &str) -> std::io::Result<proc::
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(proc::CREATE_NO_WINDOW);
     }
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
     let out_h = child.stdout.take().map(|mut s| {
         std::thread::spawn(move || {
@@ -215,7 +220,10 @@ fn run_lane(argv: &[String], cwd: &str, profile: &str) -> std::io::Result<proc::
             // Detach readers (a grandchild may hold the pipe) — same rationale as proc::run's timeout.
             drop(out_h);
             drop(err_h);
-            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "boost lane timed out"))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "boost lane timed out",
+            ))
         }
     }
 }
@@ -238,7 +246,11 @@ fn lane_summary(out: &proc::RunOut) -> String {
         Some(v) => notify_one_line(&v.to_string()),
         None => {
             let tail: String = out.stderr.trim().chars().take(160).collect();
-            if tail.is_empty() { "(no status line)".to_string() } else { tail }
+            if tail.is_empty() {
+                "(no status line)".to_string()
+            } else {
+                tail
+            }
         }
     }
 }
@@ -255,8 +267,16 @@ pub fn run_boost(repo_cfg: &Value) -> Result<(), String> {
     let boost = repo_cfg
         .get("produce_boost")
         .ok_or_else(|| "sover: produce_boost missing".to_string())?;
-    let cwd = boost.get("cwd").and_then(Value::as_str).unwrap_or("").to_string();
-    let profile = boost.get("profile_env").and_then(Value::as_str).unwrap_or("ggg").to_string();
+    let cwd = boost
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let profile = boost
+        .get("profile_env")
+        .and_then(Value::as_str)
+        .unwrap_or("ggg")
+        .to_string();
     let produce = boost_argv(boost, "produce")
         .ok_or_else(|| "sover: produce_boost.produce missing/empty".to_string())?;
     let post = boost_argv(boost, "bin")
@@ -286,7 +306,11 @@ pub fn run_boost(repo_cfg: &Value) -> Result<(), String> {
         return Err(format!("sover boost: post exit {} ({s})", po.code));
     }
 
-    page_ok(&format!("produce: {} | post: {}", lane_summary(&pr), lane_summary(&po)));
+    page_ok(&format!(
+        "produce: {} | post: {}",
+        lane_summary(&pr),
+        lane_summary(&po)
+    ));
     Ok(())
 }
 
@@ -397,7 +421,13 @@ mod tests {
             "all conditions met -> boost"
         );
         // one under the cap still boosts
-        assert!(should_boost(Some(&cfg), &green_rollup(), &behind_velocity(), true, 2));
+        assert!(should_boost(
+            Some(&cfg),
+            &green_rollup(),
+            &behind_velocity(),
+            true,
+            2
+        ));
     }
 
     #[test]
@@ -405,13 +435,25 @@ mod tests {
         let cfg = boost_cfg();
         // RED rollup
         let red = json!({"healthy": false, "status": "red"});
-        assert!(!should_boost(Some(&cfg), &red, &behind_velocity(), true, 0), "RED -> no boost");
+        assert!(
+            !should_boost(Some(&cfg), &red, &behind_velocity(), true, 0),
+            "RED -> no boost"
+        );
         // yellow-ish: status not green even if some flag true
         let yellow = json!({"healthy": true, "status": "yellow"});
-        assert!(!should_boost(Some(&cfg), &yellow, &behind_velocity(), true, 0), "yellow -> no boost");
+        assert!(
+            !should_boost(Some(&cfg), &yellow, &behind_velocity(), true, 0),
+            "yellow -> no boost"
+        );
         // healthy true but status missing -> not green -> no boost
         let no_status = json!({"healthy": true});
-        assert!(!should_boost(Some(&cfg), &no_status, &behind_velocity(), true, 0));
+        assert!(!should_boost(
+            Some(&cfg),
+            &no_status,
+            &behind_velocity(),
+            true,
+            0
+        ));
     }
 
     #[test]
@@ -420,11 +462,17 @@ mod tests {
         // healthy trend (current 3 meets target 3) -> not "behind" -> no boost
         let healthy_v = crate::ceo::velocity_context(&json!({"posts_24h": 3}), "Post 3 reels/day");
         assert_eq!(healthy_v["trend"], json!("healthy"));
-        assert!(!should_boost(Some(&cfg), &green_rollup(), &healthy_v, true, 0), "healthy trend -> no boost");
+        assert!(
+            !should_boost(Some(&cfg), &green_rollup(), &healthy_v, true, 0),
+            "healthy trend -> no boost"
+        );
         // stalled (current 0) is not "behind" -> no boost (fix a dead engine, don't pile on produce)
         let stalled_v = crate::ceo::velocity_context(&json!({"posts_24h": 0}), "Post 3 reels/day");
         assert_eq!(stalled_v["trend"], json!("stalled"));
-        assert!(!should_boost(Some(&cfg), &green_rollup(), &stalled_v, true, 0), "stalled -> no boost");
+        assert!(
+            !should_boost(Some(&cfg), &green_rollup(), &stalled_v, true, 0),
+            "stalled -> no boost"
+        );
     }
 
     #[test]
@@ -436,7 +484,10 @@ mod tests {
             "Grow capital velocity — 5 live trades/day.",
         );
         assert_eq!(trades_v["metric"], json!("live_trades_24h"));
-        assert!(!should_boost(Some(&cfg), &green_rollup(), &trades_v, true, 0), "non-posts metric -> no boost");
+        assert!(
+            !should_boost(Some(&cfg), &green_rollup(), &trades_v, true, 0),
+            "non-posts metric -> no boost"
+        );
     }
 
     #[test]
@@ -451,12 +502,30 @@ mod tests {
     #[test]
     fn should_boost_false_when_at_or_over_cap() {
         let cfg = boost_cfg(); // max_extra_per_day = 3
-        assert!(!should_boost(Some(&cfg), &green_rollup(), &behind_velocity(), true, 3), "== cap -> no boost");
-        assert!(!should_boost(Some(&cfg), &green_rollup(), &behind_velocity(), true, 9), "over cap -> no boost");
+        assert!(
+            !should_boost(Some(&cfg), &green_rollup(), &behind_velocity(), true, 3),
+            "== cap -> no boost"
+        );
+        assert!(
+            !should_boost(Some(&cfg), &green_rollup(), &behind_velocity(), true, 9),
+            "over cap -> no boost"
+        );
         // default cap (no max_extra_per_day) is 3
         let cfg_default = json!({"produce": ["x"], "bin": ["y"]});
-        assert!(should_boost(Some(&cfg_default), &green_rollup(), &behind_velocity(), true, 2));
-        assert!(!should_boost(Some(&cfg_default), &green_rollup(), &behind_velocity(), true, 3));
+        assert!(should_boost(
+            Some(&cfg_default),
+            &green_rollup(),
+            &behind_velocity(),
+            true,
+            2
+        ));
+        assert!(!should_boost(
+            Some(&cfg_default),
+            &green_rollup(),
+            &behind_velocity(),
+            true,
+            3
+        ));
     }
 
     #[test]
@@ -533,6 +602,9 @@ mod tests {
     // -------- per-sweep cap documented --------
     #[test]
     fn per_sweep_cap_is_one() {
-        assert_eq!(MAX_BOOSTS_PER_SWEEP, 1, "one produce/post boost per sweep — the heavy-session guard");
+        assert_eq!(
+            MAX_BOOSTS_PER_SWEEP, 1,
+            "one produce/post boost per sweep — the heavy-session guard"
+        );
     }
 }

@@ -105,7 +105,9 @@ pub fn read_freshness_mark(ledger_path: &Path) -> Option<FreshnessMark> {
 /// no ledger when the park began) never fires an early wake — there is no baseline to advance past.
 pub fn has_fresh_data(before: Option<FreshnessMark>, now: Option<FreshnessMark>) -> bool {
     match (before, now) {
-        (Some(b), Some(n)) => n.last_n_samples > b.last_n_samples || n.last_seen_ts > b.last_seen_ts,
+        (Some(b), Some(n)) => {
+            n.last_n_samples > b.last_n_samples || n.last_seen_ts > b.last_seen_ts
+        }
         _ => false,
     }
 }
@@ -192,7 +194,8 @@ mod tests {
     #[test]
     fn shipped_via_merged_state_continues_immediately() {
         // auto-merge lane: no number yet, state "merged" (non-local) => continue.
-        let hb = json!({"status": "sleeping", "last_pr": {"state": "merged", "branch": "rsi/iter-2"}});
+        let hb =
+            json!({"status": "sleeping", "last_pr": {"state": "merged", "branch": "rsi/iter-2"}});
         assert_eq!(park_decision(&hb, 120).park_s, 0);
     }
 
@@ -201,7 +204,10 @@ mod tests {
         // A noop drop ends status=sleeping with last_pr: null => park the floor, never 0.
         let hb = json!({"status": "sleeping", "last_pr": Value::Null, "last_summary": "Pi made no changes"});
         let plan = park_decision(&hb, 900);
-        assert_eq!(plan.park_s, MAX_PARK_FLOOR_S, "over-long interval clamps to the floor");
+        assert_eq!(
+            plan.park_s, MAX_PARK_FLOOR_S,
+            "over-long interval clamps to the floor"
+        );
     }
 
     #[test]
@@ -219,7 +225,10 @@ mod tests {
         for status in ["error", "idle", "blocked"] {
             let hb = json!({"status": status});
             let plan = park_decision(&hb, 120);
-            assert_eq!(plan.park_s, 120, "status={status} parks the bounded interval");
+            assert_eq!(
+                plan.park_s, 120,
+                "status={status} parks the bounded interval"
+            );
         }
     }
 
@@ -228,7 +237,10 @@ mod tests {
         for interval in [-5, 0, 1, 120, 900, 100_000] {
             let hb = json!({"status": "error"});
             let p = park_decision(&hb, interval).park_s;
-            assert!((0..=MAX_PARK_FLOOR_S).contains(&p), "interval={interval} -> park {p} out of [0,{MAX_PARK_FLOOR_S}]");
+            assert!(
+                (0..=MAX_PARK_FLOOR_S).contains(&p),
+                "interval={interval} -> park {p} out of [0,{MAX_PARK_FLOOR_S}]"
+            );
         }
     }
 
@@ -249,28 +261,62 @@ mod tests {
 
     #[test]
     fn freshness_mark_reads_ledger_fields() {
-        let m = freshness_mark_from(&json!({"last_seen_ts": 1783453420.0, "last_n_samples": 2788})).unwrap();
+        let m = freshness_mark_from(&json!({"last_seen_ts": 1783453420.0, "last_n_samples": 2788}))
+            .unwrap();
         assert_eq!(m.last_n_samples, 2788);
         assert_eq!(m.last_seen_ts, 1783453420.0);
     }
 
     #[test]
     fn has_fresh_data_fires_on_more_samples_or_newer_ts() {
-        let before = Some(FreshnessMark { last_seen_ts: 100.0, last_n_samples: 10 });
+        let before = Some(FreshnessMark {
+            last_seen_ts: 100.0,
+            last_n_samples: 10,
+        });
         // more samples
-        assert!(has_fresh_data(before, Some(FreshnessMark { last_seen_ts: 100.0, last_n_samples: 11 })));
+        assert!(has_fresh_data(
+            before,
+            Some(FreshnessMark {
+                last_seen_ts: 100.0,
+                last_n_samples: 11
+            })
+        ));
         // newer ts
-        assert!(has_fresh_data(before, Some(FreshnessMark { last_seen_ts: 101.0, last_n_samples: 10 })));
+        assert!(has_fresh_data(
+            before,
+            Some(FreshnessMark {
+                last_seen_ts: 101.0,
+                last_n_samples: 10
+            })
+        ));
         // no change => no wake
-        assert!(!has_fresh_data(before, Some(FreshnessMark { last_seen_ts: 100.0, last_n_samples: 10 })));
+        assert!(!has_fresh_data(
+            before,
+            Some(FreshnessMark {
+                last_seen_ts: 100.0,
+                last_n_samples: 10
+            })
+        ));
         // fewer samples (ledger reset / metric repoint) => not a "fresh" advance
-        assert!(!has_fresh_data(before, Some(FreshnessMark { last_seen_ts: 100.0, last_n_samples: 3 })));
+        assert!(!has_fresh_data(
+            before,
+            Some(FreshnessMark {
+                last_seen_ts: 100.0,
+                last_n_samples: 3
+            })
+        ));
     }
 
     #[test]
     fn has_fresh_data_never_fires_without_a_baseline() {
-        let now = Some(FreshnessMark { last_seen_ts: 999.0, last_n_samples: 999 });
-        assert!(!has_fresh_data(None, now), "no pre-park baseline => no early wake");
+        let now = Some(FreshnessMark {
+            last_seen_ts: 999.0,
+            last_n_samples: 999,
+        });
+        assert!(
+            !has_fresh_data(None, now),
+            "no pre-park baseline => no early wake"
+        );
         assert!(!has_fresh_data(now, None));
         assert!(!has_fresh_data(None, None));
     }

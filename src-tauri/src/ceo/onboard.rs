@@ -44,7 +44,7 @@
 
 use crate::control::{contracts, paths, registry};
 use crate::improver::ctx::Ctx;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 
 /// Candidate freshness-emitter commands, in priority order. Each is the SAME shape the fleet's real
@@ -175,8 +175,16 @@ pub fn onboard_project(
     // (1) AUTO-DETECT the stack via the EXISTING read-only probe. A project with no detectable test
     // command has no gate — we refuse rather than onboard a lane that cannot be gated honestly.
     let stack = contracts::detect_stack(&project_path);
-    let lang = stack.get("lang").and_then(Value::as_str).unwrap_or("unknown").to_string();
-    let gate = stack.get("test_cmd").and_then(Value::as_str).unwrap_or("").to_string();
+    let lang = stack
+        .get("lang")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let gate = stack
+        .get("test_cmd")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     if gate.trim().is_empty() {
         return json!({
             "ok": false,
@@ -208,7 +216,10 @@ pub fn onboard_project(
             "error": format!("failed to write repos.json row: {}", write.get("error").cloned().unwrap_or(Value::Null)),
         });
     }
-    let created_row = write.get("created").and_then(Value::as_bool).unwrap_or(false);
+    let created_row = write
+        .get("created")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     // Build the repo Value the contract/isolation steps read (from the freshly-written row, so we use
     // exactly what onboarding persisted — not a hand-built shape).
@@ -218,7 +229,9 @@ pub fn onboard_project(
     // UNDER Solomon (never inside the product) — the per-project isolation seam.
     let runtime_dir = match paths::runtime_dir(&repo) {
         Some(d) => d,
-        None => return json!({"ok": false, "error": "could not resolve an isolated runtime dir for the lane"}),
+        None => {
+            return json!({"ok": false, "error": "could not resolve an isolated runtime dir for the lane"});
+        }
     };
     if let Err(e) = std::fs::create_dir_all(&runtime_dir) {
         return json!({"ok": false, "error": format!("could not create isolated runtime dir: {e}")});
@@ -266,7 +279,11 @@ fn run_one_gated_cycle(repo: &Value) -> String {
         &path,
         &name,
         &provider,
-        if model.is_empty() { None } else { Some(model.as_str()) },
+        if model.is_empty() {
+            None
+        } else {
+            Some(model.as_str())
+        },
     );
 
     // The EXISTING freshness gate — reads THIS lane's runtime/<name>/freshness.json (isolated). It
@@ -288,10 +305,12 @@ fn run_one_gated_cycle(repo: &Value) -> String {
     let ran_ok = outcome.get("ok").and_then(Value::as_bool).unwrap_or(false);
     format!(
         "ran: freshness gate proceeded; orchestrator dispatched (ok={ran_ok}, reason={})",
-        outcome
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or(outcome.get("kind").and_then(Value::as_str).unwrap_or("dispatched"))
+        outcome.get("reason").and_then(Value::as_str).unwrap_or(
+            outcome
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("dispatched")
+        )
     )
 }
 
@@ -370,7 +389,11 @@ mod tests {
         ));
         std::fs::create_dir_all(d.join("tests")).unwrap();
         std::fs::write(d.join("requirements.txt"), "").unwrap();
-        std::fs::write(d.join("tests").join("test_x.py"), "def test_ok():\n    assert True\n").unwrap();
+        std::fs::write(
+            d.join("tests").join("test_x.py"),
+            "def test_ok():\n    assert True\n",
+        )
+        .unwrap();
         if with_emitter {
             std::fs::create_dir_all(d.join("tools")).unwrap();
             std::fs::write(d.join("tools").join("fitness.py"), "print('{}')\n").unwrap();
@@ -390,14 +413,22 @@ mod tests {
         // repos.json) and the notify env lock (avoid parallel notify side-effects) for the whole
         // test body. Drop happens in reverse-source order at scope exit.
         let _repos_guard = drop_repos_lock_for_test();
-        let _g = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
 
         let proj = tmp_project("e2e", true); // WITH a real tools/fitness.py emitter
         let proj_s = proj.to_string_lossy().into_owned();
 
         // Onboard from PATH + API-KEY-ENV alone. run_cycle=true exercises the real gated cycle.
-        let out = onboard_project(&proj_s, "OLLAMA_API_KEY", Some("ship one small improvement"), None, true);
+        let out = onboard_project(
+            &proj_s,
+            "OLLAMA_API_KEY",
+            Some("ship one small improvement"),
+            None,
+            true,
+        );
         assert_eq!(out["ok"], true, "onboarding must succeed: {out}");
 
         let name = out["name"].as_str().unwrap();
@@ -405,28 +436,61 @@ mod tests {
         // (1) stack auto-detected: a python gate.
         assert_eq!(out["lang"], "python");
         assert!(
-            out["gate"].as_str().unwrap().contains("pytest") || out["gate"].as_str().unwrap().contains("unittest"),
-            "a real gate was detected: {}", out["gate"]
+            out["gate"].as_str().unwrap().contains("pytest")
+                || out["gate"].as_str().unwrap().contains("unittest"),
+            "a real gate was detected: {}",
+            out["gate"]
         );
 
         // (2) freshness objective SEEDED from the real emitter (verified present per D1's rule).
-        assert_eq!(out["freshness_seeded"], true, "the real emitter must seed a freshness objective: {out}");
-        assert!(out["freshness_cmd"].as_str().unwrap().contains("tools/fitness.py"));
+        assert_eq!(
+            out["freshness_seeded"], true,
+            "the real emitter must seed a freshness objective: {out}"
+        );
+        assert!(
+            out["freshness_cmd"]
+                .as_str()
+                .unwrap()
+                .contains("tools/fitness.py")
+        );
         assert_eq!(out["no_objective"], false);
 
         // (3) ZERO hand-editing: the row was WRITTEN by onboarding and is now in repos.json with the
         // seeded objective + gate + api-key ENV + path.
         let row = row_for(name).expect("the onboarded row is in repos.json");
         assert_eq!(row["path"].as_str().unwrap(), out["path"].as_str().unwrap());
-        assert_eq!(row["api_key"], json!("OLLAMA_API_KEY"), "the api-key ENV name is stored (never a secret)");
-        assert!(row["freshness"]["cmd"].as_str().unwrap().contains("tools/fitness.py"));
-        assert!(row["gate"].as_str().unwrap().contains("pytest") || row["gate"].as_str().unwrap().contains("unittest"));
+        assert_eq!(
+            row["api_key"],
+            json!("OLLAMA_API_KEY"),
+            "the api-key ENV name is stored (never a secret)"
+        );
+        assert!(
+            row["freshness"]["cmd"]
+                .as_str()
+                .unwrap()
+                .contains("tools/fitness.py")
+        );
+        assert!(
+            row["gate"].as_str().unwrap().contains("pytest")
+                || row["gate"].as_str().unwrap().contains("unittest")
+        );
 
         // (3b) ISOLATED runtime/<name>/ created UNDER Solomon (never inside the product repo).
         let rt = std::path::Path::new(out["runtime_dir"].as_str().unwrap());
-        assert!(rt.is_dir(), "the isolated runtime dir must exist: {}", rt.display());
-        assert!(rt.ends_with(name), "the runtime dir is per-project isolated: {}", rt.display());
-        assert!(!rt.starts_with(&proj), "isolation: runtime state is NOT inside the product repo");
+        assert!(
+            rt.is_dir(),
+            "the isolated runtime dir must exist: {}",
+            rt.display()
+        );
+        assert!(
+            rt.ends_with(name),
+            "the runtime dir is per-project isolated: {}",
+            rt.display()
+        );
+        assert!(
+            !rt.starts_with(&proj),
+            "isolation: runtime state is NOT inside the product repo"
+        );
 
         // (4) ONE gated cycle ran — the freshness gate ran against the ISOLATED ledger. With a real
         // emitter that prints `{}` (no metric_id / observable) the objective reads UNOBSERVABLE, so
@@ -455,7 +519,9 @@ mod tests {
     // ===================================================================== #
     #[test]
     fn a_project_without_an_emitter_is_onboarded_no_objective_not_blind() {
-        let _g = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
 
         let proj = tmp_project("noemit", false); // NO tools/fitness.py
@@ -468,7 +534,11 @@ mod tests {
         assert_eq!(out["no_objective"], true);
         let name = out["name"].as_str().unwrap();
         let row = row_for(name).expect("row present");
-        assert_eq!(row["freshness"]["no_objective"], json!(true), "the honest sentinel is persisted: {row}");
+        assert_eq!(
+            row["freshness"]["no_objective"],
+            json!(true),
+            "the honest sentinel is persisted: {row}"
+        );
         // and it satisfies the fleet freshness disposition classifier as an explicit opt-out.
         assert_eq!(
             registry::freshness_disposition(&row),
@@ -486,7 +556,9 @@ mod tests {
     // ===================================================================== #
     #[test]
     fn onboarded_lane_state_is_isolated_from_other_lanes() {
-        let _g = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
 
         // Onboard TWO distinct projects; each must get its OWN runtime/<name>/ subtree, and running
@@ -500,7 +572,10 @@ mod tests {
 
         let rt_a = std::path::PathBuf::from(out_a["runtime_dir"].as_str().unwrap());
         let rt_b = std::path::PathBuf::from(out_b["runtime_dir"].as_str().unwrap());
-        assert_ne!(rt_a, rt_b, "each onboarded lane has a DISTINCT isolated runtime dir");
+        assert_ne!(
+            rt_a, rt_b,
+            "each onboarded lane has a DISTINCT isolated runtime dir"
+        );
 
         // Snapshot lane B's runtime dir contents, then run lane A's gated cycle. B must be untouched.
         let b_before = list_dir(&rt_b);
@@ -512,7 +587,10 @@ mod tests {
             "running lane A's gated cycle must not touch lane B's isolated state"
         );
         // and A's freshness ledger (if the gate wrote one) lives under A's dir, not B's.
-        assert!(!rt_b.join("freshness.json").exists(), "lane A's freshness gate never wrote into lane B's dir");
+        assert!(
+            !rt_b.join("freshness.json").exists(),
+            "lane A's freshness gate never wrote into lane B's dir"
+        );
 
         let _ = std::fs::remove_dir_all(&rt_a);
         let _ = std::fs::remove_dir_all(&rt_b);
@@ -524,7 +602,13 @@ mod tests {
     // ---- fail-closed refusals ----
     #[test]
     fn refuses_a_non_directory_path() {
-        let out = onboard_project("C:/no/such/onboard/path/zzz", "OLLAMA_API_KEY", None, None, false);
+        let out = onboard_project(
+            "C:/no/such/onboard/path/zzz",
+            "OLLAMA_API_KEY",
+            None,
+            None,
+            false,
+        );
         assert_eq!(out["ok"], false);
         assert!(out["error"].as_str().unwrap().contains("not a directory"));
     }
@@ -535,7 +619,10 @@ mod tests {
         let d = std::env::temp_dir().join(format!(
             "solomon_onboard_nogate_{}_{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|x| x.as_nanos()).unwrap_or(0)
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|x| x.as_nanos())
+                .unwrap_or(0)
         ));
         std::fs::create_dir_all(&d).unwrap();
         let out = onboard_project(&d.to_string_lossy(), "OLLAMA_API_KEY", None, None, false);
@@ -574,7 +661,11 @@ mod tests {
     /// A sorted list of a dir's entry names (for the isolation before/after comparison).
     fn list_dir(d: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(d)
-            .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
             .unwrap_or_default();
         names.sort();
         names

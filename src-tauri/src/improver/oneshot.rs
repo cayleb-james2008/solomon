@@ -22,7 +22,7 @@ use crate::control::proc;
 use crate::improver::ctx::Ctx;
 use crate::improver::pi;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::process::Command;
 use std::time::Duration;
 
@@ -224,7 +224,11 @@ fn parse_provision(text: &str) -> (Option<String>, Option<String>) {
     let agent_md = strip_code_fence(agent_part.trim());
     let backlog_md = strip_code_fence(backlog_part.trim());
     // (agent_md or None), (backlog_md or None)  — empty string -> None
-    let agent = if agent_md.is_empty() { None } else { Some(agent_md) };
+    let agent = if agent_md.is_empty() {
+        None
+    } else {
+        Some(agent_md)
+    };
     let backlog = if backlog_md.is_empty() {
         None
     } else {
@@ -385,7 +389,11 @@ fn recent_history_summaries(ctx: &Ctx, limit: usize) -> Vec<String> {
             Ok(v) => v,
             Err(_) => continue, // json.JSONDecodeError -> skip
         };
-        let s = rec.get("summary").and_then(Value::as_str).unwrap_or("").trim();
+        let s = rec
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
         if !s.is_empty() {
             out.push(s.to_string());
         }
@@ -662,7 +670,6 @@ fn py_rstrip(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    
 
     // Concurrent-drain regression for the wait-then-read deadlock class (also fixed in pi::run_pi,
     // visual::spawn_pi, visual::run_browser_cli): a child that floods stdout past the OS pipe buffer

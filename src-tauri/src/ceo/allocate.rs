@@ -220,7 +220,10 @@ mod tests {
         assert!(!is_scalable(false, &yellow));
         assert!(!is_scalable(false, &red));
         // green status but not healthy -> not scalable
-        assert!(!is_scalable(false, &json!({"healthy": false, "status": "green"})));
+        assert!(!is_scalable(
+            false,
+            &json!({"healthy": false, "status": "green"})
+        ));
     }
 
     #[test]

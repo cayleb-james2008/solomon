@@ -209,10 +209,14 @@ mod tests {
     // -------- path resolution --------
     #[test]
     fn resolve_path_expands_env_repo_and_relative() {
-        std::env::set_var("SOLOMON_OPS_TEST_VAR", "/tmp/ops_test_base");
+        unsafe {
+            std::env::set_var("SOLOMON_OPS_TEST_VAR", "/tmp/ops_test_base");
+        }
         let p = resolve_path("%SOLOMON_OPS_TEST_VAR%/data/x.json", "");
         assert_eq!(p, PathBuf::from("/tmp/ops_test_base/data/x.json"));
-        std::env::remove_var("SOLOMON_OPS_TEST_VAR");
+        unsafe {
+            std::env::remove_var("SOLOMON_OPS_TEST_VAR");
+        }
 
         // ${REPO} joins the repos.json path in.
         let p = resolve_path("${REPO}/logs/a.log", "/tmp/repo/root");

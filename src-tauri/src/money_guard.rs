@@ -64,7 +64,7 @@
 #![allow(dead_code)]
 
 use crate::notify;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 /// The CLOSED set of MONEY-CAPABLE action kinds Solomon's autonomous funnel is
@@ -88,11 +88,41 @@ pub const PLACE_TRADE_KIND: &str = "place_trade";
 /// half of the fail-closed classifier (the other half is: anything else money-
 /// capable that is not the whitelisted trade is also denied).
 const MONEY_OUT_MARKERS: &[&str] = &[
-    "withdraw", "payout", "transfer", "deposit", "fund", "funding", "purchase",
-    "buy", "pay", "payment", "checkout", "charge", "invoice", "wire", "ach",
-    "remit", "disburse", "spend", "ad_spend", "ads", "subscribe", "subscription",
-    "signup", "sign_up", "stripe", "paypal", "venmo", "zelle", "cashout",
-    "send_money", "sendmoney", "topup", "top_up", "refund", "settle_cash",
+    "withdraw",
+    "payout",
+    "transfer",
+    "deposit",
+    "fund",
+    "funding",
+    "purchase",
+    "buy",
+    "pay",
+    "payment",
+    "checkout",
+    "charge",
+    "invoice",
+    "wire",
+    "ach",
+    "remit",
+    "disburse",
+    "spend",
+    "ad_spend",
+    "ads",
+    "subscribe",
+    "subscription",
+    "signup",
+    "sign_up",
+    "stripe",
+    "paypal",
+    "venmo",
+    "zelle",
+    "cashout",
+    "send_money",
+    "sendmoney",
+    "topup",
+    "top_up",
+    "refund",
+    "settle_cash",
 ];
 
 /// A money-out guard decision. `Allow` carries the whitelisted lane's reason;
@@ -338,9 +368,21 @@ mod tests {
         // A representative spread of external-spend verbs — denied even on a
         // whitelisted lane (money-OUT is the HARD invariant, no lane exempts it).
         for kind in [
-            "withdraw", "withdraw_funds", "transfer", "bank_transfer", "deposit",
-            "fund_account", "purchase", "buy_ads", "pay_invoice", "payment_intent",
-            "stripe_checkout", "ad_spend", "paid_signup", "cashout", "send_money",
+            "withdraw",
+            "withdraw_funds",
+            "transfer",
+            "bank_transfer",
+            "deposit",
+            "fund_account",
+            "purchase",
+            "buy_ads",
+            "pay_invoice",
+            "payment_intent",
+            "stripe_checkout",
+            "ad_spend",
+            "paid_signup",
+            "cashout",
+            "send_money",
             "wire_transfer",
         ] {
             for repo in [whitelisted_repo(), equity_repo(), plain_repo()] {
@@ -363,16 +405,27 @@ mod tests {
     fn place_trade_on_whitelisted_lane_is_allowed() {
         // asmodeus (live_money) and kairos (equity_usd) — the two whitelist keys.
         let a = classify(PLACE_TRADE_KIND, &whitelisted_repo());
-        assert!(a.is_allowed(), "place_trade on live_money lane must ALLOW: {}", a.reason());
+        assert!(
+            a.is_allowed(),
+            "place_trade on live_money lane must ALLOW: {}",
+            a.reason()
+        );
         assert!(a.reason().to_lowercase().contains("allowed"));
 
         let k = classify(PLACE_TRADE_KIND, &equity_repo());
-        assert!(k.is_allowed(), "place_trade on equity_usd lane must ALLOW: {}", k.reason());
+        assert!(
+            k.is_allowed(),
+            "place_trade on equity_usd lane must ALLOW: {}",
+            k.reason()
+        );
 
         // ...but the SAME verb on a non-whitelisted lane is DENIED (trade only in
         // a pre-existing whitelisted account).
         let deny = classify(PLACE_TRADE_KIND, &plain_repo());
-        assert!(!deny.is_allowed(), "place_trade on a non-whitelisted lane must DENY");
+        assert!(
+            !deny.is_allowed(),
+            "place_trade on a non-whitelisted lane must DENY"
+        );
     }
 
     // ---- REQUIRED: ambiguous money action DENIED (fail-closed) ----
@@ -382,7 +435,10 @@ mod tests {
         // by the trade path nor the whitelisted trade verb: an unknown future
         // "spend"-flavored tool. DEFAULT-DENY, even on a whitelisted lane.
         let v = classify("spend_treasury", &whitelisted_repo());
-        assert!(!v.is_allowed(), "ambiguous money action must be DEFAULT-DENIED");
+        assert!(
+            !v.is_allowed(),
+            "ambiguous money action must be DEFAULT-DENIED"
+        );
 
         // A brand-new unrecognized money verb with no marker at all but forced
         // money-capable would still be denied by the default arm; here we prove a
@@ -397,12 +453,20 @@ mod tests {
         // The existing closed-registry action kinds must all sail through — the
         // guard is transparent to the non-money action funnel.
         for kind in [
-            "none", "restart_lane", "reset_to_base", "run_fix_session",
-            "park_primary_endpoint", "clear_escalation_and_retry",
+            "none",
+            "restart_lane",
+            "reset_to_base",
+            "run_fix_session",
+            "park_primary_endpoint",
+            "clear_escalation_and_retry",
             "page_operator_deduped",
         ] {
             let v = classify(kind, &plain_repo());
-            assert!(v.is_allowed(), "non-money kind '{kind}' must pass the guard: {}", v.reason());
+            assert!(
+                v.is_allowed(),
+                "non-money kind '{kind}' must pass the guard: {}",
+                v.reason()
+            );
         }
         // and the guard() entrypoint returns None (proceed) for them.
         assert!(guard("restart_lane", &plain_repo()).is_none());
@@ -416,16 +480,26 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        unsafe {
+            std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        }
 
         let refusal = guard("withdraw_all", &whitelisted_repo())
             .expect("a money-out action must produce a refusal Value");
         assert_eq!(refusal["ok"], false);
         assert_eq!(refusal["money_guard"], true);
         assert_eq!(refusal["kind"], "withdraw_all");
-        assert!(refusal["error"].as_str().unwrap().to_lowercase().contains("denied"));
+        assert!(
+            refusal["error"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("denied")
+        );
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        unsafe {
+            std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        }
     }
 
     // ---- the guard's ALLOW grants nothing executable today ----
@@ -449,7 +523,10 @@ mod tests {
             "money_guard_probe",
             false,
         );
-        assert_eq!(out["ok"], false, "execute_action must refuse place_trade (no dispatch arm)");
+        assert_eq!(
+            out["ok"], false,
+            "execute_action must refuse place_trade (no dispatch arm)"
+        );
         assert!(
             out["error"].as_str().unwrap().contains("closed registry"),
             "refusal must be the closed-registry arm, proving no Solomon-side trade dispatch: {}",

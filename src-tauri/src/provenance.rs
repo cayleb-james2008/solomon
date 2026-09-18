@@ -16,7 +16,7 @@
 use crate::control::{paths, proc, registry};
 use crate::notify;
 use chrono::Utc;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -110,8 +110,7 @@ pub fn check() -> Value {
 fn held_lanes(rows: &[Value]) -> Vec<String> {
     rows.iter()
         .filter(|r| {
-            r.get("live_app").and_then(Value::as_bool).unwrap_or(false)
-                || r.get("tiers").is_some()
+            r.get("live_app").and_then(Value::as_bool).unwrap_or(false) || r.get("tiers").is_some()
         })
         .filter_map(|r| r.get("name").and_then(Value::as_str))
         .filter(|n| !n.is_empty())
@@ -124,7 +123,16 @@ fn held_lanes(rows: &[Value]) -> Vec<String> {
 fn git_dirty(root: &Path, file: &str) -> Option<bool> {
     let root_s = root.to_string_lossy().into_owned();
     let r = proc::run(
-        &["git", "-C", &root_s, "diff", "--name-only", "HEAD", "--", file],
+        &[
+            "git",
+            "-C",
+            &root_s,
+            "diff",
+            "--name-only",
+            "HEAD",
+            "--",
+            file,
+        ],
         None,
         Some(Duration::from_secs(60)),
     )
@@ -569,14 +577,22 @@ mod tests {
             vec!["commit", "--allow-empty", "-m", "init"],
             vec!["branch", "-M", "main"],
         ] {
-            let st = Command::new("git").args(&args).current_dir(&dir).status().unwrap();
+            let st = Command::new("git")
+                .args(&args)
+                .current_dir(&dir)
+                .status()
+                .unwrap();
             assert!(st.success(), "git {args:?} failed in {dir:?}");
         }
         dir
     }
 
     fn git(dir: &Path, args: &[&str]) {
-        let st = Command::new("git").args(args).current_dir(dir).status().unwrap();
+        let st = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
         assert!(st.success(), "git {args:?} failed in {dir:?}");
     }
 
@@ -642,13 +658,19 @@ mod tests {
     fn provenance_subject_grammar_accepts_the_two_categories_only() {
         // operator + rsi family (incl. version-suffixed engine tags)
         assert!(valid_provenance_subject("operator: seed repos.json"));
-        assert!(valid_provenance_subject("rsi: park ollama-cloud/glm-5.2 until 2026-07-07"));
-        assert!(valid_provenance_subject("rsi-v3: supervisor diagnosis->action table"));
+        assert!(valid_provenance_subject(
+            "rsi: park ollama-cloud/glm-5.2 until 2026-07-07"
+        ));
+        assert!(valid_provenance_subject(
+            "rsi-v3: supervisor diagnosis->action table"
+        ));
         assert!(valid_provenance_subject("rsi-v3.1: skeptic fixes"));
         // merge commits excepted (git writes their subjects)
         assert!(valid_provenance_subject("Merge pull request #49 from x/y"));
         // everything else is a violation
-        assert!(!valid_provenance_subject("feat: expose solomon autopilot console"));
+        assert!(!valid_provenance_subject(
+            "feat: expose solomon autopilot console"
+        ));
         assert!(!valid_provenance_subject("fix repos.json provider drift"));
         assert!(!valid_provenance_subject("operator:missing-space"));
         assert!(!valid_provenance_subject("operator: ")); // empty body
@@ -810,7 +832,10 @@ mod tests {
         let barrier_sha = match marker_out {
             Ok(o) if o.status.success() => {
                 let text = String::from_utf8_lossy(&o.stdout);
-                text.lines().next().map(|l| l.trim().to_string()).unwrap_or_default()
+                text.lines()
+                    .next()
+                    .map(|l| l.trim().to_string())
+                    .unwrap_or_default()
             }
             _ => String::new(),
         };
@@ -836,13 +861,14 @@ mod tests {
             args.push("--".to_string());
             args.push(p.to_string());
         }
-        let out = Command::new("git").args(&args).current_dir(&repo_root).output();
+        let out = Command::new("git")
+            .args(&args)
+            .current_dir(&repo_root)
+            .output();
         let out = match out {
             Ok(o) if o.status.success() => o,
             _ => {
-                eprintln!(
-                    "skipping frozen-core gate: git log could not resolve the barrier range"
-                );
+                eprintln!("skipping frozen-core gate: git log could not resolve the barrier range");
                 return;
             }
         };
@@ -855,7 +881,9 @@ mod tests {
                 let short = parts.next().unwrap_or("").trim();
                 let subject = parts.next().unwrap_or("");
                 let grandfathered = !short.is_empty()
-                    && GRANDFATHERED_FROZEN.iter().any(|full| full.starts_with(short));
+                    && GRANDFATHERED_FROZEN
+                        .iter()
+                        .any(|full| full.starts_with(short));
                 !grandfathered && !is_operator_provenance(subject)
             })
             .map(|l| l.to_string())
@@ -899,11 +927,17 @@ mod tests {
             .status()
             .unwrap();
         assert!(st.success());
-        git(&dir, &["remote", "add", "origin", &remote.to_string_lossy()]);
+        git(
+            &dir,
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
         git(&dir, &["push", "-u", "origin", "main"]);
         assert_eq!(controller_clean_at(&dir, "main"), Ok(()));
         // a local commit not on origin -> Err (a stale unpushed main is out-of-band, not clean)
-        git(&dir, &["commit", "--allow-empty", "-m", "operator: local only"]);
+        git(
+            &dir,
+            &["commit", "--allow-empty", "-m", "operator: local only"],
+        );
         let err = controller_clean_at(&dir, "main").unwrap_err();
         assert!(err.contains("not on its upstream"), "{err}");
         assert!(err.contains("1 commit"), "{err}");
@@ -922,8 +956,12 @@ mod tests {
     // lanes only, deduped on re-sweep) -> commit -> cleared (holds + marker gone).
     #[test]
     fn drift_pages_once_holds_trading_lanes_and_clears_on_commit() {
-        let _env = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        let _env = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        }
         let repo = tmp_git_repo("drift");
         std::fs::write(repo.join("repos.json"), b"[{\"name\":\"x\"}]").unwrap();
         git(&repo, &["add", "repos.json"]);
@@ -948,30 +986,49 @@ mod tests {
         let out = check_impl(&repo, &rt, &rows, t0 + 60.0);
         assert!(out["actions"].as_array().unwrap().is_empty());
         assert!(!rt.join("sover").join("HOLD_META").exists());
-        assert!(out["files"]["repos.json"]["first_seen_drift"].as_f64().unwrap() > 0.0);
+        assert!(
+            out["files"]["repos.json"]["first_seen_drift"]
+                .as_f64()
+                .unwrap()
+                > 0.0
+        );
 
         // Past the grace window: exactly one page action + holds in sover/kairos, NOT maki.
         let out = check_impl(&repo, &rt, &rows, t0 + 700.0);
         let acts: Vec<String> = out["actions"]
-            .as_array().unwrap().iter()
+            .as_array()
+            .unwrap()
+            .iter()
             .map(|a| a.as_str().unwrap().to_string())
             .collect();
-        assert!(acts.iter().any(|a| a.contains("PAGED") && a.contains("repos.json")), "{acts:?}");
+        assert!(
+            acts.iter()
+                .any(|a| a.contains("PAGED") && a.contains("repos.json")),
+            "{acts:?}"
+        );
         assert!(rt.join("_config_drift_paged_repos.json").exists());
         for lane in ["sover", "kairos"] {
             let hold: Value = serde_json::from_str(
                 &std::fs::read_to_string(rt.join(lane).join("HOLD_META")).unwrap(),
-            ).unwrap();
+            )
+            .unwrap();
             assert_eq!(hold["file"], "repos.json");
             assert_eq!(hold["reason"], "unversioned config mutation: repos.json");
             assert!(hold["expires_at"].as_f64().unwrap() > t0 + 700.0);
         }
-        assert!(!rt.join("maki").join("HOLD_META").exists(), "non-trading lane never held");
+        assert!(
+            !rt.join("maki").join("HOLD_META").exists(),
+            "non-trading lane never held"
+        );
 
         // Persisting drift on the next sweep: NO second page action (marker dedupe), holds refresh.
         let out = check_impl(&repo, &rt, &rows, t0 + 800.0);
         assert!(
-            !out["actions"].as_array().unwrap().iter().any(|a| a.as_str().unwrap().contains("PAGED")),
+            !out["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a.as_str().unwrap().contains("PAGED")),
             "a persisting drift must not re-page"
         );
         assert!(rt.join("sover").join("HOLD_META").exists());
@@ -981,10 +1038,16 @@ mod tests {
         git(&repo, &["commit", "-m", "operator: whitespace touch"]);
         let out = check_impl(&repo, &rt, &rows, t0 + 900.0);
         let acts: Vec<String> = out["actions"]
-            .as_array().unwrap().iter()
+            .as_array()
+            .unwrap()
+            .iter()
             .map(|a| a.as_str().unwrap().to_string())
             .collect();
-        assert!(acts.iter().any(|a| a.contains("cleared") && a.contains("repos.json")), "{acts:?}");
+        assert!(
+            acts.iter()
+                .any(|a| a.contains("cleared") && a.contains("repos.json")),
+            "{acts:?}"
+        );
         assert!(!rt.join("_config_drift_paged_repos.json").exists());
         assert!(!rt.join("sover").join("HOLD_META").exists());
         assert!(!rt.join("kairos").join("HOLD_META").exists());
@@ -1001,7 +1064,9 @@ mod tests {
     // baseline adoption after page + one full hold TTL — never a forever-hold dead end.
     #[test]
     fn env_drift_pages_holds_then_adopts_baseline() {
-        let _env = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
         }
@@ -1018,14 +1083,24 @@ mod tests {
 
         // Past grace: page + hold, baseline NOT yet adopted (revert can still clear it).
         let out = check_impl(&repo, &rt, &rows, t0 + 700.0);
-        assert!(out["actions"].as_array().unwrap().iter().any(|a| a.as_str().unwrap().contains("PAGED")));
+        assert!(
+            out["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a.as_str().unwrap().contains("PAGED"))
+        );
         assert!(rt.join("sover").join("HOLD_META").exists());
         assert!(rt.join("_config_drift_paged_.env").exists());
 
         // Past grace + hold TTL: adopted — baseline updated, artifacts cleared, honest action.
         let out = check_impl(&repo, &rt, &rows, t0 + 30.0 + 600.0 + 3600.0 + 60.0);
         assert!(
-            out["actions"].as_array().unwrap().iter().any(|a| a.as_str().unwrap().contains("adopted")),
+            out["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a.as_str().unwrap().contains("adopted")),
             "{out}"
         );
         assert!(!rt.join("sover").join("HOLD_META").exists());
@@ -1050,11 +1125,16 @@ mod tests {
         std::fs::create_dir_all(rt.join("sover")).unwrap();
         std::fs::write(
             rt.join("sover").join("HOLD_META"),
-            json!({"file": "ops.json", "reason": "unversioned config mutation: ops.json"}).to_string(),
-        ).unwrap();
+            json!({"file": "ops.json", "reason": "unversioned config mutation: ops.json"})
+                .to_string(),
+        )
+        .unwrap();
         std::fs::write(rt.join("_config_drift_paged_repos.json"), "x").unwrap();
         clear_drift_artifacts(&rt, "repos.json");
-        assert!(rt.join("sover").join("HOLD_META").exists(), "ops.json hold must survive");
+        assert!(
+            rt.join("sover").join("HOLD_META").exists(),
+            "ops.json hold must survive"
+        );
         assert!(!rt.join("_config_drift_paged_repos.json").exists());
         let _ = std::fs::remove_dir_all(&rt);
     }

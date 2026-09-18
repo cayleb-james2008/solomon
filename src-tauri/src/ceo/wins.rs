@@ -27,7 +27,7 @@
 //! identity. A day with no wins yields an EMPTY summary (never a fabricated encouragement) — silence
 //! is honest, so the planner is never nudged by a win that did not happen.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The default number of recent daily snapshots to tail from `outcomes.jsonl`. A bounded window (a
 /// fortnight) keeps the read cheap (reverse-seek, never the whole file) and the wins recent enough
@@ -221,12 +221,16 @@ mod tests {
 
     #[test]
     fn a_flat_or_negative_equity_day_is_not_a_win() {
-        assert!(!project_wins(&json!({"equity_delta_24h": 0.0}))
-            .iter()
-            .any(|(k, _)| *k == WinKind::PositiveEquityDay));
-        assert!(!project_wins(&json!({"equity_delta_24h": -5.0}))
-            .iter()
-            .any(|(k, _)| *k == WinKind::PositiveEquityDay));
+        assert!(
+            !project_wins(&json!({"equity_delta_24h": 0.0}))
+                .iter()
+                .any(|(k, _)| *k == WinKind::PositiveEquityDay)
+        );
+        assert!(
+            !project_wins(&json!({"equity_delta_24h": -5.0}))
+                .iter()
+                .any(|(k, _)| *k == WinKind::PositiveEquityDay)
+        );
         // a zero-ship, zero-trade day evidences NO win at all.
         assert!(project_wins(&json!({"shipped_24h": 0, "live_trades_24h": 0})).is_empty());
     }
@@ -254,24 +258,36 @@ mod tests {
 
         let wins = summary["wins"].as_array().unwrap();
         // shipped_iteration: sover(day1)+asmodeus(day1)+sover(day2) = 3 lane-days, total 2+1+3=6.
-        let shipped = wins.iter().find(|w| w["kind"] == "shipped_iteration").unwrap();
+        let shipped = wins
+            .iter()
+            .find(|w| w["kind"] == "shipped_iteration")
+            .unwrap();
         assert_eq!(shipped["days"], json!(3));
         assert_eq!(shipped["total"], json!(6));
         // positive_equity_day: asmodeus day1 + day2 = 2 lane-days, total 10+4=14.
-        let eq = wins.iter().find(|w| w["kind"] == "positive_equity_day").unwrap();
+        let eq = wins
+            .iter()
+            .find(|w| w["kind"] == "positive_equity_day")
+            .unwrap();
         assert_eq!(eq["days"], json!(2));
         assert_eq!(eq["total"], json!(14));
 
         // ANONYMIZED: the serialized summary names no lane.
         let s = summary.to_string();
-        assert!(!s.contains("sover") && !s.contains("asmodeus"), "wins summary must be anonymized: {s}");
+        assert!(
+            !s.contains("sover") && !s.contains("asmodeus"),
+            "wins summary must be anonymized: {s}"
+        );
     }
 
     #[test]
     fn an_empty_ledger_yields_an_honest_empty_summary_not_a_fabricated_win() {
         let summary = wins_summary_from_lines(&[], 14);
         assert_eq!(summary["wins"], json!([]));
-        assert!(!has_wins(&summary), "no lines => no wins (never fabricated)");
+        assert!(
+            !has_wins(&summary),
+            "no lines => no wins (never fabricated)"
+        );
         // a ledger of only zero-outcome days is also honestly empty.
         let zero_day = json!({"projects": {"maki": {"shipped_24h": 0, "live_trades_24h": 0}}});
         let summary2 = wins_summary_from_lines(&[zero_day.to_string()], 14);
@@ -283,6 +299,9 @@ mod tests {
         let good = json!({"projects": {"x": {"shipped_24h": 1}}}).to_string();
         let lines = vec!["not json at all".to_string(), good, "{ broken".to_string()];
         let summary = wins_summary_from_lines(&lines, 14);
-        assert!(has_wins(&summary), "one good line still yields its win despite malformed neighbors");
+        assert!(
+            has_wins(&summary),
+            "one good line still yields its win despite malformed neighbors"
+        );
     }
 }

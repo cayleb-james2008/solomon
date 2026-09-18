@@ -38,7 +38,7 @@
 use crate::control::{paths, proc};
 use crate::notify::{self, Notice};
 use crate::pecrt::warm::ObservationLog;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -147,7 +147,9 @@ fn sha8(s: &str) -> String {
 /// True iff a backlog line reads as a cold-outreach directive (keyword heuristic, pure).
 pub(crate) fn is_outreach_directive(line: &str) -> bool {
     let lower = line.to_lowercase();
-    OUTREACH_DIRECTIVE_KEYWORDS.iter().any(|k| lower.contains(k))
+    OUTREACH_DIRECTIVE_KEYWORDS
+        .iter()
+        .any(|k| lower.contains(k))
 }
 
 /// Find TODAY'S planner-composed OUTREACH directive in a lane's backlog (pure — the exact
@@ -227,7 +229,10 @@ pub(crate) fn draft_fact(
     let subj = super::cap_line(subject, 120);
     let body_head = super::cap_line(body, 160);
     let rationale = super::cap_line(
-        target.get("rationale").and_then(Value::as_str).unwrap_or(""),
+        target
+            .get("rationale")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
         120,
     );
     format!(
@@ -242,8 +247,14 @@ pub(crate) fn draft_fact(
 /// is the busywork the eval-park doctrine forbids — fail-closed, nothing drafted). Pure.
 pub(crate) fn parse_outreach_reply(reply: &str) -> Option<(String, String)> {
     let parsed = super::extract_json(reply)?;
-    let subject = super::cap_line(parsed.get("subject").and_then(Value::as_str).unwrap_or(""), 120);
-    let body = super::cap_line(parsed.get("body").and_then(Value::as_str).unwrap_or(""), 800);
+    let subject = super::cap_line(
+        parsed.get("subject").and_then(Value::as_str).unwrap_or(""),
+        120,
+    );
+    let body = super::cap_line(
+        parsed.get("body").and_then(Value::as_str).unwrap_or(""),
+        800,
+    );
     if subject.is_empty() || body.is_empty() {
         return None;
     }
@@ -252,7 +263,13 @@ pub(crate) fn parse_outreach_reply(reply: &str) -> Option<(String, String)> {
 
 /// True iff a send is under the daily + hourly caps given the rate state (pure over the injected
 /// clock — port of sover `email_outreach::rate_ok`). A stale `date` resets everything.
-pub(crate) fn rate_ok_at(st: &Value, daily_cap: i64, hourly_cap: i64, today: &str, hour: i64) -> bool {
+pub(crate) fn rate_ok_at(
+    st: &Value,
+    daily_cap: i64,
+    hourly_cap: i64,
+    today: &str,
+    hour: i64,
+) -> bool {
     if st.get("date").and_then(Value::as_str) != Some(today) {
         return true;
     }
@@ -388,7 +405,13 @@ fn smtp_creds() -> Option<SmtpCreds> {
         .and_then(|p| p.trim().parse::<u16>().ok())
         .unwrap_or(465);
     let from = env_or_dotenv("SOLOMON_SMTP_FROM").unwrap_or_else(|| user.clone());
-    Some(SmtpCreds { host, port, user, pass, from })
+    Some(SmtpCreds {
+        host,
+        port,
+        user,
+        pass,
+        from,
+    })
 }
 
 /// The curl SMTP argv (pure — the `#[test]` pins the shape). Port 587 selects the STARTTLS form
@@ -453,7 +476,8 @@ fn send_via_curl(
     std::fs::write(&eml_path, eml.as_bytes()).map_err(|e| format!("eml write: {e}"))?;
     let _guard = TempEmlGuard(eml_path.clone());
     let argv = curl_smtp_argv(c, &eml_path.to_string_lossy(), to);
-    proc::run(&argv, None, Some(Duration::from_secs(SEND_TIMEOUT_S))).map_err(|e| format!("curl: {e}"))
+    proc::run(&argv, None, Some(Duration::from_secs(SEND_TIMEOUT_S)))
+        .map_err(|e| format!("curl: {e}"))
 }
 
 // --------------------------------------------------------------------------- //
@@ -485,7 +509,10 @@ fn append_jsonl(path: &Path, record: &Value) {
             std::fs::create_dir_all(parent)?;
         }
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
         writeln!(f, "{}", serde_json::to_string(record).unwrap_or_default())?;
         Ok(())
     })();
@@ -574,17 +601,31 @@ pub fn maybe_draft_outreach(snapshot: &Value, status: &Value) {
         if !crate::ceo::growth::eligible_repo(&repo, &north_star, &rollup) {
             continue;
         }
-        let consumed = draft_lane(&repo, &north_star, snapshot, &today, &today_marker, remaining, |user| {
-            // Model + skill resolved at call time (never hardcoded) — the growth composer's exact
-            // transport: the brain's creative worker when enabled, else the CEO model; `ctx: None`
-            // routes via the CEO chat path.
-            let model = crate::ceo::growth::pick_growth_model(
-                &crate::improver::brain::BrainConfig::from_autopilot(),
-            );
-            let skill = crate::improver::brain::load_skill(&lane, "outreach");
-            crate::improver::brain::spawn_worker(&model, OUTREACH_COMPOSER_PROMPT, &skill, user, None)
+        let consumed = draft_lane(
+            &repo,
+            &north_star,
+            snapshot,
+            &today,
+            &today_marker,
+            remaining,
+            |user| {
+                // Model + skill resolved at call time (never hardcoded) — the growth composer's exact
+                // transport: the brain's creative worker when enabled, else the CEO model; `ctx: None`
+                // routes via the CEO chat path.
+                let model = crate::ceo::growth::pick_growth_model(
+                    &crate::improver::brain::BrainConfig::from_autopilot(),
+                );
+                let skill = crate::improver::brain::load_skill(&lane, "outreach");
+                crate::improver::brain::spawn_worker(
+                    &model,
+                    OUTREACH_COMPOSER_PROMPT,
+                    &skill,
+                    user,
+                    None,
+                )
                 .map(|reply| (model, reply))
-        });
+            },
+        );
         if consumed {
             return; // at most ONE compose attempt per tail invocation
         }
@@ -611,9 +652,11 @@ where
     F: FnOnce(&str) -> Result<(String, String), String>,
 {
     let lane = paths::repo_name(repo);
-    let (Some(tpath), Some(dlog), Some(dstate)) =
-        (targets_path(repo), drafts_log_path(repo), drafted_state_path(repo))
-    else {
+    let (Some(tpath), Some(dlog), Some(dstate)) = (
+        targets_path(repo),
+        drafts_log_path(repo),
+        drafted_state_path(repo),
+    ) else {
         return false; // nameless lane — no runtime dir (fail-closed, edge E21)
     };
     if calls_remaining <= 0 {
@@ -669,7 +712,12 @@ where
     let drafted: Vec<String> = st
         .get("drafted_target_keys")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
     let Some(target) = targets.into_iter().find(|t| {
         let email = t.get("email").and_then(Value::as_str).unwrap_or("");
@@ -723,7 +771,10 @@ where
         Err(e) => {
             // LLM unavailable (quota/429/parked): named skip, attempt stays consumed — never a
             // fabricated draft (edge E5, the growth precedent).
-            record_last(&mut st, &format!("skip:llm_unavailable {}", super::cap_line(&e, 160)));
+            record_last(
+                &mut st,
+                &format!("skip:llm_unavailable {}", super::cap_line(&e, 160)),
+            );
             return true;
         }
     };
@@ -741,14 +792,27 @@ where
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let fact = draft_fact(&model, &prompt_hash, &lane, &target, &subject, &body, epoch_s);
+    let fact = draft_fact(
+        &model,
+        &prompt_hash,
+        &lane,
+        &target,
+        &subject,
+        &body,
+        epoch_s,
+    );
     match ObservationLog::at(dlog).append_fact(today, &fact) {
         Ok(()) => {
             record_last(&mut st, "ok");
             // AUTONOMOUS SEND QUEUE: persist the FULL sendable payload to the outbox so the auto-send
             // seam has the complete message (the drafts log stores only a truncated body head). The
             // recipient is the OPERATOR-SUPPLIED target's own email — Solomon never invents a contact.
-            let to = target.get("email").and_then(Value::as_str).unwrap_or("").trim().to_string();
+            let to = target
+                .get("email")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if let Some(obx) = outbox_path(repo) {
                 append_jsonl(
                     &obx,
@@ -821,7 +885,12 @@ where
     let sent_sigs: Vec<String> = st
         .get("sent_signatures")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
     // Oldest UNSENT outbox entry (FIFO — nothing starves; the rate cap paces the queue).
     let Some(entry) = read_outbox(&obx)
@@ -832,9 +901,22 @@ where
     };
     // The idempotency key of the chosen entry (the scan guarantees it is not yet sent).
     let signature = outbox_signature(&entry);
-    let to = entry.get("to").and_then(Value::as_str).unwrap_or("").trim().to_string();
-    let subject = super::cap_line(entry.get("subject").and_then(Value::as_str).unwrap_or(""), 200);
-    let body = entry.get("body").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let to = entry
+        .get("to")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let subject = super::cap_line(
+        entry.get("subject").and_then(Value::as_str).unwrap_or(""),
+        200,
+    );
+    let body = entry
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     // WELL-FORMED (edge E10): non-empty to/subject/body + a whitespace-free @-carrying recipient
     // (headers are single-line-flattened downstream, so no header injection).
     if to.is_empty()
@@ -896,7 +978,12 @@ where
             let mut sigs: Vec<String> = st
                 .get("sent_signatures")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
                 .unwrap_or_default();
             sigs.push(signature.clone());
             if sigs.len() > 500 {
@@ -917,7 +1004,11 @@ where
             json!({"lane": lane, "sent": true})
         }
         Ok(out) => {
-            let detail = format!("curl exit {}: {}", out.code, super::cap_line(&out.stderr, 200));
+            let detail = format!(
+                "curl exit {}: {}",
+                out.code,
+                super::cap_line(&out.stderr, 200)
+            );
             append_jsonl(
                 &slog,
                 &json!({"ts": ts, "to": to, "subject": subject, "message_id": "",
@@ -1024,16 +1115,28 @@ mod tests {
         let d = outreach_directive(backlog, m).expect("the outreach line matches");
         assert!(d.contains("cold outreach to 3 newsletter authors"), "{d}");
         // a growth-only line is NOT an outreach directive; stale-day lines don't match either
-        assert!(outreach_directive("- [ ] [feature] improve README (ceo 2026-07-16)\n", m).is_none());
-        assert!(outreach_directive(
-            "- [ ] [feature] cold outreach to partners (ceo 2026-07-15)\n",
-            m
-        )
-        .is_none());
+        assert!(
+            outreach_directive("- [ ] [feature] improve README (ceo 2026-07-16)\n", m).is_none()
+        );
+        assert!(
+            outreach_directive(
+                "- [ ] [feature] cold outreach to partners (ceo 2026-07-15)\n",
+                m
+            )
+            .is_none()
+        );
         // campaign steps qualify without today's marker
-        assert!(outreach_directive("- [ ] [campaign:q3] pitch email to maintainers\n", m).is_some());
+        assert!(
+            outreach_directive("- [ ] [campaign:q3] pitch email to maintainers\n", m).is_some()
+        );
         // keyword set positives + negatives
-        for pos in ["cold email", "email campaign", "reach out", "contact list", "pitch email"] {
+        for pos in [
+            "cold email",
+            "email campaign",
+            "reach out",
+            "contact list",
+            "pitch email",
+        ] {
             assert!(is_outreach_directive(pos), "{pos}");
         }
         for neg in ["fix the trader bug", "improve README", "ship release notes"] {
@@ -1063,7 +1166,11 @@ mod tests {
     fn target_key_is_stable_and_normalizes_case_and_whitespace() {
         let k = target_key("Person@Org.com");
         assert_eq!(k.len(), 8);
-        assert_eq!(k, target_key("  person@org.com  "), "trim + lowercase normalize");
+        assert_eq!(
+            k,
+            target_key("  person@org.com  "),
+            "trim + lowercase normalize"
+        );
         assert_ne!(k, target_key("other@org.com"));
     }
 
@@ -1071,13 +1178,30 @@ mod tests {
     #[test]
     fn draft_fact_shape_carries_gate_tag_target_and_provenance() {
         let t = json!({"email": "p@o.com", "rationale": "writes about this"});
-        let fact = draft_fact("m1", "ff00aa11", "sover", &t, "Subject line", "Body text", 1752);
-        assert!(fact.starts_with("rsi: outreach DRAFT [GATED, unsent, cold-email]"), "{fact}");
+        let fact = draft_fact(
+            "m1",
+            "ff00aa11",
+            "sover",
+            &t,
+            "Subject line",
+            "Body text",
+            1752,
+        );
+        assert!(
+            fact.starts_with("rsi: outreach DRAFT [GATED, unsent, cold-email]"),
+            "{fact}"
+        );
         assert!(fact.contains("lane=sover"), "{fact}");
-        assert!(fact.contains(&format!("target={}", target_key("p@o.com"))), "{fact}");
+        assert!(
+            fact.contains(&format!("target={}", target_key("p@o.com"))),
+            "{fact}"
+        );
         assert!(fact.contains("to=p@o.com"), "{fact}");
         assert!(fact.contains("subj=Subject line"), "{fact}");
-        assert!(fact.contains("(t=1752 model=m1 prompt=ff00aa11 rationale=writes about this)"), "{fact}");
+        assert!(
+            fact.contains("(t=1752 model=m1 prompt=ff00aa11 rationale=writes about this)"),
+            "{fact}"
+        );
         // it passes the observation-log fact gate (dated datum present, no summary shape)
         assert!(ObservationLog::validate_fact(&fact).is_fact());
     }
@@ -1098,36 +1222,80 @@ mod tests {
     // -------- 6: compose writes a GATED unsent draft to disk --------
     #[test]
     fn compose_writes_a_gated_unsent_provenance_tagged_draft() {
-        let _env = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
         let repo = uniq_repo("compose");
         let lane = lane_of(&repo);
         seed_targets(&repo, one_target());
-        seed_backlog(&lane, &format!("[feature] run cold outreach to the vetted list {}", marker()));
+        seed_backlog(
+            &lane,
+            &format!(
+                "[feature] run cold outreach to the vetted list {}",
+                marker()
+            ),
+        );
 
-        let consumed = draft_lane(&repo, "grow the project", &json!({}), &today(), &marker(), 10, |user| {
-            assert!(user.contains("north_star"), "the compose payload is the evidence JSON: {user}");
-            assert!(user.contains("writes about this exact niche"), "rationale rides along: {user}");
-            ok_reply()
-        });
-        assert!(consumed, "an eligible lane with a directive + target composes");
+        let consumed = draft_lane(
+            &repo,
+            "grow the project",
+            &json!({}),
+            &today(),
+            &marker(),
+            10,
+            |user| {
+                assert!(
+                    user.contains("north_star"),
+                    "the compose payload is the evidence JSON: {user}"
+                );
+                assert!(
+                    user.contains("writes about this exact niche"),
+                    "rationale rides along: {user}"
+                );
+                ok_reply()
+            },
+        );
+        assert!(
+            consumed,
+            "an eligible lane with a directive + target composes"
+        );
 
-        let body = std::fs::read_to_string(drafts_log_path(&repo).unwrap()).expect("drafts log written");
+        let body =
+            std::fs::read_to_string(drafts_log_path(&repo).unwrap()).expect("drafts log written");
         let line = body.lines().next().unwrap();
         assert!(line.contains('\t'), "dated line: {line}");
-        assert!(line.contains("rsi: outreach DRAFT [GATED, unsent, cold-email]"), "{line}");
+        assert!(
+            line.contains("rsi: outreach DRAFT [GATED, unsent, cold-email]"),
+            "{line}"
+        );
         assert!(line.contains("to=Person@Org.com"), "{line}");
         assert!(line.contains("model=model-x"), "{line}");
 
         // the AUTONOMOUS send queue carries the FULL sendable payload (not a truncated body head)
         let obx = read_outbox(&outbox_path(&repo).unwrap());
-        assert_eq!(obx.len(), 1, "compose queues exactly one outbox entry: {obx:?}");
+        assert_eq!(
+            obx.len(),
+            1,
+            "compose queues exactly one outbox entry: {obx:?}"
+        );
         assert_eq!(obx[0]["to"], "Person@Org.com");
-        assert!(obx[0]["body"].as_str().unwrap().contains("2 features shipped this week"),
-                "the outbox holds the FULL body: {}", obx[0]["body"]);
-        assert_eq!(obx[0]["signature"], send_signature("Person@Org.com",
-            "Quick intro from the project",
-            "We ship a small tool; your community writes about exactly this. 2 features shipped this week."));
+        assert!(
+            obx[0]["body"]
+                .as_str()
+                .unwrap()
+                .contains("2 features shipped this week"),
+            "the outbox holds the FULL body: {}",
+            obx[0]["body"]
+        );
+        assert_eq!(
+            obx[0]["signature"],
+            send_signature(
+                "Person@Org.com",
+                "Quick intro from the project",
+                "We ship a small tool; your community writes about exactly this. 2 features shipped this week."
+            )
+        );
 
         let st = read_json_state(&drafted_state_path(&repo).unwrap());
         assert_eq!(st["last"], "ok");
@@ -1144,7 +1312,10 @@ mod tests {
         let repo = uniq_repo("dedup");
         let lane = lane_of(&repo);
         seed_targets(&repo, one_target());
-        seed_backlog(&lane, &format!("[feature] cold outreach continues {}", marker()));
+        seed_backlog(
+            &lane,
+            &format!("[feature] cold outreach continues {}", marker()),
+        );
         // pre-seed the state as if this target was drafted on an earlier sweep today
         let st = json!({"day": today(), "day_count": 1,
                         "drafted_target_keys": [target_key("person@org.com")]});
@@ -1163,10 +1334,16 @@ mod tests {
         let mut repo = uniq_repo("daycap");
         repo["outreach"] = json!({"max_drafts_per_day": 2});
         let lane = lane_of(&repo);
-        seed_targets(&repo, json!([
-            {"email": "fresh@x.com", "rationale": "fits"},
-        ]));
-        seed_backlog(&lane, &format!("[feature] cold outreach batch {}", marker()));
+        seed_targets(
+            &repo,
+            json!([
+                {"email": "fresh@x.com", "rationale": "fits"},
+            ]),
+        );
+        seed_backlog(
+            &lane,
+            &format!("[feature] cold outreach batch {}", marker()),
+        );
         let st = json!({"day": today(), "day_count": 2, "drafted_target_keys": ["deadbeef"]});
         assert!(write_json_state(&drafted_state_path(&repo).unwrap(), &st));
 
@@ -1177,7 +1354,9 @@ mod tests {
         // a NEW day resets the counter: the same state with a stale day composes again
         let st = json!({"day": "1999-01-01", "day_count": 2, "drafted_target_keys": ["deadbeef"]});
         assert!(write_json_state(&drafted_state_path(&repo).unwrap(), &st));
-        let consumed = draft_lane(&repo, "grow", &json!({}), &today(), &marker(), 10, |_| ok_reply());
+        let consumed = draft_lane(&repo, "grow", &json!({}), &today(), &marker(), 10, |_| {
+            ok_reply()
+        });
         assert!(consumed, "the date roll resets the day cap");
         cleanup(&repo);
     }
@@ -1185,7 +1364,9 @@ mod tests {
     // -------- 9: absent targets => seed template + needs card ONCE --------
     #[test]
     fn absent_targets_seeds_template_and_pages_needs_card_once() {
-        let _env = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
         let repo = uniq_repo("needs");
         let lane = lane_of(&repo);
@@ -1200,7 +1381,10 @@ mod tests {
         assert_eq!(tpl["targets"], json!([]));
         assert!(tpl["comment"].as_str().unwrap().contains("NEVER scrapes"));
         let marker_path = needs_marker_path(&repo, "targets").unwrap();
-        assert!(marker_path.exists(), "the needs card marker dedupes future pages");
+        assert!(
+            marker_path.exists(),
+            "the needs card marker dedupes future pages"
+        );
         let mtime = std::fs::metadata(&marker_path).unwrap().modified().unwrap();
 
         // a second sweep with the (still empty) template skips SILENTLY: no re-page, marker untouched
@@ -1222,10 +1406,19 @@ mod tests {
     fn send_refuses_a_recipient_not_on_the_operator_target_list() {
         let repo = uniq_repo("sendgate");
         // the operator seeded ONE target; the outbox somehow holds a DIFFERENT recipient
-        seed_targets(&repo, json!([{"email": "listed@org.com", "rationale": "fits"}]));
+        seed_targets(
+            &repo,
+            json!([{"email": "listed@org.com", "rationale": "fits"}]),
+        );
         seed_outbox(&repo, "not-listed@elsewhere.com", "s", "an honest body");
 
-        let creds = SmtpCreds { host: "h".into(), port: 465, user: "u".into(), pass: "p".into(), from: "u".into() };
+        let creds = SmtpCreds {
+            host: "h".into(),
+            port: 465,
+            user: "u".into(),
+            pass: "p".into(),
+            from: "u".into(),
+        };
         let out = send_lane(&repo, Some(&creds), |_, _, _, _, _| {
             panic!("a recipient off the operator target list must NEVER send")
         });
@@ -1235,7 +1428,9 @@ mod tests {
         // an EMPTY outbox is simply inert (nothing to send), never a send
         let repo2 = uniq_repo("sendempty");
         seed_targets(&repo2, one_target());
-        let out2 = send_lane(&repo2, Some(&creds), |_, _, _, _, _| panic!("empty outbox never sends"));
+        let out2 = send_lane(&repo2, Some(&creds), |_, _, _, _, _| {
+            panic!("empty outbox never sends")
+        });
         assert_eq!(out2["reason"], "nothing to send");
         cleanup(&repo);
         cleanup(&repo2);
@@ -1244,20 +1439,33 @@ mod tests {
     // -------- 11: queued + SMTP absent => needs card once, no send, no signature (DATA dependency) --
     #[test]
     fn queued_without_smtp_pages_needs_card_and_stays_unsent() {
-        let _env = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
         let repo = uniq_repo("nosmtp");
         seed_targets(&repo, json!([{"email": "p@o.com", "rationale": "fits"}]));
-        seed_outbox(&repo, "p@o.com", "Hello", "We built a thing worth your time.");
+        seed_outbox(
+            &repo,
+            "p@o.com",
+            "Hello",
+            "We built a thing worth your time.",
+        );
 
         let out = send_lane(&repo, None, |_, _, _, _, _| {
             panic!("no creds — the sender must not fire")
         });
         assert_eq!(out["sent"], false);
         assert_eq!(out["reason"], "no smtp creds");
-        assert!(needs_marker_path(&repo, "smtp").unwrap().exists(), "needs card paged (deduped)");
+        assert!(
+            needs_marker_path(&repo, "smtp").unwrap().exists(),
+            "needs card paged (deduped)"
+        );
         let st = read_json_state(&sent_state_path(&repo).unwrap());
-        assert!(st.get("sent_signatures").is_none(), "no signature recorded — retriable once creds exist");
+        assert!(
+            st.get("sent_signatures").is_none(),
+            "no signature recorded — retriable once creds exist"
+        );
         cleanup(&repo);
         std::env::remove_var("SOLOMON_NOTIFY_OFF");
     }
@@ -1265,13 +1473,21 @@ mod tests {
     // -------- 12: AUTO-send (no approval) => exactly one send with the honest footer, idempotent ---
     #[test]
     fn auto_send_with_smtp_sends_exactly_once_with_footer() {
-        let _env = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
         let repo = uniq_repo("sendonce");
         let lane = lane_of(&repo);
         seed_targets(&repo, json!([{"email": "p@o.com", "rationale": "fits"}]));
         seed_outbox(&repo, "p@o.com", "Hello", "Honest body.");
-        let creds = SmtpCreds { host: "h".into(), port: 465, user: "u".into(), pass: "p".into(), from: "u".into() };
+        let creds = SmtpCreds {
+            host: "h".into(),
+            port: 465,
+            user: "u".into(),
+            pass: "p".into(),
+            from: "u".into(),
+        };
 
         let mut calls = 0;
         let out = send_lane(&repo, Some(&creds), |_, _, to, subject, body| {
@@ -1279,12 +1495,28 @@ mod tests {
             assert_eq!(to, "p@o.com");
             assert_eq!(subject, "Hello");
             // the composed body rides AND the honest sender-identity/opt-out footer is attached
-            assert!(body.contains("Honest body."), "the composed body rides: {body}");
-            assert!(body.contains(&format!("the {lane} project's automated outreach")), "footer id: {body}");
-            assert!(body.to_lowercase().contains("reply"), "opt-out line present: {body}");
-            Ok(proc::RunOut { code: 0, stdout: String::new(), stderr: String::new() })
+            assert!(
+                body.contains("Honest body."),
+                "the composed body rides: {body}"
+            );
+            assert!(
+                body.contains(&format!("the {lane} project's automated outreach")),
+                "footer id: {body}"
+            );
+            assert!(
+                body.to_lowercase().contains("reply"),
+                "opt-out line present: {body}"
+            );
+            Ok(proc::RunOut {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
         });
-        assert_eq!(out["sent"], true, "an auto-send fires with NO operator approval: {out}");
+        assert_eq!(
+            out["sent"], true,
+            "an auto-send fires with NO operator approval: {out}"
+        );
         assert_eq!(calls, 1);
         // the audit trail + signature landed
         let audit = std::fs::read_to_string(sent_log_path(&repo).unwrap()).unwrap();
@@ -1306,27 +1538,49 @@ mod tests {
     // -------- 12b: a FAILED send records no signature (retriable) --------
     #[test]
     fn failed_send_is_audited_and_retriable() {
-        let _env = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
         let repo = uniq_repo("sendfail");
         seed_targets(&repo, json!([{"email": "p@o.com", "rationale": "fits"}]));
         seed_outbox(&repo, "p@o.com", "Hello", "Body.");
-        let creds = SmtpCreds { host: "h".into(), port: 465, user: "u".into(), pass: "p".into(), from: "u".into() };
+        let creds = SmtpCreds {
+            host: "h".into(),
+            port: 465,
+            user: "u".into(),
+            pass: "p".into(),
+            from: "u".into(),
+        };
 
         let out = send_lane(&repo, Some(&creds), |_, _, _, _, _| {
-            Ok(proc::RunOut { code: 67, stdout: String::new(), stderr: "auth failed".into() })
+            Ok(proc::RunOut {
+                code: 67,
+                stdout: String::new(),
+                stderr: "auth failed".into(),
+            })
         });
         assert_eq!(out["sent"], false);
         let audit = std::fs::read_to_string(sent_log_path(&repo).unwrap()).unwrap();
         assert!(audit.contains("\"result\":\"failed\""), "{audit}");
         assert!(audit.contains("auth failed"), "{audit}");
         let st = read_json_state(&sent_state_path(&repo).unwrap());
-        assert!(st.get("sent_signatures").is_none(), "failure records NO signature — retriable (E9)");
+        assert!(
+            st.get("sent_signatures").is_none(),
+            "failure records NO signature — retriable (E9)"
+        );
         // the retry sweep CAN fire the sender again
         let out = send_lane(&repo, Some(&creds), |_, _, _, _, _| {
-            Ok(proc::RunOut { code: 0, stdout: String::new(), stderr: String::new() })
+            Ok(proc::RunOut {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
         });
-        assert_eq!(out["sent"], true, "a transient failure stays retriable: {out}");
+        assert_eq!(
+            out["sent"], true,
+            "a transient failure stays retriable: {out}"
+        );
         cleanup(&repo);
         std::env::remove_var("SOLOMON_NOTIFY_OFF");
     }
@@ -1357,24 +1611,39 @@ mod tests {
     // -------- 14: the curl SMTP argv (pure, pinned) --------
     #[test]
     fn curl_smtp_argv_shape_matches_port_and_carries_creds() {
-        let c465 = SmtpCreds { host: "mail.example.com".into(), port: 465, user: "u@example.com".into(), pass: "pw".into(), from: "from@example.com".into() };
+        let c465 = SmtpCreds {
+            host: "mail.example.com".into(),
+            port: 465,
+            user: "u@example.com".into(),
+            pass: "pw".into(),
+            from: "from@example.com".into(),
+        };
         let argv = curl_smtp_argv(&c465, "C:\\x\\m.eml", "to@dest.com");
         assert_eq!(argv[0], "curl");
         assert!(argv.contains(&"--ssl-reqd".to_string()));
-        assert!(argv.contains(&"smtps://mail.example.com:465".to_string()), "465 => smtps: {argv:?}");
+        assert!(
+            argv.contains(&"smtps://mail.example.com:465".to_string()),
+            "465 => smtps: {argv:?}"
+        );
         assert!(argv.contains(&"--mail-from".to_string()));
         assert!(argv.contains(&"from@example.com".to_string()));
         assert!(argv.contains(&"--mail-rcpt".to_string()));
         assert!(argv.contains(&"to@dest.com".to_string()));
         assert!(argv.contains(&"--upload-file".to_string()));
-        assert!(argv.contains(&"u@example.com:pw".to_string()), "--user carries creds: {argv:?}");
+        assert!(
+            argv.contains(&"u@example.com:pw".to_string()),
+            "--user carries creds: {argv:?}"
+        );
         // bounded: -m 30 rides along
         let m = argv.iter().position(|a| a == "-m").unwrap();
         assert_eq!(argv[m + 1], "30");
         // 587 selects the STARTTLS smtp:// form (still --ssl-reqd)
         let c587 = SmtpCreds { port: 587, ..c465 };
         let argv = curl_smtp_argv(&c587, "m.eml", "to@dest.com");
-        assert!(argv.contains(&"smtp://mail.example.com:587".to_string()), "587 => smtp: {argv:?}");
+        assert!(
+            argv.contains(&"smtp://mail.example.com:587".to_string()),
+            "587 => smtp: {argv:?}"
+        );
         assert!(argv.contains(&"--ssl-reqd".to_string()));
     }
 
@@ -1387,11 +1656,16 @@ mod tests {
         seed_backlog(&lane, &format!("[feature] cold outreach {}", marker()));
 
         let consumed = draft_lane(&repo, "grow", &json!({}), &today(), &marker(), 10, |_| {
-            Ok(("m".to_string(),
-                "{\"subject\":\"Note from Cayleb\",\"body\":\"hi there\"}".to_string()))
+            Ok((
+                "m".to_string(),
+                "{\"subject\":\"Note from Cayleb\",\"body\":\"hi there\"}".to_string(),
+            ))
         });
         assert!(consumed, "the attempt is consumed (no retry storm)");
-        assert!(!drafts_log_path(&repo).unwrap().exists(), "NO draft lands for a persona violation");
+        assert!(
+            !drafts_log_path(&repo).unwrap().exists(),
+            "NO draft lands for a persona violation"
+        );
         let st = read_json_state(&drafted_state_path(&repo).unwrap());
         assert_eq!(st["last"], "skip:persona_violation");
         cleanup(&repo);
@@ -1419,7 +1693,11 @@ mod tests {
         let p = outbox_path(repo).unwrap();
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&p).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+            .unwrap();
         writeln!(
             f,
             "{}",

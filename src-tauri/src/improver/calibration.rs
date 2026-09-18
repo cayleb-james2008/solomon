@@ -26,7 +26,7 @@
 //! assigned for the attempt. A crash before the terminal leaves a stale marker; the next
 //! selection overwrites it, so an aborted attempt is simply not counted.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 use crate::control::proc;
@@ -83,7 +83,9 @@ pub fn cell_at(dir: &Path, model: &str, size_class: &str) -> (u64, u64) {
         .and_then(|m| m.get(model))
         .and_then(|c| c.get(size_class));
     let n = |k: &str| -> u64 {
-        cell.and_then(|c| c.get(k)).and_then(Value::as_u64).unwrap_or(0)
+        cell.and_then(|c| c.get(k))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
     };
     (n("attempts"), n("ships"))
 }
@@ -98,7 +100,11 @@ pub fn record_outcome_at(dir: &Path, model: &str, size_class: &str, shipped: boo
     if !led.get("models").map(Value::is_object).unwrap_or(false) {
         led["models"] = json!({});
     }
-    if !led["models"].get(model).map(Value::is_object).unwrap_or(false) {
+    if !led["models"]
+        .get(model)
+        .map(Value::is_object)
+        .unwrap_or(false)
+    {
         led["models"][model] = json!({});
     }
     led["models"][model][size_class] = json!({
@@ -214,7 +220,12 @@ mod tests {
     /// ledger lands in <base>/runtime.
     fn test_ctx(tag: &str) -> Ctx {
         let base = test_dir(tag);
-        let mut c = Ctx::configure(&base.join("repo").to_string_lossy(), "calibtest", "ollama-cloud", None);
+        let mut c = Ctx::configure(
+            &base.join("repo").to_string_lossy(),
+            "calibtest",
+            "ollama-cloud",
+            None,
+        );
         c.control = base.join("control");
         c.runtime = base.join("runtime").join("calibtest");
         c.heartbeat_path = c.runtime.join("heartbeat.json");

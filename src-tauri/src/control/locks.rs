@@ -10,7 +10,7 @@ use crate::control::heartbeat;
 use crate::control::paths;
 #[cfg(windows)]
 use crate::control::proc;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
@@ -56,7 +56,7 @@ pub fn pid_alive(pid: i64) -> bool {
 }
 
 #[cfg(not(windows))]
-extern "C" {
+unsafe extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
 }
@@ -75,7 +75,11 @@ pub fn read_lock(rt: &Path) -> (i64, Option<String>) {
     }
     // Python splitlines() then index lines[0]/lines[1]; first line parsed as int.
     let lines: Vec<&str> = splitlines(raw);
-    let pid = match lines.first().map(|l| l.trim()).and_then(|s| s.parse::<i64>().ok()) {
+    let pid = match lines
+        .first()
+        .map(|l| l.trim())
+        .and_then(|s| s.parse::<i64>().ok())
+    {
         Some(p) => p,
         None => return (0, None), // ValueError/IndexError -> (0, None)
     };
@@ -239,7 +243,10 @@ pub fn acquire_supervisor_lock(repo: &Value) -> (bool, Option<String>) {
         return (false, None);
     }
     std::thread::sleep(Duration::from_millis(100));
-    (read_lock(&rt).1.as_deref() == Some(token.as_str()), Some(token))
+    (
+        read_lock(&rt).1.as_deref() == Some(token.as_str()),
+        Some(token),
+    )
 }
 
 /// control.release_supervisor_lock: release the lock only if WE still hold it (run-id == token).
@@ -320,7 +327,11 @@ pub fn read_lock_dir(dir: &Path, fname: &str) -> (i64, Option<String>) {
         return (0, None);
     }
     let lines: Vec<&str> = splitlines(raw);
-    let pid = match lines.first().map(|l| l.trim()).and_then(|s| s.parse::<i64>().ok()) {
+    let pid = match lines
+        .first()
+        .map(|l| l.trim())
+        .and_then(|s| s.parse::<i64>().ok())
+    {
         Some(p) => p,
         None => return (0, None),
     };
@@ -377,7 +388,10 @@ mod tests {
     #[test]
     fn pid_alive_csv_match_rule() {
         // quoted pid present -> alive
-        assert!(pid_in_csv(1234, "\"python.exe\",\"1234\",\"Console\",\"1\",\"50,000 K\"\r\n"));
+        assert!(pid_in_csv(
+            1234,
+            "\"python.exe\",\"1234\",\"Console\",\"1\",\"50,000 K\"\r\n"
+        ));
         // "INFO: No tasks" -> not alive
         assert!(!pid_in_csv(
             1234,
@@ -426,10 +440,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&rt);
         }
         // missing file -> (0, None)
-        let missing = std::env::temp_dir().join(format!(
-            "solomon_lock_missing_{}",
-            rand_hex32()
-        ));
+        let missing = std::env::temp_dir().join(format!("solomon_lock_missing_{}", rand_hex32()));
         assert_eq!(read_lock(&missing), (0, None));
     }
 
@@ -474,7 +485,11 @@ mod tests {
         let hb = json!({"run_id":"tokA","status":"running"});
         assert!(lock_is_live_decide(&Some("tokA".into()), Some(&hb), 120));
         // empty/null hb (non-dict) treated as just-started -> True
-        assert!(lock_is_live_decide(&Some("tokA".into()), Some(&Value::Null), 120));
+        assert!(lock_is_live_decide(
+            &Some("tokA".into()),
+            Some(&Value::Null),
+            120
+        ));
         // a truthy NON-string run_id (corrupt heartbeat) differing from the lock's string -> orphaned -> False
         let hb = json!({"run_id": 42, "status": "running", "updated_at": ts_ago(1)});
         assert!(!lock_is_live_decide(&Some("tokA".into()), Some(&hb), 120));
@@ -486,10 +501,7 @@ mod tests {
     #[test]
     fn lock_is_live_dead_pid_paths() {
         // pid 0 (empty lock) -> False without pid_alive; exercised via lock_is_live_rt with empty lock.
-        let dir = std::env::temp_dir().join(format!(
-            "solomon_lock_dead_{}",
-            rand_hex32()
-        ));
+        let dir = std::env::temp_dir().join(format!("solomon_lock_dead_{}", rand_hex32()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("lock"), "").unwrap();
         assert!(!lock_is_live_rt(&json!({"name":"x"}), &dir));

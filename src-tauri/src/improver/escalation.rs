@@ -209,7 +209,11 @@ pub fn campaign_context_block(goal: &str, history: &str, n: usize) -> String {
         {
             continue;
         }
-        let summary = rec.get("summary").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let summary = rec
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         if summary.is_empty() {
             continue;
         }
@@ -848,7 +852,8 @@ pub fn defer_backlog_item(ctx: &mut Ctx, goal: &str) -> bool {
                 lines.push(item);
                 let out = format!("{}\n", lines.join("\n"));
                 // atomic temp+rename (same RMW-race narrowing as backlog::mark_backlog_done).
-                return crate::control::proc::atomic_write_bytes(&ctx.backlog, out.as_bytes()).is_ok();
+                return crate::control::proc::atomic_write_bytes(&ctx.backlog, out.as_bytes())
+                    .is_ok();
             }
         }
     }
@@ -1107,10 +1112,14 @@ mod tests {
     #[test]
     fn campaign_context_block_lists_prior_shipped_same_slug_only() {
         let hist = concat!(
-            r#"{"status":"shipped","goal":"[campaign:sc] step one","summary":"added the fetch layer"}"#, "\n",
-            r#"{"status":"reverted","goal":"[campaign:sc] step two","summary":"tried but failed"}"#, "\n",
-            r#"{"status":"shipped","goal":"[campaign:other] x","summary":"unrelated campaign"}"#, "\n",
-            r#"{"status":"shipped","goal":"[campaign:sc] step three","summary":"wired the cache"}"#, "\n",
+            r#"{"status":"shipped","goal":"[campaign:sc] step one","summary":"added the fetch layer"}"#,
+            "\n",
+            r#"{"status":"reverted","goal":"[campaign:sc] step two","summary":"tried but failed"}"#,
+            "\n",
+            r#"{"status":"shipped","goal":"[campaign:other] x","summary":"unrelated campaign"}"#,
+            "\n",
+            r#"{"status":"shipped","goal":"[campaign:sc] step three","summary":"wired the cache"}"#,
+            "\n",
         );
         let block = campaign_context_block("[campaign:sc] step four", hist, 3);
         assert!(block.contains("Campaign context"));
@@ -1210,7 +1219,7 @@ mod tests {
     #[test]
     fn apply_fallback_model_switches_only_when_escalated() {
         let mut c = ctx(); // ollama-cloud -> fallback kimi-k2.7-code, model glm-5.2
-                           // not escalated -> no change
+        // not escalated -> no change
         apply_fallback_model(&mut c, "g");
         assert_eq!(c.pi_model, "glm-5.2");
         // escalated -> switch
@@ -1362,7 +1371,8 @@ largest coherent slice that can be edited, tested, and shipped in one cycle"
         let stop_content = std::fs::read_to_string(&c.stop_path).unwrap();
         assert_eq!(stop_content, "dirty_base_persistent\n");
         // heartbeat carries the exact reason the watchdog/supervisor match on
-        let hb: Value = serde_json::from_str(&std::fs::read_to_string(&c.heartbeat_path).unwrap()).unwrap();
+        let hb: Value =
+            serde_json::from_str(&std::fs::read_to_string(&c.heartbeat_path).unwrap()).unwrap();
         assert_eq!(hb["status"], "error");
         assert_eq!(hb["phase"], "preflight");
         assert_eq!(hb["reason"], "dirty_base_persistent");
@@ -1383,7 +1393,8 @@ largest coherent slice that can be edited, tested, and shipped in one cycle"
         assert!(c.stop_path.exists());
         let stop_content = std::fs::read_to_string(&c.stop_path).unwrap();
         assert_eq!(stop_content, "unpushed_base_persistent\n");
-        let hb: Value = serde_json::from_str(&std::fs::read_to_string(&c.heartbeat_path).unwrap()).unwrap();
+        let hb: Value =
+            serde_json::from_str(&std::fs::read_to_string(&c.heartbeat_path).unwrap()).unwrap();
         assert_eq!(hb["status"], "error");
         assert_eq!(hb["phase"], "preflight");
         assert_eq!(hb["reason"], "unpushed_base_persistent");
@@ -1403,7 +1414,8 @@ largest coherent slice that can be edited, tested, and shipped in one cycle"
         assert!(c.stop_path.exists());
         let stop_content = std::fs::read_to_string(&c.stop_path).unwrap();
         assert_eq!(stop_content, "base_gate_red_persistent\n");
-        let hb: Value = serde_json::from_str(&std::fs::read_to_string(&c.heartbeat_path).unwrap()).unwrap();
+        let hb: Value =
+            serde_json::from_str(&std::fs::read_to_string(&c.heartbeat_path).unwrap()).unwrap();
         assert_eq!(hb["status"], "error");
         assert_eq!(hb["phase"], "preflight");
         assert_eq!(hb["reason"], "base_gate_red_persistent");
@@ -1420,9 +1432,19 @@ largest coherent slice that can be edited, tested, and shipped in one cycle"
         let mut c = ctx_with_runtime("gatered_sum");
         note_base_gate_red_bail(&mut c, true, "custom gate error: module not found");
         note_base_gate_red_bail(&mut c, true, "custom gate error: module not found");
-        assert!(note_base_gate_red_bail(&mut c, true, "custom gate error: module not found"));
-        let hb: Value = serde_json::from_str(&std::fs::read_to_string(&c.heartbeat_path).unwrap()).unwrap();
-        assert!(hb["last_summary"].as_str().unwrap().starts_with("custom gate error: module not found"));
+        assert!(note_base_gate_red_bail(
+            &mut c,
+            true,
+            "custom gate error: module not found"
+        ));
+        let hb: Value =
+            serde_json::from_str(&std::fs::read_to_string(&c.heartbeat_path).unwrap()).unwrap();
+        assert!(
+            hb["last_summary"]
+                .as_str()
+                .unwrap()
+                .starts_with("custom gate error: module not found")
+        );
         let _ = std::fs::remove_dir_all(&c.runtime);
     }
 
@@ -1436,7 +1458,10 @@ largest coherent slice that can be edited, tested, and shipped in one cycle"
         assert!(!c.stop_path.exists());
         note_controller_off_base_stop(&mut c, "HEAD is 'rsi/x', not the base branch 'main'");
         // STOP sentinel written immediately with the named reason.
-        assert!(c.stop_path.exists(), "controller off-base must self-stop on the first observation");
+        assert!(
+            c.stop_path.exists(),
+            "controller off-base must self-stop on the first observation"
+        );
         assert_eq!(
             std::fs::read_to_string(&c.stop_path).unwrap(),
             "controller_off_base_persistent\n"
@@ -1460,8 +1485,14 @@ largest coherent slice that can be edited, tested, and shipped in one cycle"
         // diagnose key off.
         let mut c = ctx_with_runtime("stranded");
         assert!(!c.stop_path.exists());
-        note_stranded_branch_stop(&mut c, "rsi/iter-20260711T003141Z (+14 commit(s) not on master)");
-        assert!(c.stop_path.exists(), "a stranded branch must self-stop on the first observation");
+        note_stranded_branch_stop(
+            &mut c,
+            "rsi/iter-20260711T003141Z (+14 commit(s) not on master)",
+        );
+        assert!(
+            c.stop_path.exists(),
+            "a stranded branch must self-stop on the first observation"
+        );
         assert_eq!(
             std::fs::read_to_string(&c.stop_path).unwrap(),
             "stranded_unmerged_branch_persistent\n"
@@ -1472,7 +1503,12 @@ largest coherent slice that can be edited, tested, and shipped in one cycle"
         assert_eq!(hb["phase"], "preflight");
         assert_eq!(hb["reason"], "stranded_unmerged_branch_persistent");
         // the stranded branch is named verbatim so the operator knows exactly what to reconcile
-        assert!(hb["last_summary"].as_str().unwrap().contains("rsi/iter-20260711T003141Z"));
+        assert!(
+            hb["last_summary"]
+                .as_str()
+                .unwrap()
+                .contains("rsi/iter-20260711T003141Z")
+        );
         assert!(hb["last_summary"].as_str().unwrap().contains("self-stops"));
         let _ = std::fs::remove_dir_all(&c.runtime);
     }
@@ -1525,8 +1561,7 @@ largest coherent slice that can be edited, tested, and shipped in one cycle"
 
     #[test]
     fn consecutive_revert_at_limit_defers_and_surfaces_stuck_goal() {
-        let mut c =
-            ctx_with_backlog("add a widget", "- [ ] add a widget\n- [ ] other item\n");
+        let mut c = ctx_with_backlog("add a widget", "- [ ] add a widget\n- [ ] other item\n");
         // first revert — just counts
         note_consecutive_revert(&mut c, "add a widget");
         // second revert — anti-thrash fires (ANTI_THRASH_LIMIT == 2)
@@ -1538,10 +1573,16 @@ largest coherent slice that can be edited, tested, and shipped in one cycle"
         assert!(bl.contains("(deferred"), "backlog item was deferred: {bl}");
         assert!(bl.contains("other item"), "next item still present: {bl}");
         // corrective note injected
-        assert!(c.last_gate_feedback.contains("REVERTED 2 consecutive times"));
+        assert!(
+            c.last_gate_feedback
+                .contains("REVERTED 2 consecutive times")
+        );
         assert!(c.last_gate_feedback.contains("DIFFERENT goal"));
         // stuck_goal surfaced in the heartbeat
-        assert_eq!(c.hb.get("stuck_goal").and_then(Value::as_str), Some("add a widget"));
+        assert_eq!(
+            c.hb.get("stuck_goal").and_then(Value::as_str),
+            Some("add a widget")
+        );
     }
 
     #[test]
@@ -1552,7 +1593,10 @@ largest coherent slice that can be edited, tested, and shipped in one cycle"
         // a noop breaks the consecutive-revert streak
         note_noop(&mut c, "add a widget", 3);
         assert!(!c.consecutive_reverts.contains_key("add a widget"));
-        assert!(c.hb.get("stuck_goal").is_none(), "stuck_goal cleared on noop");
+        assert!(
+            c.hb.get("stuck_goal").is_none(),
+            "stuck_goal cleared on noop"
+        );
         // next revert starts from 1 again (not 2)
         note_consecutive_revert(&mut c, "add a widget");
         assert_eq!(c.consecutive_reverts.get("add a widget"), Some(&1));
@@ -1564,11 +1608,17 @@ largest coherent slice that can be edited, tested, and shipped in one cycle"
         let mut c = ctx_with_backlog("add a widget", "- [ ] add a widget\n");
         note_consecutive_revert(&mut c, "add a widget");
         note_consecutive_revert(&mut c, "add a widget"); // anti-thrash fires
-        assert_eq!(c.hb.get("stuck_goal").and_then(Value::as_str), Some("add a widget"));
+        assert_eq!(
+            c.hb.get("stuck_goal").and_then(Value::as_str),
+            Some("add a widget")
+        );
         // a successful ship clears everything
         clear_failure_state(&mut c, "add a widget");
         assert!(!c.consecutive_reverts.contains_key("add a widget"));
-        assert!(c.hb.get("stuck_goal").is_none(), "stuck_goal cleared on ship");
+        assert!(
+            c.hb.get("stuck_goal").is_none(),
+            "stuck_goal cleared on ship"
+        );
     }
 
     #[test]

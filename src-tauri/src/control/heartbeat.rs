@@ -8,7 +8,7 @@
 
 use crate::control::paths;
 use chrono::{NaiveDateTime, Utc};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{Read, Seek, SeekFrom};
 
 /// control.read_heartbeat: `json.load` of `runtime/<name>/heartbeat.json`, or None if
@@ -18,11 +18,7 @@ pub fn read_heartbeat(repo: &Value) -> Option<Value> {
     let rt = paths::runtime_dir(repo)?;
     let data = std::fs::read_to_string(rt.join("heartbeat.json")).ok()?;
     let v: Value = serde_json::from_str(&data).ok()?;
-    if v.is_object() {
-        Some(v)
-    } else {
-        None
-    }
+    if v.is_object() { Some(v) } else { None }
 }
 
 /// control.read_log: tail (last 16384 bytes) of `runtime/<name>/improver.log`.
@@ -338,7 +334,10 @@ mod tests {
 
         // Invalid UTF-8 in tail -> two U+FFFD then " ok"
         std::fs::write(&logf, b"\xff\xfe ok").unwrap();
-        assert_eq!(read_log(&repo), json!({"ok": true, "log": "\u{FFFD}\u{FFFD} ok"}));
+        assert_eq!(
+            read_log(&repo),
+            json!({"ok": true, "log": "\u{FFFD}\u{FFFD} ok"})
+        );
 
         // Missing file -> {ok:true, log:""}
         let _ = std::fs::remove_file(&logf);
@@ -391,7 +390,11 @@ mod tests {
         let (rt, repo) = tmp_runtime("hb_test_read_sup");
         let sf = rt.join("supervisor.jsonl");
 
-        std::fs::write(&sf, "{\"e\":\"start\"}\n{\"e\":\"stale\"}\n{\"e\":\"clear\"}\n").unwrap();
+        std::fs::write(
+            &sf,
+            "{\"e\":\"start\"}\n{\"e\":\"stale\"}\n{\"e\":\"clear\"}\n",
+        )
+        .unwrap();
         assert_eq!(
             read_supervisor_log(&repo, 2),
             vec![json!({"e":"stale"}), json!({"e":"clear"})]
@@ -461,7 +464,11 @@ mod tests {
         assert_eq!(m["success_rate"], json!(0.75));
 
         // tests passed=0 appended; failed null -> 0; decided=1 -> 0.0
-        std::fs::write(&hf, "{\"status\":\"noop\",\"tests\":{\"passed\":0,\"failed\":null},\"ts\":1}\n").unwrap();
+        std::fs::write(
+            &hf,
+            "{\"status\":\"noop\",\"tests\":{\"passed\":0,\"failed\":null},\"ts\":1}\n",
+        )
+        .unwrap();
         let m = metrics(&repo);
         assert_eq!(m["noop"], 1);
         assert_eq!(m["tests_series"], json!([{"ts":1,"passed":0,"failed":0}]));
@@ -469,9 +476,16 @@ mod tests {
 
         // spec fidelity: a TRUTHY non-int test count round-trips VERBATIM (NOT i64-coerced) — a string
         // "7" and a float 7.5 are kept as-is; only a falsy value collapses to 0 (per control-port-spec).
-        std::fs::write(&hf, "{\"status\":\"noop\",\"tests\":{\"passed\":\"7\",\"failed\":7.5},\"ts\":1}\n").unwrap();
+        std::fs::write(
+            &hf,
+            "{\"status\":\"noop\",\"tests\":{\"passed\":\"7\",\"failed\":7.5},\"ts\":1}\n",
+        )
+        .unwrap();
         let m = metrics(&repo);
-        assert_eq!(m["tests_series"], json!([{"ts":1,"passed":"7","failed":7.5}]));
+        assert_eq!(
+            m["tests_series"],
+            json!([{"ts":1,"passed":"7","failed":7.5}])
+        );
 
         // tests passed=null NOT appended
         std::fs::write(&hf, "{\"status\":\"noop\",\"tests\":{\"failed\":3}}\n").unwrap();
@@ -504,9 +518,15 @@ mod tests {
         // Empty updated_at string -> None
         assert_eq!(heartbeat_age(&json!({"updated_at":""})), None);
         // Fractional seconds rejected by strict format -> None
-        assert_eq!(heartbeat_age(&json!({"updated_at":"2026-06-22T10:00:00.500Z"})), None);
+        assert_eq!(
+            heartbeat_age(&json!({"updated_at":"2026-06-22T10:00:00.500Z"})),
+            None
+        );
         // Offset form rejected -> None
-        assert_eq!(heartbeat_age(&json!({"updated_at":"2026-06-22T10:00:00+00:00"})), None);
+        assert_eq!(
+            heartbeat_age(&json!({"updated_at":"2026-06-22T10:00:00+00:00"})),
+            None
+        );
         // Non-string updated_at -> None (Python TypeError)
         assert_eq!(heartbeat_age(&json!({"updated_at":1234567890})), None);
 

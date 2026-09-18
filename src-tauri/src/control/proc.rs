@@ -4,12 +4,12 @@
 
 use std::ffi::OsStr;
 use std::io::Read;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 
 // winproc.py creation-flag constants.
 #[cfg(windows)]
@@ -236,9 +236,9 @@ mod app_job {
     use std::sync::OnceLock;
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
     };
 
     // The job handle stored as isize so the OnceLock is Send+Sync (a raw HANDLE is not). Set once in
@@ -311,7 +311,10 @@ mod app_job {
                 unsafe { AssignProcessToJobObject(raw as HANDLE, child.as_raw_handle() as HANDLE) };
             let _ = child.kill();
             let _ = child.wait();
-            assert_ne!(assigned, 0, "AssignProcessToJobObject failed (likely ACCESS_DENIED)");
+            assert_ne!(
+                assigned, 0,
+                "AssignProcessToJobObject failed (likely ACCESS_DENIED)"
+            );
         }
     }
 }
@@ -481,10 +484,9 @@ mod tests {
         let dur = Duration::from_secs(120);
         let out = match run(args, None, Some(dur)) {
             Ok(o) => o,
-            Err(e) if e.kind() == ErrorKind::TimedOut => {
-                run(args, None, Some(dur))
-                    .expect("timeout branch must not error on large output (after one retry on timeout)")
-            }
+            Err(e) if e.kind() == ErrorKind::TimedOut => run(args, None, Some(dur)).expect(
+                "timeout branch must not error on large output (after one retry on timeout)",
+            ),
             Err(e) => panic!("unexpected error: {e}"),
         };
         assert_eq!(out.code, 0);
@@ -502,8 +504,7 @@ mod tests {
         let p = dir.join("repos.json");
         let v = serde_json::json!([{"name": "x", "interval": 120}]);
         atomic_write_json(&p, &v).unwrap();
-        let back: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let back: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
         assert_eq!(back, v);
         // tmp must not linger after a successful rename
         assert!(!dir.join("repos.json.tmp").exists());

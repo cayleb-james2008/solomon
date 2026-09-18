@@ -38,7 +38,7 @@
 //! (iteration.rs gates note_ship on `landed && !item_deviated && !beautify && !solomon`), so a
 //! deviated/blocked/reverted terminal never opens a critique it cannot honestly grade.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 use crate::control::proc;
@@ -529,11 +529,7 @@ pub fn family_demoted(ctx: &Ctx, family: &str) -> bool {
 /// bounded integer so it re-orders WITHIN a priority bucket without ever leapfrogging a higher
 /// bucket (a real ops-auto RED must still outrank a demoted chore).
 pub fn family_penalty(ctx: &Ctx, family: &str) -> u8 {
-    if family_demoted(ctx, family) {
-        1
-    } else {
-        0
-    }
+    if family_demoted(ctx, family) { 1 } else { 0 }
 }
 
 /// The mandatory value-focus directive appended to a task when its backlog family is DEMOTED (a
@@ -861,7 +857,13 @@ mod tests {
             got.ship_ts,
             p.ship_ts
         );
-        assert_eq!(got, Pending { ship_ts: got.ship_ts, ..p });
+        assert_eq!(
+            got,
+            Pending {
+                ship_ts: got.ship_ts,
+                ..p
+            }
+        );
         clear_pending(&c);
         assert!(read_pending(&c).is_none());
     }

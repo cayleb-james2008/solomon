@@ -17,12 +17,12 @@ use crate::control::proc::{self, RunOut};
 use crate::improver::budget;
 use crate::improver::ctx::Ctx;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 // --------------------------------------------------------------------------- //
@@ -45,10 +45,17 @@ use std::sync::{
 /// its summary cannot trigger a false positive.
 pub fn is_quota_error(stderr: &str) -> bool {
     let l = stderr.to_ascii_lowercase();
-    ["429", "usage limit", "rate limit", "rate_limit", "rate-limit",
-     "too many requests", "quota exceeded"]
-        .iter()
-        .any(|pat| l.contains(pat))
+    [
+        "429",
+        "usage limit",
+        "rate limit",
+        "rate_limit",
+        "rate-limit",
+        "too many requests",
+        "quota exceeded",
+    ]
+    .iter()
+    .any(|pat| l.contains(pat))
 }
 
 /// Extract every `errorMessage` from a `stopReason:"error"` assistant message in pi's stdout JSONL
@@ -134,7 +141,7 @@ pub fn kill_tree(pid: u32) {
     {
         // os.killpg(os.getpgid(pid), signal.SIGKILL); except OSError: pass
         unsafe {
-            extern "C" {
+            unsafe extern "C" {
                 fn getpgid(pid: i32) -> i32;
                 fn killpg(pgrp: i32, sig: i32) -> i32;
             }
@@ -1099,7 +1106,8 @@ add extra usage: https://ollama.com/settings (ref: c708135e-d4a9-484f-ac43-02478
                 "role": "assistant", "content": [],
                 "stopReason": "error", "errorMessage": "429 rate limit exceeded"
             }]
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(is_quota_error(&stream_error_messages(&line)));
     }
 
@@ -1109,13 +1117,15 @@ add extra usage: https://ollama.com/settings (ref: c708135e-d4a9-484f-ac43-02478
         let ok = serde_json::to_string(&json!({
             "type": "message_end",
             "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]}
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(stream_error_messages(&ok), "");
         // stopReason present but not "error" -> ignored.
         let stopped = serde_json::to_string(&json!({
             "type": "message_end",
             "message": {"role": "assistant", "content": [], "stopReason": "stop"}
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(stream_error_messages(&stopped), "");
         // Blank/undecodable lines are skipped without panicking.
         assert_eq!(stream_error_messages("\n   \nnot json\n{ truncated\n"), "");
@@ -1348,7 +1358,8 @@ add extra usage: https://ollama.com/settings (ref: c708135e-d4a9-484f-ac43-02478
         assert_eq!(out.code, 1);
         assert_eq!(out.stdout, "");
         assert!(
-            out.stderr.starts_with("429 provider parked by budget ledger until"),
+            out.stderr
+                .starts_with("429 provider parked by budget ledger until"),
             "got: {}",
             out.stderr
         );
@@ -1361,7 +1372,10 @@ add extra usage: https://ollama.com/settings (ref: c708135e-d4a9-484f-ac43-02478
             &std::fs::read_to_string(fleet.join("_provider_budget.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(after["endpoints"]["maki-cloud:glm-5.2"]["spent_calls"], json!(1));
+        assert_eq!(
+            after["endpoints"]["maki-cloud:glm-5.2"]["spent_calls"],
+            json!(1)
+        );
         // the loop's configured endpoint is untouched by the refusal
         assert_eq!(c.pi_provider, "maki-cloud");
         assert_eq!(c.pi_model, "glm-5.2");
@@ -1373,7 +1387,8 @@ add extra usage: https://ollama.com/settings (ref: c708135e-d4a9-484f-ac43-02478
         let mut c = wiring_ctx("cycle");
         // WS1's per-cycle budget window, already blown: started 100s ago with a 10s wall cap
         let now = unix_now_test();
-        let budget_file = json!({"started_at": (now as f64) - 100.0, "wall_s": 10.0, "pi_calls": 0});
+        let budget_file =
+            json!({"started_at": (now as f64) - 100.0, "wall_s": 10.0, "pi_calls": 0});
         std::fs::write(c.runtime.join("cycle_budget.json"), budget_file.to_string()).unwrap();
 
         let out = run_pi(&mut c, "do work", 60, None);
@@ -1385,10 +1400,18 @@ add extra usage: https://ollama.com/settings (ref: c708135e-d4a9-484f-ac43-02478
             "got: {}",
             out.stderr
         );
-        assert!(out.stderr.contains("wall budget exhausted"), "got: {}", out.stderr);
+        assert!(
+            out.stderr.contains("wall budget exhausted"),
+            "got: {}",
+            out.stderr
+        );
         // refused BEFORE endpoint resolution: no fleet ledger was even seeded
         assert!(
-            !c.runtime.parent().unwrap().join("_provider_budget.json").exists(),
+            !c.runtime
+                .parent()
+                .unwrap()
+                .join("_provider_budget.json")
+                .exists(),
             "cycle-budget refusal must precede any provider-ledger IO"
         );
         let _ = std::fs::remove_dir_all(c.runtime.parent().unwrap().parent().unwrap());

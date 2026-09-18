@@ -24,7 +24,7 @@ use crate::control::{
     apptest_health, branches, contracts, gh, heartbeat, keys, paths, registry, runner,
 };
 use crate::supervisor;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::path::PathBuf;
 
 // --------------------------------------------------------------------------- #
@@ -341,8 +341,12 @@ fn gh_status_cached() -> (bool, Value) {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     static CACHE: Mutex<Option<(Instant, Value)>> = Mutex::new(None);
-    let unpack =
-        |v: &Value| (v.get("ready").and_then(Value::as_bool).unwrap_or(false), v.clone());
+    let unpack = |v: &Value| {
+        (
+            v.get("ready").and_then(Value::as_bool).unwrap_or(false),
+            v.clone(),
+        )
+    };
     if let Ok(g) = CACHE.lock() {
         if let Some((t, v)) = g.as_ref() {
             if t.elapsed() < Duration::from_secs(60) {
@@ -1023,7 +1027,7 @@ fn supervise(st: &AppState, args: &[Value]) -> Value {
         match recovered {
             Ok((rec, remaining)) => {
                 restart_budget.set(remaining); // carry the shared budget to the next repo
-                                               // {"name": name, **recover(...)}
+                // {"name": name, **recover(...)}
                 let mut obj = Map::new();
                 obj.insert("name".to_string(), repo_name);
                 if let Value::Object(o) = rec {
@@ -1698,7 +1702,7 @@ mod tests {
             json!({"ok": true, "auto_ai_fix": true})
         );
         assert_eq!(dispatch("get_layout", &[]).unwrap(), Value::Null); // unset default
-                                                                       // round-trip layout
+        // round-trip layout
         let layout = json!([{"id": "a", "type": "card", "repo": "r"}]);
         assert_eq!(
             dispatch("set_layout", std::slice::from_ref(&layout)).unwrap(),

@@ -84,7 +84,9 @@ pub struct WorkingTier {
 
 impl WorkingTier {
     pub fn new() -> Self {
-        WorkingTier { entries: Vec::new() }
+        WorkingTier {
+            entries: Vec::new(),
+        }
     }
 
     /// Current entry count.
@@ -227,7 +229,9 @@ impl ObservationLog {
     pub fn validate_fact(text: &str) -> FactVerdict {
         let t = text.trim();
         if t.is_empty() {
-            return FactVerdict::RejectedSummary { why: "empty line is not a fact" };
+            return FactVerdict::RejectedSummary {
+                why: "empty line is not a fact",
+            };
         }
         let lower = t.to_ascii_lowercase();
         if let Some(_m) = SUMMARY_MARKERS.iter().find(|m| lower.contains(**m)) {
@@ -269,16 +273,24 @@ impl ObservationLog {
         // the reasoning loop never wedges on a disk hiccup (the fact is lost, not fatal).
         if let Some(parent) = self.path.parent() {
             if std::fs::create_dir_all(parent).is_err() {
-                return Err(FactVerdict::RejectedSummary { why: "observation-log dir unwritable" });
+                return Err(FactVerdict::RejectedSummary {
+                    why: "observation-log dir unwritable",
+                });
             }
         }
         use std::io::Write;
-        match std::fs::OpenOptions::new().create(true).append(true).open(&self.path) {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
             Ok(mut f) => {
                 let _ = writeln!(f, "{line}");
                 Ok(())
             }
-            Err(_) => Err(FactVerdict::RejectedSummary { why: "observation-log unwritable" }),
+            Err(_) => Err(FactVerdict::RejectedSummary {
+                why: "observation-log unwritable",
+            }),
         }
     }
 
@@ -302,7 +314,10 @@ pub struct LongTermAdapter {
 
 impl LongTermAdapter {
     pub fn new(here: PathBuf, lane: &str) -> Self {
-        LongTermAdapter { here, lane: lane.to_string() }
+        LongTermAdapter {
+            here,
+            lane: lane.to_string(),
+        }
     }
 
     /// `runtime/outcomes.jsonl` (fleet-wide outcomes — shared, not per-lane).
@@ -312,12 +327,18 @@ impl LongTermAdapter {
 
     /// `runtime/<lane>/freshness.json` (the LEDGER the freshness gate maintains).
     pub fn freshness_path(&self) -> PathBuf {
-        self.here.join("runtime").join(&self.lane).join("freshness.json")
+        self.here
+            .join("runtime")
+            .join(&self.lane)
+            .join("freshness.json")
     }
 
     /// `runtime/<lane>/progress.json` (the progress ledger).
     pub fn progress_path(&self) -> PathBuf {
-        self.here.join("runtime").join(&self.lane).join("progress.json")
+        self.here
+            .join("runtime")
+            .join(&self.lane)
+            .join("progress.json")
     }
 
     /// Read the last `n` lines of `outcomes.jsonl` — a bounded tail (reverse-seek), never the whole
@@ -498,7 +519,11 @@ impl WarmContext {
     ///
     /// `obs_tail_n` / `outcomes_tail_n` bound how much recent history seeds the working tier — both
     /// are TAILS, so a million-line ledger costs the same as a hundred-line one.
-    pub fn reconstruct_context(&mut self, obs_tail_n: usize, outcomes_tail_n: usize) -> ReconstructedContext {
+    pub fn reconstruct_context(
+        &mut self,
+        obs_tail_n: usize,
+        outcomes_tail_n: usize,
+    ) -> ReconstructedContext {
         let mut working = WorkingTier::new();
 
         // SHORT-TERM: the recent dated facts (tail, not the whole log).
@@ -548,10 +573,17 @@ mod tests {
         for i in 0..(WORKING_MAX_ENTRIES * 4) {
             w.push(&format!("entry {i}"));
         }
-        assert_eq!(w.len(), WORKING_MAX_ENTRIES, "entry count must be hard-capped, not unbounded");
+        assert_eq!(
+            w.len(),
+            WORKING_MAX_ENTRIES,
+            "entry count must be hard-capped, not unbounded"
+        );
         // FIFO: the OLDEST were dropped, the NEWEST survive.
         let rendered = w.render();
-        assert!(rendered.contains(&format!("entry {}", WORKING_MAX_ENTRIES * 4 - 1)), "newest kept");
+        assert!(
+            rendered.contains(&format!("entry {}", WORKING_MAX_ENTRIES * 4 - 1)),
+            "newest kept"
+        );
         assert!(!rendered.contains("entry 0\n"), "oldest dropped");
     }
 
@@ -563,7 +595,11 @@ mod tests {
         for _ in 0..64 {
             w.push(&big);
         }
-        assert!(w.byte_len() <= WORKING_MAX_BYTES, "byte size must be hard-capped: {}", w.byte_len());
+        assert!(
+            w.byte_len() <= WORKING_MAX_BYTES,
+            "byte size must be hard-capped: {}",
+            w.byte_len()
+        );
     }
 
     #[test]
@@ -604,10 +640,16 @@ mod tests {
             "TL;DR: 4 ships today",
         ] {
             let v = ObservationLog::validate_fact(bad);
-            assert!(!v.is_fact(), "tightened tripwire should reject digit-bearing summary: {bad:?}");
+            assert!(
+                !v.is_fact(),
+                "tightened tripwire should reject digit-bearing summary: {bad:?}"
+            );
         }
         // and a genuine first-order fact with the same digits still PASSES.
-        assert!(ObservationLog::validate_fact("kairos cycle 412 shipped PR #88, equity +0.42").is_fact());
+        assert!(
+            ObservationLog::validate_fact("kairos cycle 412 shipped PR #88, equity +0.42")
+                .is_fact()
+        );
     }
 
     #[test]
@@ -617,7 +659,10 @@ mod tests {
             "asmodeus freshness advanced: n_samples 2863",
             "sover posted 3 items at 2026-07-07T22:58:53Z",
         ] {
-            assert!(ObservationLog::validate_fact(good).is_fact(), "should accept fact: {good:?}");
+            assert!(
+                ObservationLog::validate_fact(good).is_fact(),
+                "should accept fact: {good:?}"
+            );
         }
     }
 
@@ -626,11 +671,14 @@ mod tests {
         let dir = tmp_dir("append");
         let log = ObservationLog::at(dir.join("observations.jsonl"));
         // a summary is refused, writes NOTHING.
-        let err = log.append_fact("2026-07-08", "a summary of the summaries so far").unwrap_err();
+        let err = log
+            .append_fact("2026-07-08", "a summary of the summaries so far")
+            .unwrap_err();
         assert!(matches!(err, FactVerdict::RejectedSummary { .. }));
         assert!(log.tail(10).is_empty(), "refused write must not persist");
         // a dated fact appends.
-        log.append_fact("2026-07-08", "kairos cycle 412 shipped PR #88 equity +0.42").unwrap();
+        log.append_fact("2026-07-08", "kairos cycle 412 shipped PR #88 equity +0.42")
+            .unwrap();
         let tail = log.tail(10);
         assert_eq!(tail.len(), 1);
         assert!(tail[0].starts_with("2026-07-08\t"), "line must be dated");
@@ -649,7 +697,8 @@ mod tests {
         // A LARGE observation log — reconstruct must only take the TAIL.
         let log = ObservationLog::at(runtime.join("observations.jsonl"));
         for i in 0..1000 {
-            log.append_fact("2026-07-08", &format!("cycle {i} shipped PR #{i}")).unwrap();
+            log.append_fact("2026-07-08", &format!("cycle {i} shipped PR #{i}"))
+                .unwrap();
         }
         // a freshness ledger head.
         std::fs::write(
@@ -664,8 +713,14 @@ mod tests {
 
         // working tier is bounded and seeded from the TAIL (recent cycles), not cycle 0.
         assert!(ctx.working.contains("cycle 999"), "newest obs present");
-        assert!(!ctx.working.contains("cycle 0 "), "oldest obs NOT loaded (tail only)");
-        assert!(ctx.working.contains("settled_usd_15m"), "freshness ledger head present");
+        assert!(
+            !ctx.working.contains("cycle 0 "),
+            "oldest obs NOT loaded (tail only)"
+        );
+        assert!(
+            ctx.working.contains("settled_usd_15m"),
+            "freshness ledger head present"
+        );
         // the working render is bounded regardless of the 1000-line log.
         assert!(ctx.working.len() <= WORKING_MAX_BYTES);
         // full prompt starts with the stable prefix.
@@ -685,14 +740,27 @@ mod tests {
         let mut warm = WarmContext::new(log, adapter);
 
         let first = warm.reconstruct_context(4, 4);
-        assert!(!first.prefix_cache_hit, "first wake is a cache miss (nothing cached)");
+        assert!(
+            !first.prefix_cache_hit,
+            "first wake is a cache miss (nothing cached)"
+        );
         // subsequent wakes hit — the prefix is a FIXED constant.
         for _ in 0..5 {
             let r = warm.reconstruct_context(4, 4);
-            assert!(r.prefix_cache_hit, "stable prefix must hit after the first wake");
+            assert!(
+                r.prefix_cache_hit,
+                "stable prefix must hit after the first wake"
+            );
         }
-        assert!(warm.cache.rate() > 0.8, "cache-hit rate must be observable and high: {}", warm.cache.rate());
-        assert!(warm.cache.log_line().contains("prefix_hit_rate="), "rate is emittable to logs");
+        assert!(
+            warm.cache.rate() > 0.8,
+            "cache-hit rate must be observable and high: {}",
+            warm.cache.rate()
+        );
+        assert!(
+            warm.cache.log_line().contains("prefix_hit_rate="),
+            "rate is emittable to logs"
+        );
         let _ = std::fs::remove_dir_all(&here);
     }
 
@@ -701,7 +769,10 @@ mod tests {
     #[test]
     fn stable_prefix_is_frozen() {
         // The prefix must not drift wake-to-wake; pin its identity + key invariant clauses.
-        assert!(STABLE_PREFIX.starts_with("[PECRT continuous reasoning thread — stable context prefix v1]"));
+        assert!(
+            STABLE_PREFIX
+                .starts_with("[PECRT continuous reasoning thread — stable context prefix v1]")
+        );
         assert!(STABLE_PREFIX.contains("SCHEDULER and MEMORY wrapper, not an"));
         assert!(STABLE_PREFIX.contains("cannot edit the repos.json whitelist/tiers"));
         assert!(STABLE_PREFIX.contains("Parking is PREFERRED"));
@@ -715,7 +786,9 @@ mod tests {
         // Write far more than one 8KiB chunk so the reverse-seek must span multiple chunks.
         let mut body = String::new();
         for i in 0..5000 {
-            body.push_str(&format!("line {i} with some padding to exceed a single chunk boundary\n"));
+            body.push_str(&format!(
+                "line {i} with some padding to exceed a single chunk boundary\n"
+            ));
         }
         std::fs::write(&p, &body).unwrap();
         // last 3 lines, in order.
@@ -731,7 +804,10 @@ mod tests {
         // file WITHOUT a trailing newline: last line still returned.
         let p2 = dir.join("no_trailing.txt");
         std::fs::write(&p2, "a1\nb2\nc3").unwrap();
-        assert_eq!(read_last_lines(&p2, 2), vec!["b2".to_string(), "c3".to_string()]);
+        assert_eq!(
+            read_last_lines(&p2, 2),
+            vec!["b2".to_string(), "c3".to_string()]
+        );
         // n == 0 and missing file => empty.
         assert!(read_last_lines(&p2, 0).is_empty());
         assert!(read_last_lines(&dir.join("nope"), 5).is_empty());
@@ -740,7 +816,6 @@ mod tests {
 
     #[test]
     fn long_term_adapter_is_read_only_by_contract() {
-
         // the adapter exposes only readers — a compile-time guarantee (no write method exists).
         let a = LongTermAdapter::new(tmp_dir("ro"), "kairos");
         assert!(a.outcomes_path().ends_with("outcomes.jsonl"));

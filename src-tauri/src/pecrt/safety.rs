@@ -31,7 +31,7 @@
 //! must be added here to be protected, and the DEFAULT for an unrecognized governance-shaped target
 //! is DENY (fail-closed), mirroring money_guard's default-deny arm.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// A skeptic-bypass sentinel. Any target mentioning this is a request to skip the skeptic — always
 /// denied. (The skeptic is a HARD gate; the thread can never route around it.)
@@ -216,7 +216,9 @@ mod tests {
         ];
         // Try to MUTATE each via every plausible verb, EVEN while claiming it re-enters gates.
         for target in forbidden_targets {
-            for verb in ["edit", "write", "raise", "widen", "add", "remove", "bypass", "disable", "patch"] {
+            for verb in [
+                "edit", "write", "raise", "widen", "add", "remove", "bypass", "disable", "patch",
+            ] {
                 let req = ScheduleRequest::new(verb, target, true); // claims gate re-entry — irrelevant
                 let v = classify_schedule(&req);
                 assert!(
@@ -238,7 +240,10 @@ mod tests {
     #[test]
     fn no_allow_arm_exists_for_a_governance_target() {
         let req = ScheduleRequest::new("read-then-edit", "repos.json", true);
-        assert!(matches!(classify_schedule(&req), ScheduleVerdict::Deny { .. }));
+        assert!(matches!(
+            classify_schedule(&req),
+            ScheduleVerdict::Deny { .. }
+        ));
     }
 
     /// An action that declares it will skip the gates is denied even for an ordinary target.
@@ -246,7 +251,10 @@ mod tests {
     fn scheduling_a_gate_bypass_is_denied() {
         let req = ScheduleRequest::new("run_iteration", "kairos", false); // won't re-enter gates
         let v = classify_schedule(&req);
-        assert!(!v.is_allowed(), "an unchecked (gate-skipping) action must be denied");
+        assert!(
+            !v.is_allowed(),
+            "an unchecked (gate-skipping) action must be denied"
+        );
         assert!(guard_schedule(&req).is_some());
     }
 
@@ -263,9 +271,16 @@ mod tests {
         ] {
             let req = ScheduleRequest::new(verb, target, true);
             let v = classify_schedule(&req);
-            assert!(v.is_allowed(), "'{verb}' on '{target}' should be schedulable: {}", v.reason());
+            assert!(
+                v.is_allowed(),
+                "'{verb}' on '{target}' should be schedulable: {}",
+                v.reason()
+            );
             // the ALLOW reason must name the gate funnel it re-enters (auditability).
-            assert!(v.reason().contains("gate funnel"), "allow must name the gate funnel");
+            assert!(
+                v.reason().contains("gate funnel"),
+                "allow must name the gate funnel"
+            );
             // guard returns None so the caller proceeds into the UNCHANGED funnel.
             assert!(guard_schedule(&req).is_none());
         }

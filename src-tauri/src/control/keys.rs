@@ -7,7 +7,7 @@
 //! "openrouter" (a serde_json::Map preserves insertion order with the `preserve_order`
 //! feature; we instead build the object explicitly so ordering is guaranteed).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs;
 
 use crate::control::paths;
@@ -35,12 +35,23 @@ fn provider_env_var(provider: &str) -> Option<&'static str> {
 /// is broader than Rust's `char::is_whitespace` in a couple of control chars
 /// (0x1c-0x1f) and excludes nothing it needs. Enumerated against CPython 3.11.
 fn is_py_strip_ws(c: char) -> bool {
-    matches!(c,
-        '\u{09}' | '\u{0a}' | '\u{0b}' | '\u{0c}' | '\u{0d}'
-        | '\u{1c}' | '\u{1d}' | '\u{1e}' | '\u{1f}' | '\u{20}'
-        | '\u{85}' | '\u{a0}' | '\u{1680}'
-        | '\u{2000}'..='\u{200a}'
-        | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
+    matches!(
+        c,
+        '\u{09}'
+            | '\u{0a}'
+            | '\u{0b}'
+            | '\u{0c}'
+            | '\u{0d}'
+            | '\u{1c}'
+            | '\u{1d}'
+            | '\u{1e}'
+            | '\u{1f}'
+            | '\u{20}'
+            | '\u{85}'
+            | '\u{a0}'
+            | '\u{1680}'
+            | '\u{2000}'
+            ..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
     )
 }
 
@@ -52,10 +63,18 @@ fn py_strip_ws(s: &str) -> &str {
 /// True if `c` is a line boundary per Python `str.splitlines()`. Enumerated against
 /// CPython 3.11. Note `\r\n` is handled as a single break by the splitter below.
 fn is_py_linebreak(c: char) -> bool {
-    matches!(c,
-        '\u{0a}' | '\u{0b}' | '\u{0c}' | '\u{0d}'
-        | '\u{1c}' | '\u{1d}' | '\u{1e}'
-        | '\u{85}' | '\u{2028}' | '\u{2029}'
+    matches!(
+        c,
+        '\u{0a}'
+            | '\u{0b}'
+            | '\u{0c}'
+            | '\u{0d}'
+            | '\u{1c}'
+            | '\u{1d}'
+            | '\u{1e}'
+            | '\u{85}'
+            | '\u{2028}'
+            | '\u{2029}'
     )
 }
 
@@ -116,7 +135,12 @@ pub fn set_key(provider: &str, value: &str) -> Value {
     let mut lines: Vec<String> = Vec::new();
     if paths::env_file().exists() {
         match fs::read_to_string(paths::env_file()) {
-            Ok(content) => lines = py_splitlines(&content).into_iter().map(String::from).collect(),
+            Ok(content) => {
+                lines = py_splitlines(&content)
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            }
             Err(e) => return json!({"ok": false, "error": e.to_string()}),
         }
     }
@@ -124,7 +148,10 @@ pub fn set_key(provider: &str, value: &str) -> Value {
     let mut found = false;
     for line in lines.iter_mut() {
         // line.split("=", 1)[0].strip() == key
-        let before_eq = line.split_once('=').map(|(a, _)| a).unwrap_or(line.as_str());
+        let before_eq = line
+            .split_once('=')
+            .map(|(a, _)| a)
+            .unwrap_or(line.as_str());
         if py_strip_ws(before_eq) == key {
             *line = new_line.clone();
             found = true;
@@ -237,7 +264,10 @@ mod tests {
     #[test]
     fn set_key_unknown_provider_verbatim() {
         let g = EnvGuard::new();
-        assert_eq!(set_key("gpt4", "sk-abc"), json!({"ok": false, "error": "unknown provider: gpt4"}));
+        assert_eq!(
+            set_key("gpt4", "sk-abc"),
+            json!({"ok": false, "error": "unknown provider: gpt4"})
+        );
         // short-circuits before any file access
         assert!(!paths::env_file().exists());
         drop(g);
@@ -246,7 +276,10 @@ mod tests {
     #[test]
     fn set_key_empty_provider() {
         let _g = EnvGuard::new();
-        assert_eq!(set_key("", "x"), json!({"ok": false, "error": "unknown provider: "}));
+        assert_eq!(
+            set_key("", "x"),
+            json!({"ok": false, "error": "unknown provider: "})
+        );
     }
 
     #[test]
@@ -286,7 +319,10 @@ mod tests {
         let g = EnvGuard::new();
         g.write_env("OLLAMA_API_KEY=sk-abc\n");
         assert_eq!(set_key("openrouter", "or-key"), json!({"ok": true}));
-        assert_eq!(g.read_env(), "OLLAMA_API_KEY=sk-abc\nOPENROUTER_API_KEY=or-key\n");
+        assert_eq!(
+            g.read_env(),
+            "OLLAMA_API_KEY=sk-abc\nOPENROUTER_API_KEY=or-key\n"
+        );
     }
 
     #[test]
@@ -347,70 +383,100 @@ mod tests {
     #[test]
     fn keys_status_missing_env_all_false() {
         let _g = EnvGuard::new();
-        assert_eq!(keys_status(), json!({"ollama-cloud": false, "openrouter": false}));
+        assert_eq!(
+            keys_status(),
+            json!({"ollama-cloud": false, "openrouter": false})
+        );
     }
 
     #[test]
     fn keys_status_both_present() {
         let g = EnvGuard::new();
         g.write_env("OLLAMA_API_KEY=a\nOPENROUTER_API_KEY=b\n");
-        assert_eq!(keys_status(), json!({"ollama-cloud": true, "openrouter": true}));
+        assert_eq!(
+            keys_status(),
+            json!({"ollama-cloud": true, "openrouter": true})
+        );
     }
 
     #[test]
     fn keys_status_empty_value_false() {
         let g = EnvGuard::new();
         g.write_env("OLLAMA_API_KEY=\nOPENROUTER_API_KEY=b\n");
-        assert_eq!(keys_status(), json!({"ollama-cloud": false, "openrouter": true}));
+        assert_eq!(
+            keys_status(),
+            json!({"ollama-cloud": false, "openrouter": true})
+        );
     }
 
     #[test]
     fn keys_status_double_quotes_stripped() {
         let g = EnvGuard::new();
         g.write_env("OLLAMA_API_KEY=\"abc\"\n");
-        assert_eq!(keys_status(), json!({"ollama-cloud": true, "openrouter": false}));
+        assert_eq!(
+            keys_status(),
+            json!({"ollama-cloud": true, "openrouter": false})
+        );
     }
 
     #[test]
     fn keys_status_single_quotes_stripped() {
         let g = EnvGuard::new();
         g.write_env("OPENROUTER_API_KEY='abc'\n");
-        assert_eq!(keys_status(), json!({"ollama-cloud": false, "openrouter": true}));
+        assert_eq!(
+            keys_status(),
+            json!({"ollama-cloud": false, "openrouter": true})
+        );
     }
 
     #[test]
     fn keys_status_only_quotes_empty_false() {
         let g = EnvGuard::new();
         g.write_env("OLLAMA_API_KEY=\"\"\n");
-        assert_eq!(keys_status(), json!({"ollama-cloud": false, "openrouter": false}));
+        assert_eq!(
+            keys_status(),
+            json!({"ollama-cloud": false, "openrouter": false})
+        );
     }
 
     #[test]
     fn keys_status_whitespace_only_false() {
         let g = EnvGuard::new();
         g.write_env("OLLAMA_API_KEY=   \n");
-        assert_eq!(keys_status(), json!({"ollama-cloud": false, "openrouter": false}));
+        assert_eq!(
+            keys_status(),
+            json!({"ollama-cloud": false, "openrouter": false})
+        );
     }
 
     #[test]
     fn keys_status_key_spaces_matched_value_stripped() {
         let g = EnvGuard::new();
         g.write_env("  OLLAMA_API_KEY = foo \n");
-        assert_eq!(keys_status(), json!({"ollama-cloud": true, "openrouter": false}));
+        assert_eq!(
+            keys_status(),
+            json!({"ollama-cloud": true, "openrouter": false})
+        );
     }
 
     #[test]
     fn keys_status_duplicate_last_wins() {
         let g = EnvGuard::new();
         g.write_env("OLLAMA_API_KEY=x\nOLLAMA_API_KEY=\n");
-        assert_eq!(keys_status(), json!({"ollama-cloud": false, "openrouter": false}));
+        assert_eq!(
+            keys_status(),
+            json!({"ollama-cloud": false, "openrouter": false})
+        );
     }
 
     #[test]
     fn keys_status_lines_without_eq_ignored_value_with_eq_present() {
         let g = EnvGuard::new();
         g.write_env("# comment\nrandomline\nOPENROUTER_API_KEY=a=b\n");
-        assert_eq!(keys_status(), json!({"ollama-cloud": false, "openrouter": true}));
+        assert_eq!(
+            keys_status(),
+            json!({"ollama-cloud": false, "openrouter": true})
+        );
     }
 
     #[test]
@@ -429,7 +495,10 @@ mod tests {
         // (ends with '), strip("'") removes outer singles -> '"key"' non-empty -> True.
         let g = EnvGuard::new();
         g.write_env("OLLAMA_API_KEY='\"key\"'\n");
-        assert_eq!(keys_status(), json!({"ollama-cloud": true, "openrouter": false}));
+        assert_eq!(
+            keys_status(),
+            json!({"ollama-cloud": true, "openrouter": false})
+        );
     }
 
     // ----- py_splitlines fidelity -----

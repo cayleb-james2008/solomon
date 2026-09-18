@@ -57,7 +57,11 @@ pub fn run_review_phase(ctx: &mut Ctx, branch: &str, goal: &str, summary: &str) 
     let raw = ctx.git(&["diff", &diff_range, "--stat"], 120).stdout;
     let stat: String = raw.chars().take(2000).collect();
 
-    let goal_line = if goal.is_empty() { "(no explicit goal)" } else { goal };
+    let goal_line = if goal.is_empty() {
+        "(no explicit goal)"
+    } else {
+        goal
+    };
     let task = format!(
         "Adversarially review the committed change on this rsi/* branch — you are the JUDGE.\n\n\
 Iteration goal:\n{goal_line}\n\nImplementer's summary:\n{summary}\n\n\
@@ -319,9 +323,9 @@ fn read_lessons(ctx: &Ctx) -> String {
 // run_improver._STOPWORDS (~3046-3048).
 const STOPWORDS: &[&str] = &[
     "a", "an", "the", "and", "or", "but", "for", "to", "of", "in", "on", "at", "by", "with",
-    "from", "into", "as", "is", "are", "be", "it", "this", "that", "these", "those", "add",
-    "adds", "added", "use", "uses", "using", "make", "makes", "made", "into", "via", "per", "its",
-    "it's", "not", "no", "than", "then", "so", "we", "i",
+    "from", "into", "as", "is", "are", "be", "it", "this", "that", "these", "those", "add", "adds",
+    "added", "use", "uses", "using", "make", "makes", "made", "into", "via", "per", "its", "it's",
+    "not", "no", "than", "then", "so", "we", "i",
 ];
 
 /// run_improver._tokenize (~3051-3054): lowercase `[a-z0-9]+` word tokens, dropping stopwords and
@@ -448,7 +452,10 @@ fn is_falsy(v: &serde_json::Value) -> bool {
 /// Append bytes to a file (Python `open(path, "a")`).
 fn append(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     f.write_all(text.as_bytes())
 }
 
@@ -554,19 +561,31 @@ mod tests {
     #[test]
     fn empty_idea_is_novel() {
         // tokenize("the a an") -> empty (all stopwords/short) -> always novel
-        assert!(is_novel("the a an", &["whatever long lesson text".to_string()], 0.6));
+        assert!(is_novel(
+            "the a an",
+            &["whatever long lesson text".to_string()],
+            0.6
+        ));
     }
 
     #[test]
     fn identical_is_not_novel() {
         let corpus = vec!["prefer the standard library over custom code".to_string()];
-        assert!(!is_novel("prefer standard library over custom code", &corpus, 0.6));
+        assert!(!is_novel(
+            "prefer standard library over custom code",
+            &corpus,
+            0.6
+        ));
     }
 
     #[test]
     fn disjoint_is_novel() {
         let corpus = vec!["network retries need exponential backoff".to_string()];
-        assert!(is_novel("documentation should mention licensing terms", &corpus, 0.6));
+        assert!(is_novel(
+            "documentation should mention licensing terms",
+            &corpus,
+            0.6
+        ));
     }
 
     #[test]
@@ -606,7 +625,10 @@ mod tests {
 
     #[test]
     fn lstrip_only_listed_chars() {
-        assert_eq!(lstrip_chars(" -—: hello", &[' ', '-', '\u{2014}', ':']), "hello");
+        assert_eq!(
+            lstrip_chars(" -—: hello", &[' ', '-', '\u{2014}', ':']),
+            "hello"
+        );
         assert_eq!(lstrip_chars("xhello", &[' ', '-']), "xhello");
     }
 
@@ -615,7 +637,10 @@ mod tests {
     #[test]
     fn json_str_or_falsy_uses_default() {
         assert_eq!(json_str_or(Some(&serde_json::json!("")), "?"), "?");
-        assert_eq!(json_str_or(Some(&serde_json::json!("shipped")), "?"), "shipped");
+        assert_eq!(
+            json_str_or(Some(&serde_json::json!("shipped")), "?"),
+            "shipped"
+        );
         assert_eq!(json_str_or(None, "?"), "?");
         assert_eq!(json_str_or(Some(&serde_json::Value::Null), "?"), "?");
     }

@@ -104,7 +104,7 @@ use crate::notify::{self, Notice};
 use crate::ops::{self, ledger};
 use crate::pecrt::warm::{LongTermAdapter, ObservationLog, ReconstructedContext, WarmContext};
 use chrono::{Timelike, Utc};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -259,9 +259,7 @@ fn ceo_append_tick_observation(warm: &WarmContext, iso_date: &str, fact: &str) {
 /// (carries the epoch datum + the concrete gate states), never a rollup-of-rollups. Pure (caller
 /// supplies the states + epoch) so the carry-forward `#[test]` can pin the shape without a clock.
 fn ceo_tick_fact(epoch_s: u64, plan_state: &str, summary_state: &str) -> String {
-    format!(
-        "ceo tick t={epoch_s}: plan={plan_state} summary={summary_state}"
-    )
+    format!("ceo tick t={epoch_s}: plan={plan_state} summary={summary_state}")
 }
 
 // --------------------------------------------------------------------------- //
@@ -514,7 +512,8 @@ fn ceo_day_gates() {
 
 /// Single-flight guard for the CEO slow best-effort tail — one tail thread at a time, so a slow
 /// ollama/produce run can never pile up detached threads (the observed 809-thread GUI leak).
-static CEO_SLOW_TAIL_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CEO_SLOW_TAIL_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Reset the single-flight flag when the tail thread finishes (or panics) — mirrors watchdog's
 /// `GraftFlagGuard`, so a panicking tail can never wedge the flag true and starve every future tail.
@@ -575,7 +574,10 @@ fn blind_window_notice_once() {
         if gap > BLIND_NOTICE_S {
             let _ = notify::send(&Notice::report(
                 "Solomon: ops was blind".into(),
-                format!("no probe sweeps for {:.1} h (Solomon.exe closed) — fleet status is now live again", gap / 3600.0),
+                format!(
+                    "no probe sweeps for {:.1} h (Solomon.exe closed) — fleet status is now live again",
+                    gap / 3600.0
+                ),
             ));
         }
     }
@@ -976,7 +978,10 @@ fn dead_red_lock_token() -> String {
 /// Cross-process, fail-closed lease for the read/notify/write dead-RED transaction. GUI ticks and
 /// the out-of-band sentinel can run in distinct OS processes, so an in-process mutex cannot prevent
 /// both from observing the old `_dead_red.json` and sending the same page.
-fn try_acquire_dead_red_lock_at(path: &std::path::Path, stale_after: Duration) -> Option<DeadRedLease> {
+fn try_acquire_dead_red_lock_at(
+    path: &std::path::Path,
+    stale_after: Duration,
+) -> Option<DeadRedLease> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok()?;
     }
@@ -1059,11 +1064,7 @@ fn ops_red_backlog_graft() {
             .into_iter()
             .filter_map(|r| {
                 let n = paths::repo_name(&r);
-                if n.is_empty() {
-                    None
-                } else {
-                    Some((n, r))
-                }
+                if n.is_empty() { None } else { Some((n, r)) }
             })
             .collect();
 
@@ -2043,11 +2044,7 @@ pub fn render_report(
             .into_iter()
             .filter_map(|r| {
                 let n = paths::repo_name(&r);
-                if n.is_empty() {
-                    None
-                } else {
-                    Some((n, r))
-                }
+                if n.is_empty() { None } else { Some((n, r)) }
             })
             .collect();
 
@@ -2305,7 +2302,9 @@ pub fn next_watch(snapshot: &Value, status: &Value) -> String {
         let zero_posts = p.get("posts_24h").and_then(Value::as_i64) == Some(0);
         let zero_trades = p.get("live_trades_24h").and_then(Value::as_i64) == Some(0);
         if dead_lane || zero_posts || zero_trades {
-            return format!("{name} has zero measured throughput in 24h — confirm the engine is producing before pushing the milestone.");
+            return format!(
+                "{name} has zero measured throughput in 24h — confirm the engine is producing before pushing the milestone."
+            );
         }
     }
     "All engines live — watch that today's growth goals actually move each lane's velocity number forward.".into()
@@ -2335,7 +2334,11 @@ mod tests {
     fn chat_transport_default_is_previous_ollama_behavior() {
         // Missing/unknown provider -> byte-identical previous behavior (Ollama Cloud), so a
         // corrupt or absent autopilot block can never brick the CEO.
-        for cfg in [json!({}), json!({"provider": "ollama-cloud"}), json!({"provider": "???"})] {
+        for cfg in [
+            json!({}),
+            json!({"provider": "ollama-cloud"}),
+            json!({"provider": "???"}),
+        ] {
             let (_, endpoint, key_field) = chat_transport(&cfg);
             assert_eq!(endpoint, "https://ollama.com/v1/chat/completions");
             assert_eq!(key_field, "OLLAMA_API_KEY");
@@ -2365,10 +2368,16 @@ mod tests {
         // CEO_MODEL ("minimax-m3") does not exist on OpenRouter — the configured autopilot model
         // takes its place so the morning-plan/focus calls survive the provider switch.
         let cfg = json!({"provider": "openrouter", "model": "tencent/hy3:free"});
-        assert_eq!(chat_model_for(&cfg, "openrouter", CEO_MODEL), "tencent/hy3:free");
+        assert_eq!(
+            chat_model_for(&cfg, "openrouter", CEO_MODEL),
+            "tencent/hy3:free"
+        );
         // A provider-appropriate (slashed) id passes through untouched — brain-block models stay
         // exactly as configured.
-        assert_eq!(chat_model_for(&cfg, "openrouter", "vendor/x:free"), "vendor/x:free");
+        assert_eq!(
+            chat_model_for(&cfg, "openrouter", "vendor/x:free"),
+            "vendor/x:free"
+        );
     }
 
     #[test]
@@ -2376,10 +2385,16 @@ mod tests {
         // Previous behavior preserved: under ollama-cloud the requested model is NEVER rewritten,
         // even when the config carries an (irrelevant) slashed model.
         let cfg = json!({"provider": "ollama-cloud", "model": "tencent/hy3:free"});
-        assert_eq!(chat_model_for(&cfg, "ollama-cloud", "minimax-m3"), "minimax-m3");
+        assert_eq!(
+            chat_model_for(&cfg, "ollama-cloud", "minimax-m3"),
+            "minimax-m3"
+        );
         // And a slashless configured model can never be substituted in (nothing to gain).
         let cfg2 = json!({"provider": "openrouter", "model": "glm-5.2"});
-        assert_eq!(chat_model_for(&cfg2, "openrouter", "minimax-m3"), "minimax-m3");
+        assert_eq!(
+            chat_model_for(&cfg2, "openrouter", "minimax-m3"),
+            "minimax-m3"
+        );
     }
 
     #[test]
@@ -2453,7 +2468,10 @@ mod tests {
         // (2) The reader's output is SPLICED into the plan prompt: the assembled user JSON carries
         // the anonymized win shapes. This is the wiring — a lane's plan is informed by prior wins.
         let user = build_plan_user_json("2026-07-08", &[], &json!({}), &prior_wins, "");
-        assert!(user.contains("prior_wins"), "the prompt must carry the prior_wins block: {user}");
+        assert!(
+            user.contains("prior_wins"),
+            "the prompt must carry the prior_wins block: {user}"
+        );
         assert!(
             user.contains("shipped_iteration") || user.contains("positive_equity_day"),
             "the anonymized win shape must appear in the plan prompt (reader consulted): {user}"
@@ -2468,9 +2486,16 @@ mod tests {
         // (3) NEGATIVE control (the write-only failure mode): an EMPTY summary — what a NEVER-READ
         // ledger would yield — carries no win shape into the prompt. So the win in (2) is present
         // ONLY because the reader actually read the ledger.
-        let empty_user = build_plan_user_json("2026-07-08", &[], &json!({}), &wins::wins_summary_from_lines(&[], 14), "");
+        let empty_user = build_plan_user_json(
+            "2026-07-08",
+            &[],
+            &json!({}),
+            &wins::wins_summary_from_lines(&[], 14),
+            "",
+        );
         assert!(
-            !empty_user.contains("shipped_iteration") && !empty_user.contains("positive_equity_day"),
+            !empty_user.contains("shipped_iteration")
+                && !empty_user.contains("positive_equity_day"),
             "an unread (write-only) ledger yields no win in the prompt — the presence of a win \
              proves the reader is wired: {empty_user}"
         );
@@ -2493,23 +2518,38 @@ mod tests {
         // A prior tick's observation, reconstructed through the SAME warm API morning_plan uses.
         let obs_path = unique_ceo_obs_path("plan");
         let log = ObservationLog::at(obs_path.clone());
-        log.append_fact("2026-07-08", "ceo tick t=1700009999: plan=done summary=pending")
-            .unwrap();
+        log.append_fact(
+            "2026-07-08",
+            "ceo tick t=1700009999: plan=done summary=pending",
+        )
+        .unwrap();
         let mut warm = WarmContext::new(
             ObservationLog::at(obs_path.clone()),
             LongTermAdapter::new(paths::here().to_path_buf(), CEO_WARM_LANE),
         );
         let rc = warm.reconstruct_context(CEO_WARM_OBS_TAIL, CEO_WARM_OUTCOMES_TAIL);
         // (1) the reconstructed warm working context carries the prior observation forward.
-        assert!(rc.working.contains("t=1700009999"), "warm working tier carried the prior tick obs");
+        assert!(
+            rc.working.contains("t=1700009999"),
+            "warm working tier carried the prior tick obs"
+        );
         // (2) it is SPLICED into the plan prompt under `warm_context` — a lane's plan is informed by
         // what prior ticks observed (carry-forward), not a purely cold snapshot.
         let user = build_plan_user_json("2026-07-08", &[], &json!({}), &json!({}), &rc.working);
-        assert!(user.contains("warm_context"), "the prompt must carry the warm_context block: {user}");
-        assert!(user.contains("t=1700009999"), "the prior tick observation must reach the plan prompt");
+        assert!(
+            user.contains("warm_context"),
+            "the prompt must carry the warm_context block: {user}"
+        );
+        assert!(
+            user.contains("t=1700009999"),
+            "the prior tick observation must reach the plan prompt"
+        );
         // (3) NEGATIVE control: an EMPTY warm context OMITS the key — a cold first plan is unchanged.
         let cold = build_plan_user_json("2026-07-08", &[], &json!({}), &json!({}), "");
-        assert!(!cold.contains("warm_context"), "an empty warm context must omit the key: {cold}");
+        assert!(
+            !cold.contains("warm_context"),
+            "an empty warm context must omit the key: {cold}"
+        );
 
         let _ = std::fs::remove_dir_all(obs_path.parent().unwrap());
     }
@@ -2629,13 +2669,17 @@ mod tests {
         assert!(urgent);
         // every post-mortem failure mode gets its loud flag:
         assert!(flags.iter().any(|f| f.contains("sover: ZERO posts")));
-        assert!(flags
-            .iter()
-            .any(|f| f.contains("asmodeus: zero live trades")));
+        assert!(
+            flags
+                .iter()
+                .any(|f| f.contains("asmodeus: zero live trades"))
+        );
         assert!(flags.iter().any(|f| f.contains("asmodeus: equity flat")));
-        assert!(flags
-            .iter()
-            .any(|f| f.contains("daedulus: lane never fired")));
+        assert!(
+            flags
+                .iter()
+                .any(|f| f.contains("daedulus: lane never fired"))
+        );
         // sections render priority-ordered with the fleet line up top
         assert!(md.starts_with("# Solomon evening report — 2026-07-02"));
         let a = md.find("## asmodeus").unwrap();
@@ -2680,8 +2724,7 @@ mod tests {
         assert!(line.ends_with("(ops-auto 2026-07-03)"));
 
         // idempotence: an OPEN item with the marker blocks a re-prepend...
-        let open =
-            "- [ ] [reliability][ops-auto:publish_recency] publish_recency has been RED (x)\n\
+        let open = "- [ ] [reliability][ops-auto:publish_recency] publish_recency has been RED (x)\n\
                     - [ ] something else\n";
         assert!(has_open_ops_item(open, "publish_recency"));
         // ...a DIFFERENT probe's marker is independent (one open item PER probe)...
@@ -2830,11 +2873,7 @@ mod tests {
         let path = dir.join("_dead_red.lock");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, "orphaned-owner").unwrap();
-        filetime::set_file_mtime(
-            &path,
-            filetime::FileTime::from_unix_time(1, 0),
-        )
-        .unwrap();
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
         let replacement = try_acquire_dead_red_lock_at(&path, Duration::from_secs(300))
             .expect("a stale lease can be recovered");
         assert!(
@@ -2864,7 +2903,8 @@ mod tests {
 
         const CONTENDERS: usize = 8;
         let start = std::sync::Arc::new(std::sync::Barrier::new(CONTENDERS + 1));
-        let release = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let (tx, rx) = std::sync::mpsc::channel();
         let mut threads = Vec::new();
         for _ in 0..CONTENDERS {
@@ -2900,7 +2940,10 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
-        assert_eq!(winners, 1, "stale reclaim must preserve cross-process exclusivity");
+        assert_eq!(
+            winners, 1,
+            "stale reclaim must preserve cross-process exclusivity"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3050,7 +3093,9 @@ mod tests {
             "asmodeus": {"status": "green"},
             "sover": {"status": "yellow"},
         }});
-        assert!(next_watch(&snapshot, &status_green).contains("sover has zero measured throughput"));
+        assert!(
+            next_watch(&snapshot, &status_green).contains("sover has zero measured throughput")
+        );
         // all engines live -> calm growth note
         let healthy = json!({"projects": {
             "asmodeus": {"priority": 1, "iterations_24h": 3, "live_trades_24h": 4},
@@ -3097,7 +3142,12 @@ mod tests {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir()
-            .join(format!("solomon_ceo_warm_{}_{}_{}", tag, std::process::id(), uniq))
+            .join(format!(
+                "solomon_ceo_warm_{}_{}_{}",
+                tag,
+                std::process::id(),
+                uniq
+            ))
             .join("observations.jsonl")
     }
 
@@ -3128,7 +3178,8 @@ mod tests {
         // and it is assembled behind the STABLE prefix (prefix-cache economics) — the cold path never
         // produced a stable-prefixed prompt at all.
         assert!(
-            ctx2.full_prompt().starts_with(crate::pecrt::warm::STABLE_PREFIX),
+            ctx2.full_prompt()
+                .starts_with(crate::pecrt::warm::STABLE_PREFIX),
             "warm context must sit behind the stable prefix"
         );
 
@@ -3137,9 +3188,18 @@ mod tests {
         let fact2 = ceo_tick_fact(1_700_000_222, "done", "done");
         ceo_append_tick_observation(&warm2, "2026-07-08", &fact2);
         let tail = warm2.observations.tail(10);
-        assert!(tail.iter().any(|l| l.contains("t=1700000111")), "tick-1 obs still present (append-only)");
-        assert!(tail.iter().any(|l| l.contains("t=1700000222")), "tick-2 obs appended");
-        assert!(tail.iter().all(|l| l.starts_with("2026-07-08\t")), "every line is DATED");
+        assert!(
+            tail.iter().any(|l| l.contains("t=1700000111")),
+            "tick-1 obs still present (append-only)"
+        );
+        assert!(
+            tail.iter().any(|l| l.contains("t=1700000222")),
+            "tick-2 obs appended"
+        );
+        assert!(
+            tail.iter().all(|l| l.starts_with("2026-07-08\t")),
+            "every line is DATED"
+        );
 
         let _ = std::fs::remove_dir_all(obs_path.parent().unwrap());
     }
@@ -3157,22 +3217,39 @@ mod tests {
         let obs_path = unique_ceo_obs_path("fact");
         let warm = ceo_warm_at(&obs_path, paths::here());
         ceo_append_tick_observation(&warm, "2026-07-08", &fact);
-        assert_eq!(warm.observations.tail(5).len(), 1, "the legal fact appended");
+        assert_eq!(
+            warm.observations.tail(5).len(),
+            1,
+            "the legal fact appended"
+        );
         // a summary is refused (append_fact returns Err; nothing persists) — the log can't drift.
         let refused = warm
             .observations
             .append_fact("2026-07-08", "a summary of the summaries across all ticks");
         assert!(refused.is_err(), "a summary-of-summaries must be refused");
-        assert_eq!(warm.observations.tail(5).len(), 1, "the refused summary did NOT persist");
+        assert_eq!(
+            warm.observations.tail(5).len(),
+            1,
+            "the refused summary did NOT persist"
+        );
         let _ = std::fs::remove_dir_all(obs_path.parent().unwrap());
     }
 
     #[test]
     fn tick_gate_state_renders_each_day_gate_shape() {
         assert_eq!(tick_gate_state(None), "none");
-        assert_eq!(tick_gate_state(Some(&json!({"done": "2026-07-08"}))), "done");
-        assert_eq!(tick_gate_state(Some(&json!({"done": "2026-07-08", "gave_up": true}))), "gave_up");
-        assert_eq!(tick_gate_state(Some(&json!({"attempts_date": "2026-07-08", "attempts": 2}))), "attempts=2");
+        assert_eq!(
+            tick_gate_state(Some(&json!({"done": "2026-07-08"}))),
+            "done"
+        );
+        assert_eq!(
+            tick_gate_state(Some(&json!({"done": "2026-07-08", "gave_up": true}))),
+            "gave_up"
+        );
+        assert_eq!(
+            tick_gate_state(Some(&json!({"attempts_date": "2026-07-08", "attempts": 2}))),
+            "attempts=2"
+        );
         assert_eq!(tick_gate_state(Some(&json!({}))), "pending");
     }
 
@@ -3192,7 +3269,7 @@ mod tests {
     #[test]
     fn warm_append_lands_even_when_a_sub_graft_is_slow() {
         use std::sync::atomic::{AtomicBool, Ordering as O};
-        use std::sync::{mpsc, Arc};
+        use std::sync::{Arc, mpsc};
         use std::time::{Duration, Instant};
 
         // Unique obs path so this never races the shared _ceo log (Solomon's parallel-isolation
@@ -3324,18 +3401,29 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let md = paths::here().join("runtime").join("_pending_approvals.md");
-        let js = paths::here().join("runtime").join("_pending_approvals.json");
+        let js = paths::here()
+            .join("runtime")
+            .join("_pending_approvals.json");
         let _ = std::fs::remove_file(&md);
         let _ = std::fs::remove_file(&js);
 
         let (_snapshot, _status) = tick_core();
 
-        assert!(md.exists(), "tick's fast core must regenerate _pending_approvals.md every sweep");
-        assert!(js.exists(), "tick's fast core must regenerate _pending_approvals.json every sweep");
+        assert!(
+            md.exists(),
+            "tick's fast core must regenerate _pending_approvals.md every sweep"
+        );
+        assert!(
+            js.exists(),
+            "tick's fast core must regenerate _pending_approvals.json every sweep"
+        );
         let body = std::fs::read_to_string(&md).unwrap();
         assert!(body.starts_with("# Pending approvals"), "{body}");
         // the header states the post-2026-07-16 AUTONOMY truth, not the retired approval wait
-        assert!(body.contains("run AUTONOMOUSLY behind automated gates"), "{body}");
+        assert!(
+            body.contains("run AUTONOMOUSLY behind automated gates"),
+            "{body}"
+        );
         assert!(body.contains("Still human-gated: money-out"), "{body}");
         assert!(!body.contains("Solomon never self-approves"), "{body}");
         std::env::remove_var("SOLOMON_NOTIFY_OFF");

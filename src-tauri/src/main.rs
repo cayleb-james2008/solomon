@@ -26,7 +26,7 @@ mod resurrector; // host-independent liveness floor (catalog #4): relaunch the G
 mod supervisor; // native port of improver/solomon.py — diagnose() + the 3-rung recover() ladder + escalation
 mod watchdog; // native port of monitor.py — the `watchdog` subcommand + the in-app 2-min tick (run_gui)
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tauri_plugin_updater::UpdaterExt;
 
 // Define window.pywebview.api as a Proxy forwarding each positional method call to the single
@@ -67,10 +67,11 @@ async fn update_status(app: &tauri::AppHandle) -> Value {
     // current_sha spawns git and waits on it — keep that wait on the blocking pool, never this
     // async worker (the same rule the dispatch arm below follows; a hung git here would stall a
     // runtime worker that also drives the watchdog/CEO ticks).
-    let current_sha =
-        tauri::async_runtime::spawn_blocking(|| api::dispatch("current_sha", &[]).unwrap_or(Value::Null))
-            .await
-            .unwrap_or(Value::Null);
+    let current_sha = tauri::async_runtime::spawn_blocking(|| {
+        api::dispatch("current_sha", &[]).unwrap_or(Value::Null)
+    })
+    .await
+    .unwrap_or(Value::Null);
     let updater = match app.updater() {
         Ok(u) => u,
         Err(_) => return json!({"ok": false, "available": false}),
@@ -428,11 +429,13 @@ fn run_gui() {
     // live host's heartbeat past STALE_AFTER_S. catch_unwind keeps a stray panic from silently killing
     // this liveness-critical loop (which would forge exactly the false-death it exists to prevent).
     // See resurrector.rs.
-    std::thread::spawn(|| loop {
-        let _ = std::panic::catch_unwind(resurrector::stamp_engine_heartbeat);
-        std::thread::sleep(std::time::Duration::from_secs(
-            resurrector::HEARTBEAT_STAMP_INTERVAL_S,
-        ));
+    std::thread::spawn(|| {
+        loop {
+            let _ = std::panic::catch_unwind(resurrector::stamp_engine_heartbeat);
+            std::thread::sleep(std::time::Duration::from_secs(
+                resurrector::HEARTBEAT_STAMP_INTERVAL_S,
+            ));
+        }
     });
     // THE IN-APP WATCHDOG TICK (v2 Phase A): the every-60s sweep lives INSIDE the visibly-open
     // Solomon.exe — crash-restart + RUNG-0 recovery + ops probes + incident notifications + the
@@ -445,11 +448,13 @@ fn run_gui() {
     // 2026-07-14: lowered from 120s to 60s (the autopilot dispatch is offloaded to a detached
     // single-flighted thread, so the tick no longer blocks on the AI job — a faster tick catches
     // crashed lanes and ops-RED states sooner without stacking dispatches).
-    std::thread::spawn(|| loop {
-        let _ = std::panic::catch_unwind(|| {
-            let _ = watchdog::main();
-        });
-        std::thread::sleep(std::time::Duration::from_secs(60));
+    std::thread::spawn(|| {
+        loop {
+            let _ = std::panic::catch_unwind(|| {
+                let _ = watchdog::main();
+            });
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
     });
     tauri::Builder::default()
         // single-instance MUST be registered FIRST (Tauri 2 requirement) so it runs before other

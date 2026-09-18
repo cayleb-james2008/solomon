@@ -9,7 +9,7 @@
 //! `json.dumps(_hb, indent=2)` shape the dashboard reads.
 
 use crate::control::{paths, proc};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -111,7 +111,7 @@ fn secret_token_patterns() -> &'static [regex::Regex] {
         vec![
             regex::Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b").unwrap(), // GitHub PAT/OAuth/server/refresh
             regex::Regex::new(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b").unwrap(), // fine-grained PAT
-            regex::Regex::new(r"\bsk-[A-Za-z0-9_-]{20,}\b").unwrap(),      // OpenAI/Anthropic-style keys
+            regex::Regex::new(r"\bsk-[A-Za-z0-9_-]{20,}\b").unwrap(), // OpenAI/Anthropic-style keys
             regex::Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{20,}").unwrap(), // Authorization: Bearer <tok>
         ]
     })
@@ -316,7 +316,11 @@ impl Ctx {
         let venv_py = repo_path
             .join(".venv")
             .join("Scripts")
-            .join(if cfg!(windows) { "python.exe" } else { "python" });
+            .join(if cfg!(windows) {
+                "python.exe"
+            } else {
+                "python"
+            });
 
         // prov = PROVIDERS.get(provider) or PROVIDERS['ollama-cloud']
         let prov = providers_or_default(provider);
@@ -446,7 +450,9 @@ impl Ctx {
             Ok(r) => r,
             Err(exc) => {
                 // log(f"config refresh skipped: {exc}; keeping current config")
-                self.log(&format!("config refresh skipped: {exc}; keeping current config"));
+                self.log(&format!(
+                    "config refresh skipped: {exc}; keeping current config"
+                ));
                 return;
             }
         };
@@ -553,8 +559,7 @@ impl Ctx {
                         .into_iter()
                         .find(|r| {
                             r.is_object()
-                                && r.get("name").and_then(Value::as_str)
-                                    == Some(self.name.as_str())
+                                && r.get("name").and_then(Value::as_str) == Some(self.name.as_str())
                         })
                         .unwrap_or(Value::Object(Map::new())),
                     // rows not a list, OR read/parse error: row = {}
@@ -775,7 +780,9 @@ impl Ctx {
             let v = v.trim_matches('\'');
             if is_loadable_env_key(k) && std::env::var(k).map(|e| e.is_empty()).unwrap_or(true) {
                 // Python: `not os.environ.get(k)` is true when unset OR empty-string.
-                std::env::set_var(k, v);
+                unsafe {
+                    std::env::set_var(k, v);
+                }
             }
         }
         // Per-repo override on top of the globals.
@@ -795,8 +802,12 @@ impl Ctx {
     fn resolved_api_key(&self) -> String {
         let k = &self.api_key;
         let looks_like_env_name = !k.is_empty()
-            && k.chars().next().map(|c| c.is_ascii_uppercase() || c == '_').unwrap_or(false)
-            && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+            && k.chars()
+                .next()
+                .map(|c| c.is_ascii_uppercase() || c == '_')
+                .unwrap_or(false)
+            && k.chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
         if looks_like_env_name {
             std::env::var(k).unwrap_or_else(|_| k.clone())
         } else {
@@ -819,7 +830,9 @@ impl Ctx {
         } else {
             "OLLAMA_API_KEY"
         };
-        std::env::set_var(var, self.resolved_api_key());
+        unsafe {
+            std::env::set_var(var, self.resolved_api_key());
+        }
     }
 
     /// run_improver._required_key (~587-589): the env-var name of the API key the active provider needs.
@@ -927,7 +940,11 @@ impl Ctx {
     pub fn runtime_append(&self, path: &Path, line: &str) {
         let _ = std::fs::create_dir_all(&self.runtime);
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+        {
             let _ = writeln!(f, "{line}");
         }
     }
@@ -987,7 +1004,7 @@ impl Ctx {
         // 2. fresh non-error status drops stale reason. Python `fields.get("status") not in (None,
         // "error")`: true only when status key is present AND its value is neither null nor "error".
         let drop_reason = match fields.get("status") {
-            None => false,             // absent -> in (None, ...)
+            None => false,              // absent -> in (None, ...)
             Some(Value::Null) => false, // explicit null -> in (None, ...)
             Some(Value::String(s)) => s != "error",
             Some(_) => true, // any other non-null value is "not in (None, 'error')"
@@ -1046,7 +1063,10 @@ impl Ctx {
         rec.insert("summary".to_string(), json!(truncate_chars(summary, 500)));
         // Carry the current backlog item's goal (already on the heartbeat) so downstream consumers —
         // escalation::campaign_context_block — can group prior steps by their [campaign:<slug>] marker.
-        rec.insert("goal".to_string(), self.hb.get("goal").cloned().unwrap_or(Value::Null));
+        rec.insert(
+            "goal".to_string(),
+            self.hb.get("goal").cloned().unwrap_or(Value::Null),
+        );
         if let Some(Value::Object(e)) = extra {
             for (k, v) in e {
                 rec.insert(k.clone(), v.clone());
@@ -1116,7 +1136,10 @@ impl Ctx {
     /// self-contained. The later phase wiring can swap in the dedicated gh-auth check if it diverges.
     pub fn github_ready(&self) -> (bool, String) {
         if self.gh(&["auth", "status"], 120).code != 0 {
-            return (false, "gh not authenticated (run `gh auth login`)".to_string());
+            return (
+                false,
+                "gh not authenticated (run `gh auth login`)".to_string(),
+            );
         }
         if self.git(&["ls-remote", "--heads", "origin"], 120).code != 0 {
             return (false, "origin remote not reachable".to_string());
@@ -1342,13 +1365,19 @@ mod tests {
     fn heartbeat_error_no_status_drops_phase() {
         // CASE 1: a terminal error heartbeat's phase must survive a later non-status update.
         let mut c = test_ctx();
-        c.heartbeat(json!({"status": "error", "phase": "preflight", "reason": "dirty_base_persistent"}));
+        c.heartbeat(
+            json!({"status": "error", "phase": "preflight", "reason": "dirty_base_persistent"}),
+        );
         assert_eq!(c.hb["status"], json!("error"));
         assert_eq!(c.hb["phase"], json!("preflight"));
         assert_eq!(c.hb["reason"], json!("dirty_base_persistent"));
         // reflect() later: heartbeat(phase="reflect") with NO status -> phase dropped, frozen.
         c.heartbeat(json!({"phase": "reflect"}));
-        assert_eq!(c.hb["phase"], json!("preflight"), "frozen error phase must NOT be clobbered");
+        assert_eq!(
+            c.hb["phase"],
+            json!("preflight"),
+            "frozen error phase must NOT be clobbered"
+        );
         assert_eq!(c.hb["status"], json!("error"));
         // reason preserved (no fresh non-error status set)
         assert_eq!(c.hb["reason"], json!("dirty_base_persistent"));
@@ -1358,13 +1387,22 @@ mod tests {
     fn heartbeat_fresh_nonerror_status_drops_reason() {
         // CASE 2: a fresh non-error status starts a clean slate -> a stale diagnostic reason is dropped.
         let mut c = test_ctx();
-        c.heartbeat(json!({"status": "error", "phase": "preflight", "reason": "dirty_base_persistent"}));
+        c.heartbeat(
+            json!({"status": "error", "phase": "preflight", "reason": "dirty_base_persistent"}),
+        );
         assert_eq!(c.hb["reason"], json!("dirty_base_persistent"));
         // a new iteration sets status="iterating" -> reason dropped.
         c.heartbeat(json!({"status": "iterating", "phase": "implement"}));
         assert_eq!(c.hb["status"], json!("iterating"));
-        assert_eq!(c.hb["phase"], json!("implement"), "non-error status update CAN set phase");
-        assert!(c.hb.get("reason").is_none(), "stale reason must be dropped on fresh non-error status");
+        assert_eq!(
+            c.hb["phase"],
+            json!("implement"),
+            "non-error status update CAN set phase"
+        );
+        assert!(
+            c.hb.get("reason").is_none(),
+            "stale reason must be dropped on fresh non-error status"
+        );
     }
 
     #[test]
@@ -1392,7 +1430,11 @@ mod tests {
         c.heartbeat(json!({"status": "error", "phase": "reverted", "reason": "revert_failed"}));
         assert_eq!(c.hb["status"], json!("error"));
         assert_eq!(c.hb["phase"], json!("reverted"));
-        assert_eq!(c.hb["reason"], json!("revert_failed"), "error+status preserves its reason");
+        assert_eq!(
+            c.hb["reason"],
+            json!("revert_failed"),
+            "error+status preserves its reason"
+        );
     }
 
     // ---- configure defaults ----
@@ -1449,7 +1491,11 @@ mod tests {
         fn capture(keys: Vec<&'static str>) -> Self {
             let g = APIKEY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let saved = keys.iter().map(|k| std::env::var(k).ok()).collect();
-            for k in &keys { std::env::remove_var(k); }
+            for k in &keys {
+                unsafe {
+                    std::env::remove_var(k);
+                }
+            }
             EnvVarGuard { keys, saved, _g: g }
         }
     }
@@ -1457,8 +1503,8 @@ mod tests {
         fn drop(&mut self) {
             for (k, v) in self.keys.iter().zip(self.saved.iter()) {
                 match v {
-                    Some(s) => std::env::set_var(k, s),
-                    None => std::env::remove_var(k),
+                    Some(s) => unsafe { std::env::set_var(k, s) },
+                    None => unsafe { std::env::remove_var(k) },
                 }
             }
         }
@@ -1477,12 +1523,18 @@ mod tests {
         c.apply_clean_env(&mut cmd);
         let overrides: std::collections::HashMap<&OsStr, Option<&OsStr>> = cmd.get_envs().collect();
         assert_eq!(
-            overrides.get(OsStr::new("CARGO_BUILD_JOBS")).copied().flatten(),
+            overrides
+                .get(OsStr::new("CARGO_BUILD_JOBS"))
+                .copied()
+                .flatten(),
             Some(OsStr::new("3")),
             "cargo -j capped at 3 when unset"
         );
         assert_eq!(
-            overrides.get(OsStr::new("RUST_TEST_THREADS")).copied().flatten(),
+            overrides
+                .get(OsStr::new("RUST_TEST_THREADS"))
+                .copied()
+                .flatten(),
             Some(OsStr::new("3")),
             "test-runner threads capped at 3 when unset"
         );
@@ -1492,7 +1544,9 @@ mod tests {
     fn apply_api_key_openrouter_overrides_env() {
         let _g = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY", "OLLAMA_API_KEY"]);
         // seed a "global" key
-        std::env::set_var("OPENROUTER_API_KEY", "sk-global");
+        unsafe {
+            std::env::set_var("OPENROUTER_API_KEY", "sk-global");
+        }
         let mut c = Ctx::configure("C:/x/repo", "repo", "openrouter", None);
         assert_eq!(c.pi_provider, "openrouter");
         // no per-repo key -> global stays
@@ -1508,12 +1562,17 @@ mod tests {
     #[test]
     fn apply_api_key_ollama_cloud_writes_ollama_var() {
         let _g = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY", "OLLAMA_API_KEY"]);
-        std::env::remove_var("OLLAMA_API_KEY");
+        unsafe {
+            std::env::remove_var("OLLAMA_API_KEY");
+        }
         let mut c = Ctx::configure("C:/x/repo", "repo", "ollama-cloud", None);
         assert_eq!(c.pi_provider, "maki-cloud");
         c.api_key = "sk-ollama-perrepo".to_string();
         c.apply_api_key();
-        assert_eq!(std::env::var("OLLAMA_API_KEY").unwrap(), "sk-ollama-perrepo");
+        assert_eq!(
+            std::env::var("OLLAMA_API_KEY").unwrap(),
+            "sk-ollama-perrepo"
+        );
         // openrouter var untouched
         assert!(std::env::var("OPENROUTER_API_KEY").is_err());
     }
@@ -1521,7 +1580,9 @@ mod tests {
     #[test]
     fn apply_api_key_empty_is_noop() {
         let _g = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY", "OLLAMA_API_KEY"]);
-        std::env::set_var("OPENROUTER_API_KEY", "sk-global");
+        unsafe {
+            std::env::set_var("OPENROUTER_API_KEY", "sk-global");
+        }
         let mut c = Ctx::configure("C:/x/repo", "repo", "openrouter", None);
         c.api_key = String::new();
         c.apply_api_key();
@@ -1563,7 +1624,9 @@ mod tests {
     #[test]
     fn resolved_api_key_resolves_bare_env_var_name() {
         let _g = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY_2"]);
-        std::env::set_var("OPENROUTER_API_KEY_2", or_key("resolvedsecret123"));
+        unsafe {
+            std::env::set_var("OPENROUTER_API_KEY_2", or_key("resolvedsecret123"));
+        }
         let mut c = Ctx::configure("C:/x/repo", "repo", "openrouter", None);
         c.api_key = "OPENROUTER_API_KEY_2".to_string();
         assert_eq!(c.resolved_api_key(), or_key("resolvedsecret123"));
@@ -1580,7 +1643,9 @@ mod tests {
     #[test]
     fn resolved_api_key_unresolvable_name_falls_back_to_raw_field() {
         let _g = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY_UNSET_XYZ"]);
-        std::env::remove_var("OPENROUTER_API_KEY_UNSET_XYZ");
+        unsafe {
+            std::env::remove_var("OPENROUTER_API_KEY_UNSET_XYZ");
+        }
         let mut c = Ctx::configure("C:/x/repo", "repo", "openrouter", None);
         c.api_key = "OPENROUTER_API_KEY_UNSET_XYZ".to_string();
         // Unset -> surfaces as an auth failure (the literal bare name), not a silent empty key.
@@ -1590,12 +1655,17 @@ mod tests {
     #[test]
     fn apply_api_key_resolves_env_var_name_before_injecting() {
         let _g = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY", "OPENROUTER_API_KEY_3"]);
-        std::env::set_var("OPENROUTER_API_KEY_3", or_key("thirdaccountsecret789"));
+        unsafe {
+            std::env::set_var("OPENROUTER_API_KEY_3", or_key("thirdaccountsecret789"));
+        }
         let mut c = Ctx::configure("C:/x/repo", "repo", "openrouter", None);
         c.api_key = "OPENROUTER_API_KEY_3".to_string();
         c.apply_api_key();
         // The RESOLVED secret lands in the provider's env var, not the bare name.
-        assert_eq!(std::env::var("OPENROUTER_API_KEY").unwrap(), or_key("thirdaccountsecret789"));
+        assert_eq!(
+            std::env::var("OPENROUTER_API_KEY").unwrap(),
+            or_key("thirdaccountsecret789")
+        );
     }
 
     // ---- key_shape_mismatch: the owl-alpha-class silent-provider-divergence guard ----
@@ -1613,7 +1683,10 @@ mod tests {
         let reason = c.key_shape_mismatch().expect("mismatch must be flagged");
         assert!(reason.contains("asmodeus"));
         assert!(reason.contains("ollama-cloud"));
-        assert!(reason.contains("owl-alpha"), "must name the prior incident for operator context");
+        assert!(
+            reason.contains("owl-alpha"),
+            "must name the prior incident for operator context"
+        );
     }
 
     #[test]
@@ -1629,7 +1702,12 @@ mod tests {
         // api_key is a bare env-var NAME (the 2026-07-03 indirection); the shape guard must validate
         // what it RESOLVES to, not the bare name itself (which would never look like sk-or-v1-...).
         let _g = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY_SHAPE_TEST"]);
-        std::env::set_var("OPENROUTER_API_KEY_SHAPE_TEST", or_key("shapecheckedsecret"));
+        unsafe {
+            std::env::set_var(
+                "OPENROUTER_API_KEY_SHAPE_TEST",
+                or_key("shapecheckedsecret"),
+            );
+        }
         let mut c = Ctx::configure("C:/x/repo", "repo", "openrouter", None);
         c.api_key = "OPENROUTER_API_KEY_SHAPE_TEST".to_string();
         assert!(
@@ -1646,10 +1724,18 @@ mod tests {
         let mut c = Ctx::configure("C:/x/repo", "asmodeus", "openrouter", None);
         assert_eq!(c.pi_provider, "openrouter");
         c.api_key = "some-ollama-cloud-key-12345".to_string();
-        let reason = c.key_shape_mismatch().expect("reverse-direction mismatch must be flagged");
+        let reason = c
+            .key_shape_mismatch()
+            .expect("reverse-direction mismatch must be flagged");
         assert!(reason.contains("asmodeus"), "reason must name the repo");
-        assert!(reason.contains("openrouter"), "reason must name the provider");
-        assert!(reason.contains("owl-alpha"), "must reference the prior incident for operator context");
+        assert!(
+            reason.contains("openrouter"),
+            "reason must name the provider"
+        );
+        assert!(
+            reason.contains("owl-alpha"),
+            "must reference the prior incident for operator context"
+        );
     }
 
     #[test]
@@ -1677,7 +1763,10 @@ mod tests {
         c.api_key = k.clone();
         c.apply_api_key();
         let text = format!("here is my key {k} for you");
-        assert!(c.redact(&text).contains("[REDACTED]"), "per-repo key value must be redacted");
+        assert!(
+            c.redact(&text).contains("[REDACTED]"),
+            "per-repo key value must be redacted"
+        );
         assert!(!c.redact(&text).contains(&k));
     }
 
@@ -1688,7 +1777,9 @@ mod tests {
     // iteration and making the bakeoff logs unusable. These are now normalized to an empty registry
     // list (keep current config silently), matching a valid `[]` repos.json. Genuine corruption
     // (non-empty garbage) still errors loudly.
-    fn tmp_control_with_repos(body: Option<&[u8]>) -> (std::path::PathBuf, std::sync::MutexGuard<'static, ()>) {
+    fn tmp_control_with_repos(
+        body: Option<&[u8]>,
+    ) -> (std::path::PathBuf, std::sync::MutexGuard<'static, ()>) {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("solomon_rawread_test_{}", run_id_hex()));
@@ -1722,8 +1813,7 @@ mod tests {
     fn read_repos_json_raw_leading_bom_is_stripped() {
         // A Windows editor (Notepad) save adds a UTF-8 BOM; serde_json would otherwise choke with
         // "expected value at line 1 column 1". The BOM is stripped, then the body parses normally.
-        let (dir, _g) =
-            tmp_control_with_repos(Some(b"\xEF\xBB\xBF[{\"name\": \"bakeoff\"}]"));
+        let (dir, _g) = tmp_control_with_repos(Some(b"\xEF\xBB\xBF[{\"name\": \"bakeoff\"}]"));
         let v = read_repos_json_raw(&dir).expect("BOM-prefixed repos.json must parse");
         assert_eq!(v, json!([{"name": "bakeoff"}]));
     }
@@ -1741,7 +1831,10 @@ mod tests {
         // Genuine corruption (non-empty garbage that is not whitespace) MUST still error so the
         // refresh logs "config refresh skipped" loudly — the silent-config-drift guard stays.
         let (dir, _g) = tmp_control_with_repos(Some(b"{not valid json"));
-        assert!(read_repos_json_raw(&dir).is_err(), "corrupt repos.json must still error");
+        assert!(
+            read_repos_json_raw(&dir).is_err(),
+            "corrupt repos.json must still error"
+        );
     }
 
     #[test]
@@ -1752,7 +1845,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("solomon_rawread_nomissing_{}", run_id_hex()));
         let _ = std::fs::create_dir_all(&dir);
         let _ = std::fs::remove_file(dir.join("repos.json"));
-        assert!(read_repos_json_raw(&dir).is_err(), "missing repos.json must still error");
+        assert!(
+            read_repos_json_raw(&dir).is_err(),
+            "missing repos.json must still error"
+        );
     }
 
     #[test]
@@ -1761,7 +1857,12 @@ mod tests {
         // skipped" and must keep the CLI-provided model/provider intact. Regression guard for the
         // 2026-06-29 bakeoff JSON-parse bug.
         let (dir, _g) = tmp_control_with_repos(Some(b""));
-        let mut c = Ctx::configure("C:/x/bakeoff", "bakeoff", "ollama-cloud", Some("minimax-m3"));
+        let mut c = Ctx::configure(
+            "C:/x/bakeoff",
+            "bakeoff",
+            "ollama-cloud",
+            Some("minimax-m3"),
+        );
         c.control = dir;
         c.runtime = std::env::temp_dir().join(format!("solomon_refresh_test_{}", run_id_hex()));
         c.log_path = c.runtime.join("improver.log");
@@ -1769,7 +1870,10 @@ mod tests {
         let _ = std::fs::remove_file(&c.log_path);
         // CLI gave us minimax-m3; an empty repos.json must not clobber it nor log a parse error.
         c.refresh_config_from_registry();
-        assert_eq!(c.pi_model, "minimax-m3", "CLI model preserved when repos.json is empty");
+        assert_eq!(
+            c.pi_model, "minimax-m3",
+            "CLI model preserved when repos.json is empty"
+        );
         let log = std::fs::read_to_string(&c.log_path).unwrap_or_default();
         assert!(
             !log.contains("config refresh skipped"),
@@ -1798,15 +1902,23 @@ mod tests {
             ReposGuard { saved, _g: g }
         }
         fn write(&self, rows: &[Value]) {
-            std::fs::write(paths::repos_json(), serde_json::to_string_pretty(rows).unwrap()).unwrap();
+            std::fs::write(
+                paths::repos_json(),
+                serde_json::to_string_pretty(rows).unwrap(),
+            )
+            .unwrap();
         }
     }
     impl Drop for ReposGuard {
         fn drop(&mut self) {
             let p = paths::repos_json();
             match &self.saved {
-                Some(b) => { let _ = std::fs::write(&p, b); }
-                None => { let _ = std::fs::remove_file(&p); }
+                Some(b) => {
+                    let _ = std::fs::write(&p, b);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&p);
+                }
             }
         }
     }
@@ -1833,7 +1945,10 @@ mod tests {
 
         // provider_name MUST now match the refreshed provider, keeping it in sync with pi_provider
         // so the fallback ladder and key-shape diagnostic see the current provider.
-        assert_eq!(c.provider_name, "openrouter", "provider_name must refresh on provider swap");
+        assert_eq!(
+            c.provider_name, "openrouter",
+            "provider_name must refresh on provider swap"
+        );
         assert_eq!(c.pi_provider, "openrouter");
         assert_eq!(c.pi_model, "qwen/qwen3-coder"); // openrouter default model
     }
@@ -1850,7 +1965,10 @@ mod tests {
         _rg.write(&[json!({"name": "testrepo", "provider": "bogus-provider"})]);
         c.refresh_config_from_registry();
 
-        assert_eq!(c.provider_name, "ollama-cloud", "unknown provider -> ollama-cloud name");
+        assert_eq!(
+            c.provider_name, "ollama-cloud",
+            "unknown provider -> ollama-cloud name"
+        );
         assert_eq!(c.pi_provider, "maki-cloud"); // ollama-cloud's pi_provider
     }
 
@@ -1869,20 +1987,27 @@ mod tests {
         let _rg = ReposGuard::capture();
         let _eg = EnvVarGuard::capture(vec!["OPENROUTER_API_KEY", "OLLAMA_API_KEY"]);
         // No global .env key for either provider — the per-repo key is the ONLY key.
-        std::env::remove_var("OPENROUTER_API_KEY");
-        std::env::remove_var("OLLAMA_API_KEY");
+        unsafe {
+            std::env::remove_var("OPENROUTER_API_KEY");
+            std::env::remove_var("OLLAMA_API_KEY");
+        }
 
         let mut c = test_ctx(); // name="testrepo", provider="ollama-cloud"
         assert_eq!(c.api_key, "", "api_key is empty before refresh (argv seed)");
 
         // repos.json carries a per-repo ollama-cloud key (no global .env key exists).
         let per_repo_key = "oc-secret-key-abc123";
-        _rg.write(&[json!({"name": "testrepo", "provider": "ollama-cloud", "api_key": per_repo_key})]);
+        _rg.write(&[
+            json!({"name": "testrepo", "provider": "ollama-cloud", "api_key": per_repo_key}),
+        ]);
 
         c.refresh_config_from_registry();
 
         // The per-repo key is now loaded AND applied to the env var the startup guard checks.
-        assert_eq!(c.api_key, per_repo_key, "refresh must load the per-repo api_key");
+        assert_eq!(
+            c.api_key, per_repo_key,
+            "refresh must load the per-repo api_key"
+        );
         let required = c.required_key();
         assert_eq!(required, "OLLAMA_API_KEY");
         assert_eq!(
@@ -1965,7 +2090,11 @@ mod tests {
         c.control = dir.clone();
         c.ship = "auto-merge".to_string(); // argv-frozen
         write_state_file(&dir, true);
-        assert_eq!(c.live_ship(), None, "missing repo row → None (keep argv fallback)");
+        assert_eq!(
+            c.live_ship(),
+            None,
+            "missing repo row → None (keep argv fallback)"
+        );
     }
 
     #[test]

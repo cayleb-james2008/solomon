@@ -36,7 +36,7 @@
 use crate::control::{heartbeat, paths, proc, registry};
 use crate::notify::{self, Notice};
 use chrono::Timelike;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -128,7 +128,10 @@ pub fn run() -> Value {
             let (n, wfreed) = prune_orphan_worktrees(&r, &path);
             freed += wfreed;
             if n > 0 {
-                actions.push(format!("{name}: removed {n} orphan worktree(s) ({})", human(wfreed)));
+                actions.push(format!(
+                    "{name}: removed {n} orphan worktree(s) ({})",
+                    human(wfreed)
+                ));
             }
         }
 
@@ -151,7 +154,9 @@ pub fn run() -> Value {
         //     (sometimes public) remote. Safe: keeps live-PR branches; content-free deletions.
         let rdeleted = delete_stale_remote_branches(&path, &base, &prefix);
         if rdeleted > 0 {
-            actions.push(format!("{name}: {rdeleted} stale remote {prefix}* branch(es)"));
+            actions.push(format!(
+                "{name}: {rdeleted} stale remote {prefix}* branch(es)"
+            ));
         }
 
         // 3. build dirs: ONLY delete a dir untouched for STALE_DAYS+ (abandoned = safe). The old
@@ -572,15 +577,25 @@ fn remote_branch_should_delete(
 /// state as "cannot safely delete an unmerged branch". `gh` resolves the repo from `path`'s remote.
 fn open_pr_heads(path: &str) -> (std::collections::HashSet<String>, bool) {
     let r = proc::run(
-        &["gh", "pr", "list", "--state", "open", "--json", "headRefName", "--limit", "500"],
+        &[
+            "gh",
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--json",
+            "headRefName",
+            "--limit",
+            "500",
+        ],
         Some(Path::new(path)),
         Some(Duration::from_secs(120)),
     );
     match r {
         Ok(o) if o.ok() => {
             let raw = o.stdout.trim();
-            let parsed: Value =
-                serde_json::from_str(if raw.is_empty() { "[]" } else { raw }).unwrap_or_else(|_| json!([]));
+            let parsed: Value = serde_json::from_str(if raw.is_empty() { "[]" } else { raw })
+                .unwrap_or_else(|_| json!([]));
             let set = parsed
                 .as_array()
                 .map(|a| {
@@ -627,8 +642,14 @@ pub fn delete_stale_remote_branches(path: &str, base: &str, prefix: &str) -> usi
     // Remote `<prefix>*` branches as remote-tracking short names (`origin/<prefix>...`).
     let listed = match proc::run(
         &[
-            "git", "-C", path, "branch", "-r", "--list",
-            &format!("origin/{prefix}*"), "--format=%(refname:short)",
+            "git",
+            "-C",
+            path,
+            "branch",
+            "-r",
+            "--list",
+            &format!("origin/{prefix}*"),
+            "--format=%(refname:short)",
         ],
         None,
         Some(Duration::from_secs(60)),
@@ -649,8 +670,14 @@ pub fn delete_stale_remote_branches(path: &str, base: &str, prefix: &str) -> usi
     // Merged-into-base remote-tracking branches (safe to delete regardless of PR state).
     let merged: std::collections::HashSet<String> = match proc::run(
         &[
-            "git", "-C", path, "branch", "-r", "--merged",
-            &format!("origin/{base}"), "--format=%(refname:short)",
+            "git",
+            "-C",
+            path,
+            "branch",
+            "-r",
+            "--merged",
+            &format!("origin/{base}"),
+            "--format=%(refname:short)",
         ],
         None,
         Some(Duration::from_secs(60)),
@@ -683,7 +710,12 @@ pub fn delete_stale_remote_branches(path: &str, base: &str, prefix: &str) -> usi
                 None,
                 Some(Duration::from_secs(30)),
             ) {
-                Ok(r) if r.ok() => r.stdout.trim().parse::<i64>().map(|ct| now - ct).unwrap_or(0),
+                Ok(r) if r.ok() => r
+                    .stdout
+                    .trim()
+                    .parse::<i64>()
+                    .map(|ct| now - ct)
+                    .unwrap_or(0),
                 _ => 0,
             }
         };
@@ -693,7 +725,16 @@ pub fn delete_stale_remote_branches(path: &str, base: &str, prefix: &str) -> usi
         // A ref deletion carries no content -> --no-verify is safe even under a brand-safety
         // pre-push hook (sover's public-repo guard). Never touches base or non-prefix branches.
         if let Ok(r) = proc::run(
-            &["git", "-C", path, "push", "--no-verify", "origin", "--delete", short],
+            &[
+                "git",
+                "-C",
+                path,
+                "push",
+                "--no-verify",
+                "origin",
+                "--delete",
+                short,
+            ],
             None,
             Some(Duration::from_secs(60)),
         ) {
@@ -757,28 +798,54 @@ mod tests {
     #[test]
     fn remote_orphan_old_no_pr_deleted() {
         // Not merged, PR state known, no open PR, tip older than the age floor -> orphan -> delete.
-        assert!(remote_branch_should_delete(false, false, true, MIN_AGE, MIN_AGE));
-        assert!(remote_branch_should_delete(false, false, true, MIN_AGE + 1, MIN_AGE));
+        assert!(remote_branch_should_delete(
+            false, false, true, MIN_AGE, MIN_AGE
+        ));
+        assert!(remote_branch_should_delete(
+            false,
+            false,
+            true,
+            MIN_AGE + 1,
+            MIN_AGE
+        ));
     }
 
     #[test]
     fn remote_orphan_young_no_pr_kept() {
         // A just-pushed branch (younger than the floor) with no PR yet must NOT be deleted (race).
-        assert!(!remote_branch_should_delete(false, false, true, MIN_AGE - 1, MIN_AGE));
+        assert!(!remote_branch_should_delete(
+            false,
+            false,
+            true,
+            MIN_AGE - 1,
+            MIN_AGE
+        ));
         assert!(!remote_branch_should_delete(false, false, true, 0, MIN_AGE));
     }
 
     #[test]
     fn remote_open_pr_branch_kept() {
         // A live open PR may still land -> keep regardless of age.
-        assert!(!remote_branch_should_delete(false, true, true, MIN_AGE * 10, MIN_AGE));
+        assert!(!remote_branch_should_delete(
+            false,
+            true,
+            true,
+            MIN_AGE * 10,
+            MIN_AGE
+        ));
     }
 
     #[test]
     fn remote_unknown_pr_state_keeps_unmerged() {
         // gh unreachable (pr_ok=false): an unmerged branch's PR state is unknown -> never delete
         // (must not delete a possibly-in-flight branch); only merged branches go in that case.
-        assert!(!remote_branch_should_delete(false, false, false, MIN_AGE * 10, MIN_AGE));
+        assert!(!remote_branch_should_delete(
+            false,
+            false,
+            false,
+            MIN_AGE * 10,
+            MIN_AGE
+        ));
         assert!(remote_branch_should_delete(true, false, false, 0, MIN_AGE)); // merged still deleted
     }
 
@@ -837,9 +904,10 @@ mod tests {
         assert!(got.contains(&"target-codex".to_string()));
         assert!(got.contains(&"build".to_string()));
         assert!(got.contains(&"src-tauri/target".to_string()));
-        assert!(!got
-            .iter()
-            .any(|g| g.contains("dist") || g.contains(".venv") || g == "src"));
+        assert!(
+            !got.iter()
+                .any(|g| g.contains("dist") || g.contains(".venv") || g == "src")
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -972,7 +1040,10 @@ mod tests {
         // broke the crate's build with no code change at all.
         let d = temp("sweep_build_guard");
         let debug = d.join("debug");
-        let out = debug.join("build").join("libsqlite3-sys-abc123").join("out");
+        let out = debug
+            .join("build")
+            .join("libsqlite3-sys-abc123")
+            .join("out");
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join("bindgen.rs"), vec![0u8; 200]).unwrap();
         std::fs::write(out.join("sqlite3.o"), vec![0u8; 300]).unwrap();
@@ -988,10 +1059,22 @@ mod tests {
 
         let (freed, _skipped) = sweep_old_files(&debug, 7);
 
-        assert!(out.join("bindgen.rs").exists(), "build-script output must survive untouched");
-        assert!(out.join("sqlite3.o").exists(), "build-script output must survive untouched");
-        assert!(!debug.join("deps").join("old.rlib").exists(), "non-build/ ancient files still swept");
-        assert_eq!(freed, 40, "freed count reflects only the swept non-build/ file");
+        assert!(
+            out.join("bindgen.rs").exists(),
+            "build-script output must survive untouched"
+        );
+        assert!(
+            out.join("sqlite3.o").exists(),
+            "build-script output must survive untouched"
+        );
+        assert!(
+            !debug.join("deps").join("old.rlib").exists(),
+            "non-build/ ancient files still swept"
+        );
+        assert_eq!(
+            freed, 40,
+            "freed count reflects only the swept non-build/ file"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1025,15 +1108,33 @@ mod tests {
         let clean = base.join("wt-clean");
         git(
             &main,
-            &["worktree", "add", "-q", clean.to_str().unwrap(), "-b", "rsi/iter-clean"],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                clean.to_str().unwrap(),
+                "-b",
+                "rsi/iter-clean",
+            ],
         );
         std::fs::create_dir_all(clean.join("target").join("debug")).unwrap();
-        std::fs::write(clean.join("target").join("debug").join("x.o"), vec![0u8; 2048]).unwrap();
+        std::fs::write(
+            clean.join("target").join("debug").join("x.o"),
+            vec![0u8; 2048],
+        )
+        .unwrap();
         // dirty worktree: an UNTRACKED SOURCE file (not ignored) = real in-flight work -> must KEEP.
         let dirty = base.join("wt-dirty");
         git(
             &main,
-            &["worktree", "add", "-q", dirty.to_str().unwrap(), "-b", "rsi/iter-dirty"],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                dirty.to_str().unwrap(),
+                "-b",
+                "rsi/iter-dirty",
+            ],
         );
         std::fs::write(dirty.join("newwork.rs"), b"fn f() {}").unwrap();
 
@@ -1041,7 +1142,10 @@ mod tests {
         let (removed, freed) = prune_orphan_worktrees(&repo, &main.to_string_lossy());
 
         assert_eq!(removed, 1, "only the clean orphan removed");
-        assert!(freed >= 2048, "removed orphan's nested target/ counted, got {freed}");
+        assert!(
+            freed >= 2048,
+            "removed orphan's nested target/ counted, got {freed}"
+        );
         assert!(!clean.exists(), "clean orphan gone");
         assert!(dirty.exists(), "worktree with untracked SOURCE kept");
         assert!(main.exists(), "main checkout never removed");

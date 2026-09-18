@@ -9,7 +9,7 @@
 //! `update_status` / `apply_update` are intentionally NOT ported (the Tauri updater replaces them).
 
 use crate::control::{gh, keys, paths, proc, registry};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -40,9 +40,7 @@ fn now() -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z"
-    )
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
 /// Python `int(x or 0)` over a possibly-missing / non-numeric JSON `seq` value.
@@ -162,8 +160,7 @@ fn detect_config(repo: &Value) -> Option<Value> {
 /// Standard base64 (RFC 4648, no line wrapping), ASCII output — matches
 /// base64.b64encode(bytes).decode('ascii'). Inlined (no base64 crate dependency).
 fn b64_standard(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -210,7 +207,10 @@ struct Session {
 
 impl Session {
     fn is_alive(&self) -> bool {
-        self.handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false)
+        self.handle
+            .as_ref()
+            .map(|h| !h.is_finished())
+            .unwrap_or(false)
     }
 }
 
@@ -341,7 +341,11 @@ impl AppTestManager {
         // make the next stop() a no-op (already:true) against a running app-test.
         {
             let mut sessions = self.sessions.lock().unwrap();
-            if sessions.get(name).map(|s| s.session_id == session_id).unwrap_or(false) {
+            if sessions
+                .get(name)
+                .map(|s| s.session_id == session_id)
+                .unwrap_or(false)
+            {
                 sessions.remove(name);
             }
         }
@@ -586,7 +590,14 @@ pub fn current_sha() -> Option<String> {
     let git = git.to_string_lossy().into_owned();
     let repo_s = repo.to_string_lossy().into_owned();
     let r = match proc::run(
-        &[git.as_str(), "-C", repo_s.as_str(), "rev-parse", "--short", "HEAD"],
+        &[
+            git.as_str(),
+            "-C",
+            repo_s.as_str(),
+            "rev-parse",
+            "--short",
+            "HEAD",
+        ],
         None,
         None,
     ) {
@@ -611,8 +622,9 @@ pub fn current_sha() -> Option<String> {
 pub(crate) fn solomon_repo() -> Option<PathBuf> {
     // Post-port markers: the Rust crate manifest + the canonical RSI spec doc (was solomon.spec +
     // control.py pre-port; both removed in the Python->Rust/Tauri rewrite).
-    let is_repo =
-        |d: &Path| d.join("src-tauri").join("Cargo.toml").is_file() && d.join("SOLOMON_RSI.md").is_file();
+    let is_repo = |d: &Path| {
+        d.join("src-tauri").join("Cargo.toml").is_file() && d.join("SOLOMON_RSI.md").is_file()
+    };
 
     if let Ok(env_home) = std::env::var("SOLOMON_HOME") {
         let p = PathBuf::from(&env_home);
@@ -832,7 +844,10 @@ mod tests {
         let r = read_app_test_report(&json!({}));
         assert_eq!(r.get("ok"), Some(&json!(false)));
         // NOT the "repo has no runtime" string.
-        assert_ne!(r.get("error").and_then(Value::as_str), Some("repo has no runtime"));
+        assert_ne!(
+            r.get("error").and_then(Value::as_str),
+            Some("repo has no runtime")
+        );
     }
 
     // ---- start/stop golden vectors ----
@@ -856,10 +871,7 @@ mod tests {
     fn stop_no_active_session() {
         // No session registered for this random name -> already:true.
         let name = format!("nope-{}", uuid_hex12());
-        assert_eq!(
-            manager().stop(&name),
-            json!({"ok": true, "already": true})
-        );
+        assert_eq!(manager().stop(&name), json!({"ok": true, "already": true}));
     }
 
     #[test]
@@ -889,9 +901,13 @@ mod tests {
     fn start_then_already_then_stop() {
         let _g = ENV_GUARD.lock().unwrap();
         let home = temp_home();
-        std::env::set_var("SOLOMON_HOME", &home);
+        unsafe {
+            std::env::set_var("SOLOMON_HOME", &home);
+        }
         if paths::here() != home.as_path() {
-            std::env::remove_var("SOLOMON_HOME");
+            unsafe {
+                std::env::remove_var("SOLOMON_HOME");
+            }
             return;
         }
         // A repo with web/index.html -> detect_config Some -> fresh start.
@@ -904,17 +920,24 @@ mod tests {
         let r1 = start_app_test(&repo);
         assert_eq!(r1.get("ok"), Some(&json!(true)));
         assert_eq!(r1.get("status"), Some(&json!("starting")));
-        let sid = r1.get("sessionId").and_then(Value::as_str).unwrap().to_string();
+        let sid = r1
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
         assert!(sid.starts_with(&format!("{name}-")));
         assert_eq!(sid.len(), name.len() + 1 + 12); // <name>-<12 hex>
-        assert!(sid.rsplit('-').next().unwrap().chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(
+            sid.rsplit('-')
+                .next()
+                .unwrap()
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+        );
 
         // Concurrent start while alive -> already:true with the SAME sessionId.
         let r2 = start_app_test(&repo);
-        assert_eq!(
-            r2,
-            json!({"ok": true, "already": true, "sessionId": sid})
-        );
+        assert_eq!(r2, json!({"ok": true, "already": true, "sessionId": sid}));
 
         // Clean stop -> {ok:true, sessionId}.
         let r3 = stop_app_test(&repo);
@@ -1054,7 +1077,9 @@ mod tests {
         assert!(!has_frontend(&json!({"path": d6.to_string_lossy()})));
 
         // non-existent path -> false
-        assert!(!has_frontend(&json!({"path": base.join("does_not_exist").to_string_lossy()})));
+        assert!(!has_frontend(
+            &json!({"path": base.join("does_not_exist").to_string_lossy()})
+        ));
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1092,7 +1117,10 @@ mod tests {
     fn uuid_hex12_is_12_lowercase_hex() {
         let s = uuid_hex12();
         assert_eq!(s.len(), 12);
-        assert!(s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            s.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 
     // ---- README quickstart exists at the repo root ----

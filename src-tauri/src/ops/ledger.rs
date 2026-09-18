@@ -27,7 +27,7 @@
 use super::{probe, registry};
 use crate::control::paths;
 use chrono::{DateTime, Duration, Utc};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::path::Path;
 
 /// The ledger window: one day.
@@ -68,7 +68,11 @@ pub fn lane_activity(history: &Path, now: DateTime<Utc>) -> Value {
                 None => continue,
             };
             // history is append-ordered; track the max defensively anyway.
-            if last_ts.as_deref().map(|p| fmt(ts).as_str() > p).unwrap_or(true) {
+            if last_ts
+                .as_deref()
+                .map(|p| fmt(ts).as_str() > p)
+                .unwrap_or(true)
+            {
                 last_ts = Some(fmt(ts));
             }
             if ts >= cutoff {
@@ -103,7 +107,7 @@ pub fn posts_activity(registry_file: &Path, now: DateTime<Utc>) -> Value {
                 "posts_missing_url_24h": Value::Null,
                 "last_post_at": Value::Null,
                 "unobservable": format!("unreadable post registry {}", registry_file.display()),
-            })
+            });
         }
     };
     let mut posts = 0i64;
@@ -149,8 +153,14 @@ pub fn finance_activity(db: &Path, now: DateTime<Utc>) -> Value {
     // ISO-8601 strings compare lexicographically; stored values carry fractional seconds + Z after
     // the "YYYY-MM-DDTHH:MM:SS" prefix, which only sorts them later — >= / <= against the bare
     // prefix stays correct.
-    let q = |sql: String| probe::sqlite_single_value(db, &sql).ok().unwrap_or(Value::Null);
-    let equity_now = q("SELECT equity_usd FROM equity WHERE source='tradelocker' ORDER BY id DESC LIMIT 1".into());
+    let q = |sql: String| {
+        probe::sqlite_single_value(db, &sql)
+            .ok()
+            .unwrap_or(Value::Null)
+    };
+    let equity_now = q(
+        "SELECT equity_usd FROM equity WHERE source='tradelocker' ORDER BY id DESC LIMIT 1".into(),
+    );
     let equity_then = q(format!(
         "SELECT equity_usd FROM equity WHERE source='tradelocker' AND ts <= '{cutoff}' ORDER BY id DESC LIMIT 1"
     ));
@@ -189,11 +199,14 @@ pub fn growth_publish_activity(marker: &Path, now: DateTime<Utc>) -> Value {
                 "last_growth_publish_at": Value::Null,
                 "growth_publish_unobservable":
                     format!("missing/unparsable marker {}", marker.display()),
-            })
+            });
         }
     };
     let ts = probe::parse_ts(rec.get("ts").unwrap_or(&Value::Null));
-    let published = rec.get("published").and_then(Value::as_bool).unwrap_or(false);
+    let published = rec
+        .get("published")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let cutoff = now - Duration::seconds(WINDOW_S);
     let in_window = ts.map(|t| t >= cutoff).unwrap_or(false);
     json!({
@@ -255,7 +268,10 @@ pub fn project_outcomes(entry: &Value, now: DateTime<Utc>) -> Value {
     let mut out = Map::new();
     out.insert("priority".into(), json!(registry::project_priority(entry)));
 
-    let history = paths::here().join("runtime").join(&name).join("history.jsonl");
+    let history = paths::here()
+        .join("runtime")
+        .join(&name)
+        .join("history.jsonl");
     if let Value::Object(m) = lane_activity(&history, now) {
         out.extend(m);
     }
@@ -271,7 +287,9 @@ pub fn project_outcomes(entry: &Value, now: DateTime<Utc>) -> Value {
         // all 3 probes point at the same file.
         if id.starts_with("publish_recency") && !out.contains_key("posts_24h") {
             if let Some(f) = cfg.get("file").and_then(Value::as_str) {
-                if let Value::Object(m) = posts_activity(&registry::resolve_path(f, &repo_path), now) {
+                if let Value::Object(m) =
+                    posts_activity(&registry::resolve_path(f, &repo_path), now)
+                {
                     out.extend(m);
                 }
             }
@@ -286,7 +304,8 @@ pub fn project_outcomes(entry: &Value, now: DateTime<Utc>) -> Value {
                     out.extend(m);
                 }
             }
-        } else if id.starts_with("growth_artifact") && !out.contains_key("growth_artifact_present") {
+        } else if id.starts_with("growth_artifact") && !out.contains_key("growth_artifact_present")
+        {
             if let Some(f) = cfg.get("file").and_then(Value::as_str) {
                 if let Value::Object(m) =
                     growth_artifact_activity(&registry::resolve_path(f, &repo_path))
@@ -296,7 +315,9 @@ pub fn project_outcomes(entry: &Value, now: DateTime<Utc>) -> Value {
             }
         } else if kind == "sqlite_query" && !out.contains_key("equity_usd") {
             if let Some(db) = cfg.get("db").and_then(Value::as_str) {
-                if let Value::Object(m) = finance_activity(&registry::resolve_path(db, &repo_path), now) {
+                if let Value::Object(m) =
+                    finance_activity(&registry::resolve_path(db, &repo_path), now)
+                {
                     out.extend(m);
                 }
             }
@@ -337,7 +358,10 @@ pub fn append_daily(snap: &Value) {
             );
         }
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
         writeln!(f, "{}", serde_json::to_string(&rec).unwrap_or_default())?;
         Ok(())
     })();
@@ -456,10 +480,23 @@ mod tests {
                 [&fresh],
             )
             .unwrap();
-            conn.execute("INSERT INTO trades (mode, created_at) VALUES ('live', ?1)", [&fresh]).unwrap();
-            conn.execute("INSERT INTO trades (mode, created_at) VALUES ('paper', ?1)", [&fresh]).unwrap();
-            conn.execute("INSERT INTO trades (mode, created_at) VALUES ('live', ?1)", [&old]).unwrap();
-            conn.execute("INSERT INTO venue_fills (created_at) VALUES (?1)", [&fresh]).unwrap();
+            conn.execute(
+                "INSERT INTO trades (mode, created_at) VALUES ('live', ?1)",
+                [&fresh],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO trades (mode, created_at) VALUES ('paper', ?1)",
+                [&fresh],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO trades (mode, created_at) VALUES ('live', ?1)",
+                [&old],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO venue_fills (created_at) VALUES (?1)", [&fresh])
+                .unwrap();
         }
         let got = finance_activity(&p, now);
         assert_eq!(got["equity_usd"], json!(168.97));
@@ -529,10 +566,12 @@ mod tests {
     fn growth_publish_activity_missing_marker_is_unobservable_not_zero() {
         let got = growth_publish_activity(Path::new("Z:/absent/_growth_published"), Utc::now());
         assert_eq!(got["growth_published_24h"], Value::Null); // null, never a fake zero
-        assert!(got["growth_publish_unobservable"]
-            .as_str()
-            .unwrap()
-            .contains("missing/unparsable"));
+        assert!(
+            got["growth_publish_unobservable"]
+                .as_str()
+                .unwrap()
+                .contains("missing/unparsable")
+        );
     }
 
     // -------- growth_artifact_activity (produced-artifact evidence) --------
@@ -550,7 +589,10 @@ mod tests {
         let got = growth_artifact_activity(&dir.join("Maki_*_x64-setup.exe"));
         assert_eq!(got["growth_artifact_present"], json!(true));
         // the newest match's NAME is the version evidence
-        assert_eq!(got["growth_artifact_newest"], json!("Maki_2.1.0_x64-setup.exe"));
+        assert_eq!(
+            got["growth_artifact_newest"],
+            json!("Maki_2.1.0_x64-setup.exe")
+        );
         assert!(got["growth_artifact_mtime"].is_string());
         // no matches / missing dir -> honest absence, never a panic
         let none = growth_artifact_activity(&dir.join("Other_*_setup.exe"));

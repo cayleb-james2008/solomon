@@ -21,10 +21,10 @@
 //! and writes it as `blind_window_s` — the honest "how long was ops blind" number the GUI shows.
 #![allow(dead_code)]
 
-use super::{exit_code, probe, registry, Status};
+use super::{Status, exit_code, probe, registry};
 use crate::control::{paths, proc};
 use chrono::Utc;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 

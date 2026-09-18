@@ -28,7 +28,7 @@
 #![allow(dead_code)]
 
 use crate::control::{apptest_health, heartbeat, paths, proc, registry};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -177,7 +177,14 @@ pub fn build_behind_origin() -> Option<bool> {
     let origin_default = format!("origin/{default}");
     // Best-effort fetch — a stale ref makes "behind" a false negative (we no-op), which is safe.
     let _ = proc::run(
-        &[git.as_str(), "-C", repo_s.as_str(), "fetch", "origin", default.as_str()],
+        &[
+            git.as_str(),
+            "-C",
+            repo_s.as_str(),
+            "fetch",
+            "origin",
+            default.as_str(),
+        ],
         None,
         Some(Duration::from_secs(60)),
     );
@@ -298,7 +305,13 @@ pub fn stage_build() -> Result<PathBuf, String> {
     // a clean release build can take many minutes; an incremental one is fast. A timeout aborts the
     // child and returns Err (no swap).
     let r = proc::run(
-        &[cargo_s.as_str(), "build", "--release", "--target-dir", staging_s.as_str()],
+        &[
+            cargo_s.as_str(),
+            "build",
+            "--release",
+            "--target-dir",
+            staging_s.as_str(),
+        ],
         Some(&workspace),
         Some(Duration::from_secs(60 * 30)),
     )
@@ -306,7 +319,10 @@ pub fn stage_build() -> Result<PathBuf, String> {
     if r.code != 0 {
         let tail = r.stderr.trim();
         let tail: String = tail.chars().take(300).collect();
-        return Err(format!("cargo build --release failed (code {}): {tail}", r.code));
+        return Err(format!(
+            "cargo build --release failed (code {}): {tail}",
+            r.code
+        ));
     }
     // The built exe: <staging>/release/<default-run>.exe (Cargo.toml default-run = "solomon").
     let exe_name = exe_file_name();
@@ -323,8 +339,13 @@ pub fn stage_build() -> Result<PathBuf, String> {
     refresh_release_artifact(&built, &release_dir, &exe_name)?;
     // Staging copy for the drain-window swap: same contract as always (<exe>.new.exe in release/).
     let staged = release_dir.join(new_exe_name(&exe_name));
-    std::fs::copy(&built, &staged)
-        .map_err(|e| format!("copy {} -> {} failed: {e}", built.display(), staged.display()))?;
+    std::fs::copy(&built, &staged).map_err(|e| {
+        format!(
+            "copy {} -> {} failed: {e}",
+            built.display(),
+            staged.display()
+        )
+    })?;
     Ok(staged)
 }
 
@@ -369,8 +390,7 @@ pub fn swap_and_relaunch(staged: &Path) -> Result<(), String> {
     //    If a previous .old exists, remove it first (best-effort; a lingering .old from a prior
     //    swap is stale). A failure here aborts BEFORE the live path is touched.
     let _ = std::fs::remove_file(&old);
-    std::fs::rename(&live, &old)
-        .map_err(|e| format!("rename live -> .old failed: {e}"))?;
+    std::fs::rename(&live, &old).map_err(|e| format!("rename live -> .old failed: {e}"))?;
 
     // 3. move the new exe into the live path. If THIS fails, try to restore the old exe so the
     //    live path is never left empty (the operator can still launch Solomon).
@@ -388,16 +408,18 @@ pub fn swap_and_relaunch(staged: &Path) -> Result<(), String> {
 /// Spawn the new live exe as a detached GUI process (no args). Best-effort — a failure is logged by
 /// the caller, not propagated as a swap failure (the binary IS swapped on disk).
 fn spawn_gui_relaunch(live: &Path) -> std::io::Result<()> {
-    use std::process::{Command, Stdio};
     #[cfg(windows)]
     use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
     let mut cmd = Command::new(live);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     proc::apply_clean_env(&mut cmd);
     #[cfg(windows)]
-    cmd.creation_flags(proc::DETACHED_PROCESS | proc::CREATE_NEW_PROCESS_GROUP | proc::CREATE_NO_WINDOW);
+    cmd.creation_flags(
+        proc::DETACHED_PROCESS | proc::CREATE_NEW_PROCESS_GROUP | proc::CREATE_NO_WINDOW,
+    );
     cmd.spawn()?;
     Ok(())
 }
@@ -536,7 +558,9 @@ pub fn maybe_self_redeploy() {
     let staged = match stage_build() {
         Ok(p) => p,
         Err(e) => {
-            log_loud(&format!("staging build FAILED — production remains on the old binary: {e}"));
+            log_loud(&format!(
+                "staging build FAILED — production remains on the old binary: {e}"
+            ));
             return;
         }
     };
@@ -554,7 +578,9 @@ pub fn maybe_self_redeploy() {
                     "drain window was safe but swap FAILED — production remains on the old binary: {e}"
                 ));
             } else {
-                log_loud("self-redeploy complete: new orchestrator binary swapped in and GUI relaunched");
+                log_loud(
+                    "self-redeploy complete: new orchestrator binary swapped in and GUI relaunched",
+                );
             }
             return;
         }
@@ -564,8 +590,16 @@ pub fn maybe_self_redeploy() {
 
     // No safe window within the bound — surface LOUDLY, do NOT force.
     let (ms, olt) = last_state.unwrap_or_default();
-    let ms_s = if ms.is_empty() { "none".to_string() } else { ms.join(",") };
-    let olt_s = if olt.is_empty() { "none".to_string() } else { olt.join(",") };
+    let ms_s = if ms.is_empty() {
+        "none".to_string()
+    } else {
+        ms.join(",")
+    };
+    let olt_s = if olt.is_empty() {
+        "none".to_string()
+    } else {
+        olt.join(",")
+    };
     log_loud(&format!(
         "NO safe drain window within {DRAIN_WAIT_MINS} min — production remains on the old binary. \
          mid-ship lanes: {ms_s}; live-money lanes with open trades: {olt_s}. \
@@ -595,9 +629,7 @@ fn json_truthy(v: &Value) -> bool {
 fn which_cargo() -> Option<PathBuf> {
     use std::sync::OnceLock;
     static CARGO: OnceLock<Option<PathBuf>> = OnceLock::new();
-    CARGO
-        .get_or_init(|| which::which("cargo").ok())
-        .clone()
+    CARGO.get_or_init(|| which::which("cargo").ok()).clone()
 }
 
 /// The built release exe file name. Cargo.toml `default-run = "solomon"`; on Windows the release
@@ -639,7 +671,10 @@ mod tests {
     // no-mid-ship AND no-open-live-trade => safe; else unsafe.
     #[test]
     fn drain_safe_decision_table() {
-        assert!(drain_safe(false, false), "no mid-ship, no open trade -> SAFE");
+        assert!(
+            drain_safe(false, false),
+            "no mid-ship, no open trade -> SAFE"
+        );
         assert!(!drain_safe(true, false), "mid-ship -> unsafe");
         assert!(!drain_safe(false, true), "open live trade -> unsafe");
         assert!(!drain_safe(true, true), "both unsafe -> unsafe");
@@ -663,11 +698,26 @@ mod tests {
     #[test]
     fn lane_mid_ship_phases() {
         for phase in ["ship", "pr", "merge"] {
-            assert!(lane_mid_ship(&json!({"phase": phase})), "phase={phase} is mid-ship");
+            assert!(
+                lane_mid_ship(&json!({"phase": phase})),
+                "phase={phase} is mid-ship"
+            );
         }
         // non-ship phases are NOT mid-ship
-        for phase in ["preflight", "plan", "test", "commit", "review", "ideate", "reflect", "implement"] {
-            assert!(!lane_mid_ship(&json!({"phase": phase})), "phase={phase} is NOT mid-ship");
+        for phase in [
+            "preflight",
+            "plan",
+            "test",
+            "commit",
+            "review",
+            "ideate",
+            "reflect",
+            "implement",
+        ] {
+            assert!(
+                !lane_mid_ship(&json!({"phase": phase})),
+                "phase={phase} is NOT mid-ship"
+            );
         }
         // missing / null / empty / non-string phase -> not mid-ship
         assert!(!lane_mid_ship(&json!({})));
@@ -711,16 +761,25 @@ mod tests {
         // live-money + sentinel present -> open trade
         let (rt, repo) = tmp_repo("rdp_open_live_unique", true);
         std::fs::write(rt.join("open_trade"), "").unwrap();
-        assert!(lane_open_live_trade(&repo), "live-money + open_trade sentinel -> open");
+        assert!(
+            lane_open_live_trade(&repo),
+            "live-money + open_trade sentinel -> open"
+        );
         // remove sentinel -> no open trade (safe)
         std::fs::remove_file(rt.join("open_trade")).unwrap();
-        assert!(!lane_open_live_trade(&repo), "live-money + NO sentinel -> no open trade");
+        assert!(
+            !lane_open_live_trade(&repo),
+            "live-money + NO sentinel -> no open trade"
+        );
         let _ = std::fs::remove_dir_all(&rt);
 
         // non-live-money lane with the sentinel -> NOT unsafe (sentinel is meaningless off a live-money lane)
         let (rt, repo) = tmp_repo("rdp_nonlive_unique", false);
         std::fs::write(rt.join("open_trade"), "").unwrap();
-        assert!(!lane_open_live_trade(&repo), "non-live-money + sentinel -> not unsafe on this axis");
+        assert!(
+            !lane_open_live_trade(&repo),
+            "non-live-money + sentinel -> not unsafe on this axis"
+        );
         let _ = std::fs::remove_dir_all(&rt);
     }
 
@@ -729,12 +788,18 @@ mod tests {
         // A live-money lane with no runtime dir resolvable (empty name) -> unknown -> unsafe.
         // {live_money: true} with no name -> runtime_dir None -> unsafe.
         let repo = json!({"live_money": true});
-        assert!(lane_open_live_trade(&repo), "live-money + unresolvable name -> unsafe (do not force)");
+        assert!(
+            lane_open_live_trade(&repo),
+            "live-money + unresolvable name -> unsafe (do not force)"
+        );
         // a live-money lane whose runtime dir was deleted out from under it -> unreadable -> unsafe
         let repo = json!({"name": "rdp_gone_dir_unique", "live_money": true});
         let rt = paths::runtime_dir(&repo).unwrap();
         let _ = std::fs::remove_dir_all(&rt);
-        assert!(lane_open_live_trade(&repo), "live-money + missing runtime dir -> unsafe (do not force)");
+        assert!(
+            lane_open_live_trade(&repo),
+            "live-money + missing runtime dir -> unsafe (do not force)"
+        );
     }
 
     // -------- collect_drain_state: end-to-end over synthetic repos with temp runtime --------
@@ -768,17 +833,37 @@ mod tests {
         let repos = vec![repo_a, repo_b, repo_c, repo_d];
         let (ms, olt) = collect_drain_state(&repos);
         // mid-ship: A (merge) and B (pr)
-        assert!(ms.contains(&"rdp_collect_a_unique".to_string()), "A is mid-ship");
-        assert!(ms.contains(&"rdp_collect_b_unique".to_string()), "B is mid-ship");
-        assert!(!ms.contains(&"rdp_collect_c_unique".to_string()), "C is NOT mid-ship");
+        assert!(
+            ms.contains(&"rdp_collect_a_unique".to_string()),
+            "A is mid-ship"
+        );
+        assert!(
+            ms.contains(&"rdp_collect_b_unique".to_string()),
+            "B is mid-ship"
+        );
+        assert!(
+            !ms.contains(&"rdp_collect_c_unique".to_string()),
+            "C is NOT mid-ship"
+        );
         // open live trade: A only (C is live-money but no sentinel; B/D are not live-money)
-        assert!(olt.contains(&"rdp_collect_a_unique".to_string()), "A has open live trade");
-        assert!(!olt.contains(&"rdp_collect_c_unique".to_string()), "C is live-money but flat");
+        assert!(
+            olt.contains(&"rdp_collect_a_unique".to_string()),
+            "A has open live trade"
+        );
+        assert!(
+            !olt.contains(&"rdp_collect_c_unique".to_string()),
+            "C is live-money but flat"
+        );
         // the window is unsafe (A is both mid-ship and open-live-trade)
         assert!(!drain_window_safe(&ms, &olt));
 
         // clean up
-        for name in ["rdp_collect_a_unique", "rdp_collect_b_unique", "rdp_collect_c_unique", "rdp_collect_d_unique"] {
+        for name in [
+            "rdp_collect_a_unique",
+            "rdp_collect_b_unique",
+            "rdp_collect_c_unique",
+            "rdp_collect_d_unique",
+        ] {
             let repo = json!({ "name": name });
             if let Some(rt) = paths::runtime_dir(&repo) {
                 let _ = std::fs::remove_dir_all(&rt);
@@ -808,7 +893,10 @@ mod tests {
         let built = staging_built_exe(ws, "solomon.exe");
         assert_eq!(
             built,
-            ws.join("target").join("redeploy-staging").join("release").join("solomon.exe")
+            ws.join("target")
+                .join("redeploy-staging")
+                .join("release")
+                .join("solomon.exe")
         );
         // the load-bearing invariant: the LINK output is never inside target/release (the running
         // exe's dir — an in-place relink of a locked exe fails with os error 5)
@@ -824,7 +912,11 @@ mod tests {
         );
         let stale = Duration::from_secs(OLD_ARTIFACT_MAX_AGE_S);
         // stale rollbacks prune (boundary inclusive); fresh ones stay
-        assert!(should_prune_old_artifact("solomon.exe.old-20260701T000000Z", "solomon.exe", stale));
+        assert!(should_prune_old_artifact(
+            "solomon.exe.old-20260701T000000Z",
+            "solomon.exe",
+            stale
+        ));
         assert!(!should_prune_old_artifact(
             "solomon.exe.old-20260716T000000Z",
             "solomon.exe",
@@ -832,7 +924,12 @@ mod tests {
         ));
         // NEVER the live exe, the staged .new.exe, the swap's single .old.exe slot, or another
         // exe's rollbacks — regardless of age
-        for name in ["solomon.exe", "solomon.new.exe", "solomon.old.exe", "other.exe.old-2026"] {
+        for name in [
+            "solomon.exe",
+            "solomon.new.exe",
+            "solomon.old.exe",
+            "other.exe.old-2026",
+        ] {
             assert!(
                 !should_prune_old_artifact(name, "solomon.exe", stale * 10),
                 "{name} must never be pruned"
@@ -853,20 +950,34 @@ mod tests {
             std::fs::read_dir(dir)
                 .unwrap()
                 .flatten()
-                .filter(|e| e.file_name().to_string_lossy().starts_with("solomon.exe.old-"))
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("solomon.exe.old-")
+                })
                 .count()
         };
 
         // first refresh: no live exe yet -> plain copy, no rollback artifact
         refresh_release_artifact(&built, &release, "solomon.exe").unwrap();
-        assert_eq!(std::fs::read(release.join("solomon.exe")).unwrap(), b"NEW BYTES");
+        assert_eq!(
+            std::fs::read(release.join("solomon.exe")).unwrap(),
+            b"NEW BYTES"
+        );
         assert_eq!(olds(&release), 0);
 
         // second refresh: the live exe is renamed to .old-<ts>; the new bytes take the live path
         std::fs::write(&built, b"NEWER BYTES").unwrap();
         refresh_release_artifact(&built, &release, "solomon.exe").unwrap();
-        assert_eq!(std::fs::read(release.join("solomon.exe")).unwrap(), b"NEWER BYTES");
-        assert_eq!(olds(&release), 1, "the previous live exe is preserved for rollback");
+        assert_eq!(
+            std::fs::read(release.join("solomon.exe")).unwrap(),
+            b"NEWER BYTES"
+        );
+        assert_eq!(
+            olds(&release),
+            1,
+            "the previous live exe is preserved for rollback"
+        );
         // fresh rollbacks survive the prune sweep (age gate), so both artifacts coexist
         assert!(release.join("solomon.exe").exists());
 

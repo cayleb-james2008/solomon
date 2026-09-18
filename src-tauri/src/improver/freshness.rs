@@ -30,7 +30,7 @@
 //! CYCLE BUDGET: runtime/<name>/cycle_budget.json — reset on every cycle that proceeds; pi.rs (WS2)
 //! calls [`note_pi_call`] per agent invocation and [`budget_exceeded`] before starting another one.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -71,7 +71,10 @@ fn freshness_cfg(row: &Value) -> Option<FreshnessCfg> {
     }
     Some(FreshnessCfg {
         cmd,
-        min_new_samples: f.get("min_new_samples").and_then(Value::as_i64).unwrap_or(1),
+        min_new_samples: f
+            .get("min_new_samples")
+            .and_then(Value::as_i64)
+            .unwrap_or(1),
         hard: f.get("hard").and_then(Value::as_bool).unwrap_or(true),
         // Floor 1: max_starve_cycles<=0 would make the escape valve fire every cycle, which is the
         // same observable behavior as hard=false — never a divide-into-nonsense state.
@@ -97,7 +100,10 @@ fn budget_cfg(row: &Value) -> Option<BudgetCfg> {
     if wall_s.is_none() && max_pi_calls.is_none() {
         return None;
     }
-    Some(BudgetCfg { wall_s, max_pi_calls })
+    Some(BudgetCfg {
+        wall_s,
+        max_pi_calls,
+    })
 }
 
 // --------------------------------------------------------------------------- #
@@ -248,8 +254,9 @@ fn run_shell_timed(ctx: &Ctx, script: &str) -> std::io::Result<proc::RunOut> {
             buf
         })
     });
-    let join =
-        |h: Option<std::thread::JoinHandle<String>>| h.and_then(|h| h.join().ok()).unwrap_or_default();
+    let join = |h: Option<std::thread::JoinHandle<String>>| {
+        h.and_then(|h| h.join().ok()).unwrap_or_default()
+    };
     match child.wait_timeout(Duration::from_secs(FRESHNESS_CMD_TIMEOUT_S))? {
         Some(status) => Ok(proc::RunOut {
             code: status.code().unwrap_or(-1),
@@ -288,9 +295,9 @@ fn run_freshness_probe(ctx: &Ctx, script: &str) -> Result<Report, String> {
             ))
         }
         Ok(p) => parse_last_line_report(&p.stdout),
-        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-            Err(format!("freshness cmd timed out after {FRESHNESS_CMD_TIMEOUT_S}s"))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Err(format!(
+            "freshness cmd timed out after {FRESHNESS_CMD_TIMEOUT_S}s"
+        )),
         Err(e) => Err(format!("freshness cmd failed to spawn: {e}")),
     }
 }
@@ -343,9 +350,9 @@ pub(crate) fn probe_raw(ctx: &Ctx, script: &str) -> Result<Value, String> {
             serde_json::from_str::<Value>(line)
                 .map_err(|_| format!("last stdout line is not JSON: {}", head_chars(line, 160)))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-            Err(format!("freshness cmd timed out after {FRESHNESS_CMD_TIMEOUT_S}s"))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Err(format!(
+            "freshness cmd timed out after {FRESHNESS_CMD_TIMEOUT_S}s"
+        )),
         Err(e) => Err(format!("freshness cmd failed to spawn: {e}")),
     }
 }
@@ -453,7 +460,12 @@ pub fn short_circuit(ctx: &mut Ctx) -> bool {
     let fresh = match &ledger {
         None => true,
         Some(l) if l.metric_id != report.metric_id => true,
-        Some(l) => is_fresh(&report, l.last_seen_ts, l.last_n_samples, cfg.min_new_samples),
+        Some(l) => is_fresh(
+            &report,
+            l.last_seen_ts,
+            l.last_n_samples,
+            cfg.min_new_samples,
+        ),
     };
     if fresh {
         write_ledger(
@@ -535,7 +547,11 @@ zero token spend (starve {k}/{max})",
 fn unobservable_halt(ctx: &mut Ctx, id: Option<&str>, detail: &str) {
     let id = id
         .map(str::to_string)
-        .or_else(|| read_ledger(ctx).map(|l| l.metric_id).filter(|m| !m.is_empty()))
+        .or_else(|| {
+            read_ledger(ctx)
+                .map(|l| l.metric_id)
+                .filter(|m| !m.is_empty())
+        })
         .unwrap_or_else(|| "unknown".to_string());
     let summary = format!(
         "tier-1 objective metric '{id}' is UNOBSERVABLE ({detail}) — meta-optimization halted; \
@@ -742,7 +758,10 @@ mod tests {
     fn parse_report_garbage_and_missing_fields_error() {
         assert!(parse_last_line_report("").is_err(), "no stdout");
         assert!(parse_last_line_report("   \n \n").is_err(), "blank stdout");
-        assert!(parse_last_line_report("not json at all").is_err(), "non-JSON last line");
+        assert!(
+            parse_last_line_report("not json at all").is_err(),
+            "non-JSON last line"
+        );
         // last line is JSON but a NOISE object -> missing fields is unparseable, not a guess
         assert!(
             parse_last_line_report(r#"{"metric_id":"m","latest_ts":1.0,"n_samples":2}"#).is_err(),
@@ -831,11 +850,17 @@ mod tests {
             "freshness": {"no_objective": true}
         }]);
         let mut c = test_ctx(Some(rows));
-        assert!(short_circuit(&mut c), "a live app may not optimize a blind objective");
+        assert!(
+            short_circuit(&mut c),
+            "a live app may not optimize a blind objective"
+        );
         assert_eq!(hb_str(&c, "status"), "error");
         assert_eq!(hb_str(&c, "reason"), "metric_unobservable");
         assert!(hb_str(&c, "last_summary").contains("requires a non-empty freshness.cmd"));
-        assert!(!budget_path(&c).exists(), "no AI cycle budget may open on this halt");
+        assert!(
+            !budget_path(&c).exists(),
+            "no AI cycle budget may open on this halt"
+        );
     }
 
     // ---- the acceptance shape: first run proceeds, second skips with no_new_data ----
@@ -844,7 +869,10 @@ mod tests {
     fn first_run_proceeds_second_run_skips_no_new_data() {
         let mut c = test_ctx(Some(rows_with_freshness(json!({}))));
         // run 1: no ledger -> first observation is the baseline -> proceed
-        assert!(!short_circuit(&mut c), "first probe establishes the baseline");
+        assert!(
+            !short_circuit(&mut c),
+            "first probe establishes the baseline"
+        );
         let l1 = read_ledger(&c).expect("ledger written");
         assert_eq!((l1.last_n_samples, l1.starve_count), (0, 0));
         assert_eq!(l1.last_seen_ts, 1.0);
@@ -868,11 +896,19 @@ mod tests {
         let mut c = test_ctx(Some(rows));
         write_ledger(
             &c,
-            &Ledger { metric_id: "m".into(), last_seen_ts: 1.0, last_n_samples: 3, starve_count: 5 },
+            &Ledger {
+                metric_id: "m".into(),
+                last_seen_ts: 1.0,
+                last_n_samples: 3,
+                starve_count: 5,
+            },
         );
         assert!(!short_circuit(&mut c), "new samples -> proceed");
         let l = read_ledger(&c).unwrap();
-        assert_eq!((l.last_n_samples, l.last_seen_ts, l.starve_count), (7, 2.0, 0));
+        assert_eq!(
+            (l.last_n_samples, l.last_seen_ts, l.starve_count),
+            (7, 2.0, 0)
+        );
     }
 
     #[test]
@@ -880,9 +916,17 @@ mod tests {
         let mut c = test_ctx(Some(rows_with_freshness(json!({}))));
         write_ledger(
             &c,
-            &Ledger { metric_id: "old_metric".into(), last_seen_ts: 9.0, last_n_samples: 99, starve_count: 4 },
+            &Ledger {
+                metric_id: "old_metric".into(),
+                last_seen_ts: 9.0,
+                last_n_samples: 99,
+                starve_count: 4,
+            },
         );
-        assert!(!short_circuit(&mut c), "operator repointed the objective -> new baseline");
+        assert!(
+            !short_circuit(&mut c),
+            "operator repointed the objective -> new baseline"
+        );
         assert_eq!(read_ledger(&c).unwrap().metric_id, "m");
     }
 
@@ -895,25 +939,37 @@ mod tests {
         // seed the ledger so the halt can NAME the metric even though the probe said nothing
         write_ledger(
             &c,
-            &Ledger { metric_id: "pnl_15m".into(), last_seen_ts: 1.0, last_n_samples: 0, starve_count: 0 },
+            &Ledger {
+                metric_id: "pnl_15m".into(),
+                last_seen_ts: 1.0,
+                last_n_samples: 0,
+                starve_count: 0,
+            },
         );
         assert!(short_circuit(&mut c), "unobservable halts the cycle");
         assert_eq!(hb_str(&c, "status"), "error");
         assert_eq!(hb_str(&c, "phase"), "preflight");
         assert_eq!(hb_str(&c, "reason"), "metric_unobservable");
         let s = hb_str(&c, "last_summary");
-        assert!(s.contains("'pnl_15m'") && s.contains("UNOBSERVABLE"), "got: {s}");
+        assert!(
+            s.contains("'pnl_15m'") && s.contains("UNOBSERVABLE"),
+            "got: {s}"
+        );
         assert!(s.contains("no promote/rollback/mutate"), "got: {s}");
     }
 
     #[test]
     fn garbage_stdout_is_unobservable_red() {
         // `echo` behaves the same under cmd /C and /bin/sh here
-        let rows = json!([{ "name": "freshtest", "freshness": {"cmd": "echo definitely-not-json"} }]);
+        let rows =
+            json!([{ "name": "freshtest", "freshness": {"cmd": "echo definitely-not-json"} }]);
         let mut c = test_ctx(Some(rows));
         assert!(short_circuit(&mut c));
         assert_eq!(hb_str(&c, "reason"), "metric_unobservable");
-        assert!(hb_str(&c, "last_summary").contains("'unknown'"), "no ledger -> id falls back");
+        assert!(
+            hb_str(&c, "last_summary").contains("'unknown'"),
+            "no ledger -> id falls back"
+        );
     }
 
     #[test]
@@ -937,11 +993,24 @@ mod tests {
         let mut c = test_ctx(Some(rows_with_freshness(json!({"hard": false}))));
         write_ledger(
             &c,
-            &Ledger { metric_id: "m".into(), last_seen_ts: 1.0, last_n_samples: 0, starve_count: 0 },
+            &Ledger {
+                metric_id: "m".into(),
+                last_seen_ts: 1.0,
+                last_n_samples: 0,
+                starve_count: 0,
+            },
         );
         assert!(!short_circuit(&mut c), "hard=false -> advisory only");
-        assert_eq!(hb_str(&c, "status"), "starting", "no skip heartbeat written");
-        assert_eq!(read_ledger(&c).unwrap().starve_count, 0, "soft mode does not starve-count");
+        assert_eq!(
+            hb_str(&c, "status"),
+            "starting",
+            "no skip heartbeat written"
+        );
+        assert_eq!(
+            read_ledger(&c).unwrap().starve_count,
+            0,
+            "soft mode does not starve-count"
+        );
     }
 
     #[test]
@@ -950,14 +1019,23 @@ mod tests {
         // starve_count=1: 1+1=2 < 3 -> still a skip
         write_ledger(
             &c,
-            &Ledger { metric_id: "m".into(), last_seen_ts: 1.0, last_n_samples: 0, starve_count: 1 },
+            &Ledger {
+                metric_id: "m".into(),
+                last_seen_ts: 1.0,
+                last_n_samples: 0,
+                starve_count: 1,
+            },
         );
         assert!(short_circuit(&mut c), "below the valve -> skip");
         assert_eq!(read_ledger(&c).unwrap().starve_count, 2);
         assert!(hb_str(&c, "last_summary").contains("(starve 2/3)"));
         // starve_count=2: 2+1 >= 3 -> the escape valve allows ONE non-metric cycle
         assert!(!short_circuit(&mut c), "at the valve -> one cycle allowed");
-        assert_eq!(read_ledger(&c).unwrap().starve_count, 0, "valve resets the counter");
+        assert_eq!(
+            read_ledger(&c).unwrap().starve_count,
+            0,
+            "valve resets the counter"
+        );
         let log = std::fs::read_to_string(&c.log_path).unwrap_or_default();
         assert!(
             log.contains("starvation escape — allowing one non-metric cycle"),
@@ -1006,7 +1084,10 @@ mod tests {
         let stale_probe = evidence_probe("published_reels", 112, 1_000.0);
         let mut lane_a = lane_with_probe(&stale_probe);
         // cycle 1: no ledger -> first observation baselines -> proceed (the one allowed run)
-        assert!(!short_circuit(&mut lane_a), "lane A cycle 1 baselines and runs");
+        assert!(
+            !short_circuit(&mut lane_a),
+            "lane A cycle 1 baselines and runs"
+        );
         // cycles 2..=5: identical probe (no new sample) -> PARK every time, spending no tokens
         for cycle in 2..=5 {
             assert!(
@@ -1055,7 +1136,10 @@ mod tests {
         let mut guard = 0;
         loop {
             guard += 1;
-            assert!(guard < 100, "escape valve never fired — a lane is pinned forever");
+            assert!(
+                guard < 100,
+                "escape valve never fired — a lane is pinned forever"
+            );
             let before = read_ledger(&lane_a).unwrap().starve_count;
             let skipped = short_circuit(&mut lane_a);
             if !skipped {
@@ -1096,7 +1180,10 @@ mod tests {
             hb_str(&c, "last_summary")
                 .contains("meta-work held: .env mutated outside a gated commit")
         );
-        assert!(c.runtime.join("HOLD_META").exists(), "an active hold is NOT deleted");
+        assert!(
+            c.runtime.join("HOLD_META").exists(),
+            "an active hold is NOT deleted"
+        );
     }
 
     #[test]
@@ -1105,7 +1192,10 @@ mod tests {
         let hold = json!({"reason": "r", "file": "f", "ts": 0.0, "expires_at": unix_now() - 5.0});
         std::fs::write(c.runtime.join("HOLD_META"), hold.to_string()).unwrap();
         assert!(!short_circuit(&mut c), "expired hold must not block");
-        assert!(!c.runtime.join("HOLD_META").exists(), "expired hold deleted");
+        assert!(
+            !c.runtime.join("HOLD_META").exists(),
+            "expired hold deleted"
+        );
     }
 
     #[test]
@@ -1172,10 +1262,16 @@ mod tests {
     #[test]
     fn budget_cfg_requires_a_positive_cap() {
         assert_eq!(budget_cfg(&json!({"cycle_budget": {}})), None);
-        assert_eq!(budget_cfg(&json!({"cycle_budget": {"wall_s": 0, "pi_calls": 0}})), None);
+        assert_eq!(
+            budget_cfg(&json!({"cycle_budget": {"wall_s": 0, "pi_calls": 0}})),
+            None
+        );
         assert_eq!(
             budget_cfg(&json!({"cycle_budget": {"pi_calls": 6}})),
-            Some(BudgetCfg { wall_s: None, max_pi_calls: Some(6) })
+            Some(BudgetCfg {
+                wall_s: None,
+                max_pi_calls: Some(6)
+            })
         );
     }
 
@@ -1189,7 +1285,11 @@ mod tests {
         assert!(cfg.hard);
         assert_eq!(cfg.max_starve_cycles, 16);
         assert_eq!(freshness_cfg(&json!({})), None, "no key -> off");
-        assert_eq!(freshness_cfg(&json!({"freshness": {}})), None, "no cmd -> off");
+        assert_eq!(
+            freshness_cfg(&json!({"freshness": {}})),
+            None,
+            "no cmd -> off"
+        );
         // a nonsense max_starve_cycles is floored to 1 (== escape every stale cycle), never <=0
         let row = json!({"freshness": {"cmd": "x", "max_starve_cycles": -5}});
         assert_eq!(freshness_cfg(&row).unwrap().max_starve_cycles, 1);

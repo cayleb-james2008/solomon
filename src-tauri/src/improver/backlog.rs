@@ -428,9 +428,18 @@ mod tests {
             backlog_item_rank("[reliability][ops-auto:publish_recency_tiktok] fix it"),
             0
         );
-        assert_eq!(backlog_item_rank("[feature] [campaign:harden-auth] step 1"), 1);
-        assert_eq!(backlog_item_rank("[feature] grow followers (ceo 2026-07-04)"), 2);
-        assert_eq!(backlog_item_rank("[reliability][hygiene-auto:dirty] clean up"), 3);
+        assert_eq!(
+            backlog_item_rank("[feature] [campaign:harden-auth] step 1"),
+            1
+        );
+        assert_eq!(
+            backlog_item_rank("[feature] grow followers (ceo 2026-07-04)"),
+            2
+        );
+        assert_eq!(
+            backlog_item_rank("[reliability][hygiene-auto:dirty] clean up"),
+            3
+        );
         assert_eq!(backlog_item_rank("plain chore"), 3);
     }
 
@@ -445,7 +454,10 @@ mod tests {
              - [ ] [reliability][ops-auto:publish_recency_tiktok] tiktok RED — fix posting\n",
         );
         let (goal, _tier) = top_backlog_item(&c).unwrap();
-        assert!(goal.contains("[ops-auto:publish_recency_tiktok]"), "ops-auto wins: {goal}");
+        assert!(
+            goal.contains("[ops-auto:publish_recency_tiktok]"),
+            "ops-auto wins: {goal}"
+        );
     }
 
     #[test]
@@ -470,7 +482,10 @@ mod tests {
         assert_eq!(top_backlog_item(&c).unwrap().0, "first plain");
         // two ops-auto items -> the earlier one wins (rank-0 tie, file order).
         let c2 = test_ctx("rank_ties2");
-        write_backlog(&c2, "- [ ] [ops-auto:a] first red\n- [ ] [ops-auto:b] second red\n");
+        write_backlog(
+            &c2,
+            "- [ ] [ops-auto:a] first red\n- [ ] [ops-auto:b] second red\n",
+        );
         assert!(top_backlog_item(&c2).unwrap().0.contains("[ops-auto:a]"));
     }
 

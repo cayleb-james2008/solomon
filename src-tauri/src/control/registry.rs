@@ -13,7 +13,7 @@
 //! order. The foundation documents the same trade-off; the golden diff parses-then-compares.
 
 use crate::control::{apptest_health, contracts, gh, keys, paths, proc, runner};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::path::Path;
 
 // control._PROVIDER_DEFAULT_MODEL — keep in sync with improver/run_improver.py PROVIDERS.
@@ -493,11 +493,7 @@ fn int_or_zero(v: &Value) -> i64 {
 /// control.project_interval: seconds between iterations (default 120; non-positive/invalid -> 120).
 pub fn project_interval(repo: &Value) -> i64 {
     let v = int_or_zero(get(repo, "interval"));
-    if v > 0 {
-        v
-    } else {
-        120
-    }
+    if v > 0 { v } else { 120 }
 }
 
 /// control.project_max_iterations: iterations before self-stop; 0 = unlimited (invalid/negative -> 0).
@@ -813,7 +809,10 @@ pub fn upsert_onboarded_repo(
         None => {
             let mut obj = Map::new();
             obj.insert("name".to_string(), Value::String(name.to_string()));
-            obj.insert("branch_prefix".to_string(), Value::String("rsi/".to_string()));
+            obj.insert(
+                "branch_prefix".to_string(),
+                Value::String("rsi/".to_string()),
+            );
             entries.push(Value::Object(obj));
             entries.len() - 1
         }
@@ -1707,7 +1706,10 @@ pub(crate) mod tests {
                             let base = row.get("path").and_then(|v| v.as_str()).unwrap_or("");
                             // 2026-07-10: skip if the repo isn't a real clone (no .git dir) —
                             // the lane is a stub on this machine, not a fleet-config violation.
-                            if !base.is_empty() && Path::new(base).is_dir() && !Path::new(base).join(".git").exists() {
+                            if !base.is_empty()
+                                && Path::new(base).is_dir()
+                                && !Path::new(base).join(".git").exists()
+                            {
                                 continue; // repo dir exists but isn't a git clone — stub, skip
                             }
                             failures.push(format!(

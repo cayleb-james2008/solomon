@@ -12,10 +12,10 @@
 //! is [`crate::improver::iteration::one_iteration`]; reflect lives in [`crate::improver::phases`].
 
 use crate::control::{locks, paths};
-use crate::improver::ctx::{now, Ctx};
+use crate::improver::ctx::{Ctx, now};
 use crate::improver::{iteration, oneshot, park, phases};
 use crate::pecrt::bus;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 
 /// run_improver._FALLBACK / PROVIDERS choices for `--provider`. Mirrors `choices=list(PROVIDERS)`.
@@ -78,10 +78,7 @@ fn parse_args(args: &[String]) -> Result<Args, i32> {
     let mut a = Args::default();
     let mut i = 0usize;
     // Pull the value for a `--flag value` / `--flag=value` option. `inline` is Some when "=" was used.
-    let take = |i: &mut usize,
-                    inline: Option<String>,
-                    flag: &str|
-     -> Result<String, i32> {
+    let take = |i: &mut usize, inline: Option<String>, flag: &str| -> Result<String, i32> {
         if let Some(v) = inline {
             return Ok(v);
         }
@@ -128,7 +125,9 @@ fn parse_args(args: &[String]) -> Result<Args, i32> {
                 a.ship = v;
             }
             "--gate" => a.gate = take(&mut i, inline, "--gate")?,
-            "--pr-target-branch" => a.pr_target_branch = take(&mut i, inline, "--pr-target-branch")?,
+            "--pr-target-branch" => {
+                a.pr_target_branch = take(&mut i, inline, "--pr-target-branch")?
+            }
             "--max-iterations" => {
                 let v = take(&mut i, inline, "--max-iterations")?;
                 a.max_iterations = match v.trim().parse::<i64>() {
@@ -296,7 +295,12 @@ pub fn main(args: &[String]) -> i32 {
             && ctx.git(&["fetch", "origin", "--quiet"], 120).code == 0
             && ctx
                 .git(
-                    &["rev-parse", "--verify", "--quiet", &format!("origin/{base}")],
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        &format!("origin/{base}"),
+                    ],
                     120,
                 )
                 .code
@@ -312,7 +316,7 @@ pub fn main(args: &[String]) -> i32 {
                 "status": "error",
                 "last_summary": format!(
                     "Base branch '{base}' does not exist locally or on origin — \
-set this repo's PR-target branch to a real branch in Config."
+            set this repo's PR-target branch to a real branch in Config."
                 ),
             }));
             println!("ERROR: base branch '{base}' not found (local or origin).");
@@ -431,8 +435,10 @@ set this repo's PR-target branch to a real branch in Config."
         // one_iteration must fall through to the cleanup (release_lock + error/crashed heartbeat),
         // never kill the process with the runner lock still held. catch_unwind restores that
         // (panic=unwind is intentional — see Cargo.toml / the watchdog sweep).
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| iteration::one_iteration(&mut ctx)))
-            .is_err()
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            iteration::one_iteration(&mut ctx)
+        }))
+        .is_err()
         {
             ctx.log("one_iteration panicked — treating as a crashed iteration (will be restarted)");
             break; // clean_exit stays false -> finally writes error/crashed and releases the lock
@@ -741,17 +747,28 @@ mod tests {
     #[test]
     fn parse_args_value_flags_space_form() {
         let a = parse_args(&argv(&[
-            "--repo", "r",
-            "--name", "n",
-            "--provider", "openrouter",
-            "--model", "qwen",
-            "--ship", "push",
-            "--gate", "cargo test",
-            "--pr-target-branch", "trunk",
-            "--max-iterations", "7",
-            "--reasoning", "high",
-            "--goal", "fix bug",
-            "--interval", "30",
+            "--repo",
+            "r",
+            "--name",
+            "n",
+            "--provider",
+            "openrouter",
+            "--model",
+            "qwen",
+            "--ship",
+            "push",
+            "--gate",
+            "cargo test",
+            "--pr-target-branch",
+            "trunk",
+            "--max-iterations",
+            "7",
+            "--reasoning",
+            "high",
+            "--goal",
+            "fix bug",
+            "--interval",
+            "30",
         ]))
         .expect("ok");
         assert_eq!(a.repo.as_deref(), Some("r"));
@@ -789,8 +806,14 @@ mod tests {
     #[test]
     fn parse_args_store_true_flags() {
         let a = parse_args(&argv(&[
-            "--repo", "r",
-            "--once", "--smoke", "--beautify", "--provision", "--ideate", "--solomon",
+            "--repo",
+            "r",
+            "--once",
+            "--smoke",
+            "--beautify",
+            "--provision",
+            "--ideate",
+            "--solomon",
         ]))
         .expect("ok");
         assert!(a.once);
@@ -803,19 +826,25 @@ mod tests {
 
     #[test]
     fn parse_args_bad_provider_choice_exits_2() {
-        let code = parse_args(&argv(&["--repo", "r", "--provider", "claude"])).err().unwrap();
+        let code = parse_args(&argv(&["--repo", "r", "--provider", "claude"]))
+            .err()
+            .unwrap();
         assert_eq!(code, 2);
     }
 
     #[test]
     fn parse_args_bad_ship_choice_exits_2() {
-        let code = parse_args(&argv(&["--repo", "r", "--ship", "teleport"])).err().unwrap();
+        let code = parse_args(&argv(&["--repo", "r", "--ship", "teleport"]))
+            .err()
+            .unwrap();
         assert_eq!(code, 2);
     }
 
     #[test]
     fn parse_args_bad_reasoning_choice_exits_2() {
-        let code = parse_args(&argv(&["--repo", "r", "--reasoning", "ultra"])).err().unwrap();
+        let code = parse_args(&argv(&["--repo", "r", "--reasoning", "ultra"]))
+            .err()
+            .unwrap();
         assert_eq!(code, 2);
     }
 
@@ -828,13 +857,17 @@ mod tests {
 
     #[test]
     fn parse_args_non_int_max_iterations_exits_2() {
-        let code = parse_args(&argv(&["--repo", "r", "--max-iterations", "abc"])).err().unwrap();
+        let code = parse_args(&argv(&["--repo", "r", "--max-iterations", "abc"]))
+            .err()
+            .unwrap();
         assert_eq!(code, 2);
     }
 
     #[test]
     fn parse_args_non_int_interval_exits_2() {
-        let code = parse_args(&argv(&["--repo", "r", "--interval", "x"])).err().unwrap();
+        let code = parse_args(&argv(&["--repo", "r", "--interval", "x"]))
+            .err()
+            .unwrap();
         assert_eq!(code, 2);
     }
 
@@ -846,14 +879,18 @@ mod tests {
 
     #[test]
     fn parse_args_unknown_flag_exits_2() {
-        let code = parse_args(&argv(&["--repo", "r", "--bogus"])).err().unwrap();
+        let code = parse_args(&argv(&["--repo", "r", "--bogus"]))
+            .err()
+            .unwrap();
         assert_eq!(code, 2);
     }
 
     #[test]
     fn parse_args_missing_value_at_end_exits_2() {
         // --provider with no following value
-        let code = parse_args(&argv(&["--repo", "r", "--provider"])).err().unwrap();
+        let code = parse_args(&argv(&["--repo", "r", "--provider"]))
+            .err()
+            .unwrap();
         assert_eq!(code, 2);
     }
 
@@ -866,7 +903,9 @@ mod tests {
     #[test]
     fn parse_args_repo_required_even_with_other_flags() {
         // other valid flags but no --repo
-        let code = parse_args(&argv(&["--ship", "pr", "--interval", "10"])).err().unwrap();
+        let code = parse_args(&argv(&["--ship", "pr", "--interval", "10"]))
+            .err()
+            .unwrap();
         assert_eq!(code, 2);
     }
 
@@ -909,9 +948,15 @@ mod tests {
     fn preserves_key_shape_mismatch_diagnostic_false_for_other_errors() {
         // A generic error / crashed / no_key heartbeat must NOT be preserved by this predicate —
         // the finally should overwrite them per its normal branches.
-        assert!(!preserves_key_shape_mismatch_diagnostic(&json!({"status": "error", "phase": "crashed"})));
-        assert!(!preserves_key_shape_mismatch_diagnostic(&json!({"status": "error", "last_summary": "OLLAMA_API_KEY not set"})));
-        assert!(!preserves_key_shape_mismatch_diagnostic(&json!({"status": "stopped"})));
+        assert!(!preserves_key_shape_mismatch_diagnostic(
+            &json!({"status": "error", "phase": "crashed"})
+        ));
+        assert!(!preserves_key_shape_mismatch_diagnostic(
+            &json!({"status": "error", "last_summary": "OLLAMA_API_KEY not set"})
+        ));
+        assert!(!preserves_key_shape_mismatch_diagnostic(
+            &json!({"status": "stopped"})
+        ));
         assert!(!preserves_key_shape_mismatch_diagnostic(&json!({})));
     }
 }

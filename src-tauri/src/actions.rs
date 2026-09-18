@@ -19,7 +19,7 @@
 
 use crate::control::{branches, locks, paths, registry, runner};
 use crate::notify;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 /// The CLOSED set of executable action kinds. Every `action`/`fallback` in actions.json must be a
@@ -129,7 +129,10 @@ pub fn policy_from(doc: &Value, category: &str) -> Policy {
                 .and_then(Value::as_str)
                 .unwrap_or(DEGRADED_KIND)
                 .to_string(),
-            max_fallback_runs: o.get("max_fallback_runs").and_then(Value::as_u64).unwrap_or(3),
+            max_fallback_runs: o
+                .get("max_fallback_runs")
+                .and_then(Value::as_u64)
+                .unwrap_or(3),
         },
     }
 }
@@ -245,7 +248,11 @@ fn park_primary_endpoint(repo: &Value) -> Value {
         &path,
         &name,
         &provider,
-        if model.is_empty() { None } else { Some(model.as_str()) },
+        if model.is_empty() {
+            None
+        } else {
+            Some(model.as_str())
+        },
     );
     let until = crate::improver::budget::record_quota(&ctx, &ctx.pi_provider, &ctx.pi_model);
     json!({
@@ -270,7 +277,13 @@ fn unix_now() -> u64 {
 fn page_marker_path(dir: &Path, category: &str) -> PathBuf {
     let safe: String = category
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     dir.join(format!("_paged_{safe}"))
 }
@@ -292,7 +305,7 @@ fn page_operator_deduped(repo: &Value, category: &str) -> Value {
     let dir = match paths::runtime_dir(repo) {
         Some(d) => d,
         None => {
-            return json!({"ok": false, "kind": "page_operator_deduped", "error": "repo has no runtime dir"})
+            return json!({"ok": false, "kind": "page_operator_deduped", "error": "repo has no runtime dir"});
         }
     };
     let now = unix_now();
@@ -324,7 +337,9 @@ mod tests {
     /// The REPO's actions.json (deterministic path from the manifest dir, independent of where the
     /// test binary lands): src-tauri/../actions.json.
     fn repo_actions_json() -> Value {
-        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("actions.json");
+        let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("actions.json");
         let text = std::fs::read_to_string(&p)
             .unwrap_or_else(|e| panic!("actions.json missing at {} — {e}", p.display()));
         serde_json::from_str(&text).expect("actions.json is not valid JSON")
@@ -338,7 +353,11 @@ mod tests {
     #[test]
     fn closure_every_diagnosis_maps_to_a_closed_executable_action() {
         let doc = repo_actions_json();
-        assert_eq!(doc["version"], serde_json::json!(1), "actions.json must carry version 1");
+        assert_eq!(
+            doc["version"],
+            serde_json::json!(1),
+            "actions.json must carry version 1"
+        );
         assert!(
             doc["default_ttl_s"].as_u64().unwrap_or(0) > 0,
             "actions.json needs a positive default_ttl_s"
@@ -361,7 +380,9 @@ mod tests {
                 "'{cat}' needs a positive integer ttl_s"
             );
             assert!(
-                row.get("max_fallback_runs").and_then(Value::as_u64).is_some(),
+                row.get("max_fallback_runs")
+                    .and_then(Value::as_u64)
+                    .is_some(),
                 "'{cat}' needs an integer max_fallback_runs"
             );
         }
@@ -369,9 +390,10 @@ mod tests {
         // (b) CLOSED over every row in the file (extra rows like running_stalled included).
         for (cat, row) in diagnoses {
             for field in ["action", "fallback"] {
-                let kind = row.get(field).and_then(Value::as_str).unwrap_or_else(|| {
-                    panic!("'{cat}'.{field} must be a string action kind")
-                });
+                let kind = row
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("'{cat}'.{field} must be a string action kind"));
                 assert!(
                     ACTION_KINDS.contains(&kind),
                     "'{cat}'.{field} = '{kind}' is NOT in the closed action kind set \
@@ -431,7 +453,12 @@ mod tests {
         assert!(bad["error"].as_str().unwrap().contains("closed registry"));
 
         // park on a nameless repo row refuses instead of parking a garbage ledger key.
-        let park = execute_action("park_primary_endpoint", &serde_json::json!({}), "quota_error", false);
+        let park = execute_action(
+            "park_primary_endpoint",
+            &serde_json::json!({}),
+            "quota_error",
+            false,
+        );
         assert_eq!(park["ok"], false);
     }
 
@@ -442,7 +469,9 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        unsafe {
+            std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        }
 
         let name = format!("actions_page_test_{}", std::process::id());
         let repo = serde_json::json!({ "name": name });
@@ -482,7 +511,9 @@ mod tests {
         assert!(m.starts_with(&dir));
         assert!(!m.to_string_lossy().contains(".."));
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        unsafe {
+            std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -497,7 +528,11 @@ mod tests {
         assert_eq!(load_doc_from(&bad), serde_json::json!({}));
         let arr = dir.join("arr.json");
         std::fs::write(&arr, "[1,2,3]").unwrap();
-        assert_eq!(load_doc_from(&arr), serde_json::json!({}), "non-object degrades too");
+        assert_eq!(
+            load_doc_from(&arr),
+            serde_json::json!({}),
+            "non-object degrades too"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

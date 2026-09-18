@@ -52,7 +52,7 @@
 use crate::control::{paths, proc};
 use crate::notify::{self, Notice};
 use chrono::Utc;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -191,8 +191,9 @@ const MUTATING_FS_MARKERS: &[&str] = &[
 /// Short dangerous aliases, WORD-BOUNDARY matched (a substring scan on "rm"/"del"/"irm" would trip
 /// on "form"/"deleted"/"confirm"). Denied OUTRIGHT — an alias is an obfuscation-shaped spelling of
 /// an already-denied verb, so no path allowance applies (stricter than the spec table, deliberate).
-const DENY_TOKENS: &[&str] =
-    &["rm", "del", "rmdir", "iwr", "irm", "curl", "wget", "kill", "iex", "icm"];
+const DENY_TOKENS: &[&str] = &[
+    "rm", "del", "rmdir", "iwr", "irm", "curl", "wget", "kill", "iex", "icm",
+];
 
 /// Execution-obfuscation surfaces (case-insensitive substring): `-EncodedCommand` smuggles a
 /// base64 payload past every text marker; `Invoke-Command` runs script blocks (locally or
@@ -217,7 +218,10 @@ fn push_unique(hits: &mut Vec<String>, h: &str) {
 /// True iff `prev` (the previous significant char) legitimately opens a COMMAND POSITION — start
 /// of script/line, statement separator, block/group opener, or pipe. Pure.
 fn starts_command_position(prev: Option<char>) -> bool {
-    matches!(prev, None | Some('\n') | Some(';') | Some('{') | Some('(') | Some('|'))
+    matches!(
+        prev,
+        None | Some('\n') | Some(';') | Some('{') | Some('(') | Some('|')
+    )
 }
 
 /// True iff what follows index `j` (after `&` or dot-source `.`) is an admissible LITERAL
@@ -309,7 +313,10 @@ fn call_operator_hits(script: &str) -> Vec<String> {
                 // dot-source: `.` in command position followed by whitespace (`.5` / `.Trim()` /
                 // `a.b` are not — no whitespace, or not command position).
                 let dot_source = matches!(cs.get(i + 1).copied(), Some(' ') | Some('\t'));
-                if starts_command_position(prev) && dot_source && !literal_invocation_follows(&cs, i + 1) {
+                if starts_command_position(prev)
+                    && dot_source
+                    && !literal_invocation_follows(&cs, i + 1)
+                {
                     push_unique(&mut hits, "obfuscation:dot-source-nonliteral");
                 }
             }
@@ -429,11 +436,7 @@ pub(crate) fn lint_tool(script: &str) -> Result<(), Vec<String>> {
             }
         }
     }
-    if hits.is_empty() {
-        Ok(())
-    } else {
-        Err(hits)
-    }
+    if hits.is_empty() { Ok(()) } else { Err(hits) }
 }
 
 /// Tool names become filenames + manifest keys: short, lowercase kebab/snake, letter-first — a
@@ -441,7 +444,11 @@ pub(crate) fn lint_tool(script: &str) -> Result<(), Vec<String>> {
 pub(crate) fn valid_tool_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
-        && name.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false)
+        && name
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_lowercase())
+            .unwrap_or(false)
         && name
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
@@ -451,9 +458,16 @@ pub(crate) fn valid_tool_name(name: &str) -> bool {
 /// risk posture: a false positive is at worst one linted, dry-run-gated local registration). Pure.
 pub(crate) fn is_tool_directive(line: &str) -> bool {
     let lower = line.to_lowercase();
-    ["tool", "helper", "script", "automate", "automation", "capability"]
-        .iter()
-        .any(|k| lower.contains(k))
+    [
+        "tool",
+        "helper",
+        "script",
+        "automate",
+        "automation",
+        "capability",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
 }
 
 // --------------------------------------------------------------------------- //
@@ -487,7 +501,10 @@ fn audit(event: &str, tool: &str, detail: &str) {
             std::fs::create_dir_all(parent)?;
         }
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&p)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)?;
         writeln!(
             f,
             "{}",
@@ -506,7 +523,11 @@ fn audit(event: &str, tool: &str, detail: &str) {
 // --------------------------------------------------------------------------- //
 
 /// The production subprocess runner: windowless, scrubbed env, bounded (`proc::run`).
-fn real_runner(argv: &[String], cwd: Option<&Path>, timeout: Duration) -> std::io::Result<proc::RunOut> {
+fn real_runner(
+    argv: &[String],
+    cwd: Option<&Path>,
+    timeout: Duration,
+) -> std::io::Result<proc::RunOut> {
     proc::run(argv, cwd, Some(timeout))
 }
 
@@ -540,7 +561,11 @@ where
     match runner(&argv, None, Duration::from_secs(PARSE_TIMEOUT_S)) {
         Ok(out) if out.code == 0 => {}
         Ok(out) => {
-            return Err(format!("parse: exit {} {}", out.code, super::cap_line(&out.stderr, 160)))
+            return Err(format!(
+                "parse: exit {} {}",
+                out.code,
+                super::cap_line(&out.stderr, 160)
+            ));
         }
         Err(e) => return Err(format!("parse: {e}")),
     }
@@ -693,7 +718,10 @@ fn claim_invoked_stamp(name: &str, date: &str) -> bool {
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&p)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p)?;
         f.write_all(format!("invoke {}", iso_now()).as_bytes())
     })()
     .is_ok()
@@ -741,7 +769,11 @@ where
             continue; // another OS process claimed this tool's run just now
         }
         let out = invoke_tool_with(&name, true, &[], runner);
-        audit("invoke_seam", &name, &super::cap_line(&out.to_string(), 200));
+        audit(
+            "invoke_seam",
+            &name,
+            &super::cap_line(&out.to_string(), 200),
+        );
         return out; // at most ONE validated tool invoked per sweep (bounded)
     }
     Value::Null
@@ -783,12 +815,20 @@ where
     };
     let disk_sha = crate::provenance::sha256_hex(&bytes);
     if entry.get("sha256").and_then(Value::as_str) != Some(disk_sha.as_str()) {
-        audit("invoke", name, "refused: sha256 mismatch (hand-edited body — re-register it)");
+        audit(
+            "invoke",
+            name,
+            "refused: sha256 mismatch (hand-edited body — re-register it)",
+        );
         return json!({"ok": false, "tool": name, "reason": "sha256_mismatch"});
     }
     // AUTOMATED gate only (lint + dry_run + sha256 already cleared above): a live request runs LIVE
     // autonomously; a dry-run request runs `-DryRun`. No operator `approved:true` wait.
-    let (mode, degraded) = if live { ("live", false) } else { ("dry_run", false) };
+    let (mode, degraded) = if live {
+        ("live", false)
+    } else {
+        ("dry_run", false)
+    };
     let mut argv: Vec<String> = vec![
         "powershell".into(),
         "-NoProfile".into(),
@@ -802,7 +842,11 @@ where
     if mode == "dry_run" {
         argv.push("-DryRun".into());
     }
-    let cwd = if mode == "dry_run" { sandbox_dir() } else { tools_dir() };
+    let cwd = if mode == "dry_run" {
+        sandbox_dir()
+    } else {
+        tools_dir()
+    };
     let _ = std::fs::create_dir_all(&cwd);
     let run = runner(&argv, Some(&cwd), Duration::from_secs(INVOKE_TIMEOUT_S));
     let (ok, exit_code, summary) = match &run {
@@ -822,7 +866,11 @@ where
     }
     manifest["tools"][name]["invocations"] = json!(invocations);
     let _ = write_manifest(&manifest);
-    audit("invoke", name, &format!("mode={mode} degraded={degraded} exit={exit_code}"));
+    audit(
+        "invoke",
+        name,
+        &format!("mode={mode} degraded={degraded} exit={exit_code}"),
+    );
     json!({
         "ok": ok, "tool": name, "mode": mode, "degraded": degraded,
         "exit_code": exit_code, "summary": summary,
@@ -843,7 +891,11 @@ pub fn unregister_tool(name: &str) -> Value {
     }
     let _ = write_manifest(&manifest);
     let _ = std::fs::remove_file(script_path(name));
-    audit("unregister", name, "manifest entry + script removed (rollback)");
+    audit(
+        "unregister",
+        name,
+        "manifest entry + script removed (rollback)",
+    );
     json!({"ok": true, "tool": name})
 }
 
@@ -890,7 +942,10 @@ fn claim_proposed_stamp(date: &str) -> bool {
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&p)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p)?;
         f.write_all(format!("attempt {}", iso_now()).as_bytes())
     })()
     .is_ok()
@@ -905,10 +960,13 @@ fn stamp_proposed(date: &str, note: &str) {
 /// model/skill resolution as the growth/outreach composers. Side-effectful (one LLM call);
 /// deliberately not unit-tested (the `compose_and_dispatch` precedent) — everything around it is.
 fn propose_via_brain(need: &str) -> Result<(ToolProposal, String, String), String> {
-    let model = crate::ceo::growth::pick_growth_model(&crate::improver::brain::BrainConfig::from_autopilot());
+    let model = crate::ceo::growth::pick_growth_model(
+        &crate::improver::brain::BrainConfig::from_autopilot(),
+    );
     let skill = crate::improver::brain::load_skill("_tools", "author");
     let user = serde_json::to_string_pretty(&json!({"need": need})).unwrap_or_default();
-    let reply = crate::improver::brain::spawn_worker(&model, TOOL_AUTHOR_PROMPT, &skill, &user, None)?;
+    let reply =
+        crate::improver::brain::spawn_worker(&model, TOOL_AUTHOR_PROMPT, &skill, &user, None)?;
     let parsed = super::extract_json(&reply).ok_or_else(|| "unparseable reply".to_string())?;
     let name = parsed
         .get("name")
@@ -916,13 +974,28 @@ fn propose_via_brain(need: &str) -> Result<(ToolProposal, String, String), Strin
         .unwrap_or("")
         .trim()
         .to_lowercase();
-    let purpose = super::cap_line(parsed.get("purpose").and_then(Value::as_str).unwrap_or(""), 160);
-    let script = parsed.get("script").and_then(Value::as_str).unwrap_or("").to_string();
+    let purpose = super::cap_line(
+        parsed.get("purpose").and_then(Value::as_str).unwrap_or(""),
+        160,
+    );
+    let script = parsed
+        .get("script")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     if name.is_empty() || script.trim().is_empty() {
         return Err("empty name/script".to_string());
     }
     let prompt_sha8 = crate::provenance::sha256_hex(user.as_bytes())[..8].to_string();
-    Ok((ToolProposal { name, purpose, script }, model, prompt_sha8))
+    Ok((
+        ToolProposal {
+            name,
+            purpose,
+            script,
+        },
+        model,
+        prompt_sha8,
+    ))
 }
 
 /// The day-gated TOOL-PROPOSAL seam, ridden on `ceo_slow_tail`: at most ONE propose -> lint ->
@@ -949,7 +1022,10 @@ pub fn maybe_propose_tool(_snapshot: &Value, _status: &Value) {
     }
     audit("propose", "_pending", &super::cap_line(&need, 200));
     match propose_via_brain(&need) {
-        Err(e) => stamp_proposed(&today, &format!("skip:llm_unavailable {}", super::cap_line(&e, 160))),
+        Err(e) => stamp_proposed(
+            &today,
+            &format!("skip:llm_unavailable {}", super::cap_line(&e, 160)),
+        ),
         Ok((proposal, model, prompt_sha8)) => {
             let out = register_tool(&proposal, &model, &prompt_sha8);
             let ok = out.get("ok").and_then(Value::as_bool).unwrap_or(false);
@@ -995,8 +1071,16 @@ mod tests {
     ) -> impl Fn(&[String], Option<&Path>, Duration) -> std::io::Result<proc::RunOut> + '_ {
         move |argv, _cwd, _t| {
             calls.set(calls.get() + 1);
-            let code = if argv.iter().any(|a| a == "-DryRun") { dry_code } else { 0 };
-            Ok(proc::RunOut { code, stdout: "fake ps".into(), stderr: String::new() })
+            let code = if argv.iter().any(|a| a == "-DryRun") {
+                dry_code
+            } else {
+                0
+            };
+            Ok(proc::RunOut {
+                code,
+                stdout: "fake ps".into(),
+                stderr: String::new(),
+            })
         }
     }
 
@@ -1022,7 +1106,10 @@ mod tests {
     }
 
     fn registered(name: &str) -> Value {
-        read_manifest().pointer(&format!("/tools/{name}")).cloned().unwrap_or(Value::Null)
+        read_manifest()
+            .pointer(&format!("/tools/{name}"))
+            .cloned()
+            .unwrap_or(Value::Null)
     }
 
     /// The full pipeline a usable tool walks: register runs the AUTOMATED lint + sandboxed dry-run
@@ -1045,10 +1132,22 @@ mod tests {
     fn lint_rejects_each_denied_marker_family() {
         let cases: &[(&str, &str)] = &[
             // file deletion / mutation outside runtime
-            ("Remove-Item 'C:\\Windows\\x.txt'", "fs delete outside runtime"),
-            ("Set-Content -Path 'C:\\Users\\x\\a.txt' -Value 1", "fs write outside runtime"),
-            ("Out-File -FilePath \"C:\\x.log\"", "out-file outside runtime"),
-            ("Write-Output 1 > C:\\x.txt", "redirection with no allowed path literal"),
+            (
+                "Remove-Item 'C:\\Windows\\x.txt'",
+                "fs delete outside runtime",
+            ),
+            (
+                "Set-Content -Path 'C:\\Users\\x\\a.txt' -Value 1",
+                "fs write outside runtime",
+            ),
+            (
+                "Out-File -FilePath \"C:\\x.log\"",
+                "out-file outside runtime",
+            ),
+            (
+                "Write-Output 1 > C:\\x.txt",
+                "redirection with no allowed path literal",
+            ),
             ("rm sandbox.txt", "rm alias token"),
             ("del temp.txt", "del alias token"),
             // network sends / fetches
@@ -1065,12 +1164,18 @@ mod tests {
             ("Register-ScheduledTask -TaskName x", "scheduled task"),
             ("Start-Job -ScriptBlock { 1 }", "start-job"),
             ("New-Service -Name svc", "new-service"),
-            ("Start-Process notepad.exe -WindowStyle Hidden", "start-process"),
+            (
+                "Start-Process notepad.exe -WindowStyle Hidden",
+                "start-process",
+            ),
             // eval / policy / privilege escalation
             ("Invoke-Expression $payload", "invoke-expression"),
             ("iex $x", "iex token"),
             ("Set-ExecutionPolicy Unrestricted", "execution policy"),
-            ("Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\x' -Name a -Value 1", "registry write"),
+            (
+                "Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\x' -Name a -Value 1",
+                "registry write",
+            ),
             ("Start-Process -Verb RunAs cmd", "runas"),
         ];
         for (script, why) in cases {
@@ -1084,17 +1189,32 @@ mod tests {
     fn lint_rejects_the_call_operator_obfuscation_family() {
         let cases: &[(&str, &str)] = &[
             // expression building inside the call operator (the classic linter bypass)
-            ("& ('Stop-Proc'+'ess') -Name solomon", "concat inside call operator"),
-            ("& (\"Sto\"+\"p-Process\") -Name x", "double-quote concat call"),
+            (
+                "& ('Stop-Proc'+'ess') -Name solomon",
+                "concat inside call operator",
+            ),
+            (
+                "& (\"Sto\"+\"p-Process\") -Name x",
+                "double-quote concat call",
+            ),
             ("& $cmd runtime/x", "call operator on a variable"),
-            ("& \"Stop-Pro$suffix\" -Name x", "interpolated double-quoted command name"),
+            (
+                "& \"Stop-Pro$suffix\" -Name x",
+                "interpolated double-quoted command name",
+            ),
             ("& { Stop-Something }", "scriptblock invocation"),
             ("& ([char]83 + 'top-Process')", "char-cast assembly"),
             // dotted invocation of expressions
-            ("$sb = [scriptblock]::Create($x); . $sb", "dot-sourcing a variable"),
+            (
+                "$sb = [scriptblock]::Create($x); . $sb",
+                "dot-sourcing a variable",
+            ),
             (". ($path)", "dot-sourcing a parenthesized expression"),
             // encoded / out-of-band execution
-            ("powershell -EncodedCommand SQBFAFgAIABiAGEAZA==", "-EncodedCommand"),
+            (
+                "powershell -EncodedCommand SQBFAFgAIABiAGEAZA==",
+                "-EncodedCommand",
+            ),
             ("Invoke-Command -ScriptBlock { Get-Date }", "Invoke-Command"),
             ("icm { Get-Date }", "icm alias"),
             // backtick escapes inside command position spell denied verbs without containing them
@@ -1108,7 +1228,10 @@ mod tests {
         // a backtick line continuation is not an escape.
         assert!(lint_tool("& Write-Output hello").is_ok());
         assert!(lint_tool("& 'Write-Output' hello").is_ok());
-        assert!(lint_tool("Write-Output one `\n  two").is_ok(), "line continuation is benign");
+        assert!(
+            lint_tool("Write-Output one `\n  two").is_ok(),
+            "line continuation is benign"
+        );
         // literal-but-denied names are caught by the SUBSTRING families, not missed via `&`
         assert!(lint_tool("& 'Stop-Process' -Name x").is_err());
     }
@@ -1117,11 +1240,16 @@ mod tests {
     #[test]
     fn lint_accepts_a_benign_runtime_scoped_dryrun_script() {
         let verdict = lint_tool(&benign_script());
-        assert!(verdict.is_ok(), "the benign script must lint clean: {verdict:?}");
+        assert!(
+            verdict.is_ok(),
+            "the benign script must lint clean: {verdict:?}"
+        );
         // and the name gate: sane names pass, traversal/exotic names are refused
         assert!(valid_tool_name("count-runtime-files"));
         assert!(valid_tool_name("tool_v2"));
-        for bad in ["", "..\\evil", "UPPER", "-lead", "a b", "1num", "x/..", "a.ps1"] {
+        for bad in [
+            "", "..\\evil", "UPPER", "-lead", "a b", "1num", "x/..", "a.ps1",
+        ] {
             assert!(!valid_tool_name(bad), "{bad}");
         }
     }
@@ -1140,7 +1268,11 @@ mod tests {
         let out = register_tool_with(&p, "m", "ph", &fake_runner(0, &calls));
         assert_eq!(out["ok"], false, "{out}");
         assert_eq!(out["reason"], "lint");
-        assert_eq!(calls.get(), 0, "the linter runs FIRST — no subprocess for a denied script");
+        assert_eq!(
+            calls.get(),
+            0,
+            "the linter runs FIRST — no subprocess for a denied script"
+        );
         assert!(registered(&name).is_null(), "no manifest entry");
         assert!(!script_path(&name).exists(), "no script written");
         let audit_body = std::fs::read_to_string(audit_path()).unwrap_or_default();
@@ -1155,18 +1287,31 @@ mod tests {
     fn registration_auto_validates_and_lands_usable() {
         let _l = lock();
         let name = uniq_name("autoval");
-        let p = ToolProposal { name: name.clone(), purpose: "x".into(), script: benign_script() };
+        let p = ToolProposal {
+            name: name.clone(),
+            purpose: "x".into(),
+            script: benign_script(),
+        };
         let calls = Cell::new(0u32);
         let out = register_tool_with(&p, "m", "ph", &fake_runner(0, &calls));
         assert_eq!(out["ok"], true, "{out}");
-        assert!(calls.get() >= 1, "registration RAN the sandboxed dry-run validation");
+        assert!(
+            calls.get() >= 1,
+            "registration RAN the sandboxed dry-run validation"
+        );
         let e = registered(&name);
-        assert_eq!(e["validation"], "validated", "no operator step — validated inline: {e}");
+        assert_eq!(
+            e["validation"], "validated",
+            "no operator step — validated inline: {e}"
+        );
         assert_eq!(e["dry_run"]["passed"], true);
         assert!(e["dry_run"].get("pending").is_none(), "not pending: {e}");
         // immediately invocable WITHOUT any operator approval (dry-run mode requested here)
         let out = invoke_tool_with(&name, false, &[], &fake_runner(0, &calls));
-        assert_eq!(out["ok"], true, "a validated tool invokes with NO approval: {out}");
+        assert_eq!(
+            out["ok"], true,
+            "a validated tool invokes with NO approval: {out}"
+        );
         assert_eq!(out["mode"], "dry_run");
         let _ = unregister_tool(&name);
     }
@@ -1177,25 +1322,41 @@ mod tests {
         let _l = lock();
         let name = uniq_name("reg");
         let script = benign_script();
-        let p = ToolProposal { name: name.clone(), purpose: "counts notes".into(), script: script.clone() };
+        let p = ToolProposal {
+            name: name.clone(),
+            purpose: "counts notes".into(),
+            script: script.clone(),
+        };
         let calls = Cell::new(0u32);
         let out = register_tool_with(&p, "model-z", "ab12cd34", &fake_runner(0, &calls));
         assert_eq!(out["ok"], true, "{out}");
         assert!(calls.get() >= 1, "registration ran the sandboxed dry-run");
         let e = registered(&name);
         assert_eq!(e["provenance"], "rsi:", "the provenance stamp is mandatory");
-        assert_eq!(e["sha256"], crate::provenance::sha256_hex(script.as_bytes()));
+        assert_eq!(
+            e["sha256"],
+            crate::provenance::sha256_hex(script.as_bytes())
+        );
         assert_eq!(e["validation"], "validated");
-        assert_eq!(e["dry_run"]["passed"], true, "the dry-run ran clean and is recorded");
+        assert_eq!(
+            e["dry_run"]["passed"], true,
+            "the dry-run ran clean and is recorded"
+        );
         assert!(e["dry_run"].get("pending").is_none());
         assert_eq!(e["lint"]["passed"], true);
         assert_eq!(e["authored_model"], "model-z");
         assert_eq!(e["prompt_sha8"], "ab12cd34");
         assert_eq!(e["version"], 1);
         let on_disk = std::fs::read_to_string(script_path(&name)).expect("script registered");
-        assert_eq!(on_disk, script, "the registered bytes are the exact proposal bytes");
+        assert_eq!(
+            on_disk, script,
+            "the registered bytes are the exact proposal bytes"
+        );
         let audit_body = std::fs::read_to_string(audit_path()).unwrap_or_default();
-        assert!(audit_body.contains("\"event\":\"register\""), "{audit_body}");
+        assert!(
+            audit_body.contains("\"event\":\"register\""),
+            "{audit_body}"
+        );
         let _ = unregister_tool(&name);
     }
 
@@ -1205,7 +1366,11 @@ mod tests {
         let _l = lock();
         let _ = std::fs::remove_file(manifest_path()); // hermetic: no leftover validated tools
         let name = uniq_name("invseam");
-        let p = ToolProposal { name: name.clone(), purpose: "x".into(), script: benign_script() };
+        let p = ToolProposal {
+            name: name.clone(),
+            purpose: "x".into(),
+            script: benign_script(),
+        };
         register_validated(&p);
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let _ = std::fs::remove_file(invoked_stamp_path(&name, &today)); // fresh day
@@ -1214,20 +1379,33 @@ mod tests {
         let seen_live = Cell::new(false);
         let runner = |argv: &[String], _c: Option<&Path>, _t: Duration| {
             seen_live.set(!argv.iter().any(|a| a == "-DryRun"));
-            Ok(proc::RunOut { code: 0, stdout: String::new(), stderr: String::new() })
+            Ok(proc::RunOut {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
         };
         let out = invoke_validated_tools_with(&runner);
-        assert_eq!(out["tool"], json!(name.clone()), "the validated tool is invoked: {out}");
-        assert_eq!(out["mode"], "live", "the seam invokes LIVE autonomously: {out}");
+        assert_eq!(
+            out["tool"],
+            json!(name.clone()),
+            "the validated tool is invoked: {out}"
+        );
+        assert_eq!(
+            out["mode"], "live",
+            "the seam invokes LIVE autonomously: {out}"
+        );
         assert!(seen_live.get(), "the live run carries no -DryRun switch");
-        assert!(invoked_stamp_path(&name, &today).exists(), "the per-tool per-day cap is claimed");
+        assert!(
+            invoked_stamp_path(&name, &today).exists(),
+            "the per-tool per-day cap is claimed"
+        );
 
         // a SECOND sweep the same day is capped — nothing runs (bounded)
-        let out2 = invoke_validated_tools_with(
-            &|_a: &[String], _c: Option<&Path>, _t: Duration| {
+        let out2 =
+            invoke_validated_tools_with(&|_a: &[String], _c: Option<&Path>, _t: Duration| {
                 panic!("the per-tool per-day cap must block a second same-day invoke")
-            },
-        );
+            });
         assert!(out2.is_null(), "the daily cap holds: {out2}");
         let _ = std::fs::remove_file(invoked_stamp_path(&name, &today));
         let _ = unregister_tool(&name);
@@ -1238,13 +1416,26 @@ mod tests {
     fn dry_run_failing_proposal_registers_nothing_and_audits() {
         let _l = lock();
         let name = uniq_name("dryfail");
-        let p = ToolProposal { name: name.clone(), purpose: "x".into(), script: benign_script() };
+        let p = ToolProposal {
+            name: name.clone(),
+            purpose: "x".into(),
+            script: benign_script(),
+        };
         let calls = Cell::new(0u32);
         let out = register_tool_with(&p, "m", "ph", &fake_runner(7, &calls)); // -DryRun exits 7
-        assert_eq!(out["ok"], false, "a dry-run failure rejects registration: {out}");
+        assert_eq!(
+            out["ok"], false,
+            "a dry-run failure rejects registration: {out}"
+        );
         assert_eq!(out["reason"], "dry_run");
-        assert!(registered(&name).is_null(), "NO manifest entry for a dry-run-failing tool");
-        assert!(!script_path(&name).exists(), "NO script written for a dry-run-failing tool");
+        assert!(
+            registered(&name).is_null(),
+            "NO manifest entry for a dry-run-failing tool"
+        );
+        assert!(
+            !script_path(&name).exists(),
+            "NO script written for a dry-run-failing tool"
+        );
         // it cannot be invoked (never registered)
         let out = invoke_tool_with(&name, false, &[], &fake_runner(0, &calls));
         assert_eq!(out["reason"], "not_found");
@@ -1257,11 +1448,19 @@ mod tests {
     fn tampered_script_body_is_refused_at_invoke() {
         let _l = lock();
         let name = uniq_name("tamper");
-        let p = ToolProposal { name: name.clone(), purpose: "x".into(), script: benign_script() };
+        let p = ToolProposal {
+            name: name.clone(),
+            purpose: "x".into(),
+            script: benign_script(),
+        };
         let calls = Cell::new(0u32);
         register_validated(&p);
         // hand-edit the on-disk body (bypassing registration)
-        std::fs::write(script_path(&name), "param([switch]$DryRun)\nexit 0\n# edited").unwrap();
+        std::fs::write(
+            script_path(&name),
+            "param([switch]$DryRun)\nexit 0\n# edited",
+        )
+        .unwrap();
         let out = invoke_tool_with(&name, false, &[], &fake_runner(0, &calls));
         assert_eq!(out["ok"], false, "{out}");
         assert_eq!(out["reason"], "sha256_mismatch");
@@ -1273,18 +1472,32 @@ mod tests {
     fn live_invoke_runs_autonomously_without_approval() {
         let _l = lock();
         let name = uniq_name("liveauto");
-        let p = ToolProposal { name: name.clone(), purpose: "x".into(), script: benign_script() };
+        let p = ToolProposal {
+            name: name.clone(),
+            purpose: "x".into(),
+            script: benign_script(),
+        };
         register_validated(&p);
 
         // (23) live requested on a validated tool -> runs LIVE, no operator approved:true wait.
         let seen_dryrun = Cell::new(false);
         let runner = |argv: &[String], _c: Option<&Path>, _t: Duration| {
             seen_dryrun.set(argv.iter().any(|a| a == "-DryRun"));
-            Ok(proc::RunOut { code: 0, stdout: String::new(), stderr: String::new() })
+            Ok(proc::RunOut {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
         };
         let out = invoke_tool_with(&name, true, &[], &runner);
-        assert_eq!(out["mode"], "live", "a validated tool runs LIVE with NO approval: {out}");
-        assert_eq!(out["degraded"], false, "no degradation — the automated gates already cleared it");
+        assert_eq!(
+            out["mode"], "live",
+            "a validated tool runs LIVE with NO approval: {out}"
+        );
+        assert_eq!(
+            out["degraded"], false,
+            "no degradation — the automated gates already cleared it"
+        );
         assert!(!seen_dryrun.get(), "a live run carries no -DryRun switch");
 
         // (24) a dry-run request still runs -DryRun (the caller chooses the mode).
@@ -1304,9 +1517,16 @@ mod tests {
     fn unregister_removes_entry_and_script_and_audits() {
         let _l = lock();
         let name = uniq_name("unreg");
-        let p = ToolProposal { name: name.clone(), purpose: "x".into(), script: benign_script() };
+        let p = ToolProposal {
+            name: name.clone(),
+            purpose: "x".into(),
+            script: benign_script(),
+        };
         let calls = Cell::new(0u32);
-        assert_eq!(register_tool_with(&p, "m", "ph", &fake_runner(0, &calls))["ok"], true);
+        assert_eq!(
+            register_tool_with(&p, "m", "ph", &fake_runner(0, &calls))["ok"],
+            true
+        );
         assert!(script_path(&name).exists());
 
         let out = unregister_tool(&name);
@@ -1314,7 +1534,10 @@ mod tests {
         assert!(registered(&name).is_null(), "manifest entry removed");
         assert!(!script_path(&name).exists(), "script removed");
         let audit_body = std::fs::read_to_string(audit_path()).unwrap_or_default();
-        assert!(audit_body.contains("\"event\":\"unregister\""), "{audit_body}");
+        assert!(
+            audit_body.contains("\"event\":\"unregister\""),
+            "{audit_body}"
+        );
         // a subsequent invoke reports not_found
         let out = invoke_tool_with(&name, false, &[], &fake_runner(0, &calls));
         assert_eq!(out["reason"], "not_found");
@@ -1350,7 +1573,11 @@ mod tests {
         ] {
             assert!(is_tool_directive(pos), "{pos}");
         }
-        for neg in ["fix the trader bug", "improve README", "cold outreach to partners"] {
+        for neg in [
+            "fix the trader bug",
+            "improve README",
+            "cold outreach to partners",
+        ] {
             assert!(!is_tool_directive(neg), "{neg}");
         }
     }

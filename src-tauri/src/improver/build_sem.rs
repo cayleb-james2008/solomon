@@ -94,7 +94,8 @@ fn try_claim(path: &Path) -> Option<String> {
             let _ = std::fs::remove_file(path); // never leave a 0-byte slot pinned forever
             return None;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => { /* fall through to takeover */ }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => { /* fall through to takeover */
+        }
         Err(_) => return None, // transient ACL/IO -> treat as busy this round
     }
     // Slot exists. Is its holder alive?
@@ -247,7 +248,10 @@ mod tests {
                 acquired: true,
             };
         } // drop must NOT delete a slot another lane now owns
-        assert!(slot.exists(), "token-guarded drop never clobbers a takeover");
+        assert!(
+            slot.exists(),
+            "token-guarded drop never clobbers a takeover"
+        );
 
         // A fallback guard drops without touching anything.
         let _fb = BuildSlot {

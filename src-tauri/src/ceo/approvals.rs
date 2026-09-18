@@ -25,7 +25,7 @@
 use crate::control::{paths, proc, registry};
 use crate::pecrt::warm::ObservationLog;
 use chrono::Utc;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 
 /// `runtime/_pending_approvals.md` — the human-readable surface (regenerated every tick).
@@ -35,7 +35,9 @@ fn md_path() -> PathBuf {
 
 /// `runtime/_pending_approvals.json` — the machine-readable twin for the dashboard/GUI.
 fn json_path() -> PathBuf {
-    paths::here().join("runtime").join("_pending_approvals.json")
+    paths::here()
+        .join("runtime")
+        .join("_pending_approvals.json")
 }
 
 /// `runtime/_tools/tools_manifest.json` — the self-tooling manifest (see `ceo::self_tooling`).
@@ -43,7 +45,10 @@ fn json_path() -> PathBuf {
 /// never drift between the writer and this reader. Deliberately under gitignored `runtime/` —
 /// NEVER a `provenance::TRACKED` watched file (a runtime artifact, not tracked source).
 pub(crate) fn tools_manifest_path() -> PathBuf {
-    paths::here().join("runtime").join("_tools").join("tools_manifest.json")
+    paths::here()
+        .join("runtime")
+        .join("_tools")
+        .join("tools_manifest.json")
 }
 
 // --------------------------------------------------------------------------- //
@@ -122,10 +127,13 @@ pub(crate) fn collect_tools_pending(manifest: &Value) -> Vec<Value> {
         .map(|(name, e)| {
             let pending_validation =
                 e.pointer("/dry_run/pending").and_then(Value::as_bool) == Some(true);
-            let dry_run_passed =
-                e.pointer("/dry_run/passed").and_then(Value::as_bool).unwrap_or(false);
-            let retire =
-                format!("delete tools.{name} from runtime\\_tools\\tools_manifest.json to retire it");
+            let dry_run_passed = e
+                .pointer("/dry_run/passed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let retire = format!(
+                "delete tools.{name} from runtime\\_tools\\tools_manifest.json to retire it"
+            );
             let action = if dry_run_passed && !pending_validation {
                 format!(
                     "invokes AUTONOMOUSLY behind the lint + sandboxed dry-run + sha256 gates (the \
@@ -288,7 +296,11 @@ pub fn regenerate() -> Value {
             // catch_unwind PER lane+log (edge E19): a corrupt log can never wedge the surface —
             // that one row is omitted and every other lane still renders.
             let newest = std::panic::catch_unwind(|| {
-                ObservationLog::at(path.clone()).tail(1).into_iter().next().unwrap_or_default()
+                ObservationLog::at(path.clone())
+                    .tail(1)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default()
             })
             .unwrap_or_default();
             if !newest.trim().is_empty() {
@@ -353,19 +365,35 @@ mod tests {
     #[test]
     fn collect_growth_pending_surfaces_only_auto_publishable_content_lines() {
         let rows = vec![
-            growth_row("sover", "2026-07-16\trsi: growth DRAFT [GATED, unpublished, organic] lane=sover: x (t=1)"),
-            growth_row("dotz", "2026-07-16\t{\"approved\": true, \"title\": \"ship it\"}"),
+            growth_row(
+                "sover",
+                "2026-07-16\trsi: growth DRAFT [GATED, unpublished, organic] lane=sover: x (t=1)",
+            ),
+            growth_row(
+                "dotz",
+                "2026-07-16\t{\"approved\": true, \"title\": \"ship it\"}",
+            ),
             growth_row("", "2026-07-16\tnameless row is skipped (t=1)"),
             growth_row("blank", "   "),
         ];
         let out = collect_growth_pending(&rows);
-        assert_eq!(out.len(), 1, "only the publishable sover content line surfaces: {out:?}");
+        assert_eq!(
+            out.len(),
+            1,
+            "only the publishable sover content line surfaces: {out:?}"
+        );
         assert_eq!(out[0]["lane"], "sover");
         // the action states the AUTONOMOUS truth + the EXACT stop edit
         let action = out[0]["action"].as_str().unwrap();
-        assert!(action.contains("will auto-publish at next slow-tail sweep"), "{action}");
+        assert!(
+            action.contains("will auto-publish at next slow-tail sweep"),
+            "{action}"
+        );
         assert!(action.contains("unless removed"), "{action}");
-        assert!(action.contains("delete the newest line of runtime/sover/growth_drafts.jsonl"), "{action}");
+        assert!(
+            action.contains("delete the newest line of runtime/sover/growth_drafts.jsonl"),
+            "{action}"
+        );
         // JSON control lines of ANY shape are not content — the seam refuses them, nothing imminent
         let control = vec![
             growth_row("a", "{\"approved\": \"true\"}"),
@@ -373,7 +401,10 @@ mod tests {
         ];
         assert!(collect_growth_pending(&control).is_empty());
         // a persona-violating draft will never auto-publish — never listed as imminent
-        let persona = vec![growth_row("c", "2026-07-16\tdraft credited to cayleb (t=1)")];
+        let persona = vec![growth_row(
+            "c",
+            "2026-07-16\tdraft credited to cayleb (t=1)",
+        )];
         assert!(collect_growth_pending(&persona).is_empty());
     }
 
@@ -390,9 +421,13 @@ mod tests {
         let action = out[0]["action"].as_str().unwrap();
         assert!(action.contains("auto-sends (no approval wait)"), "{action}");
         assert!(action.contains("operator target list"), "{action}");
-        assert!(action.contains("runtime/sover/outreach_outbox.jsonl"), "{action}");
+        assert!(
+            action.contains("runtime/sover/outreach_outbox.jsonl"),
+            "{action}"
+        );
         // a hand-edited JSON control line is not a queued composer draft — never surfaces
-        let approved = "{\"approved\": true, \"to\": \"p@o.com\", \"subject\": \"s\", \"body\": \"b\"}";
+        let approved =
+            "{\"approved\": true, \"to\": \"p@o.com\", \"subject\": \"s\", \"body\": \"b\"}";
         assert!(collect_outreach_pending(&[outreach_row("sover", approved)]).is_empty());
     }
 
@@ -407,7 +442,11 @@ mod tests {
                      "lint": {"passed": true}, "dry_run": {"passed": false}},
         }});
         let out = collect_tools_pending(&manifest);
-        assert_eq!(out.len(), 2, "approved:true is excluded, absent/false surface: {out:?}");
+        assert_eq!(
+            out.len(),
+            2,
+            "approved:true is excluded, absent/false surface: {out:?}"
+        );
         assert_eq!(out[0]["name"], "alpha"); // deterministic (sorted) order
         assert_eq!(out[1]["name"], "beta");
         assert_eq!(out[1]["dry_run_passed"], false);
@@ -460,7 +499,8 @@ mod tests {
     // -------- fact field extraction (pure) --------
     #[test]
     fn fact_field_and_subject_extraction() {
-        let fact = "rsi: outreach DRAFT lane=x target=k1 to=a@b.c subj=Two word subject :: body (t=1)";
+        let fact =
+            "rsi: outreach DRAFT lane=x target=k1 to=a@b.c subj=Two word subject :: body (t=1)";
         assert_eq!(fact_field(fact, "to="), "a@b.c");
         assert_eq!(fact_field(fact, "target="), "k1");
         assert_eq!(fact_subject(fact), "Two word subject");
@@ -490,19 +530,34 @@ mod tests {
         assert!(md.starts_with("# Pending approvals"), "{md}");
         assert!(md.contains("growth: 1 | outreach: 1 | tools: 2"), "{md}");
         // the header tells the AUTONOMY truth — and the pre-7/16 claim is gone
-        assert!(md.contains("run AUTONOMOUSLY behind automated gates"), "{md}");
+        assert!(
+            md.contains("run AUTONOMOUSLY behind automated gates"),
+            "{md}"
+        );
         assert!(md.contains("Still human-gated: money-out"), "{md}");
         assert!(!md.contains("Solomon never self-approves"), "{md}");
         assert!(!md.contains("waits for an operator-set"), "{md}");
         // growth: auto-publish relabel + the stop edit
-        assert!(md.contains("## Growth drafts (will auto-publish at next slow-tail unless removed)"), "{md}");
-        assert!(md.contains("delete the newest line of runtime/sover/growth_drafts.jsonl"), "{md}");
+        assert!(
+            md.contains("## Growth drafts (will auto-publish at next slow-tail unless removed)"),
+            "{md}"
+        );
+        assert!(
+            md.contains("delete the newest line of runtime/sover/growth_drafts.jsonl"),
+            "{md}"
+        );
         // outreach: autonomous send + the outbox stop edit
-        assert!(md.contains("## Outreach drafts (queued for autonomous send)"), "{md}");
+        assert!(
+            md.contains("## Outreach drafts (queued for autonomous send)"),
+            "{md}"
+        );
         assert!(md.contains("to p@o.com / subj hello there"), "{md}");
         assert!(md.contains("runtime/sover/outreach_outbox.jsonl"), "{md}");
         // tools: no approval gate; the legacy stub keeps its honest dry_run=pending flag
-        assert!(md.contains("## Self-authored tools (autonomous — no operator approval gate)"), "{md}");
+        assert!(
+            md.contains("## Self-authored tools (autonomous — no operator approval gate)"),
+            "{md}"
+        );
         assert!(md.contains("invokes AUTONOMOUSLY"), "{md}");
         assert!(md.contains("(lint=true dry_run=pending)"), "{md}");
         assert!(md.contains("delete tools.fresh"), "{md}");
@@ -514,13 +569,18 @@ mod tests {
         let md = render_md(&[], &[], &[]);
         assert!(md.contains("growth: 0 | outreach: 0 | tools: 0"), "{md}");
         assert!(md.contains("Nothing pending.\n"), "{md}");
-        assert!(!md.contains("##"), "no fabricated sections on an empty surface: {md}");
+        assert!(
+            !md.contains("##"),
+            "no fabricated sections on an empty surface: {md}"
+        );
     }
 
     // -------- regenerate writes both surfaces (hermetic temp home) --------
     #[test]
     fn regenerate_writes_both_surfaces_and_returns_counts() {
-        let _l = APPROVALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _l = APPROVALS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let out = regenerate();
         assert_eq!(out["ok"], true, "{out}");
         // counts are present and numeric; their CORRECTNESS is pinned by the pure collector tests

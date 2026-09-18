@@ -24,7 +24,7 @@
 //!   * ideate(): the is_running guard precedes the API-key check.
 
 use crate::control::{branches, contracts, heartbeat, locks, paths, proc};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -140,7 +140,15 @@ fn beautify_argv(repo: &Value, auto_push: bool, py: &str, runner: &str, path: &s
 
 /// Build enrich/ideate argv (identical except the final flag: --provision vs --ideate). `py`=self exe
 /// (program), `runner`="run-improver" subcommand token.
-fn provision_argv(repo: &Value, py: &str, runner: &str, path: &str, name: &str, prov: &str, final_flag: &str) -> Vec<String> {
+fn provision_argv(
+    repo: &Value,
+    py: &str,
+    runner: &str,
+    path: &str,
+    name: &str,
+    prov: &str,
+    final_flag: &str,
+) -> Vec<String> {
     vec![
         py.to_string(),
         runner.to_string(),
@@ -297,7 +305,8 @@ pub fn stop(repo: &Value) -> Value {
         Some(p) => p,
     };
     // 2. write empty sentinel; OSError (makedirs or write) -> error string.
-    if let Err(e) = std::fs::create_dir_all(&rsi).and_then(|_| std::fs::write(rsi.join("stop"), "")) {
+    if let Err(e) = std::fs::create_dir_all(&rsi).and_then(|_| std::fs::write(rsi.join("stop"), ""))
+    {
         return json!({"ok": false, "error": e.to_string()});
     }
     // 3. GRACE LOOP: check-then-sleep(1), up to 5 iterations. is_running never raises in this port
@@ -347,7 +356,15 @@ pub fn enrich_contract(repo: &Value, background: bool) -> Value {
     // 3/4. the runner is now this same binary's `run-improver` subcommand (no external Python host).
     let program = self_exe();
     // 5. argv.
-    let argv = provision_argv(repo, &program, "run-improver", &path, &name, &prov, "--provision");
+    let argv = provision_argv(
+        repo,
+        &program,
+        "run-improver",
+        &path,
+        &name,
+        &prov,
+        "--provision",
+    );
     // 6. background spawn.
     if background {
         return match spawn_detached(&argv, &path) {
@@ -362,7 +379,11 @@ pub fn enrich_contract(repo: &Value, background: bool) -> Value {
     // never on a healthy run. Mirrors the 4bbfd99 watchdog tick discipline: a hung subprocess must
     // NEVER wedge the caller indefinitely. `Err(TimedOut)` maps to the existing `error` branch.
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let r = match proc::run(&argv_refs, Some(Path::new(&path)), Some(Duration::from_secs(660))) {
+    let r = match proc::run(
+        &argv_refs,
+        Some(Path::new(&path)),
+        Some(Duration::from_secs(660)),
+    ) {
         Ok(o) => o,
         Err(e) => return json!({"ok": false, "error": e.to_string()}),
     };
@@ -394,7 +415,15 @@ pub fn ideate(repo: &Value) -> Value {
     // 4/5. the runner is now this same binary's `run-improver` subcommand (no external Python host).
     let program = self_exe();
     // 6. argv (differs from enrich only by the final flag).
-    let argv = provision_argv(repo, &program, "run-improver", &path, &name, &prov, "--ideate");
+    let argv = provision_argv(
+        repo,
+        &program,
+        "run-improver",
+        &path,
+        &name,
+        &prov,
+        "--ideate",
+    );
     // 7. blocking capture.
     // 660s ceiling — 10% over the `run-improver --ideate` child's internal 600s wall
     // (`TIMEOUT_PHASE_600` in pi.rs). `ideate` runs on the watchdog tick path
@@ -403,7 +432,11 @@ pub fn ideate(repo: &Value) -> Value {
     // or orphaned cargo grandchild would hang the whole sweep. `Err(TimedOut)` maps to the existing
     // `error` branch so the lane escalates instead of hanging the tick.
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let r = match proc::run(&argv_refs, Some(Path::new(&path)), Some(Duration::from_secs(660))) {
+    let r = match proc::run(
+        &argv_refs,
+        Some(Path::new(&path)),
+        Some(Duration::from_secs(660)),
+    ) {
         Ok(o) => o,
         Err(e) => return json!({"ok": false, "error": e.to_string()}),
     };
@@ -440,10 +473,30 @@ mod tests {
         assert_eq!(
             argv,
             vec![
-                "PROG.exe", "run-improver", "--repo", "C:/p/sover", "--name", "sover",
-                "--provider", "ollama-cloud", "--model", "glm-5.2", "--ship", "pr",
-                "--gate", "", "--pr-target-branch", "main", "--reasoning", "xhigh",
-                "--interval", "120", "--max-iterations", "0", "--goal", ""
+                "PROG.exe",
+                "run-improver",
+                "--repo",
+                "C:/p/sover",
+                "--name",
+                "sover",
+                "--provider",
+                "ollama-cloud",
+                "--model",
+                "glm-5.2",
+                "--ship",
+                "pr",
+                "--gate",
+                "",
+                "--pr-target-branch",
+                "main",
+                "--reasoning",
+                "xhigh",
+                "--interval",
+                "120",
+                "--max-iterations",
+                "0",
+                "--goal",
+                ""
             ]
         );
     }
@@ -455,7 +508,11 @@ mod tests {
         let prog = self_exe();
         assert!(!prog.is_empty());
         // Production program token is whatever current_exe() resolves to (or the solomon.exe fallback).
-        assert!(prog.ends_with(".exe") || prog.contains("solomon") || prog.contains(std::path::MAIN_SEPARATOR));
+        assert!(
+            prog.ends_with(".exe")
+                || prog.contains("solomon")
+                || prog.contains(std::path::MAIN_SEPARATOR)
+        );
     }
 
     #[test]
@@ -511,9 +568,24 @@ mod tests {
         assert_eq!(
             argv,
             vec![
-                "PROG.exe", "run-improver", "--repo", "C:/p/sover", "--name", "sover",
-                "--provider", "ollama-cloud", "--model", "glm-5.2", "--ship", "pr",
-                "--pr-target-branch", "main", "--reasoning", "xhigh", "--beautify", "--once"
+                "PROG.exe",
+                "run-improver",
+                "--repo",
+                "C:/p/sover",
+                "--name",
+                "sover",
+                "--provider",
+                "ollama-cloud",
+                "--model",
+                "glm-5.2",
+                "--ship",
+                "pr",
+                "--pr-target-branch",
+                "main",
+                "--reasoning",
+                "xhigh",
+                "--beautify",
+                "--once"
             ]
         );
         assert!(!argv.iter().any(|a| a == "--gate"));
@@ -533,8 +605,14 @@ mod tests {
     #[test]
     fn beautify_empty_repo_unknown() {
         // GV: {} or null -> "unknown repo".
-        assert_eq!(beautify(&json!({}), true), json!({"ok": false, "error": "unknown repo"}));
-        assert_eq!(beautify(&Value::Null, true), json!({"ok": false, "error": "unknown repo"}));
+        assert_eq!(
+            beautify(&json!({}), true),
+            json!({"ok": false, "error": "unknown repo"})
+        );
+        assert_eq!(
+            beautify(&Value::Null, true),
+            json!({"ok": false, "error": "unknown repo"})
+        );
     }
 
     #[test]
@@ -567,13 +645,32 @@ mod tests {
     fn enrich_argv_shape() {
         // GV: enrich passthrough argv ends with --provision.
         let repo = json!({"name": "sover", "path": "C:/p/sover", "provider": "ollama-cloud", "model": "glm-5.2", "goal": ""});
-        let argv = provision_argv(&repo, PROG, RUNNER, "C:/p/sover", "sover", "ollama-cloud", "--provision");
+        let argv = provision_argv(
+            &repo,
+            PROG,
+            RUNNER,
+            "C:/p/sover",
+            "sover",
+            "ollama-cloud",
+            "--provision",
+        );
         assert_eq!(argv[1], "run-improver");
         assert_eq!(
             argv,
             vec![
-                "PROG.exe", "run-improver", "--repo", "C:/p/sover", "--name", "sover",
-                "--provider", "ollama-cloud", "--model", "glm-5.2", "--goal", "", "--provision"
+                "PROG.exe",
+                "run-improver",
+                "--repo",
+                "C:/p/sover",
+                "--name",
+                "sover",
+                "--provider",
+                "ollama-cloud",
+                "--model",
+                "glm-5.2",
+                "--goal",
+                "",
+                "--provision"
             ]
         );
     }
@@ -581,7 +678,15 @@ mod tests {
     #[test]
     fn ideate_argv_differs_only_by_final_flag() {
         let repo = json!({"name": "sover", "path": "C:/p/sover", "provider": "ollama-cloud", "model": "glm-5.2", "goal": ""});
-        let argv = provision_argv(&repo, PROG, RUNNER, "C:/p/sover", "sover", "ollama-cloud", "--ideate");
+        let argv = provision_argv(
+            &repo,
+            PROG,
+            RUNNER,
+            "C:/p/sover",
+            "sover",
+            "ollama-cloud",
+            "--ideate",
+        );
         assert_eq!(argv.last().unwrap(), "--ideate");
         assert!(!argv.iter().any(|a| a == "--provision"));
     }
@@ -631,7 +736,10 @@ mod tests {
     #[test]
     fn provision_error_default_fallback() {
         // GV: both empty -> fallback string.
-        assert_eq!(provision_error("", "", "provision failed"), "provision failed");
+        assert_eq!(
+            provision_error("", "", "provision failed"),
+            "provision failed"
+        );
         assert_eq!(provision_error("", "", "ideate failed"), "ideate failed");
     }
 
@@ -659,15 +767,28 @@ mod tests {
     fn provider_key_ready_per_repo_key_counts() {
         // per-repo key set -> ready regardless of global .env state
         let repo = json!({ "name": "pkr_1", "provider": "openrouter", "api_key": "sk-or-v1-xyz" });
-        assert!(provider_key_ready(&repo), "per-repo api_key must count as ready");
+        assert!(
+            provider_key_ready(&repo),
+            "per-repo api_key must count as ready"
+        );
         let repo2 = json!({ "name": "pkr_2", "provider": "ollama-cloud", "api_key": "oc-key-abc" });
-        assert!(provider_key_ready(&repo2), "per-repo api_key counts for any provider");
+        assert!(
+            provider_key_ready(&repo2),
+            "per-repo api_key counts for any provider"
+        );
         // no per-repo key, no global key -> not ready (the global check is env-dependent, but an
         // unknown provider with no per-repo key is deterministically not ready)
         let repo3 = json!({ "name": "pkr_3", "provider": "definitely-not-a-real-provider" });
-        assert!(!provider_key_ready(&repo3), "no per-repo key + unknown provider -> not ready");
+        assert!(
+            !provider_key_ready(&repo3),
+            "no per-repo key + unknown provider -> not ready"
+        );
         // empty per-repo key falls through to the global check
-        let repo4 = json!({ "name": "pkr_4", "provider": "definitely-not-a-real-provider", "api_key": "" });
-        assert!(!provider_key_ready(&repo4), "empty per-repo key -> falls through to global (unknown provider -> not ready)");
+        let repo4 =
+            json!({ "name": "pkr_4", "provider": "definitely-not-a-real-provider", "api_key": "" });
+        assert!(
+            !provider_key_ready(&repo4),
+            "empty per-repo key -> falls through to global (unknown provider -> not ready)"
+        );
     }
 }

@@ -138,8 +138,8 @@ fn append_at(entry: &LedgerEntry, target: &Path) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("fleet_ledger: create_dir_all {}: {e}", target.display()))?;
     }
-    let line = serde_json::to_string(entry)
-        .map_err(|e| format!("fleet_ledger: serialize entry: {e}"))?;
+    let line =
+        serde_json::to_string(entry).map_err(|e| format!("fleet_ledger: serialize entry: {e}"))?;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -399,7 +399,11 @@ mod tests {
         assert!(p.exists(), "file must exist after ensure_exists");
         let content = std::fs::read_to_string(&p).unwrap();
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
-        assert_eq!(lines.len(), 1, "a freshly provisioned file has exactly the schema row");
+        assert_eq!(
+            lines.len(),
+            1,
+            "a freshly provisioned file has exactly the schema row"
+        );
         let row: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(row["project"], json!("_schema"));
         assert_eq!(row["source"], json!("_schema"));
@@ -433,7 +437,10 @@ mod tests {
         std::fs::write(&blocker, "blocker").unwrap();
         let target = blocker.join("fleet_ledger.jsonl"); // parent is a file → unwritable
         let res = ensure_exists_at(&target);
-        assert!(res.is_err(), "ensure_exists must fail when the path is unwritable");
+        assert!(
+            res.is_err(),
+            "ensure_exists must fail when the path is unwritable"
+        );
         let err = res.unwrap_err();
         assert!(
             err.contains("refusing to start"),
@@ -455,7 +462,10 @@ mod tests {
 
         e = valid_entry();
         e.project = "   ".into();
-        assert!(validate(&e).is_err(), "whitespace-only project must be rejected");
+        assert!(
+            validate(&e).is_err(),
+            "whitespace-only project must be rejected"
+        );
 
         e = valid_entry();
         e.ts = "".into();
@@ -483,7 +493,10 @@ mod tests {
         let mut e = valid_entry();
         e.revenue_usd = -5.00; // a refund
         e.cost_usd = -2.00; // a cost reversal
-        assert!(validate(&e).is_ok(), "negative dollars (refunds) must be allowed");
+        assert!(
+            validate(&e).is_ok(),
+            "negative dollars (refunds) must be allowed"
+        );
     }
 
     // -------- append_at rejects an invalid entry (validation gates the write) --------
@@ -493,7 +506,10 @@ mod tests {
         std::fs::write(&p, "").unwrap();
         let mut e = valid_entry();
         e.project = "".into();
-        assert!(append_at(&e, &p).is_err(), "append must reject an invalid entry");
+        assert!(
+            append_at(&e, &p).is_err(),
+            "append must reject an invalid entry"
+        );
         // And the file must be UNCHANGED (no partial write).
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
@@ -573,10 +589,12 @@ mod tests {
         assert_eq!(rows[0]["revenue_usd"], json!(12.5));
         assert_eq!(rows[0]["source"], json!("digital_product"));
         assert_eq!(rows[0]["cost_usd"], json!(0.0));
-        assert!(rows[0]["note"]
-            .as_str()
-            .unwrap()
-            .starts_with("rev_aaaaaaaaaaaa"));
+        assert!(
+            rows[0]["note"]
+                .as_str()
+                .unwrap()
+                .starts_with("rev_aaaaaaaaaaaa")
+        );
         // idempotent: a second rollup appends nothing (dedup by sover id)
         let n2 = rollup_from(&sover_data, &fleet);
         assert_eq!(n2, 0, "re-run must not double-append");
@@ -616,7 +634,11 @@ mod tests {
             source: "tips".into(),
             note: Some("rev_cccccccccccc (sover/ggg)".into()),
         };
-        std::fs::write(&fleet, format!("{}\n", serde_json::to_string(&pre).unwrap())).unwrap();
+        std::fs::write(
+            &fleet,
+            format!("{}\n", serde_json::to_string(&pre).unwrap()),
+        )
+        .unwrap();
         write_sover_ledger(
             &sover_data,
             "ggg",
@@ -635,12 +657,18 @@ mod tests {
     #[test]
     fn map_sover_entry_rejects_bad_rows() {
         assert!(
-            map_sover_entry("ggg", &json!({"id": "rev_x", "amount": 1.0, "date": "2026-07-15"}))
-                .is_some()
+            map_sover_entry(
+                "ggg",
+                &json!({"id": "rev_x", "amount": 1.0, "date": "2026-07-15"})
+            )
+            .is_some()
         );
         assert!(
-            map_sover_entry("ggg", &json!({"id": "rev_x", "amount": 0.0, "date": "2026-07-15"}))
-                .is_none(),
+            map_sover_entry(
+                "ggg",
+                &json!({"id": "rev_x", "amount": 0.0, "date": "2026-07-15"})
+            )
+            .is_none(),
             "zero amount rejected (money-IN only)"
         );
         assert!(
@@ -652,8 +680,11 @@ mod tests {
             "NaN rejected"
         );
         assert!(
-            map_sover_entry("ggg", &json!({"id": "bad", "amount": 1.0, "date": "2026-07-15"}))
-                .is_none(),
+            map_sover_entry(
+                "ggg",
+                &json!({"id": "bad", "amount": 1.0, "date": "2026-07-15"})
+            )
+            .is_none(),
             "non-rev id rejected"
         );
         assert!(

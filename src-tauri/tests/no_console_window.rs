@@ -99,10 +99,7 @@ const NON_CONSOLE_PROGRAM_LITERALS: &[&str] = &["\"/bin/sh\"", "\"/bin/bash\"", 
 /// program arg is a variable (not a literal), so the program-literal exemption can't catch them.
 /// `api.rs::open_in_browser` — `rundll32 url.dll,FileProtocolHandler` / `open` / `xdg-open` — are OS
 /// default-protocol handlers that do not create a console window (mirrors Python `webbrowser.open`).
-const BROWSER_OPEN_SITES: &[(&str, u32)] = &[
-    ("api.rs", 1096),
-    ("api.rs", 1109),
-];
+const BROWSER_OPEN_SITES: &[(&str, u32)] = &[("api.rs", 1096), ("api.rs", 1109)];
 
 /// How many lines forward from a `Command::new(` to look for a guard marker. Generous for the
 /// current codebase (the farthest guard sits ~12 lines away). The window does NOT stop early at
@@ -126,7 +123,9 @@ fn source_root() -> PathBuf {
 /// Recursively collect every `.rs` file under `root`, skipping nothing (the caller passes `src/`,
 /// which already excludes `tests/` and `target/`). Sorted for deterministic output.
 fn collect_rs_files(root: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(root) else { return };
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
     let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
     paths.sort();
     for p in paths {
@@ -228,7 +227,12 @@ fn rel_path(abs: &Path, root: &Path) -> String {
     abs.strip_prefix(root)
         .ok()
         .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|| abs.file_name().unwrap_or_default().to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            abs.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        })
 }
 
 /// Scan every `.rs` file under `src/` and return every production `Command::new` site that lacks a
@@ -240,7 +244,9 @@ fn scan(root: &Path) -> (Vec<Violation>, usize, usize) {
     let mut prod_total = 0usize;
     let mut guarded_total = 0usize;
     for f in &files {
-        let Ok(src) = fs::read_to_string(f) else { continue };
+        let Ok(src) = fs::read_to_string(f) else {
+            continue;
+        };
         let lines: Vec<&str> = src.lines().collect();
         let tests_start = test_mod_start_line(&lines);
         let rel = rel_path(f, root);

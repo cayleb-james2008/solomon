@@ -55,11 +55,11 @@ pub mod warm;
 // foundation, so nothing INSIDE the binary calls these yet; the re-exports are the deliberate
 // contract, exercised by the module's own #[test] suites and the pecrt.py decision mirror.
 #[allow(unused_imports)]
-pub use bus::{next_wake, FreshnessEvent, WakeReason, WakeSource, WatchSource};
+pub use bus::{FreshnessEvent, WakeReason, WakeSource, WatchSource, next_wake};
 #[allow(unused_imports)]
-pub use safety::{classify_schedule, guard_schedule, ScheduleRequest, ScheduleVerdict};
+pub use safety::{ScheduleRequest, ScheduleVerdict, classify_schedule, guard_schedule};
 #[allow(unused_imports)]
 pub use warm::{
-    ObservationLog, ReconstructedContext, WarmContext, WorkingTier, LONG_TERM_ADAPTER_READONLY,
-    STABLE_PREFIX, WORKING_MAX_BYTES, WORKING_MAX_ENTRIES,
+    LONG_TERM_ADAPTER_READONLY, ObservationLog, ReconstructedContext, STABLE_PREFIX,
+    WORKING_MAX_BYTES, WORKING_MAX_ENTRIES, WarmContext, WorkingTier,
 };

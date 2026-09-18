@@ -49,7 +49,7 @@
 use crate::ceo::orchestrator::{Specialist, Task, TaskKind};
 use crate::pecrt::warm::ObservationLog;
 use chrono::Utc;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // --------------------------------------------------------------------------- #
 // The CLOSED, READ-ONLY tool whitelist (ZERO money, ZERO external-mutation)
@@ -88,9 +88,30 @@ pub const RESEARCH_ALLOWED_TOOLS: &[&str] = &[
 /// `append` — a local append to the runtime draft log is the sanctioned DRAFT sink, not an external
 /// mutation. Money verbs are covered separately by `money_guard::is_money_capable`.
 pub const EXTERNAL_MUTATION_MARKERS: &[&str] = &[
-    "publish", "post", "deploy", "ship", "release", "send", "email", "message", "dm",
-    "commit", "push", "merge", "pr_", "open_pr", "delete", "remove", "upload", "put_",
-    "write_remote", "tweet", "toot", "webhook", "notify_external", "submit",
+    "publish",
+    "post",
+    "deploy",
+    "ship",
+    "release",
+    "send",
+    "email",
+    "message",
+    "dm",
+    "commit",
+    "push",
+    "merge",
+    "pr_",
+    "open_pr",
+    "delete",
+    "remove",
+    "upload",
+    "put_",
+    "write_remote",
+    "tweet",
+    "toot",
+    "webhook",
+    "notify_external",
+    "submit",
 ];
 
 /// True iff `tool` names an external-mutation tool (case-insensitive substring against
@@ -323,7 +344,9 @@ mod tests {
         // paths::here() memoizes once per process; other tests in the crate may have set it. To keep
         // this test hermetic regardless of order, we assert on the RESOLVED path the specialist itself
         // reports, not a path we recompute from a (possibly-cached) HERE.
-        let _env = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
 
         let repo = uniq_repo("write");
@@ -336,18 +359,32 @@ mod tests {
         assert_eq!(out["ok"], true, "research note must succeed: {out}");
         assert_eq!(out["specialist"], "research");
         assert_eq!(out["kind"], "research_note");
-        assert_eq!(out["gated"], true, "the artifact must be GATED for human review");
+        assert_eq!(
+            out["gated"], true,
+            "the artifact must be GATED for human review"
+        );
         assert_eq!(out["published"], false, "NOTHING is published");
         assert_eq!(out["spent"], false, "NOTHING is spent");
         assert_eq!(out["provenance"], "rsi:", "the draft is provenance-tagged");
 
         // The artifact is REAL: read the observation log back off disk and confirm the dated,
         // provenance-tagged, GATED line landed.
-        let artifact_path = out["artifact_path"].as_str().expect("artifact_path present");
+        let artifact_path = out["artifact_path"]
+            .as_str()
+            .expect("artifact_path present");
         let body = std::fs::read_to_string(artifact_path).expect("observation log exists on disk");
-        assert!(body.contains("rsi: research DRAFT"), "line is provenance-tagged: {body}");
-        assert!(body.contains("[GATED, unpublished]"), "line is marked gated+unpublished: {body}");
-        assert!(body.contains("competitor scan"), "the research detail is recorded: {body}");
+        assert!(
+            body.contains("rsi: research DRAFT"),
+            "line is provenance-tagged: {body}"
+        );
+        assert!(
+            body.contains("[GATED, unpublished]"),
+            "line is marked gated+unpublished: {body}"
+        );
+        assert!(
+            body.contains("competitor scan"),
+            "the research detail is recorded: {body}"
+        );
         // it is DATED (ObservationLog::dated_line prefixes an ISO date + tab).
         assert!(
             body.lines().next().unwrap().contains('\t'),
@@ -368,7 +405,9 @@ mod tests {
     // ===================================================================== #
     #[test]
     fn research_specialist_money_capable_probe_is_denied_at_the_gate() {
-        let _g = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
 
         let research = ResearchSpecialist::new();
@@ -377,8 +416,16 @@ mod tests {
         // task KIND (the surface money_guard classifies). EVERY one must be DENIED at gate() BEFORE
         // run() — even on a whitelisted live-money lane.
         for money_kind in [
-            "withdraw", "transfer", "deposit", "buy_ads", "pay_invoice", "stripe_checkout",
-            "ad_spend", "send_money", "spend_treasury", "subscribe",
+            "withdraw",
+            "transfer",
+            "deposit",
+            "buy_ads",
+            "pay_invoice",
+            "stripe_checkout",
+            "ad_spend",
+            "send_money",
+            "spend_treasury",
+            "subscribe",
         ] {
             for repo in [plain_repo(), kairos_repo()] {
                 let money_task = Task {
@@ -411,7 +458,9 @@ mod tests {
     /// spent on a denied money attempt).
     #[test]
     fn a_denied_money_probe_writes_no_artifact() {
-        let _g = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
 
         let research = ResearchSpecialist::new();
@@ -433,7 +482,10 @@ mod tests {
         let after = ResearchSpecialist::observation_log_path(&repo)
             .map(|p| std::fs::read_to_string(&p).unwrap_or_default())
             .unwrap_or_default();
-        assert_eq!(before, after, "a denied money probe must write NO observation line");
+        assert_eq!(
+            before, after,
+            "a denied money probe must write NO observation line"
+        );
         std::env::remove_var("SOLOMON_NOTIFY_OFF");
     }
 
@@ -454,8 +506,18 @@ mod tests {
             );
         }
         // Positive control: the markers DO catch real publish/pay tool names, so the guard has teeth.
-        for bad in ["post_to_x", "deploy_sover", "send_email", "git_push", "open_pr", "upload_asset"] {
-            assert!(is_external_mutation(bad), "'{bad}' should be caught as external-mutation");
+        for bad in [
+            "post_to_x",
+            "deploy_sover",
+            "send_email",
+            "git_push",
+            "open_pr",
+            "upload_asset",
+        ] {
+            assert!(
+                is_external_mutation(bad),
+                "'{bad}' should be caught as external-mutation"
+            );
         }
     }
 
@@ -478,7 +540,9 @@ mod tests {
     // ===================================================================== #
     #[test]
     fn nothing_is_published_and_nothing_is_spent() {
-        let _env = crate::notify::NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::notify::NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
 
         let research = ResearchSpecialist::new();
@@ -487,7 +551,11 @@ mod tests {
         // publish/pay path is reachable). `buy_ads` / `pay_invoice` / `stripe_checkout` are the
         // canonical spend verbs; each must refuse.
         for pay_kind in ["buy_ads", "pay_invoice", "stripe_checkout", "ad_spend"] {
-            let t = Task::new(TaskKind::Remediate(money_kind_static(pay_kind)), "sover", "probe");
+            let t = Task::new(
+                TaskKind::Remediate(money_kind_static(pay_kind)),
+                "sover",
+                "probe",
+            );
             assert!(
                 research.gate(&t, &plain_repo()).is_some(),
                 "publish/pay probe '{pay_kind}' must be DENIED — no pay tool is reachable"
@@ -528,9 +596,17 @@ mod tests {
         let globs = research.scope_globs(&kairos_repo());
         assert_eq!(globs, vec!["runtime/kairos/observations.jsonl"]);
         // NEVER the money-code blast radius.
-        assert!(!globs.iter().any(|g| g.contains("trader.py") || g.contains("kalshi")));
+        assert!(
+            !globs
+                .iter()
+                .any(|g| g.contains("trader.py") || g.contains("kalshi"))
+        );
         // NEVER a protected grader/leash path.
-        assert!(!globs.iter().any(|g| g.contains("promote.py") || g.contains(".state")));
+        assert!(
+            !globs
+                .iter()
+                .any(|g| g.contains("promote.py") || g.contains(".state"))
+        );
         // a nameless row yields no writable scope.
         assert!(research.scope_globs(&json!({})).is_empty());
     }
@@ -538,9 +614,16 @@ mod tests {
     // ---- the draft fact is a provenance-tagged, dated, first-order fact (passes validate_fact) ----
     #[test]
     fn draft_fact_is_provenance_tagged_and_a_valid_first_order_fact() {
-        let task = Task::new(TaskKind::Remediate("none"), "sover", "rival posted 4 new items");
+        let task = Task::new(
+            TaskKind::Remediate("none"),
+            "sover",
+            "rival posted 4 new items",
+        );
         let fact = ResearchSpecialist::draft_fact(&task, 1_783_000_000);
-        assert!(fact.starts_with("rsi: research DRAFT [GATED, unpublished]"), "{fact}");
+        assert!(
+            fact.starts_with("rsi: research DRAFT [GATED, unpublished]"),
+            "{fact}"
+        );
         assert!(fact.contains("lane=sover"));
         assert!(fact.contains("rival posted 4 new items"));
         // It MUST pass the observation log's first-order-fact validator (it carries a datum: t=...).
@@ -551,7 +634,10 @@ mod tests {
         // even an empty detail still yields a valid fact (the epoch datum guarantees it).
         let empty = Task::new(TaskKind::Remediate("none"), "sover", "   ");
         let f2 = ResearchSpecialist::draft_fact(&empty, 1_783_000_001);
-        assert!(crate::pecrt::warm::ObservationLog::validate_fact(&f2).is_fact(), "{f2}");
+        assert!(
+            crate::pecrt::warm::ObservationLog::validate_fact(&f2).is_fact(),
+            "{f2}"
+        );
     }
 
     /// Test helper: money verbs under test are compile-time literals; map each back to its static

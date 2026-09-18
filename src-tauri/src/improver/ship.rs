@@ -12,7 +12,7 @@ use crate::improver::ctx::Ctx;
 use crate::improver::gates;
 use crate::improver::gitops;
 use crate::improver::tiers;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 // run_improver._wait_for_ci_then_merge tuning constants (~2042-2043).
@@ -128,7 +128,16 @@ pub fn pr_checks_probe(c: &Ctx, number: Option<i64>) -> ChecksProbe {
         Some(n) if n != 0 => n,
         _ => return ChecksProbe::Unavailable,
     };
-    let p = c.gh(&["pr", "view", &num.to_string(), "--json", "statusCheckRollup"], 120);
+    let p = c.gh(
+        &[
+            "pr",
+            "view",
+            &num.to_string(),
+            "--json",
+            "statusCheckRollup",
+        ],
+        120,
+    );
     if p.code != 0 {
         return ChecksProbe::Unavailable; // gh failed (nonzero exit, incl. 124 timeout) -> unknown
     }
@@ -149,9 +158,21 @@ pub fn pr_checks_probe(c: &Ctx, number: Option<i64>) -> ChecksProbe {
     let mut bad = false;
     let mut pend = false;
     for chk in &rollup {
-        let st = chk.get("state").and_then(Value::as_str).unwrap_or("").to_uppercase();
-        let status = chk.get("status").and_then(Value::as_str).unwrap_or("").to_uppercase();
-        let concl = chk.get("conclusion").and_then(Value::as_str).unwrap_or("").to_uppercase();
+        let st = chk
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_uppercase();
+        let status = chk
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_uppercase();
+        let concl = chk
+            .get("conclusion")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_uppercase();
         if (!status.is_empty() && status != "COMPLETED") || st == "PENDING" {
             pend = true;
         }
@@ -221,7 +242,16 @@ fn await_pr_checks_probe(c: &Ctx, number: Option<i64>, attempts: i64, delay: f64
 /// --state open --json number,url`; first list element's number+url, else (None, None).
 pub fn existing_open_pr(c: &Ctx, branch: &str) -> (Option<i64>, Option<String>) {
     let p = c.gh(
-        &["pr", "list", "--head", branch, "--state", "open", "--json", "number,url"],
+        &[
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "open",
+            "--json",
+            "number,url",
+        ],
         120,
     );
     if p.code != 0 {
@@ -280,7 +310,15 @@ pub fn open_pr(c: &mut Ctx, branch: &str, title: &str, summary: &str, tests: &Va
     let base = c.base_branch.clone();
     let p = c.gh(
         &[
-            "pr", "create", "--base", &base, "--head", branch, "--title", &pr_title_str, "--body",
+            "pr",
+            "create",
+            "--base",
+            &base,
+            "--head",
+            branch,
+            "--title",
+            &pr_title_str,
+            "--body",
             &body,
         ],
         120,
@@ -302,7 +340,10 @@ pub fn open_pr(c: &mut Ctx, branch: &str, title: &str, summary: &str, tests: &Va
                 });
             }
         }
-        c.log(&format!("gh pr create failed: {}", slice_chars(&stderr, 200)));
+        c.log(&format!(
+            "gh pr create failed: {}",
+            slice_chars(&stderr, 200)
+        ));
         // Best-effort delete of exactly this run's orphaned remote branch.
         let d = c.git(&["push", "origin", "--delete", branch], 120);
         if d.code == 0 {
@@ -428,7 +469,9 @@ even though each PR was green in isolation. Reverting the merge commit on {base}
     let rev = c.git(&["revert", "--no-edit", "HEAD"], 120);
     if rev.code == 0 {
         c.git(&["push", "origin", &base], 120);
-        c.log(&format!("reverted merge of #{num} on {base} and pushed — base healed"));
+        c.log(&format!(
+            "reverted merge of #{num} on {base} and pushed — base healed"
+        ));
     } else {
         // revert failed — hard-reset as a last resort to heal the base.
         c.log(&format!(
@@ -482,7 +525,16 @@ pub fn try_squash_merge(c: &Ctx, num: i64) -> proc::RunOut {
         stderr: String::new(),
     };
     for attempt in 0..3 {
-        m = c.gh(&["pr", "merge", &num.to_string(), "--squash", "--delete-branch"], 120);
+        m = c.gh(
+            &[
+                "pr",
+                "merge",
+                &num.to_string(),
+                "--squash",
+                "--delete-branch",
+            ],
+            120,
+        );
         if m.code == 0 {
             return m;
         }
@@ -511,12 +563,21 @@ pub fn auto_merge(c: &mut Ctx, pr: &Value) -> Value {
     };
     let checks = pr.get("checks").and_then(Value::as_str);
     if checks == Some("failure") {
-        c.log(&format!("auto-merge: CI FAILING on PR {num} — leaving open, NOT merging"));
+        c.log(&format!(
+            "auto-merge: CI FAILING on PR {num} — leaving open, NOT merging"
+        ));
         return with_state(pr, "open (CI red — not merged)");
     }
     if checks == Some("pending") {
         let am = c.gh(
-            &["pr", "merge", &num.to_string(), "--auto", "--squash", "--delete-branch"],
+            &[
+                "pr",
+                "merge",
+                &num.to_string(),
+                "--auto",
+                "--squash",
+                "--delete-branch",
+            ],
             120,
         );
         if am.code == 0 {
@@ -579,7 +640,9 @@ pub fn wait_for_ci_then_merge(c: &mut Ctx, pr: &Value) -> Value {
         if probe == ChecksProbe::State("failure".to_string()) {
             // CI RED: ALWAYS auto-revert, even with a pending STOP (checked before the STOP halt).
             c.gh(&["pr", "close", &num.to_string(), "--delete-branch"], 120);
-            c.log(&format!("CI RED on PR {num} — closed PR + deleted branch (auto-revert)"));
+            c.log(&format!(
+                "CI RED on PR {num} — closed PR + deleted branch (auto-revert)"
+            ));
             return with_state(pr, "reverted (CI red)");
         }
         if stop_exists(c) {
@@ -623,7 +686,14 @@ pub fn wait_for_ci_then_merge(c: &mut Ctx, pr: &Value) -> Value {
         }
         if std::time::Instant::now() >= deadline {
             let am = c.gh(
-                &["pr", "merge", &num.to_string(), "--auto", "--squash", "--delete-branch"],
+                &[
+                    "pr",
+                    "merge",
+                    &num.to_string(),
+                    "--auto",
+                    "--squash",
+                    "--delete-branch",
+                ],
                 120,
             );
             if am.code == 0 {
@@ -689,11 +759,7 @@ pub fn ship_succeeded(pr: &Value) -> bool {
     if state.contains("local") && !state.contains("pending") {
         return true;
     }
-    state.starts_with("pushed")
-        && pr
-            .get("verified")
-            .map(value_truthy)
-            .unwrap_or(false)
+    state.starts_with("pushed") && pr.get("verified").map(value_truthy).unwrap_or(false)
 }
 
 /// Python truthiness for the `bool(pr.get("verified"))` check: True only for `true`, a nonzero
@@ -756,7 +822,9 @@ pub fn ship(c: &mut Ctx, branch: &str, title: &str, summary: &str, tests: &Value
     }
 
     if ship_mode == "local" {
-        c.log(&format!("ship=local — kept committed branch {branch} locally (unshipped)"));
+        c.log(&format!(
+            "ship=local — kept committed branch {branch} locally (unshipped)"
+        ));
         return json!({
             "number": Value::Null,
             "url": Value::Null,
@@ -779,7 +847,10 @@ pub fn ship(c: &mut Ctx, branch: &str, title: &str, summary: &str, tests: &Value
     // push timeout=300 (larger than git()'s 120s default) so a slow-but-working push isn't false-failed.
     let push = c.git(&["push", "-u", "origin", branch], 300);
     if push.code != 0 {
-        c.log(&format!("git push failed: {}", slice_chars(push.stderr.trim(), 200)));
+        c.log(&format!(
+            "git push failed: {}",
+            slice_chars(push.stderr.trim(), 200)
+        ));
         return json!({
             "number": Value::Null,
             "url": Value::Null,
@@ -886,7 +957,9 @@ mod tests {
         assert!(!ship_succeeded(&json!({"state": "push-failed"})));
         assert!(!ship_succeeded(&json!({"state": "reverted (CI red)"})));
         // 'open (merge failed)' has both 'fail' and 'open (' — fail check wins first.
-        assert!(!ship_succeeded(&json!({"number": 7, "state": "open (merge failed)"})));
+        assert!(!ship_succeeded(
+            &json!({"number": 7, "state": "open (merge failed)"})
+        ));
     }
 
     #[test]
@@ -894,12 +967,20 @@ mod tests {
         // plain 'open' (pr-mode) has no '(' -> landed
         assert!(ship_succeeded(&json!({"number": 1, "state": "open"})));
         // un-landed auto-merge states contain 'open ('
-        assert!(!ship_succeeded(&json!({"number": 1, "state": "open (CI red — not merged)"})));
-        assert!(!ship_succeeded(&json!({"number": 1, "state": "open (awaiting CI)"})));
-        assert!(!ship_succeeded(&json!({"number": 1, "state": "open (stopped before merge)"})));
+        assert!(!ship_succeeded(
+            &json!({"number": 1, "state": "open (CI red — not merged)"})
+        ));
+        assert!(!ship_succeeded(
+            &json!({"number": 1, "state": "open (awaiting CI)"})
+        ));
+        assert!(!ship_succeeded(
+            &json!({"number": 1, "state": "open (stopped before merge)"})
+        ));
         // 'merged' / 'auto-merge queued (...)' land (no 'open (' marker)
         assert!(ship_succeeded(&json!({"number": 1, "state": "merged"})));
-        assert!(ship_succeeded(&json!({"number": 1, "state": "auto-merge queued (awaiting CI)"})));
+        assert!(ship_succeeded(
+            &json!({"number": 1, "state": "auto-merge queued (awaiting CI)"})
+        ));
         // number 0 is falsy -> not the PR branch
         assert!(!ship_succeeded(&json!({"number": 0, "state": "open"})));
     }
@@ -909,9 +990,15 @@ mod tests {
         assert!(ship_succeeded(&pr("local branch (unshipped)")));
         assert!(!ship_succeeded(&pr("local (something pending)")));
         // push needs startswith('pushed') AND verified truthy
-        assert!(ship_succeeded(&json!({"state": "pushed (no PR)", "verified": true})));
-        assert!(!ship_succeeded(&json!({"state": "pushed (no PR)", "verified": false})));
-        assert!(!ship_succeeded(&json!({"state": "pushed (unverified)", "verified": false})));
+        assert!(ship_succeeded(
+            &json!({"state": "pushed (no PR)", "verified": true})
+        ));
+        assert!(!ship_succeeded(
+            &json!({"state": "pushed (no PR)", "verified": false})
+        ));
+        assert!(!ship_succeeded(
+            &json!({"state": "pushed (unverified)", "verified": false})
+        ));
     }
 
     // ---- _ship_outcome ----
@@ -920,9 +1007,18 @@ mod tests {
     fn outcome_auto_merge() {
         assert_eq!(ship_outcome(&pr("merged"), "auto-merge"), "shipped");
         // 'not merged' contains 'merged' but must be blocked
-        assert_eq!(ship_outcome(&pr("open (CI red — not merged)"), "auto-merge"), "blocked");
-        assert_eq!(ship_outcome(&pr("auto-merge queued (awaiting CI)"), "auto-merge"), "blocked");
-        assert_eq!(ship_outcome(&pr("open (awaiting CI)"), "auto-merge"), "blocked");
+        assert_eq!(
+            ship_outcome(&pr("open (CI red — not merged)"), "auto-merge"),
+            "blocked"
+        );
+        assert_eq!(
+            ship_outcome(&pr("auto-merge queued (awaiting CI)"), "auto-merge"),
+            "blocked"
+        );
+        assert_eq!(
+            ship_outcome(&pr("open (awaiting CI)"), "auto-merge"),
+            "blocked"
+        );
     }
 
     // rsi-supervisor-watchdog-2: the backlog-advance predicate (now ship_outcome=="shipped") and the
@@ -977,7 +1073,10 @@ mod tests {
 
     #[test]
     fn outcome_pr_mode_defers_to_succeeded() {
-        assert_eq!(ship_outcome(&json!({"number": 1, "state": "open"}), "pr"), "shipped");
+        assert_eq!(
+            ship_outcome(&json!({"number": 1, "state": "open"}), "pr"),
+            "shipped"
+        );
         assert_eq!(
             ship_outcome(&json!({"number": 1, "state": "open (awaiting CI)"}), "pr"),
             "blocked"
@@ -991,7 +1090,10 @@ mod tests {
     #[test]
     fn pr_title_uses_goal() {
         let c = test_ctx();
-        assert_eq!(pr_title(&c, "Add a retry to the fetcher", ""), "Add a retry to the fetcher");
+        assert_eq!(
+            pr_title(&c, "Add a retry to the fetcher", ""),
+            "Add a retry to the fetcher"
+        );
     }
 
     #[test]
@@ -1005,7 +1107,10 @@ mod tests {
         // empty goal -> fallback
         assert_eq!(pr_title(&c, "", "Only line"), "Only line");
         // all-blank summary -> 'improvement'
-        assert_eq!(pr_title(&c, "model-chosen improvement", "  \n\t"), "improvement");
+        assert_eq!(
+            pr_title(&c, "model-chosen improvement", "  \n\t"),
+            "improvement"
+        );
     }
 
     #[test]
@@ -1049,9 +1154,21 @@ mod tests {
         let mut bad = false;
         let mut pend = false;
         for chk in &arr {
-            let st = chk.get("state").and_then(Value::as_str).unwrap_or("").to_uppercase();
-            let status = chk.get("status").and_then(Value::as_str).unwrap_or("").to_uppercase();
-            let concl = chk.get("conclusion").and_then(Value::as_str).unwrap_or("").to_uppercase();
+            let st = chk
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_uppercase();
+            let status = chk
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_uppercase();
+            let concl = chk
+                .get("conclusion")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_uppercase();
             if (!status.is_empty() && status != "COMPLETED") || st == "PENDING" {
                 pend = true;
             }
@@ -1130,9 +1247,14 @@ mod tests {
 
     #[test]
     fn ss_merge_unverified_is_not_shipped() {
-        assert!(!ship_succeeded(&json!({"number": 1, "state": "open (merge unverified)"})));
+        assert!(!ship_succeeded(
+            &json!({"number": 1, "state": "open (merge unverified)"})
+        ));
         assert_eq!(
-            ship_outcome(&json!({"number": 1, "state": "open (merge unverified)"}), "auto-merge"),
+            ship_outcome(
+                &json!({"number": 1, "state": "open (merge unverified)"}),
+                "auto-merge"
+            ),
             "blocked"
         );
     }
@@ -1153,7 +1275,10 @@ mod tests {
         assert!(parse_merged_at(gh_view_out));
         // and "merged" state is correctly classified as shipped
         assert!(ship_succeeded(&json!({"number": 1, "state": "merged"})));
-        assert_eq!(ship_outcome(&json!({"number": 1, "state": "merged"}), "auto-merge"), "shipped");
+        assert_eq!(
+            ship_outcome(&json!({"number": 1, "state": "merged"}), "auto-merge"),
+            "shipped"
+        );
     }
 
     #[test]
@@ -1163,7 +1288,10 @@ mod tests {
         assert!(!parse_merged_at(gh_view_out));
         // and "open (merge unverified)" is correctly classified as blocked, NOT shipped
         assert_eq!(
-            ship_outcome(&json!({"number": 1, "state": "open (merge unverified)"}), "auto-merge"),
+            ship_outcome(
+                &json!({"number": 1, "state": "open (merge unverified)"}),
+                "auto-merge"
+            ),
             "blocked"
         );
     }
@@ -1185,7 +1313,9 @@ mod tests {
     #[test]
     fn post_merge_revert_state_is_not_shipped() {
         // Contains "reverted" -> ship_succeeded returns false (the merge was undone).
-        assert!(!ship_succeeded(&json!({"number": 36, "state": POST_MERGE_REVERT_STATE})));
+        assert!(!ship_succeeded(
+            &json!({"number": 36, "state": POST_MERGE_REVERT_STATE})
+        ));
     }
 
     #[test]

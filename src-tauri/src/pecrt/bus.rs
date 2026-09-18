@@ -129,7 +129,10 @@ impl FreshnessEvent {
             metric_id: metric_id.unwrap_or("").to_string(),
             latest_ts: latest_ts.unwrap_or(0.0),
             n_samples: n_samples.unwrap_or(0),
-            observable: v.get("observable").and_then(Value::as_bool).unwrap_or(false),
+            observable: v
+                .get("observable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
     }
 
@@ -248,7 +251,10 @@ mod tests {
         assert_eq!(WakeSource::Kill.tag(), P::Kill.tag());
         assert_eq!(WakeSource::FreshData.tag(), P::FreshData.tag());
         assert_eq!(WakeSource::OpsChange.tag(), P::OpsChange.tag());
-        assert_eq!(WakeSource::ProviderRecovery.tag(), P::ProviderRecovery.tag());
+        assert_eq!(
+            WakeSource::ProviderRecovery.tag(),
+            P::ProviderRecovery.tag()
+        );
         assert_eq!(WakeSource::FloorElapsed.tag(), P::FloorElapsed.tag());
         // The two generalized additions.
         assert_eq!(WakeSource::FileAppend.tag(), "file_append");
@@ -297,7 +303,10 @@ mod tests {
     #[test]
     fn freshness_event_absent_when_no_fields() {
         assert_eq!(FreshnessEvent::from_value(&json!({})), None);
-        assert_eq!(FreshnessEvent::from_value(&json!({"observable": true})), None);
+        assert_eq!(
+            FreshnessEvent::from_value(&json!({"observable": true})),
+            None
+        );
     }
 
     #[test]
@@ -305,23 +314,59 @@ mod tests {
         // observable absent => false.
         let e = FreshnessEvent::from_value(&json!({"metric_id": "x", "n_samples": 5})).unwrap();
         assert!(!e.observable);
-        let before = FreshnessEvent { metric_id: "x".into(), latest_ts: 0.0, n_samples: 1, observable: true };
+        let before = FreshnessEvent {
+            metric_id: "x".into(),
+            latest_ts: 0.0,
+            n_samples: 1,
+            observable: true,
+        };
         // even though 5 > 1, an unobservable current reading is NEVER an advance (RED not fresh).
         assert!(!e.advanced(Some(&before)));
     }
 
     #[test]
     fn advance_uses_same_or_rule_as_park() {
-        let before = FreshnessEvent { metric_id: "x".into(), latest_ts: 100.0, n_samples: 10, observable: true };
-        let more_samples = FreshnessEvent { metric_id: "x".into(), latest_ts: 100.0, n_samples: 11, observable: true };
-        let newer_ts = FreshnessEvent { metric_id: "x".into(), latest_ts: 101.0, n_samples: 10, observable: true };
-        let same = FreshnessEvent { metric_id: "x".into(), latest_ts: 100.0, n_samples: 10, observable: true };
-        let fewer = FreshnessEvent { metric_id: "x".into(), latest_ts: 100.0, n_samples: 3, observable: true };
+        let before = FreshnessEvent {
+            metric_id: "x".into(),
+            latest_ts: 100.0,
+            n_samples: 10,
+            observable: true,
+        };
+        let more_samples = FreshnessEvent {
+            metric_id: "x".into(),
+            latest_ts: 100.0,
+            n_samples: 11,
+            observable: true,
+        };
+        let newer_ts = FreshnessEvent {
+            metric_id: "x".into(),
+            latest_ts: 101.0,
+            n_samples: 10,
+            observable: true,
+        };
+        let same = FreshnessEvent {
+            metric_id: "x".into(),
+            latest_ts: 100.0,
+            n_samples: 10,
+            observable: true,
+        };
+        let fewer = FreshnessEvent {
+            metric_id: "x".into(),
+            latest_ts: 100.0,
+            n_samples: 3,
+            observable: true,
+        };
         assert!(more_samples.advanced(Some(&before)));
         assert!(newer_ts.advanced(Some(&before)));
         assert!(!same.advanced(Some(&before)), "no change => no advance");
-        assert!(!fewer.advanced(Some(&before)), "ledger reset/repoint => not an advance");
-        assert!(!more_samples.advanced(None), "no baseline => never advances");
+        assert!(
+            !fewer.advanced(Some(&before)),
+            "ledger reset/repoint => not an advance"
+        );
+        assert!(
+            !more_samples.advanced(None),
+            "no baseline => never advances"
+        );
     }
 
     // ---- next_wake: pure poll decision ----
@@ -341,7 +386,10 @@ mod tests {
         let r = next_wake(&sources, 300, 300).unwrap();
         assert_eq!(r.source, WakeSource::FloorElapsed);
         // and past the floor too
-        assert_eq!(next_wake(&sources, 999, 300).unwrap().source, WakeSource::FloorElapsed);
+        assert_eq!(
+            next_wake(&sources, 999, 300).unwrap().source,
+            WakeSource::FloorElapsed
+        );
     }
 
     #[test]
@@ -363,14 +411,23 @@ mod tests {
     fn a_fired_source_beats_the_floor_even_at_the_ceiling() {
         // FreshData fired exactly at the floor tick — the event wins, not FloorElapsed.
         let sources = [WatchSource::new(WakeSource::FreshData, true)];
-        assert_eq!(next_wake(&sources, 300, 300).unwrap().source, WakeSource::FreshData);
+        assert_eq!(
+            next_wake(&sources, 300, 300).unwrap().source,
+            WakeSource::FreshData
+        );
     }
 
     #[test]
     fn zero_or_negative_ceiling_floors_immediately_but_still_yields_to_kill() {
         let none_fired = [WatchSource::new(WakeSource::FileAppend, false)];
-        assert_eq!(next_wake(&none_fired, 0, 0).unwrap().source, WakeSource::FloorElapsed);
-        assert_eq!(next_wake(&none_fired, 0, -5).unwrap().source, WakeSource::FloorElapsed);
+        assert_eq!(
+            next_wake(&none_fired, 0, 0).unwrap().source,
+            WakeSource::FloorElapsed
+        );
+        assert_eq!(
+            next_wake(&none_fired, 0, -5).unwrap().source,
+            WakeSource::FloorElapsed
+        );
         // a KILL in the same tick still outranks the immediate floor.
         let kill = [
             WatchSource::new(WakeSource::FileAppend, false),
@@ -382,7 +439,10 @@ mod tests {
     #[test]
     fn empty_sources_just_waits_out_the_floor() {
         assert_eq!(next_wake(&[], 10, 300), None);
-        assert_eq!(next_wake(&[], 300, 300).unwrap().source, WakeSource::FloorElapsed);
+        assert_eq!(
+            next_wake(&[], 300, 300).unwrap().source,
+            WakeSource::FloorElapsed
+        );
     }
 
     // ---- live-loop drive model (D9): the exact tick loop run.rs runs on the bus ----
@@ -404,7 +464,10 @@ mod tests {
             }
             elapsed_s += 1;
             // Guard against a runaway test if the floor logic ever regressed.
-            assert!(elapsed_s <= max_park + 5, "park never floored — next_wake floor regressed");
+            assert!(
+                elapsed_s <= max_park + 5,
+                "park never floored — next_wake floor regressed"
+            );
         }
     }
 
@@ -420,8 +483,15 @@ mod tests {
                 WatchSource::new(WakeSource::SqliteRow, t >= 3),
             ]
         });
-        assert_eq!(source, WakeSource::SqliteRow, "a settled row must end the park");
-        assert_eq!(ticks, 3, "woke exactly when the row landed, not at the floor");
+        assert_eq!(
+            source,
+            WakeSource::SqliteRow,
+            "a settled row must end the park"
+        );
+        assert_eq!(
+            ticks, 3,
+            "woke exactly when the row landed, not at the floor"
+        );
         assert!(ticks < 300, "early wake — did not wait out max-park");
     }
 
@@ -452,7 +522,11 @@ mod tests {
                 WatchSource::new(WakeSource::Kill, t >= 5),
             ]
         });
-        assert_eq!(source, WakeSource::Kill, "KILL must preempt the data events at priority 0");
+        assert_eq!(
+            source,
+            WakeSource::Kill,
+            "KILL must preempt the data events at priority 0"
+        );
         assert_eq!(ticks, 5, "preempted on the first tick the KILL was present");
     }
 

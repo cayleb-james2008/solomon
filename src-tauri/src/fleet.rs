@@ -11,7 +11,7 @@ use crate::notify;
 use crate::ops;
 use crate::supervisor;
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -186,7 +186,7 @@ pub fn once(auto_push: bool, only_name: Option<&str>) -> Value {
     let _lease = match acquire_lock() {
         Ok(Some(l)) => l,
         Ok(None) => {
-            return json!({"ok": true, "leased": false, "summary": "Solomon Autopilot already active"})
+            return json!({"ok": true, "leased": false, "summary": "Solomon Autopilot already active"});
         }
         Err(e) => return json!({"ok": false, "error": e}),
     };
@@ -498,7 +498,14 @@ fn run_ai_job(job: &Job, repos: &[Value], cfg: &Value, auto_push: bool, st: &mut
     append_event(
         &json!({"event": "agent_call_started", "repo": job.name, "provider": cfg["provider"], "model": cfg["model"]}),
     );
-    let out = run_repo_once(repo, cfg, auto_push, key_env, &key_value, job.spec_goal.as_deref());
+    let out = run_repo_once(
+        repo,
+        cfg,
+        auto_push,
+        key_env,
+        &key_value,
+        job.spec_goal.as_deref(),
+    );
     let quota = pi::is_quota_error_output(&out.stdout, &out.stderr)
         || out.stdout.contains("\"reason\":\"quota_error\"")
         || out.stderr.contains("quota_error");
@@ -666,7 +673,10 @@ fn plan_jobs(
         // automated sweep". Without this, a paused proof_required lane blocks the queue (once()
         // picks jobs.first() and the non-AI proof_required job completes instantly, cycling
         // through the paused lanes without ever reaching the implement jobs behind them).
-        if paths::runtime_dir(repo).map(|d| d.join("paused").exists()).unwrap_or(false) {
+        if paths::runtime_dir(repo)
+            .map(|d| d.join("paused").exists())
+            .unwrap_or(false)
+        {
             continue;
         }
         let mut diag = supervisor::diagnose(repo);
@@ -779,9 +789,7 @@ fn plan_jobs(
         // operator's explicit `autopilot-wake <name>` silently produces an empty plan). Other
         // short-circuit kinds (maintenance/cooldown/blocked) are gated to their normal arms: a
         // wake on a `cooldown` lane must wait for the provider cooldown, not eat the wake budget.
-        if (kind == "proof_required" || kind == "complete")
-            && human_wake_pending(st, &name)
-        {
+        if (kind == "proof_required" || kind == "complete") && human_wake_pending(st, &name) {
             wake_job = true;
             kind = "implement";
             state = "queued";
@@ -951,12 +959,7 @@ fn plan_jobs(
             let provider = registry::project_provider(repo);
             let model = registry::project_model(repo);
             let model_opt: Option<&str> = if model.is_empty() { None } else { Some(&model) };
-            let mut ctx = Ctx::configure(
-                &paths::repo_path(repo),
-                &name,
-                &provider,
-                model_opt,
-            );
+            let mut ctx = Ctx::configure(&paths::repo_path(repo), &name, &provider, model_opt);
             let proof_diag = progress::current_diagnosis(&ctx);
             let proof_key = progress::progress_key("proof_required", &goal_text, &proof_diag);
             let proof_pre_hash = if proof_key.is_empty() {
@@ -1223,7 +1226,11 @@ fn read_proof(name: &str) -> Option<Value> {
 /// no proof, so this never fires for unit-test lanes.
 pub fn lane_spawn_failed(repo: &Value) -> bool {
     read_proof(&paths::repo_name(repo))
-        .and_then(|p| p.get("extra").and_then(|e| e.get("command_code")).and_then(Value::as_i64))
+        .and_then(|p| {
+            p.get("extra")
+                .and_then(|e| e.get("command_code"))
+                .and_then(Value::as_i64)
+        })
         .map(|c| c == -1)
         .unwrap_or(false)
 }
@@ -1255,9 +1262,7 @@ fn read_explicit_proof(name: &str) -> Option<Value> {
 fn proof_is_recent(proof: &Value) -> bool {
     proof_time(proof)
         .map(|ts| Utc::now().signed_duration_since(ts))
-        .map(|age| {
-            age >= ChronoDuration::zero() && age < ChronoDuration::hours(PROOF_FRESH_HOURS)
-        })
+        .map(|age| age >= ChronoDuration::zero() && age < ChronoDuration::hours(PROOF_FRESH_HOURS))
         .unwrap_or(false)
 }
 
@@ -1270,9 +1275,7 @@ fn retry_state_fingerprint(ops_project: &Value, diagnosis_category: &str) -> Str
         .and_then(Value::as_object)
         .map(|p| {
             p.iter()
-                .map(|(id, status)| {
-                    format!("{id}={}", status.as_str().unwrap_or("invalid"))
-                })
+                .map(|(id, status)| format!("{id}={}", status.as_str().unwrap_or("invalid")))
                 .collect()
         })
         .unwrap_or_default();
@@ -1504,10 +1507,7 @@ pub fn stuck_sweeps(name: &str) -> u64 {
 pub fn reset_stuck_sweeps(name: &str) -> std::io::Result<()> {
     let cfg = registry::autopilot_config();
     let mut st = read_state(&cfg);
-    let present = st
-        .get("stuck")
-        .and_then(|s| s.get(name))
-        .is_some();
+    let present = st.get("stuck").and_then(|s| s.get(name)).is_some();
     if !present {
         return Ok(());
     }
@@ -1576,7 +1576,11 @@ pub fn proof_cooldown_active(name: &str) -> bool {
 /// Called by `bump_stuck_counter` when a lane's consecutive proof_required count reaches
 /// PROOF_COOLDOWN_THRESHOLD. Pure (no IO): mutates the passed-in state; `write_state` persists it.
 fn arm_proof_cooldown(st: &mut Value, name: &str, consecutive: u64, now_utc: DateTime<Utc>) {
-    if !st.get("proof_cooldowns").map(Value::is_object).unwrap_or(false) {
+    if !st
+        .get("proof_cooldowns")
+        .map(Value::is_object)
+        .unwrap_or(false)
+    {
         st["proof_cooldowns"] = json!({});
     }
     let Some(m) = st.get_mut("proof_cooldowns").and_then(Value::as_object_mut) else {
@@ -1692,7 +1696,10 @@ fn spec_entry_failed(e: &Value) -> bool {
 
 /// Normalize a goal text for material-difference comparison: lowercase, whitespace collapsed.
 fn normalize_spec(goal: &str) -> String {
-    goal.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+    goal.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// True iff `candidate` differs materially from every FAILED spec in the lane's ledger window
@@ -1774,7 +1781,12 @@ fn self_spec_body(category: &str) -> &'static str {
 /// most recent failed attempts, and the anti-gaming ground rules. A belt-and-braces guard walks
 /// the rotation until the text differs materially from every failed spec in the ledger window
 /// (guaranteed to terminate: category alone changes the text).
-fn generate_self_spec(st: &Value, name: &str, blocker: &str, standing_goal: &str) -> (&'static str, String) {
+fn generate_self_spec(
+    st: &Value,
+    name: &str,
+    blocker: &str,
+    standing_goal: &str,
+) -> (&'static str, String) {
     let history = self_spec_history(st, name);
     let mut category = pick_self_spec_category(&history);
     for _ in 0..SELF_SPEC_CATEGORIES.len() {
@@ -1782,13 +1794,19 @@ fn generate_self_spec(st: &Value, name: &str, blocker: &str, standing_goal: &str
         if self_spec_differs_from_failed(&goal, &history) {
             return (category, goal);
         }
-        let idx = SELF_SPEC_CATEGORIES.iter().position(|c| *c == category).unwrap_or(0);
+        let idx = SELF_SPEC_CATEGORIES
+            .iter()
+            .position(|c| *c == category)
+            .unwrap_or(0);
         category = SELF_SPEC_CATEGORIES[(idx + 1) % SELF_SPEC_CATEGORIES.len()];
     }
     // Unreachable in practice (4 distinct category bodies vs a cap-8 window of failures whose
     // exclusion lists differ); fall through with the last candidate anyway — dispatching a
     // repeat-risk spec still beats parking forever, and the RSI gates police the result.
-    (category, compose_self_spec_goal(category, blocker, standing_goal, &history))
+    (
+        category,
+        compose_self_spec_goal(category, blocker, standing_goal, &history),
+    )
 }
 
 /// Render the self-spec goal text for `category` (see [`generate_self_spec`]).
@@ -1818,7 +1836,9 @@ fn compose_self_spec_goal(
     let north_star = if standing_goal.trim().is_empty() {
         String::new()
     } else {
-        format!("\nNorth-star context (do not chase it directly this iteration; stay on the bounded spec): {standing_goal}\n")
+        format!(
+            "\nNorth-star context (do not chase it directly this iteration; stay on the bounded spec): {standing_goal}\n"
+        )
     };
     format!(
         "SELF-SPEC (autonomous re-spec, category: {category}). {body}\n\
@@ -1940,7 +1960,11 @@ fn nhs_already_surfaced(st: &Value, name: &str, fingerprint: &str) -> bool {
 /// Record that a lane's `needs_human_spec` need was surfaced (its job dispatched and filed the
 /// proof/need). Called by `once()` after the dispatch. Pure (no IO): mutates the passed-in state.
 fn mark_nhs_surfaced(st: &mut Value, name: &str, fingerprint: &str) {
-    if !st.get("nhs_surfaced").map(Value::is_object).unwrap_or(false) {
+    if !st
+        .get("nhs_surfaced")
+        .map(Value::is_object)
+        .unwrap_or(false)
+    {
         st["nhs_surfaced"] = json!({});
     }
     if let Some(m) = st.get_mut("nhs_surfaced").and_then(Value::as_object_mut) {
@@ -2390,13 +2414,14 @@ mod tests {
             None,
             false,
         );
-        assert_eq!(changed_jobs.len(), 1, "a new RED fingerprint bypasses the old proof");
+        assert_eq!(
+            changed_jobs.len(),
+            1,
+            "a new RED fingerprint bypasses the old proof"
+        );
         assert_eq!(changed_jobs[0].kind, "implement");
         assert!(
-            !proof_matches_fresh_state(
-                &name,
-                &retry_state_fingerprint(&unchanged, "needs_goal")
-            ),
+            !proof_matches_fresh_state(&name, &retry_state_fingerprint(&unchanged, "needs_goal")),
             "a changed diagnosis category must bypass the old proof"
         );
         let _ = std::fs::remove_dir_all(rt);
@@ -2438,11 +2463,17 @@ mod tests {
             &mut st,
         );
         assert_eq!(result["outcome"], json!("blocked"));
-        assert!(result["summary"]
-            .as_str()
-            .unwrap_or("")
-            .contains("configured repo path does not exist"));
-        assert_eq!(daily_used(&st), 0, "preflight failure must not spend the daily AI budget");
+        assert!(
+            result["summary"]
+                .as_str()
+                .unwrap_or("")
+                .contains("configured repo path does not exist")
+        );
+        assert_eq!(
+            daily_used(&st),
+            0,
+            "preflight failure must not spend the daily AI budget"
+        );
         if let Some(rt) = paths::runtime_dir(&json!({"name": name})) {
             let _ = std::fs::remove_dir_all(rt);
         }
@@ -2570,8 +2601,14 @@ mod tests {
         let cfg = json!({"provider": "openrouter", "targets": [noop.clone(), ai.clone()]});
         let mut projects = Map::new();
         // Both RED => both priority 10, forcing the tie the deadlock lived in.
-        projects.insert(noop.clone(), json!({"status": "red", "reasons": ["noop_streak=red"]}));
-        projects.insert(ai.clone(), json!({"status": "red", "reasons": ["publish_recency=red"]}));
+        projects.insert(
+            noop.clone(),
+            json!({"status": "red", "reasons": ["noop_streak=red"]}),
+        );
+        projects.insert(
+            ai.clone(),
+            json!({"status": "red", "reasons": ["publish_recency=red"]}),
+        );
         let ops = json!({"projects": Value::Object(projects)});
         let mut st = json!({"manual_queue": []});
 
@@ -2579,10 +2616,16 @@ mod tests {
 
         // Precondition sanity: both jobs planned, both at priority 10, and the no-op really is
         // a non-AI proof_required job (the absorbing head the deadlock spun on).
-        let noop_job = jobs.iter().find(|j| j.name == noop).expect("noop job planned");
+        let noop_job = jobs
+            .iter()
+            .find(|j| j.name == noop)
+            .expect("noop job planned");
         let ai_job = jobs.iter().find(|j| j.name == ai).expect("ai job planned");
         assert_eq!(noop_job.kind, "proof_required");
-        assert!(!noop_job.requires_ai, "noop must be the non-AI proof_required head");
+        assert!(
+            !noop_job.requires_ai,
+            "noop must be the non-AI proof_required head"
+        );
         assert_eq!(noop_job.priority, 10, "ops-RED noop must be priority 10");
         assert!(ai_job.requires_ai, "ai job must be a runnable AI improver");
         assert_eq!(ai_job.priority, 10, "ops-RED ai job must be priority 10");
@@ -2593,7 +2636,10 @@ mod tests {
             jobs[0].name, ai,
             "scheduler must select the runnable AI job, not spin on the no-op proof_required head"
         );
-        assert!(jobs[0].requires_ai, "jobs.first() must be an AI improver job");
+        assert!(
+            jobs[0].requires_ai,
+            "jobs.first() must be an AI improver job"
+        );
 
         let _ = std::fs::remove_dir_all(noop_rt);
         let _ = std::fs::remove_dir_all(ai_rt);
@@ -2674,10 +2720,12 @@ mod tests {
         assert_eq!(pubc["api_key"], json!("OPENROUTER_API_KEY"));
         assert_eq!(pubc["model"], json!("m"));
         assert_eq!(pubc["mode"], json!("single_agent"));
-        assert!(pubc["mission"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Autonomously improve"));
+        assert!(
+            pubc["mission"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Autonomously improve")
+        );
     }
 
     #[test]
@@ -2895,9 +2943,15 @@ mod tests {
         let mut st = json!({});
         // 3 consecutive proof_required sweeps — the 3rd arms the cooldown.
         bump_stuck_counter(&mut st, "dotz", true);
-        assert!(!proof_cooldown_active_at(&st, "dotz", Utc::now()), "1st: not parked yet");
+        assert!(
+            !proof_cooldown_active_at(&st, "dotz", Utc::now()),
+            "1st: not parked yet"
+        );
         bump_stuck_counter(&mut st, "dotz", true);
-        assert!(!proof_cooldown_active_at(&st, "dotz", Utc::now()), "2nd: not parked yet");
+        assert!(
+            !proof_cooldown_active_at(&st, "dotz", Utc::now()),
+            "2nd: not parked yet"
+        );
         bump_stuck_counter(&mut st, "dotz", true);
         assert!(
             proof_cooldown_active_at(&st, "dotz", Utc::now()),
@@ -2916,7 +2970,10 @@ mod tests {
 
         // The lane eventually MOVES (shipped/blocked/complete) — stuck + cooldown both clear.
         bump_stuck_counter(&mut st, "dotz", false);
-        assert!(!proof_cooldown_active_at(&st, "dotz", Utc::now()), "cleared on a real move");
+        assert!(
+            !proof_cooldown_active_at(&st, "dotz", Utc::now()),
+            "cleared on a real move"
+        );
         assert!(st.get("stuck").unwrap().get("dotz").is_none());
     }
 
@@ -2970,7 +3027,10 @@ mod tests {
             job.kind, "implement",
             "an ACTIVE cooldown DIVERSIFIES (a gated AI attempt), never a human park"
         );
-        assert!(job.requires_ai, "the diversification is a gated AI implement iteration");
+        assert!(
+            job.requires_ai,
+            "the diversification is a gated AI implement iteration"
+        );
         assert!(
             job.reason.contains("diversification") && job.reason.contains("FRESH, DIFFERENT"),
             "the reason frames a fresh-approach attempt: {reason}",
@@ -3013,7 +3073,11 @@ mod tests {
             job.kind, "proof_required",
             "past the daily diversification cap the lane backs off to inert proof_required, not a park"
         );
-        assert!(job.reason.contains("backing off"), "the backoff is explicit: {}", job.reason);
+        assert!(
+            job.reason.contains("backing off"),
+            "the backoff is explicit: {}",
+            job.reason
+        );
 
         // EXPIRED-but-present cooldown (park expiry, no human wake, no real outcome): the
         // self-respec path RE-ARMS directly — a fresh self-generated spec is planned, never an
@@ -3036,7 +3100,10 @@ mod tests {
             job.kind, "implement",
             "park EXPIRY re-arms the autonomous re-spec (a gated AI attempt), not an inert re-fire"
         );
-        assert!(job.diversify, "the expiry re-spec is budget-charged at dispatch like any diversify");
+        assert!(
+            job.diversify,
+            "the expiry re-spec is budget-charged at dispatch like any diversify"
+        );
         assert!(
             job.spec_goal.is_some(),
             "the expiry re-spec dispatches a FRESH self-generated goal text"
@@ -3058,7 +3125,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&stuck_rt);
         std::fs::create_dir_all(&stuck_rt).unwrap();
         // No `lock` file => !running. A `stop` sentinel + reason => diagnose "stranded_unmerged_branch".
-        std::fs::write(stuck_rt.join("stop"), "stranded_unmerged_branch_persistent\n").unwrap();
+        std::fs::write(
+            stuck_rt.join("stop"),
+            "stranded_unmerged_branch_persistent\n",
+        )
+        .unwrap();
         std::fs::write(
             stuck_rt.join("heartbeat.json"),
             serde_json::to_string(&json!({
@@ -3102,13 +3173,19 @@ mod tests {
             false,
         );
 
-        let stuck_job = jobs.iter().find(|j| j.name == stuck).expect("structural job planned");
+        let stuck_job = jobs
+            .iter()
+            .find(|j| j.name == stuck)
+            .expect("structural job planned");
         assert_eq!(
             stuck_job.kind, "implement",
             "a structurally-stuck lane DIVERSIFIES (a gated AI attempt), NOT a human park"
         );
         assert_eq!(stuck_job.state, "queued");
-        assert!(stuck_job.requires_ai, "the diversification is a gated AI implement iteration");
+        assert!(
+            stuck_job.requires_ai,
+            "the diversification is a gated AI implement iteration"
+        );
         assert!(
             stuck_job.next_action.contains("DIFFERENT approach"),
             "the next action tells the brain to take a different approach: {next}",
@@ -3132,7 +3209,10 @@ mod tests {
         );
 
         // The retry-later lane, under the identical empty state, keeps the proof_required ladder.
-        let retry_job = jobs.iter().find(|j| j.name == retry).expect("retry job planned");
+        let retry_job = jobs
+            .iter()
+            .find(|j| j.name == retry)
+            .expect("retry job planned");
         assert_eq!(
             retry_job.kind, "proof_required",
             "a retry-later (config-fixable) blocker keeps proof_required — the two ladders are distinct"
@@ -3154,16 +3234,28 @@ mod tests {
     #[test]
     fn nhs_surface_once_helpers_roundtrip() {
         let mut st = json!({});
-        assert!(!nhs_already_surfaced(&st, "asmodeus", "fp1"), "nothing surfaced yet");
+        assert!(
+            !nhs_already_surfaced(&st, "asmodeus", "fp1"),
+            "nothing surfaced yet"
+        );
         mark_nhs_surfaced(&mut st, "asmodeus", "fp1");
-        assert!(nhs_already_surfaced(&st, "asmodeus", "fp1"), "identical need is parked");
+        assert!(
+            nhs_already_surfaced(&st, "asmodeus", "fp1"),
+            "identical need is parked"
+        );
         assert!(
             !nhs_already_surfaced(&st, "asmodeus", "fp2"),
             "a CHANGED fingerprint (lane state changed) re-surfaces"
         );
-        assert!(!nhs_already_surfaced(&st, "dotz", "fp1"), "per-lane, not global");
+        assert!(
+            !nhs_already_surfaced(&st, "dotz", "fp1"),
+            "per-lane, not global"
+        );
         clear_nhs_surfaced(&mut st, "asmodeus");
-        assert!(!nhs_already_surfaced(&st, "asmodeus", "fp1"), "cleared = re-surfaces once");
+        assert!(
+            !nhs_already_surfaced(&st, "asmodeus", "fp1"),
+            "cleared = re-surfaces once"
+        );
         clear_nhs_surfaced(&mut st, "never_marked"); // no-op, never panics
     }
 
@@ -3191,7 +3283,11 @@ mod tests {
         let parked_rt = paths::runtime_dir(&parked_repo).unwrap();
         let _ = std::fs::remove_dir_all(&parked_rt);
         std::fs::create_dir_all(&parked_rt).unwrap();
-        std::fs::write(parked_rt.join("stop"), "stranded_unmerged_branch_persistent\n").unwrap();
+        std::fs::write(
+            parked_rt.join("stop"),
+            "stranded_unmerged_branch_persistent\n",
+        )
+        .unwrap();
         std::fs::write(
             parked_rt.join("heartbeat.json"),
             serde_json::to_string(&json!({
@@ -3214,10 +3310,19 @@ mod tests {
         // path — same charge_diversify_dispatch seam) consumes one budget unit.
         for i in 1..=DIVERSIFY_DAILY_CAP {
             let jobs = plan_jobs(&repos, &cfg, &ops, &mut st, None, true);
-            let job = jobs.iter().find(|j| j.name == parked).expect("diversify job planned");
-            assert_eq!(job.kind, "implement", "sweep {i} diversifies (gated AI attempt): {job:?}");
+            let job = jobs
+                .iter()
+                .find(|j| j.name == parked)
+                .expect("diversify job planned");
+            assert_eq!(
+                job.kind, "implement",
+                "sweep {i} diversifies (gated AI attempt): {job:?}"
+            );
             assert!(job.requires_ai);
-            assert!(job.diversify, "the planned job is marked for the dispatch-time charge");
+            assert!(
+                job.diversify,
+                "the planned job is marked for the dispatch-time charge"
+            );
             charge_diversify_dispatch(&mut st, &parked); // the job WON the slot and dispatched
             assert_eq!(
                 diversify_count(&st, &parked, &today_local()),
@@ -3245,12 +3350,19 @@ mod tests {
 
         // The DISPLAY path still surfaces the blocker (inert proof_required, NOT a human park).
         let jobs = plan_jobs(&repos, &cfg, &ops, &mut st, None, false);
-        let job = jobs.iter().find(|j| j.name == parked).expect("display job planned");
+        let job = jobs
+            .iter()
+            .find(|j| j.name == parked)
+            .expect("display job planned");
         assert_eq!(
             job.kind, "proof_required",
             "the dashboard shows the inert blocker, not a human park: {job:?}"
         );
-        assert!(job.reason.contains("backing off"), "the backoff is explicit: {}", job.reason);
+        assert!(
+            job.reason.contains("backing off"),
+            "the backoff is explicit: {}",
+            job.reason
+        );
 
         let _ = std::fs::remove_dir_all(parked_rt);
     }
@@ -3291,8 +3403,14 @@ mod tests {
         // SAME first attempt — not silently exhaust to 3/3 with zero dispatches.
         for sweep in 1..=2 * DIVERSIFY_DAILY_CAP {
             let jobs = plan_jobs(&repos, &cfg, &ops, &mut st, None, true);
-            let job = jobs.iter().find(|j| j.name == lane).expect("re-spec job planned");
-            assert_eq!(job.kind, "implement", "sweep {sweep} still plans the re-spec: {job:?}");
+            let job = jobs
+                .iter()
+                .find(|j| j.name == lane)
+                .expect("re-spec job planned");
+            assert_eq!(
+                job.kind, "implement",
+                "sweep {sweep} still plans the re-spec: {job:?}"
+            );
             assert!(job.diversify);
             assert!(
                 job.reason.contains(&format!("1/{DIVERSIFY_DAILY_CAP}")),
@@ -3367,14 +3485,20 @@ mod tests {
             None,
             true, // the DISPATCH path — this is what once() actually runs
         );
-        let job = jobs.iter().find(|j| j.name == name).expect("self-respec planned");
+        let job = jobs
+            .iter()
+            .find(|j| j.name == name)
+            .expect("self-respec planned");
         assert_eq!(
             job.kind, "implement",
             "park expiry with no wake dispatches a real gated implement attempt: {job:?}"
         );
         assert!(job.requires_ai && job.diversify);
         assert!(!job.wake_override, "no human was involved");
-        let goal = job.spec_goal.as_deref().expect("a FRESH self-generated goal text");
+        let goal = job
+            .spec_goal
+            .as_deref()
+            .expect("a FRESH self-generated goal text");
         assert!(
             goal.contains("SELF-SPEC") && goal.contains("category:"),
             "the goal is a bounded self-spec, not the standing goal: {goal}"
@@ -3426,10 +3550,24 @@ mod tests {
             "quiet does not mean parked for a human: {jobs:?}"
         );
         // The display path still shows WHY (inert proof_required backoff), so the dashboard is honest.
-        let jobs = plan_jobs(std::slice::from_ref(&repo), &cfg, &ops, &mut st, None, false);
-        let shown = jobs.iter().find(|j| j.name == name).expect("display job planned");
+        let jobs = plan_jobs(
+            std::slice::from_ref(&repo),
+            &cfg,
+            &ops,
+            &mut st,
+            None,
+            false,
+        );
+        let shown = jobs
+            .iter()
+            .find(|j| j.name == name)
+            .expect("display job planned");
         assert_eq!(shown.kind, "proof_required");
-        assert!(shown.reason.contains("backing off"), "backoff is explicit: {}", shown.reason);
+        assert!(
+            shown.reason.contains("backing off"),
+            "backoff is explicit: {}",
+            shown.reason
+        );
 
         // A NEW DAY (the stored count is yesterday's): the budget reads 0 and the self-respec
         // re-arms with NO human wake — the cap resets naturally per-day, which is the rate limit.
@@ -3438,9 +3576,22 @@ mod tests {
             "proof_cooldowns": expired_park(&name, 3600),
             "diversify": {name.clone(): {"date": "2001-01-01", "count": DIVERSIFY_DAILY_CAP}},
         });
-        let jobs = plan_jobs(std::slice::from_ref(&repo), &cfg, &ops, &mut st_new_day, None, true);
-        let job = jobs.iter().find(|j| j.name == name).expect("self-respec re-armed");
-        assert_eq!(job.kind, "implement", "the daily reset re-arms the self-respec: {job:?}");
+        let jobs = plan_jobs(
+            std::slice::from_ref(&repo),
+            &cfg,
+            &ops,
+            &mut st_new_day,
+            None,
+            true,
+        );
+        let job = jobs
+            .iter()
+            .find(|j| j.name == name)
+            .expect("self-respec re-armed");
+        assert_eq!(
+            job.kind, "implement",
+            "the daily reset re-arms the self-respec: {job:?}"
+        );
         assert!(job.diversify && job.spec_goal.is_some());
 
         let _ = std::fs::remove_dir_all(rt);
@@ -3462,8 +3613,14 @@ mod tests {
         });
         bump_stuck_counter(&mut st, &name, false); // wake() reuses the real-move arm
         arm_human_wake(&mut st, &name);
-        assert!(proof_cooldown_entry(&st, &name).is_none(), "the ack clears the park");
-        assert!(human_wake_pending(&st, &name), "the ack arms the one-shot override");
+        assert!(
+            proof_cooldown_entry(&st, &name).is_none(),
+            "the ack clears the park"
+        );
+        assert!(
+            human_wake_pending(&st, &name),
+            "the ack arms the one-shot override"
+        );
 
         // Planning with the flag pending: a NORMAL implement on the standing spec — even though
         // the diagnosis is still unhealthy (proof_required verdict).
@@ -3475,15 +3632,31 @@ mod tests {
             None,
             true,
         );
-        let job = jobs.iter().find(|j| j.name == name).expect("override job planned");
-        assert_eq!(job.kind, "implement", "the wake override dispatches a real attempt: {job:?}");
-        assert!(job.wake_override, "marked for the dispatch-time flag consumption");
-        assert!(!job.diversify, "a human-ack'd run never charges the diversify budget");
+        let job = jobs
+            .iter()
+            .find(|j| j.name == name)
+            .expect("override job planned");
+        assert_eq!(
+            job.kind, "implement",
+            "the wake override dispatches a real attempt: {job:?}"
+        );
+        assert!(
+            job.wake_override,
+            "marked for the dispatch-time flag consumption"
+        );
+        assert!(
+            !job.diversify,
+            "a human-ack'd run never charges the diversify budget"
+        );
         assert!(
             job.spec_goal.is_none(),
             "the override runs the operator's STANDING spec, not a generated one"
         );
-        assert!(job.reason.contains("operator wake ack"), "reason names the ack: {}", job.reason);
+        assert!(
+            job.reason.contains("operator wake ack"),
+            "reason names the ack: {}",
+            job.reason
+        );
 
         // One-shot: consuming at dispatch clears the flag; a second plan (still unhealthy, no
         // park entry) falls back to the ordinary proof_required ladder — not a repeat override.
@@ -3498,7 +3671,10 @@ mod tests {
             false,
         );
         let job = jobs.iter().find(|j| j.name == name).expect("job planned");
-        assert_eq!(job.kind, "proof_required", "after the one shot the normal ladder resumes");
+        assert_eq!(
+            job.kind, "proof_required",
+            "after the one shot the normal ladder resumes"
+        );
         consume_human_wake(&mut st, "never_armed"); // no-op, never panics
 
         let _ = std::fs::remove_dir_all(rt);
@@ -3547,7 +3723,10 @@ mod tests {
             cat3, cat1,
             "a spec family that failed {SELF_SPEC_FAMILY_FAIL_LIMIT}x is abandoned"
         );
-        assert_eq!(cat3, SELF_SPEC_CATEGORIES[1], "rotation order is deterministic");
+        assert_eq!(
+            cat3, SELF_SPEC_CATEGORIES[1],
+            "rotation order is deterministic"
+        );
         assert!(goal3.contains(&format!("category: {cat3}")));
 
         // A real MOVE resets the rotation to the first category.
@@ -3592,7 +3771,13 @@ mod tests {
     /// falls within `(since, now]` (inclusive of since, exclusive of now — the last second is the
     /// caller's `now`). Lines that fail to parse are skipped (lenient, same as the probe evaluators).
     /// Pure — unit-tested over fixture lines.
-    pub fn count_job_finished(lines: &[&str], since: DateTime<Utc>, now: DateTime<Utc>, job: &str, outcome: &str) -> u64 {
+    pub fn count_job_finished(
+        lines: &[&str],
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+        job: &str,
+        outcome: &str,
+    ) -> u64 {
         let mut n = 0u64;
         for line in lines {
             let rec: Value = match serde_json::from_str(line.trim()) {
@@ -3625,7 +3810,8 @@ mod tests {
     ///   PowerShell wrapper (see ops.json solomon proof_ratio probe) AND the unit-tested pure core.
     pub fn proof_implement_ratio(lines: &[&str], now: DateTime<Utc>) -> Option<f64> {
         let since = now - ChronoDuration::hours(24);
-        let proof = count_job_finished(lines, since, now, "proof_required", "proof_required") as f64;
+        let proof =
+            count_job_finished(lines, since, now, "proof_required", "proof_required") as f64;
         let implement_shipped =
             count_job_finished(lines, since, now, "implement", "shipped") as f64;
         // An implement run that reverted also lands as proof_required (fleet.rs:401). To measure the
@@ -3635,7 +3821,8 @@ mod tests {
         // (job, outcome); here we sum the implement outcomes that mean "an AI run actually happened".
         let implement_reverted =
             count_job_finished(lines, since, now, "implement", "proof_required") as f64;
-        let implement_blocked = count_job_finished(lines, since, now, "implement", "blocked") as f64;
+        let implement_blocked =
+            count_job_finished(lines, since, now, "implement", "blocked") as f64;
         let implement = implement_shipped + implement_reverted + implement_blocked;
         if implement == 0.0 {
             return None;
@@ -3676,7 +3863,10 @@ mod tests {
             .collect();
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         let ratio = proof_implement_ratio(&refs, now).expect("ratio computed");
-        assert!((ratio - 3.5).abs() < 1e-9, "ratio is 3.5 (7 proof / 2 implement): {ratio}");
+        assert!(
+            (ratio - 3.5).abs() < 1e-9,
+            "ratio is 3.5 (7 proof / 2 implement): {ratio}"
+        );
         assert!(ratio > 2.5, "3.5:1 is RED (>2.5)");
     }
 
@@ -3691,7 +3881,8 @@ mod tests {
                     "outcome": "proof_required",
                     "ts": (now - ChronoDuration::seconds(600 + i * 60))
                         .format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                })).unwrap()
+                }))
+                .unwrap()
             })
             .chain((0..2).map(|i| {
                 serde_json::to_string(&json!({
@@ -3699,7 +3890,8 @@ mod tests {
                     "outcome": "shipped",
                     "ts": (now - ChronoDuration::seconds(300 + i * 60))
                         .format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                })).unwrap()
+                }))
+                .unwrap()
             }))
             .collect();
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
@@ -3717,12 +3909,14 @@ mod tests {
                 "event": "job_finished", "repo": "dotz", "job": "proof_required",
                 "outcome": "proof_required",
                 "ts": (now - ChronoDuration::seconds(600)).format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            })).unwrap(),
+            }))
+            .unwrap(),
             serde_json::to_string(&json!({
                 "event": "job_finished", "repo": "maki", "job": "implement",
                 "outcome": "shipped",
                 "ts": (now - ChronoDuration::seconds(300)).format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            })).unwrap(),
+            }))
+            .unwrap(),
         ];
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         let ratio = proof_implement_ratio(&refs, now).expect("ratio computed");
@@ -3741,7 +3935,8 @@ mod tests {
                     "outcome": "proof_required",
                     "ts": (now - ChronoDuration::seconds(600 + i * 60))
                         .format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                })).unwrap()
+                }))
+                .unwrap()
             })
             .collect();
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
@@ -3761,21 +3956,27 @@ mod tests {
                 "event": "job_finished", "repo": "dotz", "job": "proof_required",
                 "outcome": "proof_required",
                 "ts": (now - ChronoDuration::hours(30)).format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            })).unwrap(),
+            }))
+            .unwrap(),
             serde_json::to_string(&json!({
                 "event": "job_finished", "repo": "dotz", "job": "proof_required",
                 "outcome": "proof_required",
                 "ts": (now - ChronoDuration::seconds(600)).format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            })).unwrap(),
+            }))
+            .unwrap(),
             serde_json::to_string(&json!({
                 "event": "job_finished", "repo": "maki", "job": "implement",
                 "outcome": "shipped",
                 "ts": (now - ChronoDuration::seconds(300)).format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            })).unwrap(),
+            }))
+            .unwrap(),
         ];
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         let ratio = proof_implement_ratio(&refs, now).expect("ratio computed");
         // 1 proof (the 30h-old one excluded) / 1 implement = 1.0
-        assert!((ratio - 1.0).abs() < 1e-9, "window excludes the 30h-old event: {ratio}");
+        assert!(
+            (ratio - 1.0).abs() < 1e-9,
+            "window excludes the 30h-old event: {ratio}"
+        );
     }
 }

@@ -21,7 +21,7 @@
 //! `register_failure`'s `limit` is the Python default (3) for `_note_noop`/`_note_deviation`/
 //! `_note_revert` (the Rust signatures take it explicitly; the source passes none == 3).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::improver::ctx::{self, Ctx};
 use crate::improver::{
@@ -219,7 +219,7 @@ stashed (recoverable) before force-checkout to '{base_branch}'"
                 "phase": "preflight",
                 "last_summary": format!(
                     "Refusing to force-reset '{cur_branch}': uncommitted work could not be \
-stashed — commit or stash it manually (the loop won't clobber non-base work)."
+            stashed — commit or stash it manually (the loop won't clobber non-base work)."
                 ),
             }));
             ctx.log(&format!(
@@ -437,7 +437,9 @@ STOP + error heartbeat; reconcile the branch(es), then Start)"
         // base_gate_red_persistent and permanently self-stops a healthy lane (observed 2026-07-02:
         // dotz self-stopped ~9h on a base that was green on an unloaded box).
         if !bgreen {
-            ctx.log("base gate RED — re-running once to rule out a flaky failure before a red bail");
+            ctx.log(
+                "base gate RED — re-running once to rule out a flaky failure before a red bail",
+            );
             let (bgreen2, bt2, _tail2) = gates::run_gate(ctx);
             bgreen = bgreen2;
             bt = bt2;
@@ -577,7 +579,8 @@ Then stop."
         // ambitious [feature]/[architecture]/[campaign] slice isn't guillotined and reverted to a
         // noop. Runs AFTER apply_fallback_model (never touches the model — the escalation ladder owns
         // that) and BEFORE the plan phase, whose phase_run_pi save/restore preserves this reasoning.
-        let (tier_reasoning, tier_timeout) = tier_budget(&tier, &ctx.reasoning, pi::TIMEOUT_IMPLEMENT);
+        let (tier_reasoning, tier_timeout) =
+            tier_budget(&tier, &ctx.reasoning, pi::TIMEOUT_IMPLEMENT);
         ctx.reasoning = tier_reasoning;
         item_timeout = tier_timeout;
         let mut t = escalation::build_task(ctx, &g, &tier);
@@ -682,7 +685,9 @@ Then stop."
     if ctx.moa_enabled {
         if let Some(m) = &moa_impl_model {
             ctx.pi_model = m.clone();
-            ctx.log(&format!("MoA implementer: overriding pi_model {saved_pi_model} -> {m}"));
+            ctx.log(&format!(
+                "MoA implementer: overriding pi_model {saved_pi_model} -> {m}"
+            ));
         }
     }
     let p = match crate::ceo::orchestrator::dispatch_engineering_on_ctx(
@@ -803,7 +808,11 @@ Then stop."
     // and let the loop's natural interval sleep back off so the lanes self-throttle under the cap.
     if pi::is_quota_error_output(&p.stdout, &p.stderr) {
         let stream_err = pi::stream_error_messages(&p.stdout);
-        let source = if pi::is_quota_error(&p.stderr) { p.stderr.trim() } else { stream_err.trim() };
+        let source = if pi::is_quota_error(&p.stderr) {
+            p.stderr.trim()
+        } else {
+            stream_err.trim()
+        };
         let why = tail_chars(&ctx.redact(source), 300);
         ctx.log(&format!(
             "Pi QUOTA/TRANSPORT ERROR (429 / usage limit / rate limit — NOT a model no-op; \
@@ -817,7 +826,9 @@ NOT counted toward noop_streak, no reset): {why}"
             ctx,
             &branch,
             "quota_error",
-            &format!("Provider quota/rate-limit error (not a noop — backing off this cycle): {why}"),
+            &format!(
+                "Provider quota/rate-limit error (not a noop — backing off this cycle): {why}"
+            ),
             "sleeping",
         );
         return;
@@ -882,12 +893,7 @@ hallucinated its file edits; counting as a no-op",
             );
             ctx.log(&format!("anti-gaming (pre-gate): {why}"));
             progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "reverted");
-            escalation::note_revert(
-                ctx,
-                &goal,
-                &why,
-                NOTE_LIMIT,
-            );
+            escalation::note_revert(ctx, &goal, &why, NOTE_LIMIT);
             gitops::drop_branch(
                 ctx,
                 &branch,
@@ -1138,11 +1144,19 @@ skip, xfail, delete, or weaken any test"
             NoCommitsOutcome::Drop { detail } => {
                 ctx.log(&format!("{detail} — dropping branch"));
                 progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "noop");
-                gitops::drop_branch(ctx, &branch, "noop", &format!("{detail}. {summary}"), "sleeping");
+                gitops::drop_branch(
+                    ctx,
+                    &branch,
+                    "noop",
+                    &format!("{detail}. {summary}"),
+                    "sleeping",
+                );
                 return;
             }
             NoCommitsOutcome::Error { detail } => {
-                ctx.log(&format!("{detail} — keeping {branch} + dirty tree for inspection"));
+                ctx.log(&format!(
+                    "{detail} — keeping {branch} + dirty tree for inspection"
+                ));
                 progress::record_outcome(ctx, &progress_key, &progress_pre_hash, "error");
                 ctx.heartbeat(json!({
                     "status": "error",
@@ -1348,7 +1362,10 @@ data or a secret to the PUBLIC repo; fix the change to exclude it."
     // on a healthy long-lived lane (stranded ~6.5h of solomon self-work on 2026-07-01).
     if let Some(live) = ctx.live_ship() {
         if live != ctx.ship {
-            ctx.log(&format!("ship mode changed live: {}\u{2192}{}", ctx.ship, live));
+            ctx.log(&format!(
+                "ship mode changed live: {}\u{2192}{}",
+                ctx.ship, live
+            ));
             ctx.ship = live;
         }
     }
@@ -1439,8 +1456,7 @@ const EMPTY_IDEATE_STOP_LIMIT: i64 = 3;
 
 /// The default self-review goal injected when ideate returns no parseable ideas, so the iteration
 /// proceeds with real work instead of bailing through `needs_goal_skip` and thrashing the watchdog.
-const EMPTY_IDEATE_FALLBACK_GOAL: &str =
-    "read the code and fix one real bug, missing test, or ponytail-style simplification you find; \
+const EMPTY_IDEATE_FALLBACK_GOAL: &str = "read the code and fix one real bug, missing test, or ponytail-style simplification you find; \
      a truthful no-op beats a cosmetic change";
 
 /// run_improver.ideate_phase (~3248-3263): pipeline-phase wrapper for ideate(), run BEFORE plan at
@@ -1523,7 +1539,9 @@ fn inject_fallback_goal(ctx: &mut Ctx) {
         let _ = std::fs::create_dir_all(parent);
     }
     if std::fs::write(&ctx.backlog, body).is_err() {
-        ctx.log("ideate-empty fallback: could not write backlog — proceeding with placeholder goal");
+        ctx.log(
+            "ideate-empty fallback: could not write backlog — proceeding with placeholder goal",
+        );
     }
 }
 
@@ -1553,7 +1571,11 @@ fn ideate(ctx: &mut Ctx) -> i64 {
     // as "no parseable ideas" across the whole fleet.
     if pi::is_quota_error_output(&p.stdout, &p.stderr) {
         let stream_err = pi::stream_error_messages(&p.stdout);
-        let source = if pi::is_quota_error(&p.stderr) { p.stderr.trim() } else { stream_err.trim() };
+        let source = if pi::is_quota_error(&p.stderr) {
+            p.stderr.trim()
+        } else {
+            stream_err.trim()
+        };
         let why = tail_chars(&ctx.redact(source), 300);
         ctx.log(&format!(
             "ideate: provider quota/rate-limit error (429 — NOT 'no parseable ideas'); backing off this cycle: {why}"
@@ -2180,7 +2202,16 @@ mod tests {
         c.git(&["add", "-A"], 10);
         assert_eq!(
             c.git(
-                &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", "initial"],
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "initial"
+                ],
                 10
             )
             .code,
@@ -2192,7 +2223,11 @@ mod tests {
                 .stdout
                 .trim()
                 .to_string();
-            if b.is_empty() || b == "HEAD" { "main".to_string() } else { b }
+            if b.is_empty() || b == "HEAD" {
+                "main".to_string()
+            } else {
+                b
+            }
         };
         c.base_branch = base.clone();
         (c, dir, base)
@@ -2204,7 +2239,10 @@ mod tests {
     #[test]
     fn no_commits_dirty_tree_runner_commits_with_agent_author() {
         let (mut c, dir, base) = no_identity_repo_ctx();
-        assert_eq!(c.git(&["checkout", "-q", "-b", "rsi/iter-test"], 10).code, 0);
+        assert_eq!(
+            c.git(&["checkout", "-q", "-b", "rsi/iter-test"], 10).code,
+            0
+        );
         // The "agent" edits a tracked file and adds a new test file, but never runs git commit.
         std::fs::write(dir.join("README.md"), "# test\nimproved\n").unwrap();
         std::fs::write(dir.join("tests_rsi.py"), "def test_floor(): assert True\n").unwrap();
@@ -2237,7 +2275,10 @@ mod tests {
     #[test]
     fn no_commits_clean_tree_drops_with_named_diagnosis() {
         let (mut c, dir, base) = no_identity_repo_ctx();
-        assert_eq!(c.git(&["checkout", "-q", "-b", "rsi/iter-test"], 10).code, 0);
+        assert_eq!(
+            c.git(&["checkout", "-q", "-b", "rsi/iter-test"], 10).code,
+            0
+        );
 
         let out = resolve_no_commits_ahead(&mut c, "rsi: nothing\n\nsummary");
         match out {
@@ -2395,7 +2436,9 @@ The following:";
         let mut c = ctx();
         c.goal = "ship revenue features".to_string();
         let t = ideate_task(&c);
-        assert!(t.contains("NORTH-STAR GOAL (rank every idea by how much it advances THIS):\nship revenue features"));
+        assert!(t.contains(
+            "NORTH-STAR GOAL (rank every idea by how much it advances THIS):\nship revenue features"
+        ));
     }
 
     // ---- char_slice / tail_chars / py_dict_str ----
@@ -2501,8 +2544,10 @@ The following:";
         for i in 1..EMPTY_IDEATE_STOP_LIMIT {
             c.consecutive_empty_ideate = i;
             inject_fallback_goal(&mut c);
-            assert!(!c.stop_path.exists(),
-                "stop should not be written at consecutive_empty_ideate={i}");
+            assert!(
+                !c.stop_path.exists(),
+                "stop should not be written at consecutive_empty_ideate={i}"
+            );
         }
 
         // K-th empty result: write stop.
@@ -2533,7 +2578,11 @@ The following:";
     fn warm_working_block_is_empty_on_a_cold_lane() {
         let c = ctx();
         let _ = std::fs::remove_file(c.runtime.join("observations.jsonl"));
-        assert_eq!(warm_working_block(&c), "", "no warm memory -> no block appended");
+        assert_eq!(
+            warm_working_block(&c),
+            "",
+            "no warm memory -> no block appended"
+        );
     }
 
     /// After the lane's OWN prior cycle wrote a dated observation, the next cycle's warm block
@@ -2547,20 +2596,36 @@ The following:";
         let log = ObservationLog::at(c.runtime.join("observations.jsonl"));
         // a LARGE prior-cycle history — the block must take only the tail and stay bounded.
         for i in 0..500 {
-            log.append_fact("2026-07-08", &format!("cycle {i} shipped PR #{i} equity +0.0{i}"))
-                .unwrap();
+            log.append_fact(
+                "2026-07-08",
+                &format!("cycle {i} shipped PR #{i} equity +0.0{i}"),
+            )
+            .unwrap();
         }
         let block = warm_working_block(&c);
-        assert!(block.contains("cycle 499"), "newest prior-cycle observation carried forward: {block}");
-        assert!(!block.contains("cycle 0 "), "oldest is NOT loaded (bounded tail, not end-to-end)");
+        assert!(
+            block.contains("cycle 499"),
+            "newest prior-cycle observation carried forward: {block}"
+        );
+        assert!(
+            !block.contains("cycle 0 "),
+            "oldest is NOT loaded (bounded tail, not end-to-end)"
+        );
         // ADVISORY + no-authority framing is present (the HARD INVARIANT the skeptic enforces).
-        assert!(block.contains("ADVISORY"), "block must be labelled advisory");
+        assert!(
+            block.contains("ADVISORY"),
+            "block must be labelled advisory"
+        );
         assert!(
             block.contains("grants no authority and bypasses no gate"),
             "block must state it carries no authority / no gate-bypass"
         );
         // HARD-BOUNDED: the rendered working content can never exceed the working-tier byte cap.
-        assert!(block.len() <= WORKING_MAX_BYTES + 512, "block stays bounded: {} bytes", block.len());
+        assert!(
+            block.len() <= WORKING_MAX_BYTES + 512,
+            "block stays bounded: {} bytes",
+            block.len()
+        );
         let _ = std::fs::remove_dir_all(&c.runtime);
     }
 
@@ -2602,7 +2667,8 @@ The following:";
         // Also seed one observation so the block is non-empty regardless (isolates the outcome assert).
         std::fs::create_dir_all(&c.runtime).unwrap();
         let log = crate::pecrt::warm::ObservationLog::at(c.runtime.join("observations.jsonl"));
-        log.append_fact("2026-07-08", "prior cycle shipped PR #7 equity +0.05").unwrap();
+        log.append_fact("2026-07-08", "prior cycle shipped PR #7 equity +0.05")
+            .unwrap();
 
         let block = warm_working_block(&c);
         assert!(

@@ -11,7 +11,7 @@
 //! exit-code propagation below are load-bearing and must stay byte-identical to control.py.
 
 use crate::control::{paths, proc};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 use std::time::Duration;
 
@@ -323,7 +323,12 @@ pub fn cleanup_worktrees(repo: &Value) -> Value {
         let on_origin = git_c(
             &git,
             &path,
-            &["merge-base", "--is-ancestor", &b, &format!("refs/remotes/origin/{b}")],
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &b,
+                &format!("refs/remotes/origin/{b}"),
+            ],
         )
         .map(|r| r.code == 0)
         .unwrap_or(false);
@@ -391,10 +396,7 @@ pub fn clean_branch(repo: &Value) -> Value {
     }
     let cw = cleanup_worktrees(repo);
     // removed defaults to [] via cw.get('removed', []); pruned via cw.get('pruned') (None if errored).
-    let removed = cw
-        .get("removed")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
+    let removed = cw.get("removed").cloned().unwrap_or_else(|| json!([]));
     let pruned = cw.get("pruned").cloned().unwrap_or(Value::Null);
     json!({
         "ok": true,
@@ -429,7 +431,11 @@ pub fn reset_to_base(repo: &Value) -> Value {
     // Whole try-block: any OSError -> {ok:false, error:str(e)}.
     let result = (|| -> std::io::Result<Result<(), Value>> {
         // (a) dirty TRACKED guard FIRST. Untracked files ignored by --untracked-files=no.
-        let dirty = git_c(&git, &path, &["status", "--porcelain", "--untracked-files=no"])?;
+        let dirty = git_c(
+            &git,
+            &path,
+            &["status", "--porcelain", "--untracked-files=no"],
+        )?;
         if !dirty.stdout.trim().is_empty() {
             return Ok(Err(json!({
                 "ok": false,
@@ -538,7 +544,10 @@ mod tests {
 
     #[test]
     fn local_rsi_branches_blank_lines_dropped() {
-        assert_eq!(parse_branch_lines("\n  \n* rsi/a\n"), vec!["rsi/a".to_string()]);
+        assert_eq!(
+            parse_branch_lines("\n  \n* rsi/a\n"),
+            vec!["rsi/a".to_string()]
+        );
     }
 
     #[test]
@@ -729,7 +738,11 @@ mod tests {
     #[test]
     fn cleanup_named_branch_deletes_two() {
         assert_eq!(
-            cleanup_removed("main", "aaa", &[("rsi/iter-1", "x", true), ("rsi/iter-2", "y", true)]),
+            cleanup_removed(
+                "main",
+                "aaa",
+                &[("rsi/iter-1", "x", true), ("rsi/iter-2", "y", true)]
+            ),
             vec!["rsi/iter-1".to_string(), "rsi/iter-2".to_string()]
         );
     }
@@ -738,7 +751,11 @@ mod tests {
     fn cleanup_detached_skips_branch_at_head_sha() {
         // cur='HEAD'(detached), head_sha='bbb'; rsi/iter-3 tip==bbb skipped; rsi/iter-2 deleted.
         assert_eq!(
-            cleanup_removed("HEAD", "bbb", &[("rsi/iter-3", "bbb", true), ("rsi/iter-2", "ccc", true)]),
+            cleanup_removed(
+                "HEAD",
+                "bbb",
+                &[("rsi/iter-3", "bbb", true), ("rsi/iter-2", "ccc", true)]
+            ),
             vec!["rsi/iter-2".to_string()]
         );
     }
@@ -746,7 +763,11 @@ mod tests {
     #[test]
     fn cleanup_current_named_rsi_branch_skipped() {
         assert_eq!(
-            cleanup_removed("rsi/iter-9", "z", &[("rsi/iter-9", "z", true), ("rsi/iter-8", "q", true)]),
+            cleanup_removed(
+                "rsi/iter-9",
+                "z",
+                &[("rsi/iter-9", "z", true), ("rsi/iter-8", "q", true)]
+            ),
             vec!["rsi/iter-8".to_string()]
         );
     }
@@ -783,7 +804,10 @@ mod tests {
     fn clean_branch_refusal_string_exact_bytes() {
         // Em-dash U+2014 with surrounding spaces — must be byte-identical.
         let s = "loop is running — stop it first";
-        assert_eq!(s.as_bytes(), "loop is running \u{2014} stop it first".as_bytes());
+        assert_eq!(
+            s.as_bytes(),
+            "loop is running \u{2014} stop it first".as_bytes()
+        );
     }
 
     // ---- reset_to_base error strings + helpers ----
@@ -801,7 +825,10 @@ mod tests {
     fn reset_unpushed_refusal_format() {
         let base = "main";
         let s = format!("un-pushed commits on {base} — escalate (won't auto-discard)");
-        assert_eq!(s, "un-pushed commits on main — escalate (won't auto-discard)");
+        assert_eq!(
+            s,
+            "un-pushed commits on main — escalate (won't auto-discard)"
+        );
     }
 
     #[test]

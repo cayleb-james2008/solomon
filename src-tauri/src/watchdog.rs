@@ -34,7 +34,7 @@
 use crate::control::{self, paths};
 use crate::supervisor;
 use chrono::{DateTime, Utc};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -313,7 +313,9 @@ fn sweep_autopilot(auto_push_flag: bool) -> Value {
 /// action so the watchdog line records that a dispatch was attempted (or skipped as single-flighted).
 fn spawn_autopilot_dispatch(auto_push_flag: bool) -> Vec<Value> {
     if AUTOPILOT_DISPATCH_RUNNING.swap(true, Ordering::SeqCst) {
-        return vec![json!("autopilot dispatch skipped (prior dispatch still running)")];
+        return vec![json!(
+            "autopilot dispatch skipped (prior dispatch still running)"
+        )];
     }
     std::thread::spawn(move || {
         let _guard = AutopilotDispatchGuard;
@@ -453,7 +455,10 @@ fn autopilot_recover_pass_inner(
                 }
             }
             if json_truthy(rec.get("escalate").unwrap_or(&Value::Null)) {
-                actions.push(format!("{name} ESCALATED: {}", py_repr(rec.get("category"))));
+                actions.push(format!(
+                    "{name} ESCALATED: {}",
+                    py_repr(rec.get("category"))
+                ));
             }
             if healed {
                 if let Err(e) = reset_stuck(name) {
@@ -522,7 +527,11 @@ fn base_is_clean(path: &str) -> bool {
     // 60s timeout: a hung git (credential prompt, slow NFS, locked index) must NEVER wedge the
     // watchdog tick forever — the tick stalls + the whole fleet stops dispatching (observed
     // 2026-07-20: stuck git processes from prior iterations accumulated + blocked the tick body).
-    let r = match control::proc::run(&["git", "-C", path, "status", "--porcelain"], None, Some(Duration::from_secs(60))) {
+    let r = match control::proc::run(
+        &["git", "-C", path, "status", "--porcelain"],
+        None,
+        Some(Duration::from_secs(60)),
+    ) {
         Ok(r) => r,
         Err(_) => return false, // OSError -> False
     };
@@ -626,9 +635,9 @@ fn persistent_stop_cleared(
         // — on the resolved default branch AND clean AND pushed (exactly `controller_clean` == Ok).
         // A page-only or surface-only path can NEVER satisfy this, so the stop clears strictly after
         // a real merge-to-default + push.
-        "controller_off_base_persistent" if controller_clean => {
-            Some("controller tree reconciled (on-base + pushed + clean) — cleared controller_off_base_persistent stop")
-        }
+        "controller_off_base_persistent" if controller_clean => Some(
+            "controller tree reconciled (on-base + pushed + clean) — cleared controller_off_base_persistent stop",
+        ),
         _ => None,
     }
 }
@@ -696,11 +705,14 @@ fn sweep_repo(
                         if let Value::Object(ref mut o) = fixed {
                             o.insert("status".into(), json!("stopped"));
                             o.insert("phase".into(), Value::Null);
-                            if let Some(Value::Object(ref mut pio)) = o.get_mut("pi") {
+                            if let Some(Value::Object(pio)) = o.get_mut("pi") {
                                 pio.insert("status".into(), json!("exited"));
                                 pio.insert("exit_code".into(), json!(-1));
                             }
-                            let _ = std::fs::write(&hb_path, serde_json::to_vec(&fixed).unwrap_or_default());
+                            let _ = std::fs::write(
+                                &hb_path,
+                                serde_json::to_vec(&fixed).unwrap_or_default(),
+                            );
                             actions.push(format!("{name} stale-heartbeat: cleared frozen '{status}' -> 'stopped' (dead PID, age {:.0}s)", hb_age.unwrap_or(0.0)));
                             hb = fixed;
                         }
@@ -964,8 +976,12 @@ fn controller_preflight_actions() -> Vec<String> {
     if solomon_running {
         return Vec::new();
     }
-    let marker = paths::here().join("runtime").join("_controller_dirty_paged");
-    let pending = paths::here().join("runtime").join("_controller_dirty_pending");
+    let marker = paths::here()
+        .join("runtime")
+        .join("_controller_dirty_paged");
+    let pending = paths::here()
+        .join("runtime")
+        .join("_controller_dirty_pending");
     match crate::provenance::controller_clean() {
         Err(detail) => {
             let (page_now, stamp_pending) =
@@ -1042,7 +1058,11 @@ fn janitor_graft_actions() -> Vec<String> {
     })();
     out.get("actions")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1051,7 +1071,11 @@ fn provenance_graft_actions() -> Vec<String> {
     crate::provenance::check()
         .get("actions")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1150,7 +1174,9 @@ pub fn main() -> i32 {
         .map(|a| a.len())
         .unwrap_or(0);
     let _ = (|| -> std::io::Result<()> {
-        let p = paths::here().join("runtime").join("_sentinel_heartbeat.json");
+        let p = paths::here()
+            .join("runtime")
+            .join("_sentinel_heartbeat.json");
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1344,7 +1370,10 @@ impl Drop for GraftFlagGuard {
     }
 }
 
-fn spawn_watchdog_graft<F>(running: &'static AtomicBool, f: F) -> Option<std::thread::JoinHandle<()>>
+fn spawn_watchdog_graft<F>(
+    running: &'static AtomicBool,
+    f: F,
+) -> Option<std::thread::JoinHandle<()>>
 where
     F: FnOnce() + Send + 'static,
 {
@@ -1633,7 +1662,9 @@ mod tests {
         // + clean), never on a page-only path.
         assert_eq!(
             persistent_stop_cleared("controller_off_base_persistent", false, false, false, true),
-            Some("controller tree reconciled (on-base + pushed + clean) — cleared controller_off_base_persistent stop")
+            Some(
+                "controller tree reconciled (on-base + pushed + clean) — cleared controller_off_base_persistent stop"
+            )
         );
         // still off-base/dirty/un-pushed (controller_clean still Err) -> leave the stop. Crucially,
         // base_clean/base_pushed/base_gate_green being true is NOT enough — only the full
@@ -1695,7 +1726,10 @@ mod tests {
         git(&["config", "user.email", "t@t"], &root);
         git(&["config", "user.name", "t"], &root);
         git(&["commit", "--allow-empty", "-m", "init"], &root);
-        git(&["remote", "add", "origin", &remote.to_string_lossy()], &root);
+        git(
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+            &root,
+        );
         // Push the CURRENT branch (whatever git named it) and record it as origin's default HEAD.
         let cur = String::from_utf8(
             Command::new("git")
@@ -1723,7 +1757,10 @@ mod tests {
         // git chose for us (main OR master, per host config). This is the load-bearing dynamic bit.
         let default = control::registry::resolve_default_branch(&root_s)
             .expect("origin/HEAD resolves the default branch");
-        assert_eq!(default, cur, "resolver must return git's real default branch");
+        assert_eq!(
+            default, cur,
+            "resolver must return git's real default branch"
+        );
 
         // ON DEFAULT + PUSHED: the precondition is satisfied.
         assert!(base_is_clean(&root_s), "fresh checkout is clean");
@@ -1734,7 +1771,10 @@ mod tests {
 
         // OFF-BASE + UN-PUSHED: commit onto an rsi/* working branch (the live D0 failure shape).
         git(&["checkout", "-b", "rsi/off-base-work"], &root);
-        git(&["commit", "--allow-empty", "-m", "operator: off-base work"], &root);
+        git(
+            &["commit", "--allow-empty", "-m", "operator: off-base work"],
+            &root,
+        );
         // The default branch itself is still level with origin, but HEAD is NOT the default, and the
         // off-base commit is un-pushed — so this is NOT a valid controller start state. persistent
         // stop policy must NOT clear a controller stop while the tree is unreconciled.
@@ -1747,7 +1787,16 @@ mod tests {
 
         // RECONCILE: merge the off-base work to the resolved default and push it.
         git(&["checkout", &default], &root);
-        git(&["merge", "--no-ff", "-m", "operator: merge off-base", "rsi/off-base-work"], &root);
+        git(
+            &[
+                "merge",
+                "--no-ff",
+                "-m",
+                "operator: merge off-base",
+                "rsi/off-base-work",
+            ],
+            &root,
+        );
         // BEFORE pushing the merge, the default is ahead of origin -> pushed precondition UNMET.
         assert!(
             !base_is_pushed(&root_s, &default),
@@ -1761,7 +1810,9 @@ mod tests {
         );
         assert_eq!(
             persistent_stop_cleared("controller_off_base_persistent", true, true, true, true),
-            Some("controller tree reconciled (on-base + pushed + clean) — cleared controller_off_base_persistent stop"),
+            Some(
+                "controller tree reconciled (on-base + pushed + clean) — cleared controller_off_base_persistent stop"
+            ),
             "only a real reconcile (on-base + pushed + clean) clears the controller self-stop"
         );
 
@@ -2123,9 +2174,10 @@ mod tests {
         // Age bound 600s: the old record is dropped; only the 2 fresh remain; take last 2.
         let got = recent_snapshots_from(&log, name, 2, Some(600.0));
         assert_eq!(got.len(), 2);
-        assert!(got
-            .iter()
-            .all(|r| r.get("repo").and_then(Value::as_str) == Some(name)));
+        assert!(
+            got.iter()
+                .all(|r| r.get("repo").and_then(Value::as_str) == Some(name))
+        );
 
         // k larger than available -> all (after age filter).
         assert_eq!(recent_snapshots_from(&log, name, 50, Some(600.0)).len(), 2);
@@ -2507,7 +2559,7 @@ mod tests {
         let actions = autopilot_recover_pass_inner(
             &repos,
             &targets,
-            true,                       // auto_push_flag → allow_restart true
+            true, // auto_push_flag → allow_restart true
             crate::fleet::STUCK_SWEEP_THRESHOLD,
             &|_n| crate::fleet::STUCK_SWEEP_THRESHOLD, // stuck exactly at the threshold
             &|_n| {
@@ -2516,7 +2568,9 @@ mod tests {
             },
         );
         assert!(
-            actions.iter().any(|a| a.starts_with(&format!("{name} recover:")) && a.contains("stop")),
+            actions
+                .iter()
+                .any(|a| a.starts_with(&format!("{name} recover:")) && a.contains("stop")),
             "expected a real recover heal (stop,...) for the stuck noop lane: {actions:?}"
         );
         assert_eq!(
@@ -2592,7 +2646,11 @@ mod tests {
             actions.is_empty(),
             "a paused lane must NOT be force-healed even when otherwise heal-eligible: {actions:?}"
         );
-        assert_eq!(reset_hits.get(), 0, "no heal on a paused lane → no counter reset");
+        assert_eq!(
+            reset_hits.get(),
+            0,
+            "no heal on a paused lane → no counter reset"
+        );
         assert!(
             !dir.join("stop").exists(),
             "a paused lane must never be force-stopped by the recover pass"
@@ -2631,14 +2689,22 @@ mod tests {
             },
         );
         assert!(
-            actions.iter().any(|a| a.starts_with(&format!("{name} ESCALATED:"))),
+            actions
+                .iter()
+                .any(|a| a.starts_with(&format!("{name} ESCALATED:"))),
             "after 3 prior heals the pass must escalate (page), not force a 4th heal: {actions:?}"
         );
         assert!(
-            !actions.iter().any(|a| a.contains("recover:") && a.contains("restart")),
+            !actions
+                .iter()
+                .any(|a| a.contains("recover:") && a.contains("restart")),
             "no 4th restart heal may fire once backed off: {actions:?}"
         );
-        assert_eq!(reset_hits.get(), 0, "an escalation (no heal) must not reset the counter");
+        assert_eq!(
+            reset_hits.get(),
+            0,
+            "an escalation (no heal) must not reset the counter"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2678,7 +2744,10 @@ mod tests {
             "an evidence-gated needs_goal lane must NOT be force-cycled: {actions:?}"
         );
         assert_eq!(reset_hits.get(), 0);
-        assert!(!dir.join("stop").exists(), "needs_goal lane must not be stopped");
+        assert!(
+            !dir.join("stop").exists(),
+            "needs_goal lane must not be stopped"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2715,7 +2784,9 @@ mod tests {
             .count();
         let real_heals = actions
             .iter()
-            .filter(|a| a.contains("recover:") && a.contains("restart") && !a.contains("restart_deferred"))
+            .filter(|a| {
+                a.contains("recover:") && a.contains("restart") && !a.contains("restart_deferred")
+            })
             .count();
         assert!(
             real_heals <= MAX_LANE_RESTARTS_PER_SWEEP,

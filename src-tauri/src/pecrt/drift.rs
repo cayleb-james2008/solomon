@@ -45,7 +45,9 @@ mod tests {
     fn golden_pins_stable_prefix_and_caps() {
         let g = golden();
         assert_eq!(
-            g["stable_prefix"].as_str().expect("golden stable_prefix is a string"),
+            g["stable_prefix"]
+                .as_str()
+                .expect("golden stable_prefix is a string"),
             warm::STABLE_PREFIX,
             "STABLE_PREFIX drifted from pecrt_golden.json — update BOTH pecrt.py and the golden \
              together (the prefix is a provider-cache contract; silent drift kills cache hits AND \
@@ -71,7 +73,8 @@ mod tests {
             .map(|v| v.as_str().expect("marker is a string"))
             .collect();
         assert_eq!(
-            markers, warm::SUMMARY_MARKERS,
+            markers,
+            warm::SUMMARY_MARKERS,
             "SUMMARY_MARKERS drifted (order + content are both contract) — update pecrt.py's \
              _SUMMARY_MARKERS and pecrt_golden.json in the same change"
         );

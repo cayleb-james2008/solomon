@@ -13,7 +13,7 @@
 use crate::improver::ctx::{self, Ctx};
 use crate::improver::escalation;
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::OnceLock;
 
 // --------------------------------------------------------------------------- #
@@ -29,8 +29,8 @@ fn global_artifact_patterns() -> &'static [Regex] {
         vec![
             Regex::new(r"^AGENT_LOG\.md$").unwrap(), // the agent's per-run log (exact name)
             Regex::new(r"^capabilities/[^/]+(?:/.+)?$").unwrap(), // capabilities/<name>[/<anything>]
-            Regex::new(r"^profiles/[^/]+(?:/.+)?$").unwrap(), // profiles/<id>[/<anything>]
-            Regex::new(r"^start_[^/]+\.sh$").unwrap(), // start_<id>.sh launcher script
+            Regex::new(r"^profiles/[^/]+(?:/.+)?$").unwrap(),     // profiles/<id>[/<anything>]
+            Regex::new(r"^start_[^/]+\.sh$").unwrap(),            // start_<id>.sh launcher script
             Regex::new(r"^\.agent_artifacts/.+").unwrap(), // the explicit operator-opted-in sentinel dir
         ]
     })
@@ -100,7 +100,10 @@ pub fn untracked_non_ignored_files(ctx: &Ctx) -> Vec<String> {
 
 /// run_improver.head_sha (~919-920): `git rev-parse HEAD` stdout, stripped.
 pub fn head_sha(ctx: &Ctx) -> String {
-    ctx.git(&["rev-parse", "HEAD"], 120).stdout.trim().to_string()
+    ctx.git(&["rev-parse", "HEAD"], 120)
+        .stdout
+        .trim()
+        .to_string()
 }
 
 // --------------------------------------------------------------------------- #
@@ -179,7 +182,10 @@ pub fn is_agent_artifact(path: &str, extra_patterns: Option<&[Regex]>) -> bool {
     if p.is_empty() {
         return false;
     }
-    if global_artifact_patterns().iter().any(|pat| pattern_match(pat, p)) {
+    if global_artifact_patterns()
+        .iter()
+        .any(|pat| pattern_match(pat, p))
+    {
         return true;
     }
     if let Some(extra) = extra_patterns {
@@ -265,10 +271,7 @@ pub fn auto_stash_base(ctx: &mut Ctx, label: &str) -> bool {
     }
     // record the stash label so recovery is one command (best-effort; OSError -> pass)
     let _ = std::fs::create_dir_all(&ctx.runtime);
-    let _ = std::fs::write(
-        ctx.runtime.join("last_auto_stash.txt"),
-        format!("{msg}\n"),
-    );
+    let _ = std::fs::write(ctx.runtime.join("last_auto_stash.txt"), format!("{msg}\n"));
     ctx.log(&format!(
         "auto-stash: stashed dirty base into '{msg}' — base clean, resuming \
          (recover with: git -C <repo> stash list / stash pop)"
@@ -291,7 +294,14 @@ fn any_git_running() -> bool {
     #[cfg(windows)]
     {
         match crate::control::proc::run(
-            &["tasklist", "/FI", "IMAGENAME eq git.exe", "/NH", "/FO", "CSV"],
+            &[
+                "tasklist",
+                "/FI",
+                "IMAGENAME eq git.exe",
+                "/NH",
+                "/FO",
+                "CSV",
+            ],
             None,
             None,
         ) {
@@ -341,7 +351,11 @@ fn remove_stale_index_lock(lock_path: &std::path::Path, git_running: bool) -> bo
 /// almost certainly orphaned — the `any_git_running` guard is the belt-and-suspenders against an
 /// external (non-Solomon) git op on the same repo.
 pub fn clear_stale_index_lock(ctx: &mut Ctx) -> bool {
-    let git_dir = ctx.git(&["rev-parse", "--git-dir"], 10).stdout.trim().to_string();
+    let git_dir = ctx
+        .git(&["rev-parse", "--git-dir"], 10)
+        .stdout
+        .trim()
+        .to_string();
     let lock_path = if git_dir.is_empty() {
         // rev-parse failed (bad repo / corrupt) — fall back to the conventional .git/index.lock.
         ctx.repo.join(".git").join("index.lock")
@@ -360,13 +374,17 @@ pub fn clear_stale_index_lock(ctx: &mut Ctx) -> bool {
     }
     let git_running = any_git_running();
     if remove_stale_index_lock(&lock_path, git_running) {
-        ctx.log("preflight: cleared stale .git/index.lock (orphaned by a killed-mid-git iteration)");
+        ctx.log(
+            "preflight: cleared stale .git/index.lock (orphaned by a killed-mid-git iteration)",
+        );
         return true;
     }
     if git_running {
         ctx.log("preflight: .git/index.lock exists but a git process is running — leaving it (may be live)");
     } else {
-        ctx.log("preflight: .git/index.lock exists but could not be removed — git checkout may fail");
+        ctx.log(
+            "preflight: .git/index.lock exists but could not be removed — git checkout may fail",
+        );
     }
     false
 }
@@ -386,9 +404,15 @@ pub fn reconcile_preflight_stashes(ctx: &mut Ctx) {
     // Parse "stash@{N}: On branch: solomon-auto-preflight ..." (stash@{0} is newest).
     let mut preflight: Vec<usize> = Vec::new();
     for line in list.lines() {
-        let Some(rest) = line.strip_prefix("stash@{") else { continue };
-        let Some((idx_str, after)) = rest.split_once('}') else { continue };
-        let Ok(idx) = idx_str.parse::<usize>() else { continue };
+        let Some(rest) = line.strip_prefix("stash@{") else {
+            continue;
+        };
+        let Some((idx_str, after)) = rest.split_once('}') else {
+            continue;
+        };
+        let Ok(idx) = idx_str.parse::<usize>() else {
+            continue;
+        };
         if after.contains("solomon-auto-preflight") {
             preflight.push(idx);
         }
@@ -449,10 +473,7 @@ fn stash_has_real_content(ctx: &Ctx, ref_str: &str, extra: &[Regex]) -> bool {
     // `git ls-tree --name-only` lists the files IN the untracked commit; `git diff ^1 ^3` would
     // also list base files absent from ^3 (all of them when ^3 is empty), producing false
     // positives. ls-tree gives exactly the untracked files swept into the stash.
-    let untracked = ctx.git(
-        &["ls-tree", "--name-only", &format!("{ref_str}^3")],
-        120,
-    );
+    let untracked = ctx.git(&["ls-tree", "--name-only", &format!("{ref_str}^3")], 120);
     // A missing `^3` parent (no --include-untracked) legitimately fails with git's code 128 -> the
     // stash simply has no untracked content, fall through to droppable. But a TRANSIENT timeout
     // (code 124) means we could NOT inspect it, so we must NOT conclude "empty -> drop": retain,
@@ -539,9 +560,15 @@ fn prune_excess_empty_preflight_stashes(ctx: &mut Ctx, extra: &[Regex]) {
     let list = ctx.git(&["stash", "list"], 120).stdout;
     let mut empty: Vec<usize> = Vec::new();
     for line in list.lines() {
-        let Some(rest) = line.strip_prefix("stash@{") else { continue };
-        let Some((idx_str, after)) = rest.split_once('}') else { continue };
-        let Ok(idx) = idx_str.parse::<usize>() else { continue };
+        let Some(rest) = line.strip_prefix("stash@{") else {
+            continue;
+        };
+        let Some((idx_str, after)) = rest.split_once('}') else {
+            continue;
+        };
+        let Ok(idx) = idx_str.parse::<usize>() else {
+            continue;
+        };
         if !after.contains("solomon-auto-preflight") {
             continue;
         }
@@ -583,7 +610,10 @@ pub fn abort_branch(ctx: &Ctx, branch: &str) -> bool {
     let co = ctx.git(&["checkout", "--force", &ctx.base_branch], 120);
     if co.code != 0 {
         let err: String = co.stderr.trim().chars().take(200).collect();
-        log_ro(ctx, &format!("CRITICAL: could not return to {}: {err}", ctx.base_branch));
+        log_ro(
+            ctx,
+            &format!("CRITICAL: could not return to {}: {err}", ctx.base_branch),
+        );
         return false;
     }
     let head = ctx
@@ -594,7 +624,10 @@ pub fn abort_branch(ctx: &Ctx, branch: &str) -> bool {
     if head != ctx.base_branch {
         log_ro(
             ctx,
-            &format!("CRITICAL: not on {} after checkout; refusing to delete {branch}", ctx.base_branch),
+            &format!(
+                "CRITICAL: not on {} after checkout; refusing to delete {branch}",
+                ctx.base_branch
+            ),
         );
         return false;
     }
@@ -625,7 +658,12 @@ pub fn drop_branch(ctx: &mut Ctx, branch: &str, phase: &str, summary: &str, stat
     // ALL revert paths (gate-red, anti-gaming, cross-repo, eval, leak guard, visual, review reject)
     // since they all go through drop_branch with phase="reverted".
     if phase == "reverted" {
-        if let Some(goal) = ctx.hb.get("goal").and_then(Value::as_str).map(|s| s.to_string()) {
+        if let Some(goal) = ctx
+            .hb
+            .get("goal")
+            .and_then(Value::as_str)
+            .map(|s| s.to_string())
+        {
             escalation::note_consecutive_revert(ctx, &goal);
         }
     }
@@ -731,7 +769,11 @@ pub fn stranded_unmerged_branches(ctx: &Ctx) -> Vec<StrandedBranch> {
             continue;
         }
         let rl = ctx.git(
-            &["rev-list", "--count", &format!("{}..{}", ctx.base_branch, b)],
+            &[
+                "rev-list",
+                "--count",
+                &format!("{}..{}", ctx.base_branch, b),
+            ],
             120,
         );
         if rl.code != 0 {
@@ -865,7 +907,10 @@ pub fn dirty_files(ctx: &Ctx) -> Vec<String> {
     let st = ctx.git(&["status", "--porcelain"], 120);
     if st.code != 0 {
         let err: String = st.stderr.trim().chars().take(120).collect();
-        return vec![format!("(git status --porcelain failed rc={}: {err})", st.code)];
+        return vec![format!(
+            "(git status --porcelain failed rc={}: {err})",
+            st.code
+        )];
     }
     st.stdout
         .lines()
@@ -916,7 +961,12 @@ pub fn repo_private_paths(ctx: &Ctx, name: &str) -> Vec<String> {
             if s.trim().is_empty() {
                 None // `if str(p).strip()` — drop blank entries
             } else {
-                Some(s.trim().replace('\\', "/").trim_end_matches('/').to_string())
+                Some(
+                    s.trim()
+                        .replace('\\', "/")
+                        .trim_end_matches('/')
+                        .to_string(),
+                )
             }
         })
         .collect()
@@ -1190,11 +1240,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut c = Ctx::configure(&dir.to_string_lossy(), "testrepo", "ollama-cloud", None);
-        c.runtime = std::env::temp_dir().join(format!(
-            "solomon_stash_rt_{}_{}",
-            std::process::id(),
-            uniq
-        ));
+        c.runtime =
+            std::env::temp_dir().join(format!("solomon_stash_rt_{}_{}", std::process::id(), uniq));
         std::fs::create_dir_all(&c.runtime).unwrap();
 
         // git init + minimal config (CI environments may lack global git config).
@@ -1237,7 +1284,10 @@ mod tests {
 
         let files = dirty_files(&c);
         assert!(files.iter().any(|f| f == "README.md"), "files: {files:?}");
-        assert!(files.iter().any(|f| f == "new_module.py"), "files: {files:?}");
+        assert!(
+            files.iter().any(|f| f == "new_module.py"),
+            "files: {files:?}"
+        );
         assert!(
             !files.iter().any(|f| f.contains("noise.log")),
             "ignored file must not appear: {files:?}"
@@ -1332,7 +1382,12 @@ mod tests {
     #[test]
     fn nonbase_wip_needs_stash_truth_table() {
         // dirty operator/agent WIP on a foreign feature branch -> protect it.
-        assert!(nonbase_wip_needs_stash(true, "sover-refactor", "main", "rsi/"));
+        assert!(nonbase_wip_needs_stash(
+            true,
+            "sover-refactor",
+            "main",
+            "rsi/"
+        ));
         // the lane's OWN throwaway branch -> disposable, force-clear (no stash).
         assert!(!nonbase_wip_needs_stash(
             true,
@@ -1343,7 +1398,12 @@ mod tests {
         // dirty BASE -> handled by the separate base auto-recover, not here.
         assert!(!nonbase_wip_needs_stash(true, "main", "main", "rsi/"));
         // clean foreign branch -> nothing to protect.
-        assert!(!nonbase_wip_needs_stash(false, "sover-refactor", "main", "rsi/"));
+        assert!(!nonbase_wip_needs_stash(
+            false,
+            "sover-refactor",
+            "main",
+            "rsi/"
+        ));
     }
 
     /// Behavior guard 1: a dirty TRACKED change on a FOREIGN feature branch (the state
@@ -1391,7 +1451,12 @@ mod tests {
 
         assert!(tree_dirty(&c), "sanity: the own-branch tree is dirty");
         assert!(
-            !nonbase_wip_needs_stash(tree_dirty(&c), "rsi/iter-20260712-abc", &c.base_branch, "rsi/"),
+            !nonbase_wip_needs_stash(
+                tree_dirty(&c),
+                "rsi/iter-20260712-abc",
+                &c.base_branch,
+                "rsi/"
+            ),
             "the lane's own throwaway branch must NOT be stashed — force-clear is correct"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1414,7 +1479,10 @@ mod tests {
             auto_stash_base(&mut c, &base),
             "the existing base auto-stash must still fire on a dirty base"
         );
-        assert!(!tree_dirty(&c), "base tree must be clean after the auto-stash");
+        assert!(
+            !tree_dirty(&c),
+            "base tree must be clean after the auto-stash"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&c.runtime);
     }
@@ -1508,18 +1576,33 @@ mod tests {
         c.git(&["checkout", "-b", "rsi/iter-stranded"], 10);
         std::fs::write(dir.join("finished.py"), "print('outis 2.0')\n").unwrap();
         c.git(&["add", "-A"], 10);
-        c.git(&["commit", "--quiet", "-m", "finished but unshipped work"], 10);
+        c.git(
+            &["commit", "--quiet", "-m", "finished but unshipped work"],
+            10,
+        );
         c.git(&["checkout", "--force", &c.base_branch], 10);
 
         // Stranded solomon-recovered/* branch: a swept-work commit unreachable from base.
         c.git(&["checkout", "-b", "solomon-recovered/20260713-0"], 10);
         std::fs::write(dir.join("swept.py"), "print('swept operator work')\n").unwrap();
         c.git(&["add", "-A"], 10);
-        c.git(&["commit", "--quiet", "-m", "solomon-recovered: swept preflight work"], 10);
+        c.git(
+            &[
+                "commit",
+                "--quiet",
+                "-m",
+                "solomon-recovered: swept preflight work",
+            ],
+            10,
+        );
         c.git(&["checkout", "--force", &c.base_branch], 10);
 
         let detected = stranded_unmerged_branches(&c);
-        assert_eq!(detected.len(), 2, "both stranded branches detected: {detected:?}");
+        assert_eq!(
+            detected.len(),
+            2,
+            "both stranded branches detected: {detected:?}"
+        );
         for s in &detected {
             assert!(s.ahead > 0, "stranding means commits the base lacks: {s:?}");
             assert!(!s.on_origin, "no remote in the fixture: {s:?}");
@@ -1529,7 +1612,11 @@ mod tests {
         let blocking = preflight_stranded_guard(&c, "auto-merge");
         assert_eq!(blocking.len(), 2, "guard must trip on both: {blocking:?}");
         assert!(blocking.iter().any(|s| s.name == "rsi/iter-stranded"));
-        assert!(blocking.iter().any(|s| s.name == "solomon-recovered/20260713-0"));
+        assert!(
+            blocking
+                .iter()
+                .any(|s| s.name == "solomon-recovered/20260713-0")
+        );
 
         // Under ship=local the kept rsi/* branch is the lane's deliberate product (never blocks),
         // but swept OPERATOR work still blocks.
@@ -1557,7 +1644,11 @@ mod tests {
         std::fs::write(dir.join("advance.py"), "x = 1\n").unwrap();
         c.git(&["add", "-A"], 10);
         c.git(&["commit", "--quiet", "-m", "advance base"], 10);
-        let parent = c.git(&["rev-parse", "HEAD~1"], 10).stdout.trim().to_string();
+        let parent = c
+            .git(&["rev-parse", "HEAD~1"], 10)
+            .stdout
+            .trim()
+            .to_string();
         c.git(&["branch", "rsi/iter-behind", &parent], 10);
 
         assert!(
@@ -1612,8 +1703,18 @@ mod tests {
         // ship=local keeps gate-green rsi/* branches by design -> no block
         assert!(!stranded_blocks_fork("rsi/iter-x", 3, false, "local"));
         // swept OPERATOR work blocks even on a local lane
-        assert!(stranded_blocks_fork("solomon-recovered/20260713-0", 1, false, "local"));
-        assert!(stranded_blocks_fork("solomon-recovered/20260713-0", 1, false, "auto-merge"));
+        assert!(stranded_blocks_fork(
+            "solomon-recovered/20260713-0",
+            1,
+            false,
+            "local"
+        ));
+        assert!(stranded_blocks_fork(
+            "solomon-recovered/20260713-0",
+            1,
+            false,
+            "auto-merge"
+        ));
         // not ahead -> never stranded
         assert!(!stranded_blocks_fork("rsi/iter-x", 0, false, "auto-merge"));
     }
@@ -1698,7 +1799,10 @@ mod tests {
         let lock = dir.join("index.lock");
         std::fs::write(&lock, "").unwrap();
         assert!(remove_stale_index_lock(&lock, false));
-        assert!(!lock.exists(), "stale lock must be removed when no git is running");
+        assert!(
+            !lock.exists(),
+            "stale lock must be removed when no git is running"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1717,7 +1821,10 @@ mod tests {
         let lock = dir.join("index.lock");
         std::fs::write(&lock, "").unwrap();
         assert!(!remove_stale_index_lock(&lock, true));
-        assert!(lock.exists(), "lock must NOT be removed while a git process might hold it");
+        assert!(
+            lock.exists(),
+            "lock must NOT be removed while a git process might hold it"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

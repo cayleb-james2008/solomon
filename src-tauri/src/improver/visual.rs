@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::improver::ctx::{self, Ctx};
 
@@ -234,7 +234,11 @@ fn run_inner(ctx: &mut Ctx) -> Value {
     let fb = report.get("feedback").and_then(Value::as_str).unwrap_or("");
     ctx.log(&format!(
         "visual review: complete — {} findings, feedback: {}",
-        report.get("findings").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0),
+        report
+            .get("findings")
+            .and_then(Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0),
         char_slice(fb, 100)
     ));
     report
@@ -271,7 +275,11 @@ fn run_capture(
 
     for page in &iter_pages {
         // path = str(page or "/")  — an empty page string becomes "/".
-        let path = if page.is_empty() { "/".to_string() } else { page.clone() };
+        let path = if page.is_empty() {
+            "/".to_string()
+        } else {
+            page.clone()
+        };
         let url = format!(
             "{}/{}",
             base_url.trim_end_matches('/'),
@@ -393,7 +401,10 @@ fn save_screenshots(capture_result: &Value, out_dir: &Path) -> Value {
         .cloned()
         .unwrap_or_default();
     for (i, page_data) in pages.iter().enumerate() {
-        let b64 = page_data.get("screenshot_b64").and_then(Value::as_str).unwrap_or("");
+        let b64 = page_data
+            .get("screenshot_b64")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         if b64.is_empty() {
             continue;
         }
@@ -424,7 +435,11 @@ fn save_screenshots(capture_result: &Value, out_dir: &Path) -> Value {
 /// `_build_vision_task` — build the pi task text: iteration summary header, per-page console/network
 /// errors (capped at 10 each), nav error, a11y tree (trimmed to ~2000 chars), and a screenshot
 /// reference line. `pages_config` is accepted for parity but unused (matches the Python).
-fn build_vision_task(capture_result: &Value, iteration_summary: &str, _pages_config: &[String]) -> String {
+fn build_vision_task(
+    capture_result: &Value,
+    iteration_summary: &str,
+    _pages_config: &[String],
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     parts.push(format!(
         "RSI ITERATION SUMMARY (what the coder changed):\n{iteration_summary}\n"
@@ -468,7 +483,10 @@ fn build_vision_task(capture_result: &Value, iteration_summary: &str, _pages_con
         }
 
         // a11y tree (trimmed to ~2000 chars)
-        let a11y_raw = page_data.get("a11y_yaml").and_then(Value::as_str).unwrap_or("");
+        let a11y_raw = page_data
+            .get("a11y_yaml")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let a11y = a11y_raw.trim().to_string();
         if !a11y.is_empty() {
             let a11y = if char_len(&a11y) > 2000 {
@@ -480,7 +498,10 @@ fn build_vision_task(capture_result: &Value, iteration_summary: &str, _pages_con
         }
 
         // screenshot reference
-        let b64 = page_data.get("screenshot_b64").and_then(Value::as_str).unwrap_or("");
+        let b64 = page_data
+            .get("screenshot_b64")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         if !b64.is_empty() {
             parts.push(format!(
                 "SCREENSHOT: [base64 PNG, {} chars — attached as image input]",
@@ -491,7 +512,9 @@ fn build_vision_task(capture_result: &Value, iteration_summary: &str, _pages_con
         }
     }
 
-    parts.push("\n\nReview this app per the visual_review.md contract. Output your findings.".to_string());
+    parts.push(
+        "\n\nReview this app per the visual_review.md contract. Output your findings.".to_string(),
+    );
     parts.join("\n")
 }
 
@@ -601,7 +624,9 @@ fn spawn_pi(ctx: &Ctx, args: &[String], vision_model: &str, timeout: Duration) -
     }
 
     // Normal exit: write ends are closed, so the readers have finished; join for the full output.
-    let out = stdout_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    let out = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
     if let Some(h) = stderr_handle {
         let _ = h.join();
     }
@@ -625,7 +650,10 @@ fn final_text(stdout: &str) -> String {
             Err(_) => continue, // JSONDecodeError
         };
         let msgs: Vec<Value> = if ev.get("type").and_then(Value::as_str) == Some("agent_end") {
-            ev.get("messages").and_then(Value::as_array).cloned().unwrap_or_default()
+            ev.get("messages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
         } else if ev.get("message").map(Value::is_object).unwrap_or(false) {
             vec![ev.get("message").cloned().unwrap_or(Value::Null)]
         } else {
@@ -736,8 +764,9 @@ fn build_feedback(findings: &Value, summary: &str) -> String {
         return String::new(); // only info/pass — no actionable feedback
     }
 
-    let mut parts: Vec<String> =
-        vec!["VISUAL REVIEW FEEDBACK (from the previous iteration's E2E sandbox review):".to_string()];
+    let mut parts: Vec<String> = vec![
+        "VISUAL REVIEW FEEDBACK (from the previous iteration's E2E sandbox review):".to_string(),
+    ];
     if !critical.is_empty() {
         parts.push("CRITICAL issues found:".to_string());
         for f in &critical {
@@ -804,8 +833,16 @@ fn capture_counts(capture_result: &Value) -> (i64, i64, i64) {
     let mut network = 0i64;
     if let Some(arr) = pages {
         for p in arr {
-            console += p.get("console_errors").and_then(Value::as_array).map(|a| a.len() as i64).unwrap_or(0);
-            network += p.get("network_errors").and_then(Value::as_array).map(|a| a.len() as i64).unwrap_or(0);
+            console += p
+                .get("console_errors")
+                .and_then(Value::as_array)
+                .map(|a| a.len() as i64)
+                .unwrap_or(0);
+            network += p
+                .get("network_errors")
+                .and_then(Value::as_array)
+                .map(|a| a.len() as i64)
+                .unwrap_or(0);
         }
     }
     (n_pages, console, network)
@@ -849,7 +886,11 @@ struct AgentBrowser {
 
 impl AgentBrowser {
     /// `AgentBrowser.__init__` + `__enter__` — set up the runtime/profile dirs and a unique session.
-    fn open(repo_path: &Path, runtime_dir: &Path, allowed_origins: &[String]) -> std::io::Result<Self> {
+    fn open(
+        repo_path: &Path,
+        runtime_dir: &Path,
+        allowed_origins: &[String],
+    ) -> std::io::Result<Self> {
         let runtime_dir = runtime_dir.to_path_buf();
         std::fs::create_dir_all(&runtime_dir)?;
         let profile_dir = runtime_dir.join("browser-profile");
@@ -883,7 +924,11 @@ impl AgentBrowser {
         let mut binary: Option<String> = std::env::var("SOLOMON_AGENT_BROWSER")
             .ok()
             .filter(|s| !s.is_empty())
-            .or_else(|| which::which("agent-browser").ok().map(|p| p.to_string_lossy().into_owned()));
+            .or_else(|| {
+                which::which("agent-browser")
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+            });
         #[cfg(windows)]
         if let Some(b) = &binary {
             let native = Path::new(b)
@@ -896,7 +941,9 @@ impl AgentBrowser {
             }
         }
         let mut command: Vec<String> = vec![
-            binary.clone().unwrap_or_else(|| "agent-browser".to_string()),
+            binary
+                .clone()
+                .unwrap_or_else(|| "agent-browser".to_string()),
             "--session".into(),
             self.session_id.clone(),
             "--profile".into(),
@@ -972,7 +1019,10 @@ impl AgentBrowser {
         self.guard_alive();
         let result = self.run_cli(&["open", url], 30);
         if result.get("ok").and_then(Value::as_bool) != Some(true) {
-            let err = result.get("error").and_then(Value::as_str).unwrap_or("navigation failed");
+            let err = result
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("navigation failed");
             return self.fail(err);
         }
         self.observe()
@@ -983,7 +1033,10 @@ impl AgentBrowser {
     fn observe(&mut self) -> Value {
         let snapshot = self.run_cli(&["snapshot", "-i", "-c"], 30);
         if snapshot.get("ok").and_then(Value::as_bool) != Some(true) {
-            let err = snapshot.get("error").and_then(Value::as_str).unwrap_or("snapshot failed");
+            let err = snapshot
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("snapshot failed");
             return self.fail(err);
         }
         let data = snapshot.get("data").cloned().unwrap_or(Value::Null);
@@ -1044,7 +1097,14 @@ impl AgentBrowser {
             })
             .collect();
         let frame_ok = shot.get("ok").and_then(Value::as_bool) == Some(true);
-        self.write_state(true, Some(elements), frame_ok, console_errors, network_errors, None)
+        self.write_state(
+            true,
+            Some(elements),
+            frame_ok,
+            console_errors,
+            network_errors,
+            None,
+        )
     }
 
     /// `_fail` — write + return an `{ok:false, status:"error", error}` state.
@@ -1072,7 +1132,10 @@ impl AgentBrowser {
         state.insert("networkErrors".into(), Value::Array(network_errors));
         if frame_ok {
             // state["frame"] = {seq, mime, available} (a truthy dict).
-            state.insert("frame".into(), json!({"mime": "image/jpeg", "available": true}));
+            state.insert(
+                "frame".into(),
+                json!({"mime": "image/jpeg", "available": true}),
+            );
         }
         if let Some(e) = error {
             state.insert("error".into(), json!(truncate(e, 300)));
@@ -1104,8 +1167,14 @@ impl AgentBrowser {
         if self.probe_alive() {
             return;
         }
-        self.write_state(false, None, false, Vec::new(), Vec::new(),
-                         Some("agent-browser session is not responding (process crashed)"));
+        self.write_state(
+            false,
+            None,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Some("agent-browser session is not responding (process crashed)"),
+        );
         // _reinit_session: best-effort close + reset started.
         self.run_cli(&["close"], 10);
         self.started = false;
@@ -1115,7 +1184,10 @@ impl AgentBrowser {
         if !self.started {
             return true; // nothing to probe yet — the action itself starts it.
         }
-        self.run_cli(&["get", "url"], 10).get("ok").and_then(Value::as_bool) == Some(true)
+        self.run_cli(&["get", "url"], 10)
+            .get("ok")
+            .and_then(Value::as_bool)
+            == Some(true)
     }
 
     /// `close` — close the session (when a binary resolves) and remove the state/frame files +
@@ -1143,7 +1215,11 @@ impl Drop for AgentBrowser {
 /// Run one agent-browser CLI invocation with a hard timeout, scrubbed/headed-off env, in `cwd`.
 /// `Some((code, stdout, stderr))` on completion; `None` on timeout or spawn failure. Mirrors
 /// agent_browser._clean_env (strip secret-shaped + PYTHONPATH/PYTHONHOME; force headless jpeg q70).
-fn run_browser_cli(args: &[String], cwd: &Path, timeout: Duration) -> Option<(i32, String, String)> {
+fn run_browser_cli(
+    args: &[String],
+    cwd: &Path,
+    timeout: Duration,
+) -> Option<(i32, String, String)> {
     let mut cmd = Command::new(&args[0]);
     cmd.args(&args[1..]);
     cmd.current_dir(cwd);
@@ -1161,7 +1237,9 @@ fn run_browser_cli(args: &[String], cwd: &Path, timeout: Duration) -> Option<(i3
     cmd.env("AGENT_BROWSER_HEADED", "false");
     cmd.env("AGENT_BROWSER_SCREENSHOT_FORMAT", "jpeg");
     cmd.env("AGENT_BROWSER_SCREENSHOT_QUALITY", "70");
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     apply_hidden(&mut cmd);
 
     let mut child = cmd.spawn().ok()?;
@@ -1195,8 +1273,12 @@ fn run_browser_cli(args: &[String], cwd: &Path, timeout: Duration) -> Option<(i3
             return None;
         }
     };
-    let out = stdout_handle.and_then(|h| h.join().ok()).unwrap_or_default();
-    let err = stderr_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    let out = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let err = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
     Some((
         code,
         String::from_utf8_lossy(&out).into_owned(),
@@ -1248,7 +1330,9 @@ impl Sandbox {
         cmd.current_dir(&work_dir);
         apply_sandbox_env(&mut cmd, config, port, &state_dir);
         cmd.env("HOST", "127.0.0.1");
-        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         apply_hidden_group(&mut cmd);
 
         let child = cmd.spawn().map_err(|e| format!("{e}"))?;
@@ -1344,7 +1428,9 @@ fn build_launch_argv(
     }
     if let Some(first) = args.first().cloned() {
         let sep = std::path::MAIN_SEPARATOR;
-        let normalized = first.replace('/', &sep.to_string()).replace('\\', &sep.to_string());
+        let normalized = first
+            .replace('/', &sep.to_string())
+            .replace('\\', &sep.to_string());
         let venv_prefix = format!(".venv{sep}");
         let venv_prefix2 = format!("venv{sep}");
         if (normalized.starts_with(&venv_prefix) || normalized.starts_with(&venv_prefix2))
@@ -1367,8 +1453,17 @@ fn build_launch_argv(
 /// turn the ValueError into an ok:false error anyway).
 fn apply_sandbox_env(cmd: &mut Command, config: &Value, port: u16, state_dir: &Path) {
     const SAFE: &[&str] = &[
-        "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "NUMBER_OF_PROCESSORS",
-        "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "OS", "LANG", "TZ",
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+        "PROCESSOR_IDENTIFIER",
+        "OS",
+        "LANG",
+        "TZ",
     ];
     // Start from an empty environment, then add back the safe keys.
     cmd.env_clear();
@@ -1423,8 +1518,17 @@ fn secret_shaped(name: &str) -> bool {
 /// `_copy_ignore` mirror: copytree skipping the fixed ignore set + `.env`/`.env.*`/`*.pem`.
 fn copy_tree_filtered(src: &Path, dst: &Path) -> std::io::Result<()> {
     const FIXED: &[&str] = &[
-        ".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
-        ".mypy_cache", ".ruff_cache", ".tox", "runtime", "build",
+        ".git",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        "runtime",
+        "build",
     ];
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -1499,15 +1603,16 @@ fn apply_hidden(_cmd: &mut Command) {}
 
 #[cfg(windows)]
 fn apply_hidden_group(cmd: &mut Command) {
-    cmd.creation_flags(crate::control::proc::CREATE_NO_WINDOW | crate::control::proc::CREATE_NEW_PROCESS_GROUP);
+    cmd.creation_flags(
+        crate::control::proc::CREATE_NO_WINDOW | crate::control::proc::CREATE_NEW_PROCESS_GROUP,
+    );
 }
 #[cfg(not(windows))]
 fn apply_hidden_group(_cmd: &mut Command) {}
 
 // Standard base64 (RFC 4648) encode/decode — no external crate (base64 is not a declared dep, and
 // Cargo.toml is off-limits). Matches Python's base64.b64encode(...).decode("ascii") / b64decode(...).
-const B64_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn b64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -1639,7 +1744,9 @@ fn short_hex(n: usize) -> String {
         .unwrap_or(0);
     let mut state = nanos
         ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_mul(0xD1B5_4A32_D192_ED03);
+        ^ COUNTER
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(0xD1B5_4A32_D192_ED03);
     let mut out = String::new();
     while out.len() < n {
         // splitmix64
@@ -1769,7 +1876,8 @@ mod tests {
         #[cfg(not(windows))]
         let made_link = std::os::unix::fs::symlink(&src, &cycle).is_ok();
 
-        copy_tree_filtered(&src, &dst).expect("copy must succeed, never overflow on a symlink cycle");
+        copy_tree_filtered(&src, &dst)
+            .expect("copy must succeed, never overflow on a symlink cycle");
 
         assert!(dst.join("sub").join("a.txt").exists(), "real file copied");
         assert!(!dst.join(".git").exists(), "ignored dir skipped");
@@ -1791,8 +1899,14 @@ mod tests {
     // ---- _parse_summary -------------------------------------------------
     #[test]
     fn parse_summary_case_insensitive_prefix() {
-        assert_eq!(parse_summary("noise\nsummary:  all good \nmore"), "all good");
-        assert_eq!(parse_summary("SUMMARY: The page renders cleanly."), "The page renders cleanly.");
+        assert_eq!(
+            parse_summary("noise\nsummary:  all good \nmore"),
+            "all good"
+        );
+        assert_eq!(
+            parse_summary("SUMMARY: The page renders cleanly."),
+            "The page renders cleanly."
+        );
     }
 
     #[test]
@@ -1877,14 +1991,20 @@ mod tests {
             "screenshot_b64": "AAAA"
         }]});
         let task = build_vision_task(&capture, "added a button", &["/dash".to_string()]);
-        assert!(task.starts_with("RSI ITERATION SUMMARY (what the coder changed):\nadded a button\n"));
+        assert!(
+            task.starts_with("RSI ITERATION SUMMARY (what the coder changed):\nadded a button\n")
+        );
         assert!(task.contains("\nPAGES CAPTURED: 1\n"));
         assert!(task.contains("\n--- PAGE: /dash ---"));
         assert!(task.contains("CONSOLE ERRORS:\n  ! boom"));
         assert!(task.contains("NETWORK ERRORS: none"));
         assert!(task.contains("ACCESSIBILITY TREE:\n- button: Go [r1]"));
         assert!(task.contains("SCREENSHOT: [base64 PNG, 4 chars — attached as image input]"));
-        assert!(task.ends_with("Review this app per the visual_review.md contract. Output your findings."));
+        assert!(
+            task.ends_with(
+                "Review this app per the visual_review.md contract. Output your findings."
+            )
+        );
     }
 
     #[test]
@@ -1935,10 +2055,15 @@ mod tests {
     #[test]
     fn run_capture_all_failed_returns_none_semantics() {
         // Mirror the predicate directly: captured non-empty but no screenshot_b64 → None.
-        let captured = [json!({"path": "/", "screenshot_b64": ""}),
-            json!({"path": "/x", "nav_error": "navigation failed"})];
+        let captured = [
+            json!({"path": "/", "screenshot_b64": ""}),
+            json!({"path": "/x", "nav_error": "navigation failed"}),
+        ];
         let any_shot = captured.iter().any(|p| {
-            p.get("screenshot_b64").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false)
+            p.get("screenshot_b64")
+                .and_then(Value::as_str)
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
         });
         assert!(!captured.is_empty() && !any_shot);
     }
@@ -1968,7 +2093,10 @@ mod tests {
     fn config_launch_truthiness() {
         assert_eq!(config_launch(&json!({})), "");
         assert_eq!(config_launch(&json!({"launch": ""})), "");
-        assert_eq!(config_launch(&json!({"launch": "python app.py"})), "python app.py");
+        assert_eq!(
+            config_launch(&json!({"launch": "python app.py"})),
+            "python app.py"
+        );
         assert!(!config_launch(&json!({"launch": ["python", "app.py"]})).is_empty());
     }
 
@@ -2020,7 +2148,16 @@ mod tests {
         assert_eq!(b64_encode(b"fo"), "Zm8=");
         assert_eq!(b64_encode(b"foo"), "Zm9v");
         assert_eq!(b64_encode(b"foobar"), "Zm9vYmFy");
-        for v in [b"".as_ref(), b"f", b"fo", b"foo", b"foob", b"fooba", b"foobar", &[0u8, 255, 1, 254]] {
+        for v in [
+            b"".as_ref(),
+            b"f",
+            b"fo",
+            b"foo",
+            b"foob",
+            b"fooba",
+            b"foobar",
+            &[0u8, 255, 1, 254],
+        ] {
             assert_eq!(b64_decode(&b64_encode(v)).unwrap(), v.to_vec());
         }
     }
@@ -2028,7 +2165,10 @@ mod tests {
     // ---- origin host ----------------------------------------------------
     #[test]
     fn origin_host_strips_port_and_scheme() {
-        assert_eq!(origin_host("http://127.0.0.1:54321/path"), Some("127.0.0.1".to_string()));
+        assert_eq!(
+            origin_host("http://127.0.0.1:54321/path"),
+            Some("127.0.0.1".to_string())
+        );
         assert_eq!(origin_host("ftp://x"), None);
     }
 }

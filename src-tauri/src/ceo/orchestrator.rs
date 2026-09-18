@@ -53,7 +53,7 @@ use crate::control::proc::RunOut;
 use crate::improver::ctx::Ctx;
 use crate::improver::{calibration, progress};
 use crate::pecrt::safety::{self, ScheduleRequest};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 
 // --------------------------------------------------------------------------- #
@@ -159,8 +159,8 @@ pub const ENGINEERING_ALLOWED_TOOLS: &[&str] = &[
     "edit_file",
     "list_dir",
     "search",
-    "run_gate",       // run the project's own test/eval gate (read-only verdict)
-    "github_status",  // the read-only github_* tools (never push/merge/close — pi's shims enforce)
+    "run_gate",      // run the project's own test/eval gate (read-only verdict)
+    "github_status", // the read-only github_* tools (never push/merge/close — pi's shims enforce)
 ];
 
 /// The Engineering specialist: TODAY's stateless `pi` coding agent, registered behind
@@ -187,7 +187,11 @@ impl EngineeringSpecialist {
             &path,
             &name,
             &provider,
-            if model.is_empty() { None } else { Some(model.as_str()) },
+            if model.is_empty() {
+                None
+            } else {
+                Some(model.as_str())
+            },
         )
     }
 
@@ -355,10 +359,12 @@ pub fn diagnosis_to_task_kind(diagnosis: &str) -> TaskKind {
         // stranded_unmerged_branch (finding #61) belongs here too: the fix is a HUMAN reconcile of
         // finished work — clear_escalation_and_retry would un-pin the STOP sentinel and thrash
         // park→clear→re-park on a condition that re-trips deterministically every preflight.
-        "no_key" | "key_shape_mismatch" | "gh_not_ready" | "metric_unobservable"
-        | "stranded_unmerged_branch" | "unknown_error" => {
-            TaskKind::Remediate("page_operator_deduped")
-        }
+        "no_key"
+        | "key_shape_mismatch"
+        | "gh_not_ready"
+        | "metric_unobservable"
+        | "stranded_unmerged_branch"
+        | "unknown_error" => TaskKind::Remediate("page_operator_deduped"),
 
         // Any category not enumerated above still gets an executable task (the deduped page) rather
         // than a panic or a dead end. The closure test guarantees every KNOWN diagnosis is mapped
@@ -492,7 +498,12 @@ pub fn selection_readers_contract(ctx: &mut Ctx) -> Vec<&'static str> {
                     .map(std::path::Path::to_path_buf)
                     .unwrap_or_else(|| ctx.control.join("runtime"));
                 for _ in 0..calibration::MIN_ATTEMPTS {
-                    calibration::record_outcome_at(&fleet_dir, &ctx.pi_model, "__contract_class__", false);
+                    calibration::record_outcome_at(
+                        &fleet_dir,
+                        &ctx.pi_model,
+                        "__contract_class__",
+                        false,
+                    );
                 }
                 calibration::decompose_directive(ctx, "__contract_class__").is_some()
             }
@@ -575,7 +586,11 @@ pub fn select_and_dispatch(repo: &Value, candidates: &[Candidate]) -> Value {
 /// same isolation the `progress`/`calibration` unit tests use. Production callers go through
 /// [`select_and_dispatch`], which builds the real lane Ctx and dispatches to the Engineering
 /// specialist.
-pub fn select_and_dispatch_with_ctx(ctx: &mut Ctx, repo: &Value, candidates: &[Candidate]) -> Value {
+pub fn select_and_dispatch_with_ctx(
+    ctx: &mut Ctx,
+    repo: &Value,
+    candidates: &[Candidate],
+) -> Value {
     select_and_dispatch_core(&EngineeringSpecialist::new(), ctx, repo, candidates)
 }
 
@@ -774,8 +789,16 @@ mod tests {
         // The lane's candidate work for this wake: the SAME oversized code item first, a distinct
         // fallback second. The first is the retry-theater task; the second is the different work the
         // orchestrator must fall to once the first is quarantined.
-        let stuck = Candidate::new("gate_red_streak", "fix the persistently red widget gate", "chore");
-        let other = Candidate::new("noop_streak", "add a regression test for the parser", "chore");
+        let stuck = Candidate::new(
+            "gate_red_streak",
+            "fix the persistently red widget gate",
+            "chore",
+        );
+        let other = Candidate::new(
+            "noop_streak",
+            "add a regression test for the parser",
+            "chore",
+        );
         let candidates = vec![stuck.clone(), other.clone()];
 
         let stuck_key = progress::selection_key(&ctx, &stuck.detail);
@@ -810,7 +833,8 @@ mod tests {
         );
         let stuck_strikes = read_strikes(&ctx, &stuck_key);
         assert_eq!(
-            stuck_strikes, progress::QUARANTINE_STRIKES,
+            stuck_strikes,
+            progress::QUARANTINE_STRIKES,
             "the quarantined task was NOT re-run on the 4th wake (its strike count is frozen)"
         );
 
@@ -844,7 +868,10 @@ mod tests {
         let out = select_and_dispatch_core(&spec, &mut ctx, &repo, &[a, b]);
         assert_eq!(out["ok"], false);
         assert_eq!(out["reason"], "all_quarantined");
-        assert_eq!(out["dispatched"], false, "no task was dispatched (no pi spend)");
+        assert_eq!(
+            out["dispatched"], false,
+            "no task was dispatched (no pi spend)"
+        );
 
         std::env::remove_var("SOLOMON_NOTIFY_OFF");
     }
@@ -905,7 +932,11 @@ mod tests {
         };
 
         // An ARCHITECTURE-class candidate (proven low): the directive MUST be appended.
-        let big = Candidate::new("gate_red_streak", "re-architect the ingestion pipeline", "architecture");
+        let big = Candidate::new(
+            "gate_red_streak",
+            "re-architect the ingestion pipeline",
+            "architecture",
+        );
         select_and_dispatch_core(&cap, &mut ctx, &repo, &[big]);
         let seen_big = cap.seen.borrow().clone();
         assert!(
@@ -938,7 +969,11 @@ mod tests {
     #[test]
     fn engineering_coding_task_builds_byte_identical_pi_invocation() {
         let repo = plain_repo();
-        let task = Task::new(TaskKind::Code, "sover", "add a test for the main entrypoint");
+        let task = Task::new(
+            TaskKind::Code,
+            "sover",
+            "add a test for the main entrypoint",
+        );
 
         // What the specialist WOULD spawn (via build_ctx + the shared build_pi_argv):
         let spec_ctx = EngineeringSpecialist::build_ctx(&repo);
@@ -983,7 +1018,10 @@ mod tests {
         assert_eq!(out["specialist"], "engineering");
         assert_eq!(out["kind"], "code");
         assert_eq!(out["lane"], "sover");
-        assert!(out.get("exit_code").is_some(), "an honest exit_code is reported");
+        assert!(
+            out.get("exit_code").is_some(),
+            "an honest exit_code is reported"
+        );
 
         std::env::remove_var("SOLOMON_NOTIFY_OFF");
     }
@@ -1026,7 +1064,10 @@ mod tests {
         for diag in crate::supervisor::diagnose_categories() {
             let k = diagnosis_to_task_kind(diag);
             // as_str() is always a non-empty, dispatchable identity.
-            assert!(!k.as_str().is_empty(), "diagnosis '{diag}' produced an empty task kind");
+            assert!(
+                !k.as_str().is_empty(),
+                "diagnosis '{diag}' produced an empty task kind"
+            );
         }
         // an unknown/future diagnosis string still gets an executable floor (the deduped page).
         assert_eq!(
@@ -1053,8 +1094,15 @@ mod tests {
         // at gate() BEFORE run() — even on a whitelisted live-money lane (money-OUT is the HARD
         // invariant, no lane exempts it).
         for money_kind in [
-            "withdraw", "transfer", "deposit", "buy_ads", "pay_invoice", "stripe_checkout",
-            "ad_spend", "send_money", "spend_treasury",
+            "withdraw",
+            "transfer",
+            "deposit",
+            "buy_ads",
+            "pay_invoice",
+            "stripe_checkout",
+            "ad_spend",
+            "send_money",
+            "spend_treasury",
         ] {
             for repo in [plain_repo(), kairos_repo()] {
                 // Express the money-capable probe as the task's KIND — the exact surface the gate's
@@ -1243,7 +1291,13 @@ mod tests {
         // only arm that reaches run_pi_on_ctx — was never taken).
         let mut ctx = iso_ctx("kairos");
         for repo in [plain_repo(), kairos_repo()] {
-            for money_kind in ["withdraw", "transfer", "pay_invoice", "buy_ads", "send_money"] {
+            for money_kind in [
+                "withdraw",
+                "transfer",
+                "pay_invoice",
+                "buy_ads",
+                "send_money",
+            ] {
                 let verdict = dispatch_engineering_on_ctx(
                     &mut ctx,
                     &repo,
@@ -1333,7 +1387,9 @@ mod tests {
         let eng = EngineeringSpecialist::new();
         // The shipping lanes (repos.json). A rename that introduces a governance substring would make
         // this fail — the intended tripwire.
-        for lane in ["maki", "sover", "asmodeus", "daedulus", "dotz", "solomon", "kairos"] {
+        for lane in [
+            "maki", "sover", "asmodeus", "daedulus", "dotz", "solomon", "kairos",
+        ] {
             // A plain Code task on the lane — the exact envelope the live seam builds each iteration.
             let task = Task::new(TaskKind::Code, lane, "implement the top backlog item");
             // The gate must ADMIT (None) so the dispatch proceeds to pi UNCHANGED. Probe against BOTH

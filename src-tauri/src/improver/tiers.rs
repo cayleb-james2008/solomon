@@ -193,11 +193,7 @@ pub fn money_ship_override(
     let money = files
         .iter()
         .any(|f| globs.iter().any(|g| entry_matches(g, f)));
-    if money {
-        Some("pr".to_string())
-    } else {
-        None
-    }
+    if money { Some("pr".to_string()) } else { None }
 }
 
 // --------------------------------------------------------------------------- #
@@ -291,7 +287,9 @@ mod tests {
         let got = protected_violation(&t, &v(&["core.py", "promote.py"]));
         assert_eq!(
             got.as_deref(),
-            Some("diff touches protected grader/leash file promote.py — auto-reverted (write-protected grader)")
+            Some(
+                "diff touches protected grader/leash file promote.py — auto-reverted (write-protected grader)"
+            )
         );
     }
 
@@ -300,7 +298,9 @@ mod tests {
         let t = kairos_tiers();
         assert_eq!(
             protected_violation(&t, &v(&[".state/kairos.db"])).as_deref(),
-            Some("diff touches protected grader/leash file .state/kairos.db — auto-reverted (write-protected grader)")
+            Some(
+                "diff touches protected grader/leash file .state/kairos.db — auto-reverted (write-protected grader)"
+            )
         );
         assert!(protected_violation(&t, &v(&["tools/fitness.py"])).is_some());
         assert!(protected_violation(&t, &v(&["AGENTS.md"])).is_some());
@@ -309,7 +309,10 @@ mod tests {
     #[test]
     fn protected_violation_none_for_clean_or_legacy() {
         let t = kairos_tiers();
-        assert_eq!(protected_violation(&t, &v(&["core.py", "web/index.html"])), None);
+        assert_eq!(
+            protected_violation(&t, &v(&["core.py", "web/index.html"])),
+            None
+        );
         assert_eq!(protected_violation(&t, &[]), None);
         // legacy shapes: no tiers key / not an object / no protected list -> None
         assert_eq!(protected_violation(&json!({}), &v(&["promote.py"])), None);
@@ -326,7 +329,10 @@ mod tests {
     fn money_plus_active_eval_is_none() {
         // money-path diff under an ACTIVE needle: auto-land stands.
         let t = kairos_tiers();
-        assert_eq!(money_ship_override(&t, &v(&["trader.py"]), true, "auto-merge"), None);
+        assert_eq!(
+            money_ship_override(&t, &v(&["trader.py"]), true, "auto-merge"),
+            None
+        );
     }
 
     #[test]
@@ -337,7 +343,8 @@ mod tests {
             Some("pr")
         );
         assert_eq!(
-            money_ship_override(&t, &v(&["core.py", "config.json"]), false, "auto-merge").as_deref(),
+            money_ship_override(&t, &v(&["core.py", "config.json"]), false, "auto-merge")
+                .as_deref(),
             Some("pr")
         );
     }
@@ -345,7 +352,10 @@ mod tests {
     #[test]
     fn non_money_is_none() {
         let t = kairos_tiers();
-        assert_eq!(money_ship_override(&t, &v(&["core.py", "app.py"]), false, "auto-merge"), None);
+        assert_eq!(
+            money_ship_override(&t, &v(&["core.py", "app.py"]), false, "auto-merge"),
+            None
+        );
         assert_eq!(money_ship_override(&t, &[], false, "auto-merge"), None);
     }
 
@@ -353,15 +363,30 @@ mod tests {
     fn configured_pr_is_none() {
         // ship=pr configured: nothing to downgrade — the override only bites auto-merge.
         let t = kairos_tiers();
-        assert_eq!(money_ship_override(&t, &v(&["trader.py"]), false, "pr"), None);
-        assert_eq!(money_ship_override(&t, &v(&["trader.py"]), false, "local"), None);
-        assert_eq!(money_ship_override(&t, &v(&["trader.py"]), false, "push"), None);
+        assert_eq!(
+            money_ship_override(&t, &v(&["trader.py"]), false, "pr"),
+            None
+        );
+        assert_eq!(
+            money_ship_override(&t, &v(&["trader.py"]), false, "local"),
+            None
+        );
+        assert_eq!(
+            money_ship_override(&t, &v(&["trader.py"]), false, "push"),
+            None
+        );
     }
 
     #[test]
     fn legacy_row_is_none() {
-        assert_eq!(money_ship_override(&json!({}), &v(&["trader.py"]), false, "auto-merge"), None);
-        assert_eq!(money_ship_override(&Value::Null, &v(&["trader.py"]), false, "auto-merge"), None);
+        assert_eq!(
+            money_ship_override(&json!({}), &v(&["trader.py"]), false, "auto-merge"),
+            None
+        );
+        assert_eq!(
+            money_ship_override(&Value::Null, &v(&["trader.py"]), false, "auto-merge"),
+            None
+        );
     }
 
     // ---- files_from_diff ----
@@ -386,7 +411,16 @@ rename from old_name.py
 rename to new_name.py
 ";
         let files = files_from_diff(diff);
-        assert_eq!(files, v(&["trader.py", "new_file.py", "gone.py", "old_name.py", "new_name.py"]));
+        assert_eq!(
+            files,
+            v(&[
+                "trader.py",
+                "new_file.py",
+                "gone.py",
+                "old_name.py",
+                "new_name.py"
+            ])
+        );
     }
 
     #[test]

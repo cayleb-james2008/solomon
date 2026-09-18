@@ -11,7 +11,7 @@
 
 use crate::control::paths;
 use chrono::Utc;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 /// Files the janitor must NEVER delete, rotate, or rewrite (case-insensitive: Windows FS is, and
@@ -245,7 +245,11 @@ fn sweep_dir(root: &Path, lim: &Limits) -> Value {
     let subdirs: Vec<PathBuf> = std::fs::read_dir(root)
         .map(|rd| {
             rd.flatten()
-                .filter(|e| e.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false))
+                .filter(|e| {
+                    e.file_type()
+                        .map(|t| t.is_dir() && !t.is_symlink())
+                        .unwrap_or(false)
+                })
                 .map(|e| e.path())
                 .collect()
         })
@@ -349,7 +353,7 @@ fn sweep_dir(root: &Path, lim: &Limits) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use filetime::{set_file_mtime, FileTime};
+    use filetime::{FileTime, set_file_mtime};
 
     fn tmp_root(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -398,7 +402,7 @@ mod tests {
             ("wd_stall_14520_83900", true, true),
             ("app_test_foo_123", true, true),
             ("sup_test_stale_live_pid_154396", false, false), // dir-only: a same-named FILE is left alone
-            ("sup_testish", true, false),                     // needs the trailing underscore prefix
+            ("sup_testish", true, false), // needs the trailing underscore prefix
             ("history.jsonl", false, false),
             ("heartbeat.json", false, false),
             ("normal.log", false, false),
@@ -446,10 +450,19 @@ mod tests {
 
         let out = sweep_dir(&root, &Limits::default());
         assert!(!lane.join("old.tmp").exists(), "old .tmp must be deleted");
-        assert!(!lane.join("_bb_probe.js").exists(), "old _bb_*.js must be deleted");
-        assert!(!lane.join("__pycache__").exists(), "old __pycache__ dir must be deleted");
+        assert!(
+            !lane.join("_bb_probe.js").exists(),
+            "old _bb_*.js must be deleted"
+        );
+        assert!(
+            !lane.join("__pycache__").exists(),
+            "old __pycache__ dir must be deleted"
+        );
         assert!(lane.join("fresh.tmp").exists(), "fresh .tmp must survive");
-        assert!(lane.join("heartbeat.json").exists(), "protected must survive any age");
+        assert!(
+            lane.join("heartbeat.json").exists(),
+            "protected must survive any age"
+        );
         assert!(lane.join("lock").exists(), "lock must survive any age");
         assert_eq!(out["deleted"], 3);
         assert!(out["freed_bytes"].as_u64().unwrap() > 0);
@@ -465,15 +478,36 @@ mod tests {
         std::fs::write(lane.join("big.log"), vec![b'x'; 100]).unwrap();
         std::fs::write(lane.join("big.log.1"), vec![b'y'; 50]).unwrap(); // stale gen-1 to replace
         std::fs::write(lane.join("small.jsonl"), b"tiny").unwrap();
-        let lim = Limits { rotate_bytes: 64, ..Limits::default() };
+        let lim = Limits {
+            rotate_bytes: 64,
+            ..Limits::default()
+        };
 
         let out = sweep_dir(&root, &lim);
         assert_eq!(out["rotated"], 1);
-        assert_eq!(file_len(&lane.join("big.log")), 0, "live file recreated empty");
-        assert_eq!(file_len(&lane.join("big.log.1")), 100, "gen-1 is the old live file");
-        assert!(!lane.join("big.log.1.1").exists(), "never a third generation");
-        assert_eq!(file_len(&lane.join("small.jsonl")), 4, "under-threshold untouched");
-        assert!(out["freed_bytes"].as_u64().unwrap() >= 50, "old .1 counted as freed");
+        assert_eq!(
+            file_len(&lane.join("big.log")),
+            0,
+            "live file recreated empty"
+        );
+        assert_eq!(
+            file_len(&lane.join("big.log.1")),
+            100,
+            "gen-1 is the old live file"
+        );
+        assert!(
+            !lane.join("big.log.1.1").exists(),
+            "never a third generation"
+        );
+        assert_eq!(
+            file_len(&lane.join("small.jsonl")),
+            4,
+            "under-threshold untouched"
+        );
+        assert!(
+            out["freed_bytes"].as_u64().unwrap() >= 50,
+            "old .1 counted as freed"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -491,17 +525,35 @@ mod tests {
         make_old(&lane.join("_canary_a"));
         // 160 bytes total; cap 100: oldest .1 (old.log.1, -40) -> 120, still over -> new.log.1
         // (-40) -> 80 <= cap. The canary dir survives because the .1 deletions sufficed.
-        let lim = Limits { repo_cap_bytes: 100, ..Limits::default() };
+        let lim = Limits {
+            repo_cap_bytes: 100,
+            ..Limits::default()
+        };
         sweep_dir(&root, &lim);
         assert!(!lane.join("old.log.1").exists(), "oldest .1 deleted first");
-        assert!(!lane.join("new.log.1").exists(), ".1 rotations deleted before canaries");
-        assert!(lane.join("_canary_a").exists(), "canary spared once under cap");
-        assert!(lane.join("keep.jsonl").exists(), "non-rotation files never deleted by the cap");
+        assert!(
+            !lane.join("new.log.1").exists(),
+            ".1 rotations deleted before canaries"
+        );
+        assert!(
+            lane.join("_canary_a").exists(),
+            "canary spared once under cap"
+        );
+        assert!(
+            lane.join("keep.jsonl").exists(),
+            "non-rotation files never deleted by the cap"
+        );
 
         // Still over cap with no .1 left -> the oldest canary dir goes.
-        let lim2 = Limits { repo_cap_bytes: 50, ..Limits::default() };
+        let lim2 = Limits {
+            repo_cap_bytes: 50,
+            ..Limits::default()
+        };
         sweep_dir(&root, &lim2);
-        assert!(!lane.join("_canary_a").exists(), "canary deleted when .1s are exhausted");
+        assert!(
+            !lane.join("_canary_a").exists(),
+            "canary deleted when .1s are exhausted"
+        );
         assert!(lane.join("keep.jsonl").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -513,8 +565,16 @@ mod tests {
         let lane = root.join("lane");
         std::fs::create_dir_all(&lane).unwrap();
         let lines: Vec<String> = (0..12).map(|i| format!("{{\"i\":{i}}}")).collect();
-        std::fs::write(lane.join("history.jsonl"), format!("{}\n", lines.join("\n"))).unwrap();
-        let lim = Limits { compact_over: 10, compact_keep: 5, ..Limits::default() };
+        std::fs::write(
+            lane.join("history.jsonl"),
+            format!("{}\n", lines.join("\n")),
+        )
+        .unwrap();
+        let lim = Limits {
+            compact_over: 10,
+            compact_keep: 5,
+            ..Limits::default()
+        };
 
         let out = sweep_dir(&root, &lim);
         let content = std::fs::read_to_string(lane.join("history.jsonl")).unwrap();
@@ -524,11 +584,17 @@ mod tests {
         let marker: Value = serde_json::from_str(got[5]).unwrap();
         assert_eq!(marker["dropped"], 7);
         assert!(marker.get("janitor_compacted").is_some());
-        assert!(!lane.join("history.jsonl.compact_new").exists(), "tmp cleaned up");
-        assert!(out["actions"].as_array().unwrap().iter().any(|a| a
-            .as_str()
-            .unwrap_or("")
-            .contains("compacted")));
+        assert!(
+            !lane.join("history.jsonl.compact_new").exists(),
+            "tmp cleaned up"
+        );
+        assert!(
+            out["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a.as_str().unwrap_or("").contains("compacted"))
+        );
 
         // Idempotent: a second sweep leaves the already-small file alone.
         sweep_dir(&root, &lim);

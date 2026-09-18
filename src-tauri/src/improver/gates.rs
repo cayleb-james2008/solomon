@@ -20,7 +20,7 @@
 use crate::control::proc;
 use crate::improver::ctx::{self, Ctx};
 use crate::improver::gitops;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -49,18 +49,20 @@ fn eval_float_re() -> &'static Regex {
 /// These match anywhere; the two JS/TS lookbehind alternatives are handled separately.
 fn skip_marker_plain_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(concat!(
-        r"@\s*\w+\.(?:skip|skipif|xfail)\b",
-        r"|@\s*(?:skip|skipif|xfail)\b",
-        r"|\bmark\.(?:skip|skipif|xfail)\b",
-        r"|pytest\.(?:skip|xfail)\s*\(",
-        r"|unittest\.skip",
-        r"|\.skipTest\s*\(",
-        r"|raise\s+(?:unittest\.)?SkipTest",
-        r"|\bt\.Skip(?:Now|f)?\s*\(",
-        r"|#\s*\[\s*ignore\b",
-    ))
-    .unwrap())
+    RE.get_or_init(|| {
+        Regex::new(concat!(
+            r"@\s*\w+\.(?:skip|skipif|xfail)\b",
+            r"|@\s*(?:skip|skipif|xfail)\b",
+            r"|\bmark\.(?:skip|skipif|xfail)\b",
+            r"|pytest\.(?:skip|xfail)\s*\(",
+            r"|unittest\.skip",
+            r"|\.skipTest\s*\(",
+            r"|raise\s+(?:unittest\.)?SkipTest",
+            r"|\bt\.Skip(?:Now|f)?\s*\(",
+            r"|#\s*\[\s*ignore\b",
+        ))
+        .unwrap()
+    })
 }
 
 /// The two `(?<![\w.])`-guarded JS/TS alternatives of _SKIP_MARKER_RE, WITHOUT the lookbehind (which
@@ -341,8 +343,7 @@ pub fn run_gate(c: &mut Ctx) -> (bool, Value, String) {
             && tests.get("passed").and_then(Value::as_i64).unwrap_or(0) == 0
             && tests.get("failed").and_then(Value::as_i64).unwrap_or(0) == 0
             && tests.get("errors").and_then(Value::as_i64).unwrap_or(0) == 0;
-        if empty && missing_module_re().is_match(&tail)
-        {
+        if empty && missing_module_re().is_match(&tail) {
             // a HARD, non-transient failure with the same all-zeros signature: surface immediately.
             let mut tests = tests;
             if let Value::Object(m) = &mut tests {
@@ -515,7 +516,9 @@ pub fn new_skip_markers(diff_text: &str) -> Vec<String> {
     let js = skip_marker_js_re();
     diff_text
         .lines()
-        .filter(|ln| ln.starts_with('+') && !ln.starts_with("+++") && skip_marker_matches(ln, plain, js))
+        .filter(|ln| {
+            ln.starts_with('+') && !ln.starts_with("+++") && skip_marker_matches(ln, plain, js)
+        })
         .map(|s| s.to_string())
         .collect()
 }
@@ -578,7 +581,12 @@ pub fn item_demands_tests(goal: &str) -> bool {
 /// a `tiers.protected` list write-protects its grader/leash files — a diff touching one is reverted
 /// before any numeric check (the loop must never edit the graders that grade it). Rows without
 /// `tiers` skip that rail entirely (legacy behavior byte-identical, no git call added).
-pub fn anti_gaming_reason(c: &Ctx, base_tests: &Value, tests: &Value, diff_text: &str) -> Option<String> {
+pub fn anti_gaming_reason(
+    c: &Ctx,
+    base_tests: &Value,
+    tests: &Value,
+    diff_text: &str,
+) -> Option<String> {
     // Tier-0 grader write-protection. The file list comes from the diff's OWN headers (the caller
     // already produced this exact committed diff — no second git invocation); the row is read fresh
     // so an operator edit to `tiers` takes effect mid-loop like every other repos.json key. A
@@ -621,7 +629,9 @@ pub fn anti_gaming_reason(c: &Ctx, base_tests: &Value, tests: &Value, diff_text:
             let base_cv = base_c.and_then(Value::as_i64).unwrap_or(0);
             let cur_cv = cur_c.and_then(Value::as_i64).unwrap_or(0);
             if cur_cv < base_cv {
-                return Some(format!("collected count fell {base_cv}→{cur_cv} (tests removed)"));
+                return Some(format!(
+                    "collected count fell {base_cv}→{cur_cv} (tests removed)"
+                ));
             }
         }
         // error count increased — new test failures introduced
@@ -717,8 +727,16 @@ pub fn run_cross_repo_gates(c: &mut Ctx, history_rec: &mut Value) -> Value {
     }
     let mut results = Map::new();
     for dep in deps {
-        let dep_name = dep.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-        let dep_path = dep.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+        let dep_name = dep
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let dep_path = dep
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         if dep_name.is_empty() || dep_path.is_empty() || !Path::new(&dep_path).is_dir() {
             continue; // best-effort skip
         }
@@ -757,7 +775,11 @@ pub fn run_cross_repo_gates(c: &mut Ctx, history_rec: &mut Value) -> Value {
             }
             Err(e) => {
                 // a spawn failure: treat the OS error as the dep gate's RED output.
-                proc::RunOut { code: -1, stdout: String::new(), stderr: e.to_string() }
+                proc::RunOut {
+                    code: -1,
+                    stdout: String::new(),
+                    stderr: e.to_string(),
+                }
             }
         };
         let out = format!("{}{}", p.stdout, p.stderr);
@@ -842,7 +864,11 @@ pub fn run_eval_gate(c: &mut Ctx, base_score: Option<f64>) -> Value {
             ));
             return json!({"ok": true, "score": Value::Null, "reason": "eval timed out (no drop measured)"});
         }
-        Err(e) => proc::RunOut { code: -1, stdout: String::new(), stderr: e.to_string() },
+        Err(e) => proc::RunOut {
+            code: -1,
+            stdout: String::new(),
+            stderr: e.to_string(),
+        },
     };
     let out = format!("{}{}", p.stdout, p.stderr);
     let score = parse_eval_score(&out);
@@ -912,9 +938,16 @@ pub fn narrated_without_writing(summary: &str) -> bool {
         return false;
     }
     let s = summary.to_lowercase();
-    let claims_work = ["added ", "created ", "i add", "implement", "wrote ", "new file"]
-        .iter()
-        .any(|w| s.contains(w));
+    let claims_work = [
+        "added ",
+        "created ",
+        "i add",
+        "implement",
+        "wrote ",
+        "new file",
+    ]
+    .iter()
+    .any(|w| s.contains(w));
     // mentions_file = bool(re.search(r"`[^`]+\.[A-Za-z]{1,4}`", summary)) or ".py" in s
     let mentions_file = mentions_file_re().is_match(summary) || s.contains(".py");
     claims_work && mentions_file
@@ -953,7 +986,10 @@ pub fn visual_gate_reason(vr: &Value) -> Option<String> {
         } else {
             "review infrastructure failed".to_string()
         };
-        return Some(format!("visual review unavailable: {}", truncate_chars(&detail, 240)));
+        return Some(format!(
+            "visual review unavailable: {}",
+            truncate_chars(&detail, 240)
+        ));
     }
     // findings = vr_result.get("findings") or []
     let findings: Vec<Value> = match vr.get("findings") {
@@ -1016,7 +1052,9 @@ fn run_command_timed(mut cmd: Command, timeout: Option<Duration>) -> std::io::Re
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(proc::CREATE_NO_WINDOW);
     }
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     match timeout {
         None => {
             let o = cmd.output()?;
@@ -1063,7 +1101,10 @@ fn run_command_timed(mut cmd: Command, timeout: Option<Duration>) -> std::io::Re
                     // could keep the pipe open and hang the join — return promptly. See proc::run.
                     drop(out_h);
                     drop(err_h);
-                    Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "subprocess timed out"))
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "subprocess timed out",
+                    ))
                 }
             }
         }
@@ -1284,7 +1325,10 @@ mod tests {
         let c = ctx();
         // passed held steady (10) but collected dropped 12->10
         let r = anti_gaming_reason(&c, &bt(10, 12), &full(10, 0, 0, 0, 10), "");
-        assert_eq!(r.as_deref(), Some("collected count fell 12→10 (tests removed)"));
+        assert_eq!(
+            r.as_deref(),
+            Some("collected count fell 12→10 (tests removed)")
+        );
     }
 
     #[test]
@@ -1295,7 +1339,8 @@ mod tests {
         // errors=2 on the red base → collected 696; after the fix 694 passed/0 errors → collected 694.)
         let c = ctx();
         let base = json!({"passed": 693, "failed": 1, "errors": 2, "skipped": 0, "collected": 696});
-        let after = json!({"passed": 694, "failed": 0, "errors": 0, "skipped": 0, "collected": 694});
+        let after =
+            json!({"passed": 694, "failed": 0, "errors": 0, "skipped": 0, "collected": 694});
         assert_eq!(anti_gaming_reason(&c, &base, &after, ""), None);
     }
 
@@ -1319,7 +1364,9 @@ mod tests {
         let r = anti_gaming_reason(&c, &base, &after, "");
         assert_eq!(
             r.as_deref(),
-            Some("skipped count increased significantly 0→3 (tests being skipped instead of fixed)")
+            Some(
+                "skipped count increased significantly 0→3 (tests being skipped instead of fixed)"
+            )
         );
     }
 
@@ -1349,14 +1396,19 @@ mod tests {
         let r = anti_gaming_reason(&c, &base, &json!({}), diff);
         assert_eq!(
             r.as_deref(),
-            Some("removed 1 test definition(s) on a gate with no parseable counts (numeric anti-gaming rail inactive)")
+            Some(
+                "removed 1 test definition(s) on a gate with no parseable counts (numeric anti-gaming rail inactive)"
+            )
         );
     }
 
     #[test]
     fn anti_gaming_clean_returns_none() {
         let c = ctx();
-        assert_eq!(anti_gaming_reason(&c, &bt(10, 10), &full(11, 0, 0, 0, 11), ""), None);
+        assert_eq!(
+            anti_gaming_reason(&c, &bt(10, 10), &full(11, 0, 0, 0, 11), ""),
+            None
+        );
     }
 
     // ---- skip marker regex precision ----
@@ -1373,7 +1425,10 @@ mod tests {
         assert_eq!(new_skip_markers("+    model.fit(X, y)").len(), 0);
         assert_eq!(new_skip_markers("+    self.test.only(x)").len(), 0);
         // '+++' header excluded
-        assert_eq!(new_skip_markers("+++ b/test_x.py @pytest.mark.skip").len(), 0);
+        assert_eq!(
+            new_skip_markers("+++ b/test_x.py @pytest.mark.skip").len(),
+            0
+        );
     }
 
     // ---- test-def detection ----
@@ -1418,7 +1473,9 @@ mod tests {
         let r = eval_gate_reason(Some(0.9), Some(0.8));
         assert_eq!(
             r.as_deref(),
-            Some("eval score fell 0.9→0.8 (the change made the product WORSE on the richer needle, even though tests stayed green)")
+            Some(
+                "eval score fell 0.9→0.8 (the change made the product WORSE on the richer needle, even though tests stayed green)"
+            )
         );
     }
 
@@ -1427,7 +1484,10 @@ mod tests {
     fn leak_in_diff_secret_token() {
         let c = ctx();
         let diff = "+ token = ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345\n+ ok";
-        assert_eq!(leak_in_diff(&c, diff), "a secret-shaped token is present in the diff");
+        assert_eq!(
+            leak_in_diff(&c, diff),
+            "a secret-shaped token is present in the diff"
+        );
     }
 
     #[test]
@@ -1450,7 +1510,10 @@ mod tests {
             "a secret-shaped token is present in the diff"
         );
         assert_eq!(
-            leak_in_diff(&c, "+OPENAI_API_KEY = sk_underscore_not_a_known_prefix_123\n+fine"),
+            leak_in_diff(
+                &c,
+                "+OPENAI_API_KEY = sk_underscore_not_a_known_prefix_123\n+fine"
+            ),
             "a secret-shaped token is present in the diff"
         );
         // the same credential on a REMOVED line is not scanned (added-only)
@@ -1465,14 +1528,19 @@ mod tests {
         // key_shape_mismatch() hardening change gets reverted (2026-06-30 incident).
         let c = ctx();
         let diff = "+        c.api_key = format!(\"{}-or-v1-{}\", \"sk\", \"7810c0c208a9b368710342d765c2c4d79c19581176509191ef335157d1467c20\");\n+        let k = format!(\"{}-or-v1-{}\", \"sk\", \"uniquerandperrepo\");\n+ok\n";
-        assert_eq!(leak_in_diff(&c, diff), "",
-            "parts-built key construction must not trip the leak guard");
+        assert_eq!(
+            leak_in_diff(&c, diff),
+            "",
+            "parts-built key construction must not trip the leak guard"
+        );
     }
 
     // ---- narrated_without_writing ----
     #[test]
     fn narrated_without_writing_cases() {
-        assert!(narrated_without_writing("Added tests/test_x.py covering the parser"));
+        assert!(narrated_without_writing(
+            "Added tests/test_x.py covering the parser"
+        ));
         assert!(narrated_without_writing("I implemented the fix in app.py"));
         // claims work but mentions no file -> false
         assert!(!narrated_without_writing("Refactored the loop for clarity"));
@@ -1492,7 +1560,9 @@ mod tests {
         assert_eq!(r.as_deref(), Some("visual review unavailable: boom"));
         // ok=True, no critical -> None
         assert_eq!(
-            visual_gate_reason(&json!({"ok": true, "findings": [{"severity": "warning", "description": "x"}]})),
+            visual_gate_reason(
+                &json!({"ok": true, "findings": [{"severity": "warning", "description": "x"}]})
+            ),
             None
         );
         // ok=True, one critical -> blocking reason
@@ -1502,14 +1572,19 @@ mod tests {
         }));
         assert_eq!(
             r.as_deref(),
-            Some("visual review found 1 critical issue(s) — reverting (visual_gate is on): login button missing")
+            Some(
+                "visual review found 1 critical issue(s) — reverting (visual_gate is on): login button missing"
+            )
         );
     }
 
     #[test]
     fn visual_gate_reason_ok_no_findings() {
         assert_eq!(visual_gate_reason(&json!({"ok": true})), None);
-        assert_eq!(visual_gate_reason(&json!({"ok": true, "findings": []})), None);
+        assert_eq!(
+            visual_gate_reason(&json!({"ok": true, "findings": []})),
+            None
+        );
     }
 
     // ---- cargo_manifest_dir (Gate #1b detection) ----

@@ -53,7 +53,10 @@ impl BrainConfig {
             return Self::disabled();
         };
         Self {
-            enabled: brain.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+            enabled: brain
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             aggregator: brain
                 .get("aggregator")
                 .and_then(Value::as_str)
@@ -293,19 +296,23 @@ pub fn run_moa_plan(ctx: &mut Ctx, task: &str) -> String {
     let plan_model_for_closure = plan_model.clone();
     let (plan_result, ideate_result) = std::thread::scope(|scope| {
         let plan_handle = scope.spawn(move || {
-            spawn_worker(&plan_model_for_closure, PLAN_PROMPT, &plan_skill, task, Some(ctx_ref))
+            spawn_worker(
+                &plan_model_for_closure,
+                PLAN_PROMPT,
+                &plan_skill,
+                task,
+                Some(ctx_ref),
+            )
         });
         let ideate_handle = scope.spawn(move || {
-            ideate_model_for_closure.as_ref().map(|im| {
-                spawn_worker(im, IDEATE_PROMPT, &ideate_skill, task, Some(ctx_ref))
-            })
+            ideate_model_for_closure
+                .as_ref()
+                .map(|im| spawn_worker(im, IDEATE_PROMPT, &ideate_skill, task, Some(ctx_ref)))
         });
         let plan_result = plan_handle
             .join()
             .unwrap_or_else(|_| Err("planner thread panicked".to_string()));
-        let ideate_result = ideate_handle
-            .join()
-            .unwrap_or(None);
+        let ideate_result = ideate_handle.join().unwrap_or(None);
         (plan_result, ideate_result)
     });
 
@@ -351,20 +358,25 @@ pub fn run_moa_plan(ctx: &mut Ctx, task: &str) -> String {
         Some(it) => format!("1. [Plan]: {plan_text}\n2. [Ideate]: {it}"),
         None => format!("1. [Plan]: {plan_text}"),
     };
-    let agg_user = format!("{AGGREGATE_SYNTHESIZE_PROMPT}\n\nResponses from models:\n{layer1_inputs}");
+    let agg_user =
+        format!("{AGGREGATE_SYNTHESIZE_PROMPT}\n\nResponses from models:\n{layer1_inputs}");
     let agg_skill = load_skill(&lane, "aggregate");
     match spawn_worker(&cfg.aggregator, "", &agg_skill, &agg_user, Some(&*ctx)) {
         Ok(synth) => {
             ctx.log("MoA: synthesized plan ready for implementer");
             moa_event(&lane, 2, &cfg.aggregator, "ok", "synthesized plan");
-            format!("{synth}\n\n--- MoA directives ---\n1. NEVER add #[skip], #[ignore], #[should_panic], pytest.mark.skip, @skipif, @xfail, #[cfg(skip)], or ANY test-skip/xfail/ignore marker to ANY test — not even temporarily, not even \"just to see what happens\", not even if the test is failing. The runner's anti-gaming scan detects skip markers in the diff and REVERTS the entire iteration, wasting the cycle. CONCRETE EXAMPLE OF WHAT NOT TO DO: if a test `test_paused_writes_stop_sentinel` is failing because the implementation isn't complete yet, DO NOT add `#[ignore]` to it. Instead, FIX THE IMPLEMENTATION so the test passes. If you cannot make the test pass, DO NOT commit — abort the iteration (a truthful null beats a gamed success). NEVER delete, weaken, comment out, or narrow an existing test to make the gate pass. If a test fails, FIX THE CODE, not the test.\n2. For Rust repos: your code MUST pass `cargo clippy --workspace --all-targets -- -D warnings` with ZERO warnings. Common clippy lints to avoid: overly_complex_bool_expr (use `assert!(!x)` not `assert!(x || !x)`), manual_range_contains (use `(a..b).contains(&v)` not `v >= a && v < b`), needless_range_loop (use iterators), redundant_closure (use `f` not `|x| f(x)`). Run `cargo clippy` mentally before writing each line.")
+            format!(
+                "{synth}\n\n--- MoA directives ---\n1. NEVER add #[skip], #[ignore], #[should_panic], pytest.mark.skip, @skipif, @xfail, #[cfg(skip)], or ANY test-skip/xfail/ignore marker to ANY test — not even temporarily, not even \"just to see what happens\", not even if the test is failing. The runner's anti-gaming scan detects skip markers in the diff and REVERTS the entire iteration, wasting the cycle. CONCRETE EXAMPLE OF WHAT NOT TO DO: if a test `test_paused_writes_stop_sentinel` is failing because the implementation isn't complete yet, DO NOT add `#[ignore]` to it. Instead, FIX THE IMPLEMENTATION so the test passes. If you cannot make the test pass, DO NOT commit — abort the iteration (a truthful null beats a gamed success). NEVER delete, weaken, comment out, or narrow an existing test to make the gate pass. If a test fails, FIX THE CODE, not the test.\n2. For Rust repos: your code MUST pass `cargo clippy --workspace --all-targets -- -D warnings` with ZERO warnings. Common clippy lints to avoid: overly_complex_bool_expr (use `assert!(!x)` not `assert!(x || !x)`), manual_range_contains (use `(a..b).contains(&v)` not `v >= a && v < b`), needless_range_loop (use iterators), redundant_closure (use `f` not `|x| f(x)`). Run `cargo clippy` mentally before writing each line."
+            )
         }
         Err(e) => {
             ctx.log(&format!(
                 "MoA aggregator failed ({e}); handing raw task + advisory plan to implementer"
             ));
             moa_event(&lane, 2, &cfg.aggregator, "failed", &e);
-            format!("{task}\n\n--- Advisory plan (MoA planner, aggregator failed) ---\n{plan_text}\n\n--- MoA directives ---\n1. NEVER add #[skip], #[ignore], #[should_panic], pytest.mark.skip, @skipif, @xfail, #[cfg(skip)], or ANY test-skip/xfail/ignore marker to ANY test — not even temporarily, not even \"just to see what happens\", not even if the test is failing. The runner's anti-gaming scan detects skip markers in the diff and REVERTS the entire iteration, wasting the cycle. CONCRETE EXAMPLE OF WHAT NOT TO DO: if a test `test_paused_writes_stop_sentinel` is failing because the implementation isn't complete yet, DO NOT add `#[ignore]` to it. Instead, FIX THE IMPLEMENTATION so the test passes. If you cannot make the test pass, DO NOT commit — abort the iteration (a truthful null beats a gamed success). NEVER delete, weaken, comment out, or narrow an existing test to make the gate pass. If a test fails, FIX THE CODE, not the test.\n2. For Rust repos: your code MUST pass `cargo clippy --workspace --all-targets -- -D warnings` with ZERO warnings. Common clippy lints to avoid: overly_complex_bool_expr, manual_range_contains (use `(a..b).contains(&v)`), needless_range_loop, redundant_closure. Run `cargo clippy` mentally before writing each line.")
+            format!(
+                "{task}\n\n--- Advisory plan (MoA planner, aggregator failed) ---\n{plan_text}\n\n--- MoA directives ---\n1. NEVER add #[skip], #[ignore], #[should_panic], pytest.mark.skip, @skipif, @xfail, #[cfg(skip)], or ANY test-skip/xfail/ignore marker to ANY test — not even temporarily, not even \"just to see what happens\", not even if the test is failing. The runner's anti-gaming scan detects skip markers in the diff and REVERTS the entire iteration, wasting the cycle. CONCRETE EXAMPLE OF WHAT NOT TO DO: if a test `test_paused_writes_stop_sentinel` is failing because the implementation isn't complete yet, DO NOT add `#[ignore]` to it. Instead, FIX THE IMPLEMENTATION so the test passes. If you cannot make the test pass, DO NOT commit — abort the iteration (a truthful null beats a gamed success). NEVER delete, weaken, comment out, or narrow an existing test to make the gate pass. If a test fails, FIX THE CODE, not the test.\n2. For Rust repos: your code MUST pass `cargo clippy --workspace --all-targets -- -D warnings` with ZERO warnings. Common clippy lints to avoid: overly_complex_bool_expr, manual_range_contains (use `(a..b).contains(&v)`), needless_range_loop, redundant_closure. Run `cargo clippy` mentally before writing each line."
+            )
         }
     }
 }
@@ -380,11 +392,9 @@ pub fn run_moa_aggregator_only(system: &str, user: &str) -> String {
         return crate::ceo::ollama_chat(&cfg.aggregator, system, user)
             .unwrap_or_else(|_| user.to_string());
     }
-    let agg_user = format!(
-        "{AGGREGATE_SYNTHESIZE_PROMPT}\n\nResponses from models:\n1. [Input]: {user}"
-    );
-    crate::ceo::ollama_chat(&cfg.aggregator, system, &agg_user)
-        .unwrap_or_else(|_| user.to_string())
+    let agg_user =
+        format!("{AGGREGATE_SYNTHESIZE_PROMPT}\n\nResponses from models:\n1. [Input]: {user}");
+    crate::ceo::ollama_chat(&cfg.aggregator, system, &agg_user).unwrap_or_else(|_| user.to_string())
 }
 
 /// The MoA verifier — a SEPARATE post-gate call (Slice 4, integration point D). Replaces the
@@ -399,7 +409,13 @@ pub fn run_moa_verifier(ctx: &mut Ctx, committed_diff: &str) -> String {
     }
     let lane = ctx.name.clone();
     let verify_skill = load_skill(&lane, "verify");
-    match spawn_worker(&cfg.verifier, VERIFY_PROMPT, &verify_skill, committed_diff, Some(&*ctx)) {
+    match spawn_worker(
+        &cfg.verifier,
+        VERIFY_PROMPT,
+        &verify_skill,
+        committed_diff,
+        Some(&*ctx),
+    ) {
         Ok(v) => v,
         Err(e) => {
             ctx.log(&format!(

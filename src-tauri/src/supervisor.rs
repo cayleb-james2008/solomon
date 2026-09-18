@@ -29,7 +29,7 @@
 
 use crate::control::{branches, heartbeat, locks, paths, proc, registry, runner};
 use chrono::{NaiveDateTime, Utc};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -473,7 +473,11 @@ pub fn diagnose(repo: &Value) -> Value {
         // automated clear is revalidate_persisted_error's VERIFIED recheck (no stranded branch
         // remains — never a blind retry).
         cat = "stranded_unmerged_branch".into();
-        ev = trunc_or(summary, 200, "stranded finished rsi/* work found at preflight");
+        ev = trunc_or(
+            summary,
+            200,
+            "stranded finished rsi/* work found at preflight",
+        );
         rec = vec![
             "a finished rsi/* or solomon-recovered/* branch is not an ancestor of the fork base \
              and not visible on origin — merge/ship/push it (or delete it if truly obsolete), \
@@ -1403,7 +1407,10 @@ fn ttl_escalation_step(repo: &Value, auto_push: bool) -> Option<Value> {
         return None; // un-expired: existing recover()/diagnose() behavior, untouched
     }
 
-    let runs = esc.get("fallback_runs").and_then(Value::as_u64).unwrap_or(0);
+    let runs = esc
+        .get("fallback_runs")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let degraded = runs >= policy.max_fallback_runs;
     let (kind, window_s) = if degraded {
         // Fallbacks exhausted: the documented degraded mode is a deduped operator page, re-armed
@@ -1512,9 +1519,14 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
     // RUNG 2 / revert_failed special path.
     if cat == "revert_failed" {
         if is_live_app(repo) {
-            return finish(repo, &d, vec!["skipped reset_to_base (live app)".into()], true,
+            return finish(
+                repo,
+                &d,
+                vec!["skipped reset_to_base (live app)".into()],
+                true,
                 "live-app repo: working tree dirtied by the running app (expected) — not resetting; \
-                 pause the lane or restart the app instead");
+                 pause the lane or restart the app instead",
+            );
         }
         if locks::is_running(repo) {
             return finish(
@@ -1672,8 +1684,13 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
                 // per-sweep restart budget is spent we must NOT stop (a stop we cannot follow with a
                 // restart euthanizes the lane). Defer the whole action to a later sweep instead.
                 if !spend_restart_budget() {
-                    return finish(repo, &d, vec!["restart_deferred".into()], false,
-                        "noop_streak recovery deferred (per-sweep restart budget spent — retries next sweep)");
+                    return finish(
+                        repo,
+                        &d,
+                        vec!["restart_deferred".into()],
+                        false,
+                        "noop_streak recovery deferred (per-sweep restart budget spent — retries next sweep)",
+                    );
                 }
                 runner::stop(repo);
                 actions.push("stop".into());
@@ -1753,9 +1770,14 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
         actions.push("clear_stop".into());
     } else if cat == "dirty_tree" {
         if is_live_app(repo) {
-            return finish(repo, &d, vec!["skipped reset_to_base (live app)".into()], true,
+            return finish(
+                repo,
+                &d,
+                vec!["skipped reset_to_base (live app)".into()],
+                true,
                 "live-app repo: working tree dirtied by the running app (expected) — not resetting; \
-                 pause the lane or restart the app instead");
+                 pause the lane or restart the app instead",
+            );
         }
         let (ok, token) = locks::acquire_supervisor_lock(repo);
         if !ok {
@@ -1839,8 +1861,13 @@ pub fn recover(repo: &Value, allow_pi: bool, allow_restart: bool, auto_push: boo
         // in recover(). Respect the same per-sweep budget so N gate-red lanes can't fire N builds at
         // once. Defer to a later sweep when the budget is spent.
         if !spend_restart_budget() {
-            return finish(repo, &d, actions, false,
-                "Solomon fix-session deferred (per-sweep restart budget spent — retries next sweep)");
+            return finish(
+                repo,
+                &d,
+                actions,
+                false,
+                "Solomon fix-session deferred (per-sweep restart budget spent — retries next sweep)",
+            );
         }
         let r = solomon_fix_session(repo, auto_push);
         actions.push("solomon_fix_session".into());
@@ -2106,10 +2133,12 @@ mod tests {
         assert_eq!(d["auto_safe"], false);
         assert_eq!(d["healthy"], false);
         // evidence is the truncated summary (first 200 chars).
-        assert!(d["evidence"]
-            .as_str()
-            .unwrap()
-            .starts_with("repos.json api_key for 'demo'"));
+        assert!(
+            d["evidence"]
+                .as_str()
+                .unwrap()
+                .starts_with("repos.json api_key for 'demo'")
+        );
         // targeted recommendation, not the generic git-status fallback.
         assert_eq!(
             d["recommended"],
@@ -2154,10 +2183,12 @@ mod tests {
         );
         assert_eq!(d["auto_safe"], false);
         assert_eq!(d["healthy"], false);
-        assert!(d["evidence"]
-            .as_str()
-            .unwrap()
-            .starts_with("repos.json api_key for 'demo'"));
+        assert!(
+            d["evidence"]
+                .as_str()
+                .unwrap()
+                .starts_with("repos.json api_key for 'demo'")
+        );
         // Same targeted recommendation as the first direction.
         assert_eq!(
             d["recommended"],
@@ -2189,9 +2220,11 @@ mod tests {
         let read = read_escalation(&repo).expect("escalation.json written");
         assert_eq!(read["category"], "key_shape_mismatch");
         let steps = read["suggested_manual_steps"].as_array().unwrap();
-        assert!(steps
-            .iter()
-            .any(|s| s.as_str().unwrap().contains("repos.json")));
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("repos.json"))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2218,9 +2251,11 @@ mod tests {
         let read = read_escalation(&repo).expect("escalation.json written");
         assert_eq!(read["category"], "key_shape_mismatch");
         let steps = read["suggested_manual_steps"].as_array().unwrap();
-        assert!(steps
-            .iter()
-            .any(|s| s.as_str().unwrap().contains("repos.json")));
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("repos.json"))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2294,11 +2329,13 @@ mod tests {
             r["actions_taken"],
             json!(["skipped reset_to_base (live app)"])
         );
-        assert!(!r["actions_taken"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|a| a == "reset_to_base"));
+        assert!(
+            !r["actions_taken"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a == "reset_to_base")
+        );
         let _ = std::fs::remove_dir_all(&dir);
 
         // Plain repo (no path): dirty_tree still routes into reset_to_base (which fails on the
@@ -2310,11 +2347,13 @@ mod tests {
         );
         assert_eq!(diagnose(&repo2)["category"], "dirty_tree");
         let r2 = recover(&repo2, false, false, false);
-        assert!(r2["actions_taken"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|a| a == "reset_to_base"));
+        assert!(
+            r2["actions_taken"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a == "reset_to_base")
+        );
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
@@ -2456,14 +2495,18 @@ mod tests {
         assert_eq!(d["healthy"], false);
         assert_eq!(d["auto_safe"], false);
         // evidence is the REAL summary (truncated to 200 chars), NOT the misleading crash/kill text.
-        assert!(d["evidence"]
-            .as_str()
-            .unwrap()
-            .starts_with("Base branch 'main' has been dirty"));
-        assert!(!d["evidence"]
-            .as_str()
-            .unwrap()
-            .contains("crash/kill mid-stop"));
+        assert!(
+            d["evidence"]
+                .as_str()
+                .unwrap()
+                .starts_with("Base branch 'main' has been dirty")
+        );
+        assert!(
+            !d["evidence"]
+                .as_str()
+                .unwrap()
+                .contains("crash/kill mid-stop")
+        );
         let _ = std::fs::remove_dir_all(&dir);
 
         // base_gate_red_persistent — the third reason the watchdog does NOT auto-clear; must still
@@ -2483,14 +2526,18 @@ mod tests {
         );
         let d = diagnose(&repo);
         assert_eq!(d["category"], "persistent_self_stop");
-        assert!(d["evidence"]
-            .as_str()
-            .unwrap()
-            .starts_with("Base gate has been RED"));
-        assert!(!d["evidence"]
-            .as_str()
-            .unwrap()
-            .contains("crash/kill mid-stop"));
+        assert!(
+            d["evidence"]
+                .as_str()
+                .unwrap()
+                .starts_with("Base gate has been RED")
+        );
+        assert!(
+            !d["evidence"]
+                .as_str()
+                .unwrap()
+                .contains("crash/kill mid-stop")
+        );
         let _ = std::fs::remove_dir_all(&dir);
 
         // unpushed_base_persistent too.
@@ -2507,10 +2554,12 @@ mod tests {
         );
         let d = diagnose(&repo);
         assert_eq!(d["category"], "persistent_self_stop");
-        assert!(d["evidence"]
-            .as_str()
-            .unwrap()
-            .starts_with("Base is ahead of origin"));
+        assert!(
+            d["evidence"]
+                .as_str()
+                .unwrap()
+                .starts_with("Base is ahead of origin")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2528,10 +2577,12 @@ mod tests {
         let d = diagnose(&repo);
         assert_eq!(d["category"], "stop_lingering");
         assert_eq!(d["auto_safe"], false);
-        assert!(d["evidence"]
-            .as_str()
-            .unwrap()
-            .contains("crash/kill mid-stop"));
+        assert!(
+            d["evidence"]
+                .as_str()
+                .unwrap()
+                .contains("crash/kill mid-stop")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2559,12 +2610,16 @@ mod tests {
         let read = read_escalation(&repo).expect("escalation.json written");
         assert_eq!(read["category"], "persistent_self_stop");
         let steps = read["suggested_manual_steps"].as_array().unwrap();
-        assert!(steps
-            .iter()
-            .any(|s| s.as_str().unwrap().contains("base_gate_red_persistent")));
-        assert!(steps
-            .iter()
-            .any(|s| s.as_str().unwrap().contains("dirty_base_persistent")));
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("base_gate_red_persistent"))
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("dirty_base_persistent"))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2818,10 +2873,12 @@ mod tests {
         assert_eq!(out["category"], "noop_streak");
         assert_eq!(out["escalate"], false);
         assert_eq!(out["actions_taken"], json!([]));
-        assert!(out["message"]
-            .as_str()
-            .unwrap()
-            .contains("in-flight iteration"));
+        assert!(
+            out["message"]
+                .as_str()
+                .unwrap()
+                .contains("in-flight iteration")
+        );
         // No stop sentinel was written (the in-flight iteration was not killed).
         assert!(
             !dir.join("stop").exists(),
@@ -2896,10 +2953,12 @@ mod tests {
         let d = diagnose(&repo);
         assert_eq!(d["category"], "stale_lock");
         assert_eq!(d["auto_safe"], false); // anti-thrash demoted
-        assert!(d["evidence"]
-            .as_str()
-            .unwrap()
-            .contains("escalating instead of looping"));
+        assert!(
+            d["evidence"]
+                .as_str()
+                .unwrap()
+                .contains("escalating instead of looping")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2930,10 +2989,12 @@ mod tests {
         let d = diagnose(&repo);
         assert_eq!(d["category"], "stale_lock");
         assert_eq!(d["auto_safe"], false); // anti-thrash demoted despite ok records interleaving
-        assert!(d["evidence"]
-            .as_str()
-            .unwrap()
-            .contains("escalating instead of looping"));
+        assert!(
+            d["evidence"]
+                .as_str()
+                .unwrap()
+                .contains("escalating instead of looping")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3077,10 +3138,12 @@ mod tests {
         let out3 = recover(&repo, false, true, true);
         assert_eq!(out3["category"], "no_key");
         assert_eq!(out3["escalate"], true);
-        assert!(!out3
-            .get("escalate_deduped")
-            .map(|v| v.as_bool().unwrap_or(false))
-            .unwrap_or(false));
+        assert!(
+            !out3
+                .get("escalate_deduped")
+                .map(|v| v.as_bool().unwrap_or(false))
+                .unwrap_or(false)
+        );
         assert!(dir.join("escalation.json").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3605,17 +3668,34 @@ mod tests {
         esc["fallback_runs"] = json!(2);
         write_esc_file(&dir, &esc);
 
-        write_escalation(&repo, &json!({"category": "no_key", "evidence": "re-observed"}));
+        write_escalation(
+            &repo,
+            &json!({"category": "no_key", "evidence": "re-observed"}),
+        );
         let esc2 = read_escalation(&repo).unwrap();
-        assert_eq!(esc2["expires_at"], json!("2000-01-01T00:00:00Z"), "cycle preserved");
+        assert_eq!(
+            esc2["expires_at"],
+            json!("2000-01-01T00:00:00Z"),
+            "cycle preserved"
+        );
         assert_eq!(esc2["fallback_runs"], json!(2), "runs preserved");
-        assert_eq!(esc2["evidence"], json!("re-observed"), "diagnosis payload still refreshed");
+        assert_eq!(
+            esc2["evidence"],
+            json!("re-observed"),
+            "diagnosis payload still refreshed"
+        );
 
         // a different category is a NEW problem: fresh stamp, runs reset.
-        write_escalation(&repo, &json!({"category": "quota_error", "evidence": "429"}));
+        write_escalation(
+            &repo,
+            &json!({"category": "quota_error", "evidence": "429"}),
+        );
         let esc3 = read_escalation(&repo).unwrap();
         assert_eq!(esc3["fallback_runs"], json!(0));
-        assert!(esc_expires_in(&repo) > 0, "fresh future expiry for the new category");
+        assert!(
+            esc_expires_in(&repo) > 0,
+            "fresh future expiry for the new category"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3652,8 +3732,14 @@ mod tests {
             let esc = read_escalation(&repo).unwrap();
             assert_eq!(esc["fallback_runs"], json!(1));
             assert_eq!(esc["fallback_history"].as_array().unwrap().len(), 1);
-            assert_eq!(esc["fallback_history"][0]["action"], json!("page_operator_deduped"));
-            assert!(esc_expires_in(&repo) > 3000, "expiry re-stamped a window out");
+            assert_eq!(
+                esc["fallback_history"][0]["action"],
+                json!("page_operator_deduped")
+            );
+            assert!(
+                esc_expires_in(&repo) > 3000,
+                "expiry re-stamped a window out"
+            );
             assert!(dir.join("_paged_no_key").exists(), "page marker stamped");
 
             // Second sweep inside the fresh window: NO second execution — the pre-step defers and
@@ -3661,7 +3747,11 @@ mod tests {
             let out2 = recover(&repo, false, false, false);
             assert!(out2.get("ttl_expired").is_none());
             let esc2 = read_escalation(&repo).unwrap();
-            assert_eq!(esc2["fallback_runs"], json!(1), "no double execution in one window");
+            assert_eq!(
+                esc2["fallback_runs"],
+                json!(1),
+                "no double execution in one window"
+            );
             let sup = std::fs::read_to_string(dir.join("supervisor.jsonl")).unwrap();
             assert_eq!(
                 sup.matches("ttl_fallback:page_operator_deduped").count(),
@@ -3766,7 +3856,10 @@ mod tests {
         assert_eq!(out["category"], json!("no_key"));
         let esc = read_escalation(&repo).unwrap();
         assert_eq!(esc["fallback_runs"], json!(0));
-        assert!(esc_expires_in(&repo) > 0, "legacy record now carries a live TTL");
+        assert!(
+            esc_expires_in(&repo) > 0,
+            "legacy record now carries a live TTL"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3800,14 +3893,22 @@ mod tests {
             vec!["commit", "--allow-empty", "-m", "init"],
             vec!["branch", "-M", "main"],
         ] {
-            let st = Command::new("git").args(&args).current_dir(&dir).status().unwrap();
+            let st = Command::new("git")
+                .args(&args)
+                .current_dir(&dir)
+                .status()
+                .unwrap();
             assert!(st.success(), "git {args:?} failed in {dir:?}");
         }
         dir
     }
 
     fn gitc(dir: &Path, args: &[&str]) {
-        let st = Command::new("git").args(args).current_dir(dir).status().unwrap();
+        let st = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
         assert!(st.success(), "git {args:?} failed in {dir:?}");
     }
 
@@ -3838,9 +3939,21 @@ mod tests {
         }
         // Process/config/provider conditions are NOT in the set — their state files are current
         // truth (locks), their writers clear them (config), or they own a cooldown (quota).
-        for cat in ["ok", "stale_lock", "stuck", "needs_goal", "no_key", "quota_error",
-                    "persistent_self_stop", "noop_streak", "unknown_error"] {
-            assert!(!is_recheckable_stale_error(cat), "{cat} must not be re-checkable");
+        for cat in [
+            "ok",
+            "stale_lock",
+            "stuck",
+            "needs_goal",
+            "no_key",
+            "quota_error",
+            "persistent_self_stop",
+            "noop_streak",
+            "unknown_error",
+        ] {
+            assert!(
+                !is_recheckable_stale_error(cat),
+                "{cat} must not be re-checkable"
+            );
         }
     }
 
@@ -3860,11 +3973,18 @@ mod tests {
             }),
         );
         let d = diagnose(&repo);
-        assert_eq!(d["category"], json!("dirty_tree"), "fixture reproduces the wedge diagnosis");
+        assert_eq!(
+            d["category"],
+            json!("dirty_tree"),
+            "fixture reproduces the wedge diagnosis"
+        );
         let out = revalidate_persisted_error(&repo, &d).expect("verified-healed error clears");
         assert_eq!(out["ok"], json!(true));
         assert_eq!(out["escalate"], json!(false));
-        assert_eq!(out["actions_taken"][0], json!("stale_error_recheck_cleared"));
+        assert_eq!(
+            out["actions_taken"][0],
+            json!("stale_error_recheck_cleared")
+        );
         let hb = heartbeat::read_heartbeat(&repo).unwrap();
         assert_eq!(hb["status"], json!("idle"), "lane returned to idle");
         assert!(hb.get("reason").is_none());
@@ -3898,7 +4018,11 @@ mod tests {
             "a still-true condition is NEVER cleared (fail-closed)"
         );
         let hb = heartbeat::read_heartbeat(&repo).unwrap();
-        assert_eq!(hb["status"], json!("error"), "heartbeat untouched while the error is real");
+        assert_eq!(
+            hb["status"],
+            json!("error"),
+            "heartbeat untouched while the error is real"
+        );
         let _ = std::fs::remove_dir_all(&rdir);
         let _ = std::fs::remove_dir_all(&gdir);
     }
@@ -3950,13 +4074,20 @@ mod tests {
             revalidate_persisted_error(&repo, &d).is_none(),
             "a live stranding must keep the park"
         );
-        assert!(rdir.join("stop").exists(), "stop sentinel untouched while stranded");
+        assert!(
+            rdir.join("stop").exists(),
+            "stop sentinel untouched while stranded"
+        );
 
         // Reconcile: merge the stranded branch into the base (the human fix this park asks for).
         gitc(&gdir, &["merge", "rsi/iter-x"]);
-        let out = revalidate_persisted_error(&repo, &d).expect("verified-reconciled stranding clears");
+        let out =
+            revalidate_persisted_error(&repo, &d).expect("verified-reconciled stranding clears");
         let acts = out["actions_taken"].as_array().unwrap();
-        assert!(acts.iter().any(|a| a == "clear_stop"), "the runner's own stop sentinel clears: {acts:?}");
+        assert!(
+            acts.iter().any(|a| a == "clear_stop"),
+            "the runner's own stop sentinel clears: {acts:?}"
+        );
         assert!(!rdir.join("stop").exists());
         let hb = heartbeat::read_heartbeat(&repo).unwrap();
         assert_eq!(hb["status"], json!("idle"));
@@ -3989,14 +4120,21 @@ mod tests {
             }),
         );
         let d = diagnose(&repo);
-        assert_eq!(d["category"], json!("gh_not_ready"), "fixture reproduces the wedge diagnosis");
+        assert_eq!(
+            d["category"],
+            json!("gh_not_ready"),
+            "fixture reproduces the wedge diagnosis"
+        );
 
         // Probe still red — FAIL-CLOSED: the error stays and the heartbeat is untouched.
         assert!(
             revalidate_persisted_error_inner(&repo, &d, &|_| false).is_none(),
             "a still-failing gh probe must keep the error"
         );
-        assert_eq!(heartbeat::read_heartbeat(&repo).unwrap()["status"], json!("error"));
+        assert_eq!(
+            heartbeat::read_heartbeat(&repo).unwrap()["status"],
+            json!("error")
+        );
 
         // Probe green (gh auth + origin re-verified) — the stale error clears to idle.
         let expected_path = format!("C:/p/{name}");
@@ -4007,7 +4145,10 @@ mod tests {
         .expect("verified-green gh probe clears the stale error");
         assert_eq!(out["ok"], json!(true));
         assert_eq!(out["escalate"], json!(false));
-        assert_eq!(out["actions_taken"][0], json!("stale_error_recheck_cleared"));
+        assert_eq!(
+            out["actions_taken"][0],
+            json!("stale_error_recheck_cleared")
+        );
         let hb = heartbeat::read_heartbeat(&repo).unwrap();
         assert_eq!(hb["status"], json!("idle"), "lane returned to idle");
         assert!(hb.get("reason").is_none());
@@ -4037,20 +4178,28 @@ mod tests {
         let out = recover(&repo, false, false, false);
         assert_eq!(out["ok"], json!(true));
         assert_eq!(out["escalate"], json!(false));
-        assert_eq!(out["actions_taken"][0], json!("stale_error_recheck_cleared"));
+        assert_eq!(
+            out["actions_taken"][0],
+            json!("stale_error_recheck_cleared")
+        );
         // The supervisor log carries the recheck record AND the healthy transition record.
         let log = heartbeat::read_supervisor_log(&repo, 5);
         assert!(
             log.iter().any(|l| {
                 l.get("actions")
                     .and_then(Value::as_array)
-                    .map(|a| a.iter().any(|x| x.as_str() == Some("stale_error_recheck_cleared")))
+                    .map(|a| {
+                        a.iter()
+                            .any(|x| x.as_str() == Some("stale_error_recheck_cleared"))
+                    })
                     .unwrap_or(false)
             }),
             "supervisor.jsonl records the recheck-clear: {log:?}"
         );
         assert_eq!(
-            log.last().and_then(|l| l.get("category")).and_then(Value::as_str),
+            log.last()
+                .and_then(|l| l.get("category"))
+                .and_then(Value::as_str),
             Some("ok"),
             "note_healthy stamped the healthy transition (dedupe broken for recurrences)"
         );

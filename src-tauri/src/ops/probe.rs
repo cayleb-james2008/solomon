@@ -12,11 +12,11 @@
 //! Get-CimInstance Win32_Process (wmic does not exist on this machine) — NEVER by PID; the fleet's
 //! heartbeat PIDs are known to recycle.
 
-use super::registry;
 use super::Status;
+use super::registry;
 use crate::control::proc;
 use chrono::{DateTime, Utc};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -960,7 +960,7 @@ fn eval_git_sha_match(cfg: &Value, repo_path: &str) -> ProbeOutcome {
             return unobservable(
                 &threshold,
                 format!("missing/unparsable {}", hb_path.display()),
-            )
+            );
         }
     };
     let sha = match hb

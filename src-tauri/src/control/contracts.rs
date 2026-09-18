@@ -8,7 +8,7 @@
 
 use crate::control::paths::{here, repo_name, repo_path};
 use crate::control::registry;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 
 /// control._CONTRACT_FILES.get(which): 'backlog'->backlog.md, 'agent'->AGENT.md, else None.
@@ -118,9 +118,15 @@ pub fn detect_stack(path: &str) -> Value {
             format!("{py} -m unittest discover -s tests -t tests")
         }
     };
-    let has_manifest = ["pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.py", "setup.cfg"]
-        .iter()
-        .any(|f| here_f(f));
+    let has_manifest = [
+        "pyproject.toml",
+        "requirements.txt",
+        "requirements-dev.txt",
+        "setup.py",
+        "setup.cfg",
+    ]
+    .iter()
+    .any(|f| here_f(f));
 
     if has_manifest {
         lang = "python";
@@ -176,10 +182,17 @@ pub fn detect_stack(path: &str) -> Value {
 /// control.render_default_contract: deterministic (agent_md, backlog_md) tailored to the stack.
 pub fn render_default_contract(repo: &Value) -> (String, String) {
     let name_owned = repo_name(repo);
-    let name = if name_owned.is_empty() { "project".to_string() } else { name_owned };
+    let name = if name_owned.is_empty() {
+        "project".to_string()
+    } else {
+        name_owned
+    };
 
     let stack = detect_stack(&repo_path(repo));
-    let stack_lang = stack.get("lang").and_then(Value::as_str).unwrap_or("unknown");
+    let stack_lang = stack
+        .get("lang")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
     let stack_test_cmd = stack.get("test_cmd").and_then(Value::as_str).unwrap_or("");
     let entrypoints: Vec<&str> = stack
         .get("entrypoints")
@@ -262,7 +275,10 @@ pub fn ensure_contracts(repo: &Value) -> Value {
     }
     let pres = contracts_present(repo);
     let pres_agent = pres.get("agent").and_then(Value::as_bool).unwrap_or(false);
-    let pres_backlog = pres.get("backlog").and_then(Value::as_bool).unwrap_or(false);
+    let pres_backlog = pres
+        .get("backlog")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let mut created: Vec<Value> = Vec::new();
     if !(pres_agent && pres_backlog) {
@@ -425,17 +441,26 @@ mod tests {
         let (repo, dir) = unique_repo();
         let _ = fs::remove_dir_all(&dir);
         // both absent
-        assert_eq!(contracts_present(&repo), json!({"agent": false, "backlog": false}));
+        assert_eq!(
+            contracts_present(&repo),
+            json!({"agent": false, "backlog": false})
+        );
         // agent whitespace-only -> false; backlog non-empty -> true
         write_contract(&repo, "agent", "   \n");
         write_contract(&repo, "backlog", "y");
-        assert_eq!(contracts_present(&repo), json!({"agent": false, "backlog": true}));
+        assert_eq!(
+            contracts_present(&repo),
+            json!({"agent": false, "backlog": true})
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn contracts_present_no_name() {
-        assert_eq!(contracts_present(&json!({})), json!({"agent": false, "backlog": false}));
+        assert_eq!(
+            contracts_present(&json!({})),
+            json!({"agent": false, "backlog": false})
+        );
     }
 
     #[test]
@@ -511,7 +536,10 @@ mod tests {
         let r = detect_stack(d.to_str().unwrap());
         assert_eq!(r["lang"], "python");
         // no venv exe -> py == "python"
-        assert_eq!(r["test_cmd"], "python -m unittest discover -s tests -t tests");
+        assert_eq!(
+            r["test_cmd"],
+            "python -m unittest discover -s tests -t tests"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -530,7 +558,10 @@ mod tests {
 
         let dg = tmp_dir("go");
         fs::write(dg.join("go.mod"), "module x").unwrap();
-        assert_eq!(detect_stack(dg.to_str().unwrap())["test_cmd"], "go test ./...");
+        assert_eq!(
+            detect_stack(dg.to_str().unwrap())["test_cmd"],
+            "go test ./..."
+        );
         let _ = fs::remove_dir_all(&dg);
     }
 
@@ -552,7 +583,10 @@ mod tests {
         fs::create_dir_all(d.join("src")).unwrap();
         fs::write(d.join("src").join("main.ts"), "").unwrap();
         let r = detect_stack(d.to_str().unwrap());
-        assert_eq!(r["entrypoints"], json!(["app.py", "main.py", "src/main.ts"]));
+        assert_eq!(
+            r["entrypoints"],
+            json!(["app.py", "main.py", "src/main.ts"])
+        );
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -592,7 +626,9 @@ mod tests {
     fn render_gate_fallback_literal_when_nothing_detected() {
         // unknown stack (path missing) + no gate -> literal in the Verify-locally line
         let (agent, _) = render_default_contract(&json!({"name": "r", "path": "C:/nope_zzz"}));
-        assert!(agent.contains("run the gate yourself — `(set a gate command in Config)` — it must be green."));
+        assert!(agent.contains(
+            "run the gate yourself — `(set a gate command in Config)` — it must be green."
+        ));
     }
 
     #[test]
@@ -609,7 +645,11 @@ mod tests {
     fn render_goal_absent_omits_block() {
         let (agent, _) = render_default_contract(&json!({"name": "r"}));
         assert!(!agent.contains("## North-star"));
-        assert!(agent.contains("verified improvement.\n\n## Your job this run (exactly one improvement)"));
+        assert!(
+            agent.contains(
+                "verified improvement.\n\n## Your job this run (exactly one improvement)"
+            )
+        );
     }
 
     #[test]
@@ -620,7 +660,9 @@ mod tests {
         let (without, _) = render_default_contract(&json!({"name": "r"}));
         assert!(!without.contains("github_*"));
         // pull-request line immediately followed by the Stay-in-the-product bullet
-        assert!(without.contains("opens a pull request for the operator to review.\n- **Stay in the product.**"));
+        assert!(without.contains(
+            "opens a pull request for the operator to review.\n- **Stay in the product.**"
+        ));
     }
 
     #[test]
@@ -628,7 +670,8 @@ mod tests {
         let d = tmp_dir("cm_ep");
         fs::write(d.join("app.py"), "").unwrap();
         fs::write(d.join("requirements.txt"), "").unwrap();
-        let (agent, _) = render_default_contract(&json!({"name": "r", "path": d.to_str().unwrap()}));
+        let (agent, _) =
+            render_default_contract(&json!({"name": "r", "path": d.to_str().unwrap()}));
         assert!(agent.contains("- Entry points: `app.py`\n- Detected stack: python.\n- Read these first to learn the codebase before changing anything."));
         let _ = fs::remove_dir_all(&d);
     }
@@ -638,7 +681,8 @@ mod tests {
         let d = tmp_dir("cm_td");
         fs::create_dir_all(d.join("lib")).unwrap();
         fs::create_dir_all(d.join("src")).unwrap();
-        let (agent, _) = render_default_contract(&json!({"name": "r", "path": d.to_str().unwrap()}));
+        let (agent, _) =
+            render_default_contract(&json!({"name": "r", "path": d.to_str().unwrap()}));
         // top_dirs sorted: lib, src
         assert!(agent.contains("- Top-level directories: `lib`, `src`\n- Read these first to learn the codebase before changing anything."));
         assert!(!agent.contains("Detected stack:"));
@@ -648,7 +692,11 @@ mod tests {
     #[test]
     fn render_code_map_fallback() {
         let (agent, _) = render_default_contract(&json!({"name": "r", "path": "C:/nope_zzz2"}));
-        assert!(agent.contains("- Read the README and the main entry point first to learn the codebase."));
+        assert!(
+            agent.contains(
+                "- Read the README and the main entry point first to learn the codebase."
+            )
+        );
     }
 
     #[test]
@@ -732,7 +780,7 @@ mod tests {
     /// proof — otherwise this contract test fails, enforcing the "no write-only ledger" rule.
     #[test]
     fn every_orchestrator_ledger_is_read_back_into_the_dispatch_decision() {
-        use crate::ceo::orchestrator::{selection_readers_contract, ORCHESTRATOR_LEDGERS};
+        use crate::ceo::orchestrator::{ORCHESTRATOR_LEDGERS, selection_readers_contract};
         use crate::improver::{calibration, progress};
 
         // (0) The registry is non-empty and names the two substrates D7 re-asserts.

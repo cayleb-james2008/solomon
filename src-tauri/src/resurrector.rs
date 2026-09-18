@@ -38,7 +38,7 @@
 
 use crate::control::{paths, proc};
 use chrono::{DateTime, NaiveDateTime, Utc};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 
 /// STALE_AFTER_S — the engine-host liveness threshold `T`. The GUI host stamps its heartbeat every
@@ -121,11 +121,7 @@ pub fn stamp_engine_heartbeat() {
 fn read_engine_heartbeat() -> Option<Value> {
     let data = std::fs::read_to_string(engine_heartbeat_path()).ok()?;
     let v: Value = serde_json::from_str(&data).ok()?;
-    if v.is_object() {
-        Some(v)
-    } else {
-        None
-    }
+    if v.is_object() { Some(v) } else { None }
 }
 
 /// Age (seconds) of a heartbeat record's `ts`, relative to `now`. `None` when `ts` is absent /
@@ -223,9 +219,9 @@ pub fn decide(
 /// the SELF binary with no subcommand; no trade/whitelist/budget/git capability is reachable from
 /// here.
 fn spawn_engine_host() -> std::io::Result<u32> {
-    use std::process::{Command, Stdio};
     #[cfg(windows)]
     use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(&exe);
     // NO args — the bare exe is the GUI host path (main.rs: an empty argv → run_gui()).
@@ -234,7 +230,9 @@ fn spawn_engine_host() -> std::io::Result<u32> {
         .stderr(Stdio::null());
     proc::apply_clean_env(&mut cmd);
     #[cfg(windows)]
-    cmd.creation_flags(proc::DETACHED_PROCESS | proc::CREATE_NEW_PROCESS_GROUP | proc::CREATE_NO_WINDOW);
+    cmd.creation_flags(
+        proc::DETACHED_PROCESS | proc::CREATE_NEW_PROCESS_GROUP | proc::CREATE_NO_WINDOW,
+    );
     let child = cmd.spawn()?;
     Ok(child.id())
 }
@@ -277,7 +275,10 @@ pub fn run() {
         },
         // page: the real operator page (urgent, red).
         &|title, body| {
-            let _ = crate::notify::send(&crate::notify::Notice::red(title.to_string(), body.to_string()));
+            let _ = crate::notify::send(&crate::notify::Notice::red(
+                title.to_string(),
+                body.to_string(),
+            ));
         },
     );
 }
@@ -311,7 +312,14 @@ fn run_with(
         .map(|d| d.as_secs_f64() < SPAWN_COOLDOWN_S)
         .unwrap_or(false);
 
-    match decide(hb_present, age, alive, STALE_AFTER_S, already_paged, in_cooldown) {
+    match decide(
+        hb_present,
+        age,
+        alive,
+        STALE_AFTER_S,
+        already_paged,
+        in_cooldown,
+    ) {
         Action::Wait => {
             // Host alive (or no positive death signal): clear the dedupe marker the moment a fresh
             // heartbeat proves recovery, re-arming the page for the next death episode. Only clear on
@@ -400,10 +408,19 @@ mod tests {
     #[test]
     fn decide_fresh_host_waits() {
         // Fresh heartbeat (age below T), PID irrelevant → Wait.
-        assert_eq!(decide(true, Some(10.0), false, 360.0, false, false), Action::Wait);
-        assert_eq!(decide(true, Some(10.0), true, 360.0, false, false), Action::Wait);
+        assert_eq!(
+            decide(true, Some(10.0), false, 360.0, false, false),
+            Action::Wait
+        );
+        assert_eq!(
+            decide(true, Some(10.0), true, 360.0, false, false),
+            Action::Wait
+        );
         // Exactly AT the threshold is not yet stale (strict `>`).
-        assert_eq!(decide(true, Some(360.0), false, 360.0, false, false), Action::Wait);
+        assert_eq!(
+            decide(true, Some(360.0), false, 360.0, false, false),
+            Action::Wait
+        );
     }
 
     #[test]
@@ -424,7 +441,10 @@ mod tests {
     #[test]
     fn decide_stale_but_pid_alive_waits() {
         // A HUNG host (stale heartbeat, PID still alive) must NOT be double-spawned.
-        assert_eq!(decide(true, Some(99999.0), true, 360.0, false, false), Action::Wait);
+        assert_eq!(
+            decide(true, Some(99999.0), true, 360.0, false, false),
+            Action::Wait
+        );
     }
 
     #[test]
@@ -432,15 +452,24 @@ mod tests {
         // Stale + dead pid, but a relaunch fired within SPAWN_COOLDOWN_S → the new host hasn't
         // published its first heartbeat yet; the stale record is the OLD host's, not a fresh death.
         // Hold off — no redundant respawn.
-        assert_eq!(decide(true, Some(1000.0), false, 360.0, false, true), Action::Wait);
+        assert_eq!(
+            decide(true, Some(1000.0), false, 360.0, false, true),
+            Action::Wait
+        );
         // Even with the episode already paged, the cooldown still suppresses the respawn.
-        assert_eq!(decide(true, Some(1000.0), false, 360.0, true, true), Action::Wait);
+        assert_eq!(
+            decide(true, Some(1000.0), false, 360.0, true, true),
+            Action::Wait
+        );
     }
 
     #[test]
     fn decide_missing_or_unparseable_heartbeat_waits() {
         // Missing heartbeat is NOT death (fresh install / deliberately-closed host).
-        assert_eq!(decide(false, None, false, 360.0, false, false), Action::Wait);
+        assert_eq!(
+            decide(false, None, false, 360.0, false, false),
+            Action::Wait
+        );
         // Present but unparseable ts (age None) → fail safe → Wait.
         assert_eq!(decide(true, None, false, 360.0, false, false), Action::Wait);
     }
@@ -448,7 +477,10 @@ mod tests {
     #[test]
     fn decide_negative_age_future_ts_waits() {
         // A future ts (clock skew) yields a negative age → not stale → Wait (never resurrect on skew).
-        assert_eq!(decide(true, Some(-500.0), false, 360.0, false, false), Action::Wait);
+        assert_eq!(
+            decide(true, Some(-500.0), false, 360.0, false, false),
+            Action::Wait
+        );
     }
 
     #[test]
@@ -520,7 +552,10 @@ mod tests {
             "heartbeat records THIS process pid"
         );
         let age = heartbeat_age_s(&hb, Utc::now()).expect("stamped ts is parseable");
-        assert!((0.0..5.0).contains(&age), "a just-stamped heartbeat is fresh, age was {age}");
+        assert!(
+            (0.0..5.0).contains(&age),
+            "a just-stamped heartbeat is fresh, age was {age}"
+        );
         assert!(
             age < STALE_AFTER_S,
             "a single fresh stamp is well inside the staleness window"
@@ -564,7 +599,10 @@ mod tests {
         assert_eq!(spawns.get(), 1, "should have spawned the host once");
         assert_eq!(pages.get(), 1, "should have paged once");
         assert!(marker.exists(), "dedupe marker armed after the first page");
-        assert!(last.exists(), "spawn-cooldown stamp armed after the relaunch");
+        assert!(
+            last.exists(),
+            "spawn-cooldown stamp armed after the relaunch"
+        );
 
         // Sweep 2 immediately after: still stale + dead, but INSIDE the spawn cooldown → Wait (no
         // redundant respawn, no page). This is the belt-and-suspenders against a respawn storm while
@@ -578,7 +616,11 @@ mod tests {
         // page per episode, no storm).
         let _ = std::fs::remove_file(&last);
         run_with(now, &pid_dead, &spawn, &page);
-        assert_eq!(spawns.get(), 2, "past cooldown, re-heals the persisting death");
+        assert_eq!(
+            spawns.get(),
+            2,
+            "past cooldown, re-heals the persisting death"
+        );
         assert_eq!(pages.get(), 1, "but pages only ONCE per episode — no storm");
 
         let _ = std::fs::remove_file(&hb_path);
@@ -647,7 +689,11 @@ mod tests {
         let pid_alive = |_pid: i64| true; // recorded pid still alive
 
         run_with(now, &pid_alive, &spawn, &page);
-        assert_eq!(spawns.get(), 0, "a hung (alive-pid) host is never double-spawned");
+        assert_eq!(
+            spawns.get(),
+            0,
+            "a hung (alive-pid) host is never double-spawned"
+        );
         assert!(!marker.exists(), "no page, no marker, for a hung host");
 
         let _ = std::fs::remove_file(&hb_path);

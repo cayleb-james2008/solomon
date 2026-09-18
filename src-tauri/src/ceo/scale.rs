@@ -306,8 +306,14 @@ pub fn maybe_scale_lanes(snapshot: &Value, status: &Value) {
 
         let cd_elapsed = cooldown_elapsed(&name, &cfg);
 
-        let new = match next_interval(Some(&cfg), baseline, current, &velocity, scalable, cd_elapsed)
-        {
+        let new = match next_interval(
+            Some(&cfg),
+            baseline,
+            current,
+            &velocity,
+            scalable,
+            cd_elapsed,
+        ) {
             Some(n) => n,
             None => continue,
         };
@@ -321,7 +327,18 @@ pub fn maybe_scale_lanes(snapshot: &Value, status: &Value) {
         let action = baseline_action(tightening, marker.is_some(), new, baseline, baseline);
 
         let result = registry::set_repo_config(
-            &name, None, None, None, None, None, Some(new), None, None, None, None, None,
+            &name,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(new),
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         if result.get("ok").and_then(Value::as_bool) != Some(true) {
             continue; // write refused (corrupt repos.json etc.) — don't stamp/page a non-write
@@ -349,7 +366,9 @@ fn page(name: &str, from: i64, to: i64, scalable: bool) {
     } else {
         crate::notify::Notice::recovered(
             format!("Solomon: {name} cadence backed off"),
-            format!("{name}: interval {from}s -> {to}s (unhealthy/real-money — restoring baseline)"),
+            format!(
+                "{name}: interval {from}s -> {to}s (unhealthy/real-money — restoring baseline)"
+            ),
         )
     };
     let _ = crate::notify::send(&notice);
@@ -413,7 +432,14 @@ mod tests {
         );
         // unknown/other trends likewise never tighten.
         assert_eq!(
-            next_interval(Some(&cfg()), 900, 900, &json!({"trend": "growing"}), true, true),
+            next_interval(
+                Some(&cfg()),
+                900,
+                900,
+                &json!({"trend": "growing"}),
+                true,
+                true
+            ),
             None
         );
         assert_eq!(
@@ -425,10 +451,7 @@ mod tests {
     #[test]
     fn no_scale_cfg_never_scales_even_when_behind() {
         // No scale block -> None even with trend forced "behind" and everything else screaming go.
-        assert_eq!(
-            next_interval(None, 900, 900, &behind(), true, true),
-            None
-        );
+        assert_eq!(next_interval(None, 900, 900, &behind(), true, true), None);
     }
 
     #[test]
@@ -475,7 +498,10 @@ mod tests {
         assert_eq!(min_interval_s(&json!({})), 1);
         assert_eq!(min_interval_s(&json!({"min_interval_s": 0})), 1);
         assert_eq!(scale_cooldown_s(&json!({})), DEFAULT_SCALE_COOLDOWN_S);
-        assert_eq!(scale_cooldown_s(&json!({"cooldown_s": -1})), DEFAULT_SCALE_COOLDOWN_S);
+        assert_eq!(
+            scale_cooldown_s(&json!({"cooldown_s": -1})),
+            DEFAULT_SCALE_COOLDOWN_S
+        );
         assert_eq!(scale_cooldown_s(&json!({"cooldown_s": 600})), 600);
     }
 

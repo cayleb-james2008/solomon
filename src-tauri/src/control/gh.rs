@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::control::{paths, proc};
 
@@ -264,7 +264,13 @@ pub fn list_prs(repo: &Value) -> Vec<Value> {
 
 /// control.merge_pr: `gh pr merge <n> --squash --delete-branch`. {ok} | {ok,error}.
 pub fn merge_pr(repo: &Value, number: i64) -> Value {
-    pr_action(repo, "merge", number, &["--squash", "--delete-branch"], "merge failed")
+    pr_action(
+        repo,
+        "merge",
+        number,
+        &["--squash", "--delete-branch"],
+        "merge failed",
+    )
 }
 
 /// control.close_pr: `gh pr close <n> --delete-branch`. Default error literal "close failed".
@@ -280,8 +286,7 @@ fn pr_action(repo: &Value, sub: &str, number: i64, flags: &[&str], default_err: 
     };
     let gh = gh.as_os_str();
     let num = number.to_string();
-    let mut argv: Vec<&std::ffi::OsStr> =
-        vec![gh, "pr".as_ref(), sub.as_ref(), num.as_ref()];
+    let mut argv: Vec<&std::ffi::OsStr> = vec![gh, "pr".as_ref(), sub.as_ref(), num.as_ref()];
     for f in flags {
         argv.push(f.as_ref());
     }
@@ -484,25 +489,41 @@ mod tests {
 
     #[test]
     fn err_prefers_stderr() {
-        let r = proc::RunOut { code: 1, stdout: "".into(), stderr: "  not mergeable\n".into() };
+        let r = proc::RunOut {
+            code: 1,
+            stdout: "".into(),
+            stderr: "  not mergeable\n".into(),
+        };
         assert_eq!(err_or_default(&r, "merge failed"), "not mergeable");
     }
 
     #[test]
     fn err_falls_to_stdout() {
-        let r = proc::RunOut { code: 1, stdout: "no such PR\n".into(), stderr: "".into() };
+        let r = proc::RunOut {
+            code: 1,
+            stdout: "no such PR\n".into(),
+            stderr: "".into(),
+        };
         assert_eq!(err_or_default(&r, "close failed"), "no such PR");
     }
 
     #[test]
     fn err_falls_to_default_merge() {
-        let r = proc::RunOut { code: 1, stdout: "".into(), stderr: "".into() };
+        let r = proc::RunOut {
+            code: 1,
+            stdout: "".into(),
+            stderr: "".into(),
+        };
         assert_eq!(err_or_default(&r, "merge failed"), "merge failed");
     }
 
     #[test]
     fn err_default_close_distinct_from_merge() {
-        let r = proc::RunOut { code: 1, stdout: "".into(), stderr: "".into() };
+        let r = proc::RunOut {
+            code: 1,
+            stdout: "".into(),
+            stderr: "".into(),
+        };
         assert_eq!(err_or_default(&r, "close failed"), "close failed");
     }
 
