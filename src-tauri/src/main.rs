@@ -285,7 +285,11 @@ fn attach_parent_console() {
     // Release builds are windows_subsystem="windows" (no console). For a headless subcommand invoked
     // from a terminal, re-attach to the parent's console so println!/eprintln! stay visible. Harmless
     // no-op when there is no parent console (the scheduled watchdog task / a detached spawn).
-    extern "system" {
+    // Edition 2024 requires `extern` blocks to be marked `unsafe`. This block is Windows-only, so
+    // a Linux build never compiled it and the edition bump silently broke the Windows target;
+    // `cargo xwin check --target x86_64-pc-windows-msvc` caught it. The `AttachConsole` call is
+    // already inside an `unsafe {}` block below.
+    unsafe extern "system" {
         fn AttachConsole(dw_process_id: u32) -> i32;
     }
     const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
