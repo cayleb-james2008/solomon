@@ -1260,7 +1260,8 @@ mod tests {
         let _env = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         let repo = uniq_repo("content");
         let out = dispatch_growth_content(
@@ -1307,7 +1308,8 @@ mod tests {
         if let Some(dir) = std::path::Path::new(artifact_path).parent() {
             let _ = std::fs::remove_dir_all(dir);
         }
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // ===================================================================== #
@@ -1321,7 +1323,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         let growth = GrowthSpecialist::new();
 
@@ -1372,7 +1375,8 @@ mod tests {
             );
         }
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     /// A denied money probe never reaches run() through the real dispatch path either: dispatch
@@ -1383,7 +1387,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         let growth = GrowthSpecialist::new();
         // A unique whitelisted (equity_usd) lane so the money DENY fires on the strongest lane while
@@ -1408,7 +1413,8 @@ mod tests {
             before, after,
             "a denied money probe must write NO growth draft line"
         );
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // ===================================================================== #
@@ -1467,7 +1473,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         // A lane with NO growth_publish block: a publish task must NOT publish (opt-in only) and must
         // NOT spend. It returns published:false with the not_opted_in mode — never a live publish.
@@ -1482,7 +1489,8 @@ mod tests {
         assert_eq!(out["spent"], false, "publishing never spends");
         assert_eq!(out["mode"], "not_opted_in");
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     #[test]
@@ -1490,7 +1498,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         // A lane opted in (growth_publish present) but mode is the DEFAULT dry_run (or absent) must
         // DRY-RUN: validate + report the sanctioned lane argv WITHOUT spawning it, published:false.
@@ -1539,7 +1548,8 @@ mod tests {
             &json!({"growth_publish": {}})
         ));
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // A LIVE-mode publish on an opted-in lane actually routes through the sanctioned lane and reports
@@ -1551,7 +1561,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         // A real, trivial, fast-exiting command stands in for a project's OWN published lane binary:
         // it exits 0, so a clean live publish reports published:true. On Windows the sanctioned lane is
@@ -1601,7 +1612,8 @@ mod tests {
         );
         assert_eq!(out_fail["spent"], false);
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // ===================================================================== #
@@ -1614,7 +1626,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         let growth = GrowthSpecialist::new();
         for gov_target in [
@@ -1638,7 +1651,8 @@ mod tests {
             );
         }
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // ANTI-SELF-PROMOTION (the reward-hacking guard): the Growth specialist can NEVER promote its own
@@ -1651,7 +1665,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         let growth = GrowthSpecialist::new();
         // Any attempt to touch repos.json (where growth_publish.mode lives) is denied at the gate.
@@ -1678,7 +1693,8 @@ mod tests {
             "Growth must never have repos.json in its writable scope: {scope:?}"
         );
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // ---- scope_globs restricts writes to the growth-drafts path ONLY ----
@@ -2046,7 +2062,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         let repo = uniq_repo("composed");
         // The exact detail shape compose_and_dispatch builds from a parsed reply + the directive.
@@ -2086,7 +2103,8 @@ mod tests {
         if let Some(dir) = std::path::Path::new(path).parent() {
             let _ = std::fs::remove_dir_all(dir);
         }
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // ---- PUBLISH "last inch" — the human approval gate (draft_line_approved is pure + fail-closed) ----
@@ -2151,7 +2169,8 @@ mod tests {
         let _env = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
         let today = Utc::now().format("%Y-%m-%d").to_string();
 
         // --- a plain composed draft (NO approved:true) AUTO-publishes exactly once ---
@@ -2235,7 +2254,8 @@ mod tests {
         );
         assert_eq!(out_d["reason"], json!("already published"));
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
         let _ = std::fs::remove_dir_all(rt);
         let _ = std::fs::remove_dir_all(rt_p);
         let _ = std::fs::remove_dir_all(rt_d);

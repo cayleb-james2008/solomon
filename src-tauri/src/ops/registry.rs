@@ -205,7 +205,6 @@ mod tests {
     }
 
     // -------- path resolution --------
-    #[test]
     // -------- path resolution --------
     #[test]
     fn resolve_path_expands_env_repo_and_relative() {

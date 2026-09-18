@@ -1225,7 +1225,8 @@ mod tests {
         let _env = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
         let repo = uniq_repo("compose");
         let lane = lane_of(&repo);
         seed_targets(&repo, one_target());
@@ -1303,7 +1304,8 @@ mod tests {
         assert_eq!(st["drafted_target_keys"][0], target_key("person@org.com"));
 
         cleanup(&repo);
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // -------- 7: dedup — a drafted target is never redrafted --------
@@ -1367,7 +1369,8 @@ mod tests {
         let _env = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
         let repo = uniq_repo("needs");
         let lane = lane_of(&repo);
         seed_backlog(&lane, &format!("[feature] cold outreach {}", marker()));
@@ -1398,7 +1401,8 @@ mod tests {
             "the needs marker is claimed once, never rewritten per sweep"
         );
         cleanup(&repo);
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // -------- 10: SEND refuses a recipient NOT on the operator target list (hard anti-scrape) -----
@@ -1442,7 +1446,8 @@ mod tests {
         let _env = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
         let repo = uniq_repo("nosmtp");
         seed_targets(&repo, json!([{"email": "p@o.com", "rationale": "fits"}]));
         seed_outbox(
@@ -1467,7 +1472,8 @@ mod tests {
             "no signature recorded — retriable once creds exist"
         );
         cleanup(&repo);
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // -------- 12: AUTO-send (no approval) => exactly one send with the honest footer, idempotent ---
@@ -1476,7 +1482,8 @@ mod tests {
         let _env = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
         let repo = uniq_repo("sendonce");
         let lane = lane_of(&repo);
         seed_targets(&repo, json!([{"email": "p@o.com", "rationale": "fits"}]));
@@ -1532,7 +1539,8 @@ mod tests {
         assert_eq!(out["sent"], false);
         assert_eq!(out["reason"], "nothing to send");
         cleanup(&repo);
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // -------- 12b: a FAILED send records no signature (retriable) --------
@@ -1541,7 +1549,8 @@ mod tests {
         let _env = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
         let repo = uniq_repo("sendfail");
         seed_targets(&repo, json!([{"email": "p@o.com", "rationale": "fits"}]));
         seed_outbox(&repo, "p@o.com", "Hello", "Body.");
@@ -1582,7 +1591,8 @@ mod tests {
             "a transient failure stays retriable: {out}"
         );
         cleanup(&repo);
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // -------- 13: rate caps (pure clock-injected port of sover email_outreach) --------

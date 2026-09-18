@@ -3362,7 +3362,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _ = std::fs::remove_file(crate::ceo::self_tooling::manifest_path());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
         let seam_dir = paths::here().join("runtime").join(CEO_WARM_LANE);
         let markers = [
             "_seam_outreach_compose",
@@ -3382,7 +3383,8 @@ mod tests {
                 "the {m} seam must be invoked by ceo_autonomy_seams (wired, not dead code)"
             );
         }
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // -------- CEO autonomy wiring: the tick's FAST core regenerates the approvals surface --------
@@ -3396,7 +3398,8 @@ mod tests {
         let _env = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
         let _a = crate::ceo::approvals::APPROVALS_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -3426,6 +3429,7 @@ mod tests {
         );
         assert!(body.contains("Still human-gated: money-out"), "{body}");
         assert!(!body.contains("Solomon never self-approves"), "{body}");
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 }

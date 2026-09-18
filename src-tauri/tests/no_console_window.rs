@@ -99,7 +99,7 @@ const NON_CONSOLE_PROGRAM_LITERALS: &[&str] = &["\"/bin/sh\"", "\"/bin/bash\"", 
 /// program arg is a variable (not a literal), so the program-literal exemption can't catch them.
 /// `api.rs::open_in_browser` — `rundll32 url.dll,FileProtocolHandler` / `open` / `xdg-open` — are OS
 /// default-protocol handlers that do not create a console window (mirrors Python `webbrowser.open`).
-const BROWSER_OPEN_SITES: &[(&str, u32)] = &[("api.rs", 1096), ("api.rs", 1109)];
+const BROWSER_OPEN_SITES: &[(&str, u32)] = &[("api.rs", 1100), ("api.rs", 1113)];
 
 /// How many lines forward from a `Command::new(` to look for a guard marker. Generous for the
 /// current codebase (the farthest guard sits ~12 lines away). The window does NOT stop early at

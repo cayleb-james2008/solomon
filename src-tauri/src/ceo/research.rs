@@ -347,7 +347,8 @@ mod tests {
         let _env = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         let repo = uniq_repo("write");
         let out = dispatch_research(
@@ -395,7 +396,8 @@ mod tests {
         if let Some(dir) = std::path::Path::new(artifact_path).parent() {
             let _ = std::fs::remove_dir_all(dir);
         }
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // ===================================================================== #
@@ -408,7 +410,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         let research = ResearchSpecialist::new();
 
@@ -450,7 +453,8 @@ mod tests {
                 );
             }
         }
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     /// A denied money probe never reaches run() through the real dispatch path either: dispatch
@@ -461,7 +465,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         let research = ResearchSpecialist::new();
         // A unique whitelisted (equity_usd) lane so the money DENY fires on the strongest lane while
@@ -486,7 +491,8 @@ mod tests {
             before, after,
             "a denied money probe must write NO observation line"
         );
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // ===================================================================== #
@@ -543,7 +549,8 @@ mod tests {
         let _env = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         let research = ResearchSpecialist::new();
 
@@ -584,7 +591,8 @@ mod tests {
                 let _ = std::fs::remove_dir_all(dir);
             }
         }
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // ---- scope_globs restricts writes to the drafts/observation-log path ONLY ----

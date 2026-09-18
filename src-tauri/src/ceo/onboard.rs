@@ -416,7 +416,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         let proj = tmp_project("e2e", true); // WITH a real tools/fitness.py emitter
         let proj_s = proj.to_string_lossy().into_owned();
@@ -509,7 +510,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(rt);
         let _ = std::fs::remove_dir_all(&proj);
         drop_onboarded_row(name);
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // ===================================================================== #
@@ -522,7 +524,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         let proj = tmp_project("noemit", false); // NO tools/fitness.py
         let proj_s = proj.to_string_lossy().into_owned();
@@ -547,7 +550,8 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(std::path::Path::new(out["runtime_dir"].as_str().unwrap()));
         let _ = std::fs::remove_dir_all(&proj);
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // ===================================================================== #
@@ -559,7 +563,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         // Onboard TWO distinct projects; each must get its OWN runtime/<name>/ subtree, and running
         // one lane's gated cycle must write only under THAT lane's dir — never the other's.
@@ -596,7 +601,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&rt_b);
         let _ = std::fs::remove_dir_all(&a);
         let _ = std::fs::remove_dir_all(&b);
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // ---- fail-closed refusals ----

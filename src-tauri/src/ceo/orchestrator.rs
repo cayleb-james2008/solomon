@@ -780,7 +780,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         let repo = plain_repo();
         let mut ctx = iso_ctx("sover");
@@ -838,7 +839,8 @@ mod tests {
             "the quarantined task was NOT re-run on the 4th wake (its strike count is frozen)"
         );
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     #[test]
@@ -846,7 +848,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         let repo = plain_repo();
         let mut ctx = iso_ctx("sover");
@@ -873,7 +876,8 @@ mod tests {
             "no task was dispatched (no pi spend)"
         );
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     /// Read a key's `count_no_delta` from the isolated ctx's progress ledger (test helper).
@@ -894,7 +898,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         let repo = plain_repo();
         let mut ctx = iso_ctx("sover");
@@ -957,7 +962,8 @@ mod tests {
             "a class with no low-ship-rate evidence must run WHOLE (no directive): {seen_small}"
         );
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // ===================================================================== #
@@ -1012,7 +1018,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         let out = dispatch_for_diagnosis(&plain_repo(), "gate_red_streak", "fix the red gate");
         assert_eq!(out["specialist"], "engineering");
@@ -1023,7 +1030,8 @@ mod tests {
             "an honest exit_code is reported"
         );
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // ===================================================================== #
@@ -1085,7 +1093,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         let eng = EngineeringSpecialist::new();
 
@@ -1138,7 +1147,8 @@ mod tests {
             );
         }
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     /// Test helper: a `Remediate(&'static str)` needs a static kind. The money verbs under test are
@@ -1169,7 +1179,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         let eng = EngineeringSpecialist::new();
 
@@ -1207,7 +1218,8 @@ mod tests {
         assert_eq!(denied["ok"], false);
         assert_eq!(denied["pecrt_safety"], true);
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // ---- trait wiring: scope_globs reads the SAME repos.json tiers the ship gate reads ----
@@ -1249,7 +1261,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         // An isolated lane ctx (never the live runtime) on an ordinary engineering lane. A plain
         // backlog Code task on this lane is neither money-capable nor a governance target, so the
@@ -1275,7 +1288,8 @@ mod tests {
              dispatched to the Engineering specialist (got a gate DENY): {out:?}"
         );
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     #[test]
@@ -1283,7 +1297,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         // A money-capable task kind attributed to the same live dispatch seam MUST be DENIED at the
         // gate BEFORE any pi spawn — even on a whitelisted live-money lane (money-OUT is the HARD
@@ -1322,7 +1337,8 @@ mod tests {
             }
         }
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     #[test]
@@ -1330,7 +1346,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         // A dispatch whose lane names a self-governance surface (whitelist / cycle_budget / skeptic /
         // blast-radius / kill / freshness) MUST be DENIED at the gate before any pi spawn — pecrt
@@ -1366,7 +1383,8 @@ mod tests {
             );
         }
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 
     // ===================================================================== #
@@ -1382,7 +1400,8 @@ mod tests {
         let _g = crate::notify::NOTIFY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SOLOMON_NOTIFY_OFF", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_NOTIFY_OFF", "1") };
 
         let eng = EngineeringSpecialist::new();
         // The shipping lanes (repos.json). A rename that introduces a governance substring would make
@@ -1404,6 +1423,7 @@ mod tests {
             }
         }
 
-        std::env::remove_var("SOLOMON_NOTIFY_OFF");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_NOTIFY_OFF") };
     }
 }

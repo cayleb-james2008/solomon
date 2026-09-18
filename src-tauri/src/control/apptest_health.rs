@@ -723,12 +723,14 @@ mod tests {
     fn browser_state_verbatim_and_array_and_missing() {
         let _g = ENV_GUARD.lock().unwrap();
         let home = temp_home();
-        std::env::set_var("SOLOMON_HOME", &home);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_HOME", &home) };
         // Force HERE re-resolution is impossible (OnceLock); instead assert via runtime_dir using the
         // same name. We rely on paths::here() having been pinned by SOLOMON_HOME on first call within
         // this process. If another test already initialized HERE, skip the file-backed assertions.
         if paths::here() != home.as_path() {
-            std::env::remove_var("SOLOMON_HOME");
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("SOLOMON_HOME") };
             return;
         }
         // verbatim
@@ -751,7 +753,8 @@ mod tests {
         let r = browser_state(&json!({"name": "missing"}));
         assert_eq!(r.get("ok"), Some(&json!(false)));
         assert!(r.get("error").and_then(Value::as_str).is_some());
-        std::env::remove_var("SOLOMON_HOME");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_HOME") };
         // HERE is a process-global OnceLock pinned to this `home` on first resolution. Other modules'
         // file-backed tests resolve env_file()/runtime under the same HERE, so the pinned dir must
         // outlive this test. Only delete it if HERE was pinned elsewhere.
@@ -879,9 +882,11 @@ mod tests {
         // Non-empty repo dict whose path has no frontend -> config error (not "unknown repo").
         let _g = ENV_GUARD.lock().unwrap();
         let home = temp_home();
-        std::env::set_var("SOLOMON_HOME", &home);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SOLOMON_HOME", &home) };
         if paths::here() != home.as_path() {
-            std::env::remove_var("SOLOMON_HOME");
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("SOLOMON_HOME") };
             return;
         }
         let empty_repo_dir = home.join("blank_repo");
@@ -891,7 +896,8 @@ mod tests {
             start_app_test(&repo),
             json!({"ok": false, "error": "no runnable frontend configuration found"})
         );
-        std::env::remove_var("SOLOMON_HOME");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_HOME") };
         if paths::here() != home.as_path() {
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -946,7 +952,8 @@ mod tests {
         // Idempotent stop after stop.
         assert_eq!(stop_app_test(&repo), json!({"ok": true, "already": true}));
 
-        std::env::remove_var("SOLOMON_HOME");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("SOLOMON_HOME") };
         if paths::here() != home.as_path() {
             let _ = std::fs::remove_dir_all(&home);
         }
