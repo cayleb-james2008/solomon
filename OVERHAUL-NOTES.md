@@ -129,3 +129,30 @@ this host (QEMU 11.0.1 under KVM; Windows LTSC eval ISO `sha256 e4ab2e35…`); W
 Windows testing remains NOT RUN.
 
 **Windows CI note:** the workflows run on `windows-latest`; this pass did not execute them.
+
+## Windows runtime test on a real Windows VM (2026-09-18)
+
+A Windows 10 Enterprise LTSC Evaluation VM was built on this host (QEMU 11.0.1 under KVM,
+installed from the Microsoft evaluation ISO, fully unattended via an `autounattend.xml` on a
+second CD; the VM then downloaded the built .exe over the QEMU user-network from a local HTTP
+server on `10.0.2.2:8899`). Result, reported **from inside the guest** and uploaded back:
+`solomon.exe` **RESULT=RUNNING_AFTER_12s** — it launched and was still running 12 seconds later on
+Windows 10.0.19044.
+
+**A real Windows-only bug was found by this and fixed.** The first cross-build imported the MSVC
+C runtime dynamically, and on the clean VM it failed immediately with
+`The code execution cannot proceed because VCRUNTIME140.dll was not found` — a fresh Windows
+install has no Visual C++ redistributable. The fix (now committed) is a Windows-scoped
+`.cargo/config.toml`:
+
+```toml
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+```
+
+This links the C runtime statically, so the .exe imports only core Windows system DLLs. Verified
+by parsing the PE import table: `runtime-DLLs=NONE (self-contained)`. After the fix the app ran
+on the same clean VM. Linux builds are unaffected (the setting is target-scoped).
+
+Raw evidence kept in `_verify/windows-vm/` (gitignored): the uploaded
+`windows-runtime-report.txt` and a screen capture of the result lines.

@@ -1,0 +1,13 @@
+# Windows release builds link the C runtime statically.
+#
+# Verified on a real Windows 10 Enterprise LTSC VM (2026-09-18): the default MSVC
+# dynamic-CRT build fails on a clean Windows install with
+#   "The code execution cannot proceed because VCRUNTIME140.dll was not found"
+# because the Visual C++ redistributable is not present on a fresh machine.
+# With `-C target-feature=+crt-static` the .exe imports only core Windows system
+# DLLs and launches and stays up on that same clean install (verified: the app
+# remained running 12s after launch, on Windows 10.0.19044).
+#
+# Scoped to the Windows target only, so Linux/macOS builds are unaffected.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
